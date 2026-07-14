@@ -37,8 +37,20 @@ Analog frame data from playtests.
   `loadCharacter()` validates; `setCharacters()` swaps bundles between
   matches (never mid-sim). Sprites are cosmetic — the sim never reads them.
 - Run: `npm run studio` → http://localhost:8474.
-- Remaining for M2 exit: atlas packing, pose-conditioned generation /
-  archetype pose libraries, then build character #2 fully in Studio < 2 days.
+- Shoto archetype pose library (SHOTO_POSES in studio main.ts) auto-fills
+  generation prompts per canonical move id — reused across the roster;
+  characters override via meta.moveDesc. "batch ALL moves" generates every
+  step of every move, auto-accepts QC passes, one seed-salted retry on
+  failure. Seeds are stable per (char, move, step) for reproducibility.
+- Atlas packed on every save (browser-side grid of fixed 192px cells) →
+  characters/<id>/sprites/atlas.png + atlas.json — the spec §3 ship format.
+- Test tab has a P2 character select for versus matches between bundles.
+- NOTE: flux.2-klein-4b on NVIDIA build does NOT accept user reference
+  images (`image` param only takes their gallery example_ids; NVCF asset
+  upload works but is rejected with "Expected: example_id"). Consistency
+  relies on palette lock + pixelation + archetype poses + QC gate. If
+  drift is unacceptable, options: different model endpoint with image
+  input, or flux.1-dev canny/depth with archetype pose control images.
 
 ## Layout
 

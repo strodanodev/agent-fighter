@@ -84,11 +84,54 @@ const saveChar = async (): Promise<void> => {
       body: JSON.stringify(stBundle),
     });
     stDirty = false;
-    stStatus = `saved · hash ${r.versionHash}`;
+    const packed = await packAtlas();
+    stStatus = `saved · hash ${r.versionHash}${packed ? ` · atlas ${packed} frames` : ''}`;
   } catch (e) {
     stStatus = `SAVE FAILED: ${(e as Error).message}`;
   }
   renderAll();
+};
+
+/**
+ * Pack all referenced sprites into atlas.png + atlas.json (spec §3: the
+ * bundle ships a packed atlas, never hand-made). Cells are fixed-size so a
+ * simple grid is optimal enough. Returns frame count, or 0 if no sprites.
+ */
+const packAtlas = async (): Promise<number> => {
+  const names = [...new Set(
+    stBundle!.moves.flatMap((mv) => mv.steps.map((s) => s.sprite)).filter((s): s is string => !!s))];
+  if (names.length === 0) return 0;
+  // Ensure every sprite is loaded (accepted-this-session ones are canvases already).
+  const cells = await Promise.all(names.map(async (name) => {
+    const cached = spriteImgs.get(`${stCharId}/${name}`);
+    if (cached instanceof HTMLCanvasElement) return { name, img: cached as CanvasImageSource };
+    const img = new Image();
+    img.src = `/characters/${stCharId}/sprites/${name}`;
+    await new Promise((res, rej) => { img.onload = res; img.onerror = () => rej(new Error(`missing sprite ${name}`)); });
+    return { name, img: img as CanvasImageSource };
+  }));
+  const cols = Math.ceil(Math.sqrt(cells.length));
+  const rows = Math.ceil(cells.length / cols);
+  const atlas = document.createElement('canvas');
+  atlas.width = cols * CELL_W;
+  atlas.height = rows * CELL_W;
+  const ctx = atlas.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+  const frames: Record<string, { x: number; y: number; w: number; h: number; pivotX: number; pivotY: number }> = {};
+  cells.forEach((c, k) => {
+    const x = (k % cols) * CELL_W;
+    const y = Math.floor(k / cols) * CELL_W;
+    ctx.drawImage(c.img, x, y);
+    frames[c.name] = { x, y, w: CELL_W, h: CELL_W, pivotX: PIVOT_X, pivotY: PIVOT_Y };
+  });
+  await apiJson(`/api/characters/${stCharId}/sprites/atlas.png`, {
+    method: 'PUT', body: canvasToPngDataUrl(atlas),
+  });
+  await apiJson(`/api/characters/${stCharId}/sprites/atlas.json`, {
+    method: 'PUT',
+    body: JSON.stringify({ cellW: CELL_W, cellH: CELL_W, frames }, null, 2),
+  });
+  return cells.length;
 };
 
 const generateImage = async (prompt: string, seed: number): Promise<HTMLImageElement> => {
@@ -105,15 +148,31 @@ const saveSprite = async (name: string, cell: HTMLCanvasElement): Promise<void> 
   await apiJson(`/api/characters/${stCharId}/sprites/${name}`, {
     method: 'PUT', body: canvasToPngDataUrl(cell),
   });
-  spriteImgs.set(name, cell);
+  spriteImgs.set(`${stCharId}/${name}`, cell);
 };
 
-const getSprite = (name: string): HTMLCanvasElement | HTMLImageElement | null => {
-  const hit = spriteImgs.get(name);
+/** Sprite as a readable canvas (for pipeline ops) — converts loaded Images. */
+const spriteCanvas = (name: string): HTMLCanvasElement | null => {
+  const spr = getSprite(name);
+  if (spr instanceof HTMLCanvasElement) return spr;
+  if (spr instanceof HTMLImageElement && spr.complete && spr.naturalWidth > 0) {
+    const c = document.createElement('canvas');
+    c.width = spr.naturalWidth;
+    c.height = spr.naturalHeight;
+    c.getContext('2d')!.drawImage(spr, 0, 0);
+    spriteImgs.set(`${stCharId}/${name}`, c);
+    return c;
+  }
+  return null;
+};
+
+const getSprite = (name: string, charId = stCharId): HTMLCanvasElement | HTMLImageElement | null => {
+  const key = `${charId}/${name}`;
+  const hit = spriteImgs.get(key);
   if (hit) return hit;
   const img = new Image();
-  img.src = `/characters/${stCharId}/sprites/${name}`;
-  spriteImgs.set(name, img);
+  img.src = `/characters/${charId}/sprites/${name}`;
+  spriteImgs.set(key, img);
   return img.complete ? img : null;
 };
 
@@ -447,8 +506,8 @@ const renderFramesTab = (): HTMLElement => {
       title: 'hurtbox draft from sprite alpha (head/torso/legs bands)',
       onclick: () => {
         if (!stp.sprite) { stStatus = 'no sprite on this step'; renderAll(); return; }
-        const spr = spriteImgs.get(stp.sprite);
-        if (!(spr instanceof HTMLCanvasElement)) { stStatus = 'sprite not loaded as canvas (accept via Generate tab first)'; renderAll(); return; }
+        const spr = spriteCanvas(stp.sprite);
+        if (!spr) { stStatus = 'sprite not loaded yet — try again in a moment'; renderAll(); return; }
         const boxes = autoHurtboxes(spr);
         if (boxes.length) { stp.hurtboxes = boxes; stDirty = true; stStatus = `drafted ${boxes.length} hurtboxes`; }
         renderAll();
@@ -458,10 +517,10 @@ const renderFramesTab = (): HTMLElement => {
       title: 'hitbox draft from diff vs previous step sprite',
       onclick: () => {
         const prev = curMove()?.steps[stStepIdx - 1];
-        const a = prev?.sprite ? spriteImgs.get(prev.sprite) : null;
-        const bSpr = stp.sprite ? spriteImgs.get(stp.sprite) : null;
-        if (!(a instanceof HTMLCanvasElement) || !(bSpr instanceof HTMLCanvasElement)) {
-          stStatus = 'need canvas sprites on this + previous step'; renderAll(); return;
+        const a = prev?.sprite ? spriteCanvas(prev.sprite) : null;
+        const bSpr = stp.sprite ? spriteCanvas(stp.sprite) : null;
+        if (!a || !bSpr) {
+          stStatus = 'need loaded sprites on this + previous step'; renderAll(); return;
         }
         const draft = diffHitboxDraft(a, bSpr);
         if (draft) {
@@ -672,6 +731,14 @@ type DummyMode = 'idle' | 'block' | 'crouch' | 'jump' | 'mash';
 let stDummy: DummyMode = 'idle';
 let stGame: GameState | null = null;
 let stShowBoxes = true;
+let stP2Id = ''; // '' = mirror match vs the edited character
+let stP2Bundle: CharacterBundle | null = null;
+
+const selectP2 = async (id: string): Promise<void> => {
+  stP2Id = id;
+  stP2Bundle = id ? await apiJson<CharacterBundle>(`/api/characters/${id}`) : null;
+  renderAll();
+};
 
 const dummyInput = (g: GameState): InputFrame => {
   const me = g.fighters[1], op = g.fighters[0];
@@ -688,7 +755,8 @@ const dummyInput = (g: GameState): InputFrame => {
 const applyBundleToSim = (): string | null => {
   try {
     const lc = loadCharacter(structuredClone(stBundle!));
-    setCharacters(lc, lc);
+    const lc2 = stP2Bundle ? loadCharacter(structuredClone(stP2Bundle)) : lc;
+    setCharacters(lc, lc2);
     stGame = createGameState(stSeed++);
     return null;
   } catch (e) {
@@ -720,7 +788,7 @@ const testPaint = (cv: HTMLCanvasElement): void => {
       let stp: MoveStep | null = null;
       for (const s of mv.steps) { acc += s.frames; if (f.actionFrame < acc) { stp = s; break; } }
       if (stp?.sprite) {
-        const spr = getSprite(stp.sprite);
+        const spr = getSprite(stp.sprite, i === 1 && stP2Id ? stP2Id : stCharId);
         if (spr) {
           ctx.save();
           ctx.translate(x, y);
@@ -801,6 +869,7 @@ const renderTestTab = (): HTMLElement => {
   return mkEl('div', { class: 'pane' },
     mkEl('div', { class: 'row' },
       mkEl('button', { onclick: () => renderAll() }, 'apply + restart'),
+      mkEl('label', {}, ' P2 ', selInput(stP2Id, ['', ...stCharList], (v) => { void selectP2(v); })),
       mkEl('label', {}, ' dummy ', selInput(stDummy, ['idle', 'block', 'crouch', 'jump', 'mash'], (v) => { stDummy = v as DummyMode; })),
       mkEl('label', {}, ' boxes ', mkEl('input', {
         type: 'checkbox', checked: stShowBoxes,
@@ -817,8 +886,77 @@ const SPRITE_STYLE = 'flat solid white background, 2D fighting game sprite, full
   + 'side view facing right, feet on the ground at the bottom, sharp pixel art style, '
   + 'crisp outlines, vibrant colors, centered, no text, no watermark';
 
+/**
+ * Archetype pose library (spec §5.1: "archetype pose libraries are the big
+ * cost saver" — built once per archetype, reused across the roster). Keyed by
+ * canonical move id; characters override via meta.moveDesc.
+ */
+const SHOTO_POSES: Record<string, string> = {
+  '5LP': 'throwing a quick standing left jab punch at head height',
+  '5MP': 'throwing a standing straight right cross punch',
+  '5HP': 'throwing a powerful standing heavy straight punch at full extension',
+  '5LK': 'throwing a quick standing front snap kick',
+  '5MK': 'throwing a standing roundhouse kick to the midsection',
+  '5HK': 'throwing a heavy standing high roundhouse kick',
+  '2LP': 'crouching low and throwing a quick jab punch',
+  '2MP': 'crouching low and throwing a straight punch',
+  '2HP': 'crouching then launching a rising uppercut punch aimed straight up',
+  '2LK': 'crouching low and throwing a quick ankle-height kick',
+  '2MK': 'crouching low and throwing an extended low kick along the ground',
+  '2HK': 'crouching low sweep kick, leg fully extended along the ground',
+  'j.LP': 'airborne mid-jump, throwing a quick downward jab punch',
+  'j.MP': 'airborne mid-jump, throwing a straight punch',
+  'j.HP': 'airborne mid-jump, throwing a heavy downward-angled punch',
+  'j.LK': 'airborne mid-jump, striking with a quick knee',
+  'j.MK': 'airborne mid-jump, throwing a side kick',
+  'j.HK': 'airborne mid-jump, throwing a heavy roundhouse kick',
+  '236P': 'thrusting both palms forward launching a glowing energy fireball projectile',
+  '623P': 'leaping upward in a rising dragon uppercut, fist extended toward the sky',
+  '214K': 'spinning hurricane kick with one leg extended horizontally',
+  '236PP': 'dramatic super attack rush, punching forward surrounded by a blazing energy aura',
+};
+
+const PHASE_HINTS: Record<string, string> = {
+  startup: 'wind-up anticipation motion before the strike',
+  active: 'the moment of impact, limb at full extension',
+  recovery: 'follow-through, returning to fighting stance',
+};
+
+const poseFor = (mv: MoveDef): string =>
+  meta().moveDesc?.[mv.id] || SHOTO_POSES[mv.id] || mv.id;
+
+/** Stable per-frame seed: same character/move/step regenerates identically. */
+const seedFor = (moveId: string, stepIdx: number, salt: number): number => {
+  let h = 0x9e3779b9 ^ salt;
+  for (const ch of `${stCharId}/${moveId}/${stepIdx}`) {
+    h = Math.imul(h ^ ch.charCodeAt(0), 0x01000193);
+  }
+  return (h >>> 0) % 1_000_000;
+};
+
 const spriteName = (moveId: string, stepIdx: number): string =>
   `${moveId.replace(/[^a-zA-Z0-9_-]/g, '_')}_s${stepIdx}.png`;
+
+/** Generate + normalize + QC one frame of a move. */
+const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | null> => {
+  const m = meta();
+  const desc = m.desc || stBundle!.name;
+  const stp = mv.steps[i]!;
+  const prompt = `${desc}, ${poseFor(mv)}, animation frame ${i + 1} of ${mv.steps.length}, `
+    + `${PHASE_HINTS[stp.phase] ?? ''}, ${SPRITE_STYLE}`;
+  const img = await generateImage(prompt, seedFor(mv.id, i, salt));
+  const norm = normalizeFrame(img, m.palette ?? null);
+  if (!norm) return null;
+  return { norm, qc: qcScore(norm, m.refBodyW ?? null), accepted: false };
+};
+
+const acceptFrame = async (mv: MoveDef, i: number, r: GenResult): Promise<void> => {
+  const name = spriteName(mv.id, i);
+  await saveSprite(name, r.norm.cell);
+  mv.steps[i]!.sprite = name;
+  r.accepted = true;
+  stDirty = true;
+};
 
 const runGeneration = async (which: 'reference' | 'move'): Promise<void> => {
   if (stGenBusy || !stBundle) return;
@@ -830,7 +968,7 @@ const runGeneration = async (which: 'reference' | 'move'): Promise<void> => {
       stStatus = 'generating reference…'; renderAll();
       const img = await generateImage(
         `${desc}, standing idle fighting stance, character reference, ${SPRITE_STYLE}`,
-        (Math.random() * 1e6) | 0);
+        seedFor('_ref', 0, stSeed++));
       const norm = normalizeFrame(img, null);
       if (!norm) throw new Error('normalize failed (no subject found)');
       stRefPreview = norm;
@@ -838,23 +976,56 @@ const runGeneration = async (which: 'reference' | 'move'): Promise<void> => {
     } else {
       const mv = curMove();
       if (!mv) throw new Error('no move selected');
-      const palette = m.palette ?? null;
-      const moveDesc = m.moveDesc?.[mv.id] || mv.id;
       const n = mv.steps.length;
       for (let i = 0; i < n; i++) {
         stStatus = `generating ${mv.id} frame ${i + 1}/${n}…`; renderAll();
-        const img = await generateImage(
-          `${desc}, ${moveDesc}, animation frame ${i + 1} of ${n}, ${SPRITE_STYLE}`,
-          ((Math.random() * 1e6) | 0) + i);
-        const norm = normalizeFrame(img, palette);
-        if (!norm) continue;
-        stGenResults.set(i, { norm, qc: qcScore(norm, m.refBodyW ?? null), accepted: false });
+        const r = await genFrame(mv, i);
+        if (r) stGenResults.set(i, r);
         renderAll();
       }
       stStatus = `generated ${stGenResults.size}/${n} frames — review QC + accept`;
     }
   } catch (e) {
     stStatus = `generation failed: ${(e as Error).message}`;
+  }
+  stGenBusy = false;
+  renderAll();
+};
+
+/**
+ * Batch: generate every step of every move (spec §5.2 "per-move batch
+ * generation"). QC passes auto-accept; failures are listed for per-move
+ * regeneration. One retry with a new seed on QC failure.
+ */
+const runGenerateAll = async (): Promise<void> => {
+  if (stGenBusy || !stBundle) return;
+  stGenBusy = true;
+  const failures: string[] = [];
+  const total = stBundle.moves.reduce((n, mv) => n + mv.steps.length, 0);
+  let done = 0;
+  try {
+    for (const mv of stBundle.moves) {
+      for (let i = 0; i < mv.steps.length; i++) {
+        done++;
+        stStatus = `batch ${done}/${total} · ${mv.id} step ${i}…`; renderAll();
+        try {
+          let r = await genFrame(mv, i);
+          if (r && !r.qc.pass) r = (await genFrame(mv, i, 1)) ?? r; // one retry
+          if (r && r.qc.pass) {
+            await acceptFrame(mv, i, r);
+          } else {
+            failures.push(`${mv.id}#${i}${r ? ` QC${r.qc.score}` : ''}`);
+          }
+        } catch (e) {
+          failures.push(`${mv.id}#${i} ERR`);
+        }
+      }
+    }
+    stStatus = failures.length === 0
+      ? `batch complete: all ${total} frames accepted — SAVE to persist`
+      : `batch done, ${total - failures.length}/${total} accepted · needs review: ${failures.join(' ')}`;
+  } catch (e) {
+    stStatus = `batch aborted: ${(e as Error).message}`;
   }
   stGenBusy = false;
   renderAll();
@@ -921,16 +1092,24 @@ const renderGenerateTab = (): HTMLElement => {
           mkEl('button', {
             disabled: r.accepted ? '' : null,
             onclick: () => {
-              const name = spriteName(mv.id, i);
-              void saveSprite(name, r.norm.cell).then(() => {
-                mv.steps[i]!.sprite = name;
-                r.accepted = true;
-                stDirty = true;
-                stStatus = `accepted ${name}`;
-                renderAll();
-              });
+              void acceptFrame(mv, i, r).then(() => { stStatus = `accepted ${spriteName(mv.id, i)}`; renderAll(); });
             },
           }, r.accepted ? 'accepted ✓' : 'accept'),
+          mkEl('button', {
+            disabled: stGenBusy ? '' : null,
+            onclick: () => {
+              void (async () => {
+                stGenBusy = true;
+                stStatus = `retrying ${mv.id}#${i}…`; renderAll();
+                try {
+                  const nr = await genFrame(mv, i, (Math.random() * 999) | 0);
+                  if (nr) stGenResults.set(i, nr);
+                } catch (e) { stStatus = `retry failed: ${(e as Error).message}`; }
+                stGenBusy = false;
+                renderAll();
+              })();
+            },
+          }, 'retry'),
         ) : null,
       ));
     }
@@ -945,7 +1124,7 @@ const renderGenerateTab = (): HTMLElement => {
       })),
       mv ? mkEl('label', {}, ' pose description ', mkEl('input', {
         value: m.moveDesc?.[mv.id] ?? '', style: 'width:340px',
-        placeholder: 'e.g. throwing a heavy straight right punch',
+        placeholder: SHOTO_POSES[mv.id] ?? 'e.g. throwing a heavy straight right punch',
         onchange: (e: Event) => {
           (m.moveDesc ??= {})[mv.id] = (e.target as HTMLInputElement).value;
           stDirty = true;
@@ -953,7 +1132,14 @@ const renderGenerateTab = (): HTMLElement => {
       })) : null,
       mkEl('button', { disabled: stGenBusy || !mv ? '' : null, onclick: () => void runGeneration('move') },
         stGenBusy ? 'generating…' : `generate ${mv?.steps.length ?? 0} frames`),
+      mkEl('button', {
+        disabled: stGenBusy ? '' : null,
+        title: 'every step of every move · QC passes auto-accept, one retry on failure',
+        onclick: () => void runGenerateAll(),
+      }, stGenBusy ? '…' : `⚡ batch ALL moves (${b.moves.reduce((n, x) => n + x.steps.length, 0)} frames)`),
     ),
+    mkEl('p', { class: 'hint' },
+      'pose defaults come from the shoto archetype library — blank input = archetype pose; type to override'),
     mkEl('div', { class: 'genrow' }, ...results),
     mkEl('p', { class: 'hint' },
       'accept a frame → it becomes the step sprite; then Frames tab → auto-hurtbox / auto-hitbox drafts. Save when done.'),
