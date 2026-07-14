@@ -32,7 +32,7 @@ interface StudioMeta {
   moveDesc?: Record<string, string>;
 }
 
-type TabName = 'character' | 'frames' | 'moves' | 'cancels' | 'test' | 'generate';
+type TabName = 'character' | 'frames' | 'moves' | 'cancels' | 'test' | 'generate' | 'stage';
 
 // ------------------------------------------------------------------ state
 let stCharId = 'analog';
@@ -278,7 +278,7 @@ const selInput = (value: string, options: string[], onCommit: (v: string) => voi
 
 // ------------------------------------------------------------------ header
 const renderHeader = (): HTMLElement => {
-  const tabs: TabName[] = ['character', 'frames', 'moves', 'cancels', 'test', 'generate'];
+  const tabs: TabName[] = ['character', 'frames', 'moves', 'cancels', 'test', 'generate', 'stage'];
   return mkEl('div', { class: 'header' },
     mkEl('span', { class: 'logo' }, 'AF STUDIO'),
     selInput(stCharId, stCharList, (id) => { void loadChar(id).then(renderAll); }),
@@ -1753,6 +1753,207 @@ const renderGenerateTab = (): HTMLElement => {
 };
 
 // ------------------------------------------------------------------ root
+// ------------------------------------------------------------------ stage tab
+interface StageMetaEd {
+  name: string;
+  imageW: number;
+  imageH: number;
+  floorY: number;
+  skyColor: string;
+  deckColor: string;
+}
+let stStageId = 'rooftop';
+let stStageList: string[] = [];
+let stStageMeta: StageMetaEd | null = null;
+let stStageImg: HTMLImageElement | HTMLCanvasElement | null = null;
+let stStageBusy = false;
+let stStageDirty = false;
+
+const loadStageEd = async (id: string): Promise<void> => {
+  stStageId = id;
+  stStageMeta = null;
+  stStageImg = null;
+  try {
+    const r = await fetch(`/stages/${id}/stage.json`);
+    if (r.ok) stStageMeta = (await r.json()) as StageMetaEd;
+    const img = new Image();
+    img.src = `/stages/${id}/background.png?v=${Math.random()}`;
+    await new Promise<void>((res) => { img.onload = () => res(); img.onerror = () => res(); });
+    if (img.naturalWidth > 0) stStageImg = img;
+  } catch { /* new stage */ }
+  stStageMeta ??= {
+    name: id, imageW: 1536, imageH: 640, floorY: 520,
+    skyColor: '#2b1b4d', deckColor: '#3a3644',
+  };
+  stStageDirty = false;
+  renderAll();
+};
+
+const saveStageEd = async (): Promise<void> => {
+  if (!stStageMeta) return;
+  if (stStageImg) {
+    const c = document.createElement('canvas');
+    c.width = stStageImg instanceof HTMLCanvasElement ? stStageImg.width : stStageImg.naturalWidth;
+    c.height = stStageImg instanceof HTMLCanvasElement ? stStageImg.height : stStageImg.naturalHeight;
+    c.getContext('2d')!.drawImage(stStageImg, 0, 0);
+    stStageMeta.imageW = c.width;
+    stStageMeta.imageH = c.height;
+    await apiJson(`/api/stages/${stStageId}/background.png`, {
+      method: 'PUT', body: c.toDataURL('image/png'),
+    });
+  }
+  await apiJson(`/api/stages/${stStageId}/stage.json`, {
+    method: 'PUT', body: JSON.stringify(stStageMeta, null, 2),
+  });
+  stStageDirty = false;
+  stStatus = `stage "${stStageId}" saved`;
+  if (!stStageList.includes(stStageId)) stStageList.push(stStageId);
+  renderAll();
+};
+
+const renderStageTab = (): HTMLElement => {
+  void (async () => {
+    if (stStageList.length === 0) {
+      try { stStageList = await apiJson<string[]>('/api/stages'); } catch { /* none */ }
+      if (!stStageMeta) await loadStageEd(stStageList[0] ?? 'rooftop');
+    }
+  })();
+
+  const m = stStageMeta;
+  if (!m) return mkEl('div', { class: 'pane' }, 'loading stage…');
+
+  // Preview canvas with a draggable floor line.
+  const pw = 768;
+  const ph = Math.round(pw * (m.imageH / m.imageW));
+  const cv = mkEl('canvas', { width: pw, height: ph, class: 'frcanvas', style: 'cursor:row-resize' });
+  const paint = (): void => {
+    const ctx = cv.getContext('2d')!;
+    ctx.fillStyle = m.skyColor;
+    ctx.fillRect(0, 0, pw, ph);
+    if (stStageImg) {
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(stStageImg, 0, 0, pw, ph);
+    } else {
+      ctx.fillStyle = '#8a91a8';
+      ctx.font = '14px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('no background yet — generate or upload one', pw / 2, ph / 2);
+    }
+    // Floor line: where the fighters' feet sit.
+    const fy = (m.floorY / m.imageH) * ph;
+    ctx.strokeStyle = '#ffd166';
+    ctx.setLineDash([8, 6]);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, fy);
+    ctx.lineTo(pw, fy);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#ffd166';
+    ctx.font = 'bold 12px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`floor y=${m.floorY} (drag)`, 8, fy - 6);
+  };
+  // setTimeout, NOT rAF — hidden tabs throttle rAF to zero (automation runs headless).
+  setTimeout(paint, 0);
+  let dragging = false;
+  cv.onmousedown = () => { dragging = true; };
+  cv.onmousemove = (e) => {
+    if (!dragging) return;
+    const r = cv.getBoundingClientRect();
+    m.floorY = Math.max(0, Math.min(m.imageH, Math.round(((e.clientY - r.top) / ph) * m.imageH)));
+    stStageDirty = true;
+    paint();
+  };
+  cv.onmouseup = cv.onmouseleave = () => { dragging = false; };
+
+  const upload = mkEl('input', {
+    type: 'file', accept: 'image/png,image/svg+xml,image/jpeg',
+    onchange: (e: Event) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      const img = new Image();
+      img.onload = () => {
+        stStageImg = img;
+        stStageMeta!.imageW = img.naturalWidth;
+        stStageMeta!.imageH = img.naturalHeight;
+        stStageDirty = true;
+        stStatus = `loaded ${file.name} (${img.naturalWidth}×${img.naturalHeight})`;
+        renderAll();
+      };
+      img.src = URL.createObjectURL(file);
+    },
+  });
+
+  return mkEl('div', { class: 'pane' },
+    mkEl('div', { class: 'row' },
+      mkEl('label', {}, 'stage ', selInput(stStageId, [...new Set([...stStageList, stStageId])], (id) => { void loadStageEd(id); })),
+      mkEl('button', {
+        onclick: () => {
+          const id = prompt('new stage id (lowercase, dashes):');
+          if (!id || !/^[a-z0-9][a-z0-9-]{0,40}$/.test(id)) return;
+          stStageId = id;
+          stStageImg = null;
+          stStageMeta = { name: id, imageW: 1536, imageH: 640, floorY: 520, skyColor: '#2b1b4d', deckColor: '#3a3644' };
+          stStageDirty = true;
+          renderAll();
+        },
+      }, '+ new'),
+      mkEl('button', {
+        class: stStageDirty ? 'save dirty' : 'save',
+        onclick: () => void saveStageEd(),
+      }, stStageDirty ? 'save stage *' : 'save stage'),
+    ),
+    mkEl('div', { class: 'genblock' },
+      mkEl('b', {}, 'background · generate or upload (PNG/SVG)'),
+      mkEl('div', { class: 'row' },
+        mkEl('input', {
+          id: 'stageprompt', style: 'width:520px',
+          placeholder: 'e.g. pixel art city rooftop at dusk, purple sunset sky, empty concrete floor at the bottom',
+        }),
+        mkEl('button', {
+          disabled: stStageBusy ? '' : null,
+          onclick: () => {
+            void (async () => {
+              const p = (document.getElementById('stageprompt') as HTMLInputElement).value.trim();
+              if (!p) { stStatus = 'enter a stage prompt'; renderAll(); return; }
+              stStageBusy = true;
+              stStatus = 'generating stage…'; renderAll();
+              try {
+                // Keep it terse: long prompts trip the 800-char cap + filter.
+                const img = await generateImage(`${p}, retro 16-bit style, no text`, (Math.random() * 1e6) | 0, 1536, 640);
+                stStageImg = img;
+                stStageMeta!.imageW = img.naturalWidth;
+                stStageMeta!.imageH = img.naturalHeight;
+                stStageDirty = true;
+                stStatus = 'stage generated — set the floor line, then save';
+              } catch (e) {
+                stStatus = `stage generation failed: ${(e as Error).message}`;
+              }
+              stStageBusy = false;
+              renderAll();
+            })();
+          },
+        }, stStageBusy ? 'generating…' : 'generate'),
+        mkEl('label', {}, ' or upload ', upload),
+      ),
+    ),
+    cv,
+    mkEl('div', { class: 'row' },
+      mkEl('label', { class: 'field' }, 'sky color ', mkEl('input', {
+        type: 'color', value: m.skyColor,
+        onchange: (e: Event) => { m.skyColor = (e.target as HTMLInputElement).value; stStageDirty = true; renderAll(); },
+      })),
+      mkEl('label', { class: 'field' }, 'deck color ', mkEl('input', {
+        type: 'color', value: m.deckColor,
+        onchange: (e: Event) => { m.deckColor = (e.target as HTMLInputElement).value; stStageDirty = true; renderAll(); },
+      })),
+      mkEl('span', { class: 'hint' },
+        'floor line = where fighters\' feet sit in the image · sky/deck colors extend the art when the camera sees past it'),
+    ),
+  );
+};
+
 const renderAll = (): void => {
   const app = document.getElementById('app')!;
   cancelAnimationFrame(stRaf);
@@ -1769,6 +1970,7 @@ const renderAll = (): void => {
     case 'cancels': app.append(renderCancelsTab()); break;
     case 'test': app.append(renderTestTab()); break;
     case 'generate': app.append(renderGenerateTab()); break;
+    case 'stage': app.append(renderStageTab()); break;
   }
 };
 

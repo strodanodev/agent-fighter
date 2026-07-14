@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, '..', '..');
 const CHARACTERS = join(ROOT, 'characters');
+const STAGES = join(ROOT, 'stages');
 const PORT = Number(process.env.PORT || 8474);
 
 // ---- .env (zero-dep parse) -------------------------------------------------
@@ -135,7 +136,7 @@ const bundleHash = (bundle) => {
 
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json',
-  '.png': 'image/png', '.css': 'text/css',
+  '.png': 'image/png', '.css': 'text/css', '.svg': 'image/svg+xml',
 };
 
 // ---- server ----------------------------------------------------------------
@@ -250,6 +251,36 @@ const server = createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     }
 
+    // ------------------------------------------------ stages
+    // Stage backgrounds are plain files: stages/<id>/background.png (or .svg)
+    // + stage.json (floor anchor, extend colors). The game client consumes
+    // them; the Studio Stage tab generates/uploads them.
+    if (path === '/api/stages' && req.method === 'GET') {
+      const list = existsSync(STAGES)
+        ? readdirSync(STAGES, { withFileTypes: true })
+          .filter((d) => d.isDirectory() && existsSync(join(STAGES, d.name, 'stage.json')))
+          .map((d) => d.name)
+        : [];
+      return json(res, 200, list);
+    }
+    const stageApi = path.match(/^\/api\/stages\/([^/]+)\/([^/]+)$/);
+    if (stageApi && req.method === 'PUT') {
+      const [, id, name] = stageApi;
+      if (!safeId(id) || !/^(background\.(png|svg)|stage\.json)$/.test(name)) {
+        return json(res, 400, { error: 'bad stage path' });
+      }
+      const dir = join(STAGES, id);
+      mkdirSync(dir, { recursive: true });
+      const raw = await readBody(req);
+      if (name.endsWith('.json') || name.endsWith('.svg')) {
+        writeFileSync(join(dir, name), raw);
+      } else {
+        const b64 = raw.toString('utf8').replace(/^data:image\/\w+;base64,/, '');
+        writeFileSync(join(dir, name), Buffer.from(b64, 'base64'));
+      }
+      return json(res, 200, { ok: true });
+    }
+
     // ------------------------------------------------ static
     let filePath = null;
     if (path === '/' || path === '/index.html') {
@@ -258,6 +289,10 @@ const server = createServer(async (req, res) => {
       const rel = normalize(path.slice('/characters/'.length)).replace(/^([.][.][/\\])+/, '');
       filePath = join(CHARACTERS, rel);
       if (!filePath.startsWith(CHARACTERS)) filePath = null;
+    } else if (path.startsWith('/stages/')) {
+      const rel = normalize(path.slice('/stages/'.length)).replace(/^([.][.][/\\])+/, '');
+      filePath = join(STAGES, rel);
+      if (!filePath.startsWith(STAGES)) filePath = null;
     }
     if (filePath && existsSync(filePath)) {
       const ext = filePath.slice(filePath.lastIndexOf('.'));

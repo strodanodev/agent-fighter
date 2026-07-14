@@ -1,7 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="400" height="46" viewBox="0 0 400 46">
   <!-- Health bar frame, LEFT player orientation (arrow nose points to screen center).
        The right player's frame is this image mirrored by the renderer.
-       The fill is drawn UNDER this frame, clipped to the tray window polygon:
+       The tray window is a REAL HOLE (even-odd fill): the renderer paints the
+       dark tray + health fill underneath, clipped to the window polygon:
          (16,10) (358,10) (381,23) (358,36) (16,36) (11,31) (11,15)
        Keep that polygon in sync with HUD_GEO.healthWindow in ui.ts. -->
   <defs>
@@ -18,22 +19,23 @@
       <stop offset="1" stop-color="#8a5f1e"/>
     </linearGradient>
   </defs>
-  <!-- dark silhouette / outline -->
-  <polygon points="5,1 362,1 399,23 362,45 5,45 0,39 0,7" fill="#101116"/>
-  <!-- steel plate -->
-  <polygon points="7,3 360,3 395,23 360,43 7,43 2,37 2,9" fill="url(#steel)"/>
-  <!-- top highlight -->
-  <polygon points="7,3 360,3 371,9 9,9 4,12 2,9" fill="#c8cdda" opacity="0.35"/>
+  <!-- dark silhouette with window hole -->
+  <path fill-rule="evenodd" fill="#101116" d="M5 1 H362 L399 23 L362 45 H5 L0 39 V7 Z
+    M16 10 H358 L381 23 L358 36 H16 L11 31 V15 Z"/>
+  <!-- steel plate with window hole -->
+  <path fill-rule="evenodd" fill="url(#steel)" d="M7 3 H360 L395 23 L360 43 H7 L2 37 V9 Z
+    M16 10 H358 L381 23 L358 36 H16 L11 31 V15 Z"/>
+  <!-- top highlight (above the window) -->
+  <polygon points="7,3 360,3 369,8 10,8 4,11 2,9" fill="#c8cdda" opacity="0.35"/>
   <!-- gold trim channel -->
   <polygon points="10,6 358,6 390,23 358,40 10,40 5,34 5,12" fill="none" stroke="url(#gold)" stroke-width="2.4"/>
-  <!-- tray window: TRANSPARENT — the renderer paints the dark tray + health
-       fill underneath, clipped to this polygon (HUD_GEO.healthWindow) -->
+  <!-- window inner shadow -->
   <polygon points="16,10 358,10 381,23 358,36 16,36 11,31 11,15" fill="none" stroke="#000000" stroke-opacity="0.55" stroke-width="1.6"/>
   <!-- rivets -->
-  <circle cx="9" cy="8" r="2.4" fill="#d7dbe6"/><circle cx="9" cy="8" r="1.1" fill="#5b6070"/>
-  <circle cx="9" cy="38" r="2.4" fill="#8b91a1"/><circle cx="9" cy="38" r="1.1" fill="#3c404d"/>
-  <circle cx="354" cy="8" r="2.4" fill="#d7dbe6"/><circle cx="354" cy="8" r="1.1" fill="#5b6070"/>
-  <circle cx="354" cy="38" r="2.4" fill="#8b91a1"/><circle cx="354" cy="38" r="1.1" fill="#3c404d"/>
+  <circle cx="8" cy="7" r="2.2" fill="#d7dbe6"/><circle cx="8" cy="7" r="1" fill="#5b6070"/>
+  <circle cx="8" cy="39" r="2.2" fill="#8b91a1"/><circle cx="8" cy="39" r="1" fill="#3c404d"/>
+  <circle cx="362" cy="7" r="2.2" fill="#d7dbe6"/><circle cx="362" cy="7" r="1" fill="#5b6070"/>
+  <circle cx="362" cy="39" r="2.2" fill="#8b91a1"/><circle cx="362" cy="39" r="1" fill="#3c404d"/>
   <!-- gold nose cap -->
-  <polygon points="381,17 395,23 381,29 376,23" fill="url(#gold)"/>
+  <polygon points="383,18 396,23 383,28 379,23" fill="url(#gold)"/>
 </svg>
