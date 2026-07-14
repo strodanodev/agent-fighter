@@ -1,0 +1,17 @@
+{
+  "name": "agent-fighter",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Agent Fighter — browser 2D fighting game. Milestone 0: deterministic sim skeleton.",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "npm run test -w @af/core",
+    "build": "npm run build -w @af/core && npm run build -w @af/client",
+    "demo": "npm run demo -w @af/client"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@af/client",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Browser client. M0: dependency-free Canvas 2D renderer behind a swap-ready interface (PixiJS planned).",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "demo": "node tools/bundle.mjs"
+  },
+  "dependencies": {
+    "@af/core": "*"
+  }
+}
