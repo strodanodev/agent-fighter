@@ -274,23 +274,81 @@ const alphaBBox = (c: HTMLCanvasElement): { l: number; t: number; r: number; b: 
 
 /**
  * Extract a locked palette (spec: palette quantization fixes most visible
- * drift almost for free). Histogram over 5-bit RGB buckets, top N.
+ * drift almost for free) via MEDIAN CUT. A top-buckets histogram is wrong
+ * here: it rewards big uniform regions (black outlines, dark cloth) and
+ * starves a character's signature colors (a red gi spread across many shaded
+ * buckets never ranks). Median cut partitions the occupied color space, so
+ * every distinct color family gets representation.
  */
 export const extractPalette = (c: HTMLCanvasElement, n = 16): RGB[] => {
   const ctx = c.getContext('2d', { willReadFrequently: true })!;
   const d = ctx.getImageData(0, 0, c.width, c.height).data;
-  const buckets = new Map<number, { n: number; r: number; g: number; b: number }>();
+  const px: [number, number, number][] = [];
   for (let i = 0; i < d.length; i += 4) {
-    if (d[i + 3]! < 128) continue;
-    const key = ((d[i]! >> 3) << 10) | ((d[i + 1]! >> 3) << 5) | (d[i + 2]! >> 3);
-    let bk = buckets.get(key);
-    if (!bk) buckets.set(key, bk = { n: 0, r: 0, g: 0, b: 0 });
-    bk.n++; bk.r += d[i]!; bk.g += d[i + 1]!; bk.b += d[i + 2]!;
+    if (d[i + 3]! >= 128) px.push([d[i]!, d[i + 1]!, d[i + 2]!]);
   }
-  return [...buckets.values()]
-    .sort((a, b) => b.n - a.n)
-    .slice(0, n)
-    .map((bk) => [Math.round(bk.r / bk.n), Math.round(bk.g / bk.n), Math.round(bk.b / bk.n)] as RGB);
+  if (px.length === 0) return [];
+
+  interface Box { pixels: [number, number, number][] }
+  const range = (box: Box): { ch: number; span: number } => {
+    const lo = [255, 255, 255], hi = [0, 0, 0];
+    for (const p of box.pixels) {
+      for (let ch = 0; ch < 3; ch++) {
+        if (p[ch]! < lo[ch]!) lo[ch] = p[ch]!;
+        if (p[ch]! > hi[ch]!) hi[ch] = p[ch]!;
+      }
+    }
+    let ch = 0, span = -1;
+    for (let k = 0; k < 3; k++) {
+      if (hi[k]! - lo[k]! > span) { span = hi[k]! - lo[k]!; ch = k; }
+    }
+    return { ch, span };
+  };
+
+  const boxes: Box[] = [{ pixels: px }];
+  while (boxes.length < n) {
+    // Split the box with the widest channel span (deterministic tie-break by index).
+    let best = -1, bestSpan = 0, bestCh = 0;
+    for (let i = 0; i < boxes.length; i++) {
+      if (boxes[i]!.pixels.length < 2) continue;
+      const { ch, span } = range(boxes[i]!);
+      if (span > bestSpan) { bestSpan = span; best = i; bestCh = ch; }
+    }
+    if (best < 0 || bestSpan === 0) break;
+    const box = boxes[best]!;
+    // Deterministic ordering: sort by split channel, then full RGB.
+    box.pixels.sort((a, b) => a[bestCh]! - b[bestCh]!
+      || a[0]! - b[0]! || a[1]! - b[1]! || a[2]! - b[2]!);
+    const mid = box.pixels.length >> 1;
+    boxes.splice(best, 1,
+      { pixels: box.pixels.slice(0, mid) },
+      { pixels: box.pixels.slice(mid) });
+  }
+
+  return boxes.map((box) => {
+    let r = 0, g = 0, b = 0;
+    for (const p of box.pixels) { r += p[0]!; g += p[1]!; b += p[2]!; }
+    const m = box.pixels.length;
+    return [Math.round(r / m), Math.round(g / m), Math.round(b / m)] as RGB;
+  });
+};
+
+/** Alpha bounding box (exported for Studio: reference body measurements). */
+export const alphaBounds = (c: HTMLCanvasElement): { l: number; t: number; r: number; b: number } | null =>
+  alphaBBox(c);
+
+/** Mean chroma (max-min channel) of opaque pixels — 0 for grayscale art. */
+export const meanChroma = (c: HTMLCanvasElement): number => {
+  const d = c.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, c.width, c.height).data;
+  let sum = 0, n = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 3]! <= 40) continue;
+    const mx = Math.max(d[i]!, d[i + 1]!, d[i + 2]!);
+    const mn = Math.min(d[i]!, d[i + 1]!, d[i + 2]!);
+    sum += mx - mn;
+    n++;
+  }
+  return n === 0 ? 0 : sum / n;
 };
 
 /**
@@ -361,7 +419,9 @@ export interface QCResult {
 }
 
 /** Per-frame QC vs the reference sheet (spec §5.1 stage 4). */
-export const qcScore = (frame: NormalizedFrame, refBodyW: number | null, passAt = 55): QCResult => {
+export const qcScore = (
+  frame: NormalizedFrame, refBodyW: number | null, passAt = 55, refChroma: number | null = null,
+): QCResult => {
   const paletteMatch = frame.paletteMatch;
   // Height is normalized by construction; width drift is the real proportion signal.
   const heightRatio = refBodyW ? frame.bodyW / refBodyW : 1;
@@ -372,6 +432,11 @@ export const qcScore = (frame: NormalizedFrame, refBodyW: number | null, passAt 
   if (frame.majorBlobs > 1) score = Math.min(score, 35);
   // Surviving background-colored area = key failure (bleed).
   if (frame.bleed > 0.06) score = Math.min(score, Math.round(50 - frame.bleed * 100));
+  // Desaturation vs a colorful reference: the model drew the character in
+  // grayscale — quantization cannot restore color, so reject and reroll.
+  if (refChroma !== null && refChroma >= 40 && meanChroma(frame.cell) < refChroma * 0.4) {
+    score = Math.min(score, 40);
+  }
   return { score, paletteMatch, heightRatio, pass: score >= passAt };
 };
 

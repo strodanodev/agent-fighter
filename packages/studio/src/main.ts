@@ -16,9 +16,10 @@ import type {
   CharacterBundle, GameState, HitboxDef, InputFrame, MoveDef, MoveStep, Rect,
 } from '@af/core';
 import {
-  CELL_W, PIVOT_X, PIVOT_Y, autoHurtboxes, canvasToPngDataUrl,
+  CELL_W, PIVOT_X, PIVOT_Y, alphaBounds, autoHurtboxes, canvasToPngDataUrl,
   decodeBase64Image, diffHitboxDraft, enclosedWhitePockets, extractPalette,
-  flipCanvasH, maskDiff, mirrorMask16, normalizeFrame, qcScore, silhouetteMask16,
+  flipCanvasH, maskDiff, meanChroma, mirrorMask16, normalizeFrame, qcScore,
+  silhouetteMask16,
 } from './pipeline.js';
 import type { NormalizedFrame, QCResult, RGB } from './pipeline.js';
 
@@ -27,6 +28,7 @@ interface StudioMeta {
   palette?: RGB[];
   refBodyW?: number;
   refMask?: number[]; // 16×16 silhouette of the reference (facing detection)
+  refChroma?: number; // mean chroma of the reference (desaturation QC)
   moveDesc?: Record<string, string>;
 }
 
@@ -1200,7 +1202,7 @@ const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | n
   // Specials/supers carry energy VFX that legitimately drift from the body
   // palette — lower bar; the palette lock still normalizes the colors.
   const passAt = mv.type === 'special' || mv.type === 'super' ? 45 : 55;
-  return { norm, qc: qcScore(norm, refW, passAt), accepted: false, flipped };
+  return { norm, qc: qcScore(norm, refW, passAt, m.refChroma ?? null), accepted: false, flipped };
 };
 
 const acceptFrame = async (mv: MoveDef, i: number, r: GenResult): Promise<void> => {
@@ -1298,6 +1300,7 @@ interface AuditRow {
   facingSus: boolean;
   facingStrong: boolean;
   pockets: number;
+  gray: boolean; // desaturated vs a colorful reference
   fixed?: string;
 }
 let stAudit: AuditRow[] | null = null;
@@ -1344,8 +1347,9 @@ const runAudit = async (): Promise<void> => {
           facingSus = !facingStrong && dMir < dRef * 0.95;
         }
         const pockets = enclosedWhitePockets(cell);
-        if (facingStrong || facingSus || pockets > 0) {
-          stAudit.push({ moveIdx: mi, step: i, name, facingSus, facingStrong, pockets });
+        const gray = (m.refChroma ?? 0) >= 40 && meanChroma(cell) < (m.refChroma ?? 0) * 0.4;
+        if (facingStrong || facingSus || pockets > 0 || gray) {
+          stAudit.push({ moveIdx: mi, step: i, name, facingSus, facingStrong, pockets, gray });
         }
       }
     }
@@ -1395,7 +1399,7 @@ const auditFixAll = async (): Promise<void> => {
   for (const row of stAudit) {
     if (row.fixed) continue;
     if (row.facingStrong) await auditFlip(row);
-    else if (row.pockets > 0) await auditRegen(row);
+    else if (row.pockets > 0 || row.gray) await auditRegen(row);
   }
   stStatus = 'audit auto-fix complete — SAVE to persist sprite refs + atlas';
   renderAll();
@@ -1443,6 +1447,7 @@ const renderGenerateTab = (): HTMLElement => {
           m.palette = pal;
           m.refBodyW = stRefPreview!.bodyW;
           m.refMask = silhouetteMask16(stRefPreview!.cell);
+          m.refChroma = Math.round(meanChroma(stRefPreview!.cell));
           void saveSprite('_reference.png', stRefPreview!.cell);
           stDirty = true;
           stStatus = `reference locked: ${pal.length}-color palette, body ${stRefPreview!.bodyW}×${stRefPreview!.bodyH}, facing mask stored`;
@@ -1455,6 +1460,27 @@ const renderGenerateTab = (): HTMLElement => {
       ...m.palette.map((c) => mkEl('span', {
         class: 'swatch', style: `background:rgb(${c[0]},${c[1]},${c[2]})`,
       })),
+      mkEl('button', {
+        title: 're-extract palette + facing mask + body size from the SAVED reference sprite (use after a palette-extraction fix)',
+        onclick: () => {
+          void (async () => {
+            let ref = spriteCanvas('_reference.png');
+            for (let w = 0; w < 30 && !ref; w++) {
+              await new Promise((r) => setTimeout(r, 100));
+              ref = spriteCanvas('_reference.png');
+            }
+            if (!ref) { stStatus = 'no saved reference found'; renderAll(); return; }
+            m.palette = extractPalette(ref, 16);
+            m.refMask = silhouetteMask16(ref);
+            m.refChroma = Math.round(meanChroma(ref));
+            const bb = alphaBounds(ref);
+            if (bb) m.refBodyW = bb.r - bb.l + 1;
+            stDirty = true;
+            stStatus = `palette refreshed from saved reference (${m.palette.length} colors)`;
+            renderAll();
+          })();
+        },
+      }, '⟳ refresh palette'),
     ) : mkEl('p', { class: 'hint' }, 'no reference yet — frames will skip palette lock + QC'),
   );
 
@@ -1547,7 +1573,8 @@ const renderGenerateTab = (): HTMLElement => {
           mkEl('td', {}, row.name),
           mkEl('td', {},
             [row.facingStrong ? 'FACING' : row.facingSus ? 'facing?' : '',
-              row.pockets > 0 ? `bleed×${row.pockets}` : ''].filter(Boolean).join(' · ')),
+              row.pockets > 0 ? `bleed×${row.pockets}` : '',
+              row.gray ? 'GRAY' : ''].filter(Boolean).join(' · ')),
           mkEl('td', {}, row.fixed ?? '—'),
           mkEl('td', {},
             mkEl('button', { disabled: stAuditBusy ? '' : null, onclick: () => void auditFlip(row) }, '↔ flip'),
