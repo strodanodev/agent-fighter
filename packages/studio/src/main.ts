@@ -217,8 +217,18 @@ const packAtlas = async (): Promise<number> => {
     frames[p.name] = { x: p.sx, y: p.sy, w: p.w, h: p.h, pivotX: p.px, pivotY: p.py };
   }
 
-  await apiJson(`/api/characters/${stCharId}/sprites/atlas.png`, {
-    method: 'PUT', body: canvasToPngDataUrl(atlas),
+  /**
+   * Ship WebP. Trimming cut the atlas PIXELS ~4x (a big VRAM/decode win) but
+   * barely touched the FILE, because empty space costs a PNG almost nothing —
+   * the megabytes are the art itself. WebP at q0.92 is visually
+   * indistinguishable here and roughly a fifth the bytes. PNG stays the
+   * fallback for any browser that can't encode it.
+   */
+  const webp = atlas.toDataURL('image/webp', 0.92);
+  const useWebp = webp.startsWith('data:image/webp');
+  const imageName = useWebp ? 'atlas.webp' : 'atlas.png';
+  await apiJson(`/api/characters/${stCharId}/sprites/${imageName}`, {
+    method: 'PUT', body: useWebp ? webp : canvasToPngDataUrl(atlas),
   });
   await apiJson(`/api/characters/${stCharId}/sprites/atlas.json`, {
     method: 'PUT',
@@ -226,6 +236,7 @@ const packAtlas = async (): Promise<number> => {
     // detail, so the renderer must shrink them back to world size; `smooth`
     // tells it to filter rather than point-sample (anime art, not pixel art).
     body: JSON.stringify({
+      image: imageName,
       cellW: CELL_W, cellH: CELL_W, scale: SPRITE_SCALE, smooth: true, frames,
     }, null, 2),
   });
@@ -1932,6 +1943,10 @@ const renderGenerateTab = (): HTMLElement => {
     if (!name) return null;
     const t = mkEl('canvas', { width: size, height: size, class: 'thumb' });
     const tc = t.getContext('2d')!;
+    // The PNG streams in async. Retry on a bounded timer — NOT gated on the
+    // canvas already being in the DOM, since the first paint happens while the
+    // element is still being built (that check left every thumb blank).
+    let tries = 0;
     const paint = (): void => {
       const spr = getSprite(name);
       tc.imageSmoothingEnabled = true;
@@ -1939,7 +1954,7 @@ const renderGenerateTab = (): HTMLElement => {
       tc.fillStyle = '#12141f';
       tc.fillRect(0, 0, size, size);
       if (spr) tc.drawImage(spr, 0, 0, size, size);
-      else if (document.body.contains(t)) setTimeout(paint, 120);
+      else if (tries++ < 60) setTimeout(paint, 120);
     };
     paint();
     return t;
@@ -1977,15 +1992,9 @@ const renderGenerateTab = (): HTMLElement => {
     // so it should never be invisible just because you haven't regenerated it.
     !stRefPreview && stUpload === null ? mkEl('div', { class: 'row' },
       savedThumb('_reference.png') ?? mkEl('div', { class: 'thumb empty' }, 'no reference'),
-      mkEl('div', {},
-        mkEl('p', { class: 'hint' }, m.palette
-          ? `locked reference in use · ${m.palette.length}-colour palette · every frame is generated from this image`
-          : 'no reference locked yet — generate or upload one, then "use as reference"'),
-        mkEl('button', {
-          title: 're-extract palette/facing/chroma from the saved reference',
-          onclick: () => { void refreshPaletteFromSaved(); },
-        }, '⟳ refresh palette'),
-      ),
+      mkEl('p', { class: 'hint' }, m.palette
+        ? `locked reference in use · every frame is generated from this image`
+        : 'no reference locked yet — generate or upload one, then "use as reference"'),
     ) : null,
     // An uploaded image: use it verbatim, or have the model redraw it in the
     // game's art style first (keeping the character).

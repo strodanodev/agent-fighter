@@ -1836,9 +1836,12 @@ const loadRoster = async (id) => {
     const bundle = await fetchJson(`/characters/${id}/character.json`);
     if (!bundle)
         throw new Error(`character "${id}" not found`);
-    const [atlas, sheet, portrait] = await Promise.all([
-        fetchJson(`/characters/${id}/sprites/atlas.json`),
-        loadImage(`/characters/${id}/sprites/atlas.png`),
+    const atlas = await fetchJson(`/characters/${id}/sprites/atlas.json`);
+    // Atlases ship as WebP (a fraction of the bytes); `image` names the file.
+    // Older atlases predate the field and are always atlas.png.
+    const sheetFile = atlas?.image ?? 'atlas.png';
+    const [sheet, portrait] = await Promise.all([
+        loadImage(`/characters/${id}/sprites/${sheetFile}`),
         loadImage(`/characters/${id}/sprites/_reference.png`),
     ]);
     return {

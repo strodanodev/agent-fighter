@@ -13,6 +13,8 @@ export interface AtlasFrame {
 }
 
 export interface AtlasData {
+  /** Packed sheet filename (atlas.webp). Absent in legacy atlases → atlas.png. */
+  image?: string;
   cellW: number;
   cellH: number;
   /**
@@ -83,9 +85,12 @@ export const listCharacters = async (): Promise<string[]> =>
 export const loadRoster = async (id: string): Promise<Roster> => {
   const bundle = await fetchJson<CharacterBundle>(`/characters/${id}/character.json`);
   if (!bundle) throw new Error(`character "${id}" not found`);
-  const [atlas, sheet, portrait] = await Promise.all([
-    fetchJson<AtlasData>(`/characters/${id}/sprites/atlas.json`),
-    loadImage(`/characters/${id}/sprites/atlas.png`),
+  const atlas = await fetchJson<AtlasData>(`/characters/${id}/sprites/atlas.json`);
+  // Atlases ship as WebP (a fraction of the bytes); `image` names the file.
+  // Older atlases predate the field and are always atlas.png.
+  const sheetFile = atlas?.image ?? 'atlas.png';
+  const [sheet, portrait] = await Promise.all([
+    loadImage(`/characters/${id}/sprites/${sheetFile}`),
     loadImage(`/characters/${id}/sprites/_reference.png`),
   ]);
   return {
