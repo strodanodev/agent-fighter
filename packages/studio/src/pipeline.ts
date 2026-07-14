@@ -62,6 +62,8 @@ const dist2 = (r: number, g: number, b: number, c: RGB): number => {
   return dr * dr + dg * dg + db * db;
 };
 
+const clampByte = (v: number): number => (v < 0 ? 0 : v > 255 ? 255 : Math.round(v));
+
 /**
  * Background removal: flood-fill transparency from every border pixel whose
  * color is close to the border median, THEN clear enclosed background
@@ -148,6 +150,38 @@ export const removeBackground = (
       bleedPx += comp.length; // survived bg-colored area → QC signal
     }
   }
+
+  // Pass 3: soft-edge feathering + colour decontamination. Passes 1-2 are a
+  // BINARY classification (fully opaque or fully transparent), which is
+  // correct for the bulk of the image but produces a hard, staircased edge
+  // on fine detail (a fence's diagonal wires, a mesh pattern) and leaves a
+  // faint white halo on partially-blended boundary pixels — this is the
+  // "janky" look. Only pixels touching that hard boundary get a smooth
+  // alpha ramp based on colour distance, and have the background's
+  // remaining tint subtracted back out (standard matting decontamination),
+  // rather than reprocessing the whole image and risking legitimate
+  // near-white foreground content elsewhere.
+  const innerR = Math.max(8, tol * 0.35);
+  const src = new Uint8ClampedArray(d); // read neighbours from the PRE-feather state
+  for (let p = 0; p < w * h; p++) {
+    if (src[p * 4 + 3] === 0) continue; // already transparent
+    const x = p % w, y = (p / w) | 0;
+    let nearBoundary = false;
+    for (const [qx, qy] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]] as const) {
+      if (qx < 0 || qy < 0 || qx >= w || qy >= h) continue;
+      if (src[(qy * w + qx) * 4 + 3] === 0) { nearBoundary = true; break; }
+    }
+    if (!nearBoundary) continue;
+    const i = p * 4;
+    const dist = Math.sqrt(dist2(src[i]!, src[i + 1]!, src[i + 2]!, bg));
+    if (dist >= tol) continue; // clearly foreground colour — leave fully opaque
+    const alphaFrac = Math.max(0.15, Math.min(1, (dist - innerR) / Math.max(1, tol - innerR)));
+    d[i] = clampByte(bg[0] + (src[i]! - bg[0]) / alphaFrac);
+    d[i + 1] = clampByte(bg[1] + (src[i + 1]! - bg[1]) / alphaFrac);
+    d[i + 2] = clampByte(bg[2] + (src[i + 2]! - bg[2]) / alphaFrac);
+    d[i + 3] = Math.round(alphaFrac * 255);
+  }
+
   ctx.putImageData(im, 0, 0);
   return { canvas: c, bleed: opaquePx > 0 ? bleedPx / opaquePx : 0 };
 };

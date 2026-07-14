@@ -113,19 +113,24 @@ export interface StageLayerMeta {
    * true (backdrop, e.g. sky/skyline): stretch the WHOLE source image to
    * the stage's shared imageH/floorY framing, same as the legacy single
    * background. false/absent (a keyed object plane, e.g. a fence or a row
-   * of buildings): scaled to its OWN `worldH` (below) and anchored so its
-   * opaque content's bottom edge sits on the world floor line.
+   * of buildings): positioned with `scale`/`offsetX`/`offsetY` below —
+   * fully MANUAL, set once in the Studio (by dragging or typing values) and
+   * persisted here. Auto-sizing off detected content was tried and
+   * abandoned: a single stray shape in a generation (an unrelated rooftop
+   * ledge alongside a requested fence, say) silently wrecks the whole
+   * layer's scale and anchor with no way to correct it. Manual control
+   * means a bad auto-guess is just a starting point, never the final word.
    */
   stretch?: boolean;
-  /**
-   * Object planes only: the WORLD-PX height their own opaque content should
-   * occupy (independent of the backdrop's width-fit scale — a generated
-   * "fence" image commonly fills its whole canvas edge-to-edge, and sizing
-   * it off the backdrop's scale would make it many times a fighter's
-   * height). Compare against a fighter's ~112 world-px body height when
-   * choosing this. Ignored when `stretch` is true.
-   */
-  worldH?: number;
+  /** Object planes only: world px per source px. Ignored when stretch. */
+  scale?: number;
+  /** Object planes only: world-px horizontal nudge, added on top of the
+   * parallax depth offset. Ignored when stretch. */
+  offsetX?: number;
+  /** Object planes only: world-px position of the source image's TOP edge,
+   * relative to the world floor line (STAGE.floorYPx + offsetY). Ignored
+   * when stretch. */
+  offsetY?: number;
 }
 
 export interface StageMeta {
@@ -144,38 +149,10 @@ export interface StageLayer {
   img: HTMLImageElement;
   depth: number;
   stretch: boolean;
-  worldH: number;
-  /** Row index (source px) of the lowest opaque pixel. */
-  contentBottomPx: number;
-  /** Opaque content height in source px (bottom - top + 1). */
-  contentHeightPx: number;
+  scale: number;
+  offsetX: number;
+  offsetY: number;
 }
-
-/** Opaque content's vertical extent (source px), or the full image height if
- * fully opaque/undetectable (degrades to today's stretch-like sizing). */
-const contentVerticalExtent = (img: HTMLImageElement): { bottom: number; height: number } => {
-  const c = document.createElement('canvas');
-  c.width = img.naturalWidth;
-  c.height = img.naturalHeight;
-  const ctx = c.getContext('2d', { willReadFrequently: true })!;
-  ctx.drawImage(img, 0, 0);
-  const d = ctx.getImageData(0, 0, c.width, c.height).data;
-  let top = -1, bottom = -1;
-  for (let y = 0; y < c.height; y++) {
-    for (let x = 0; x < c.width; x++) {
-      if (d[(y * c.width + x) * 4 + 3]! > 10) { top = y; break; }
-    }
-    if (top >= 0) break;
-  }
-  for (let y = c.height - 1; y >= 0; y--) {
-    for (let x = 0; x < c.width; x++) {
-      if (d[(y * c.width + x) * 4 + 3]! > 10) { bottom = y; break; }
-    }
-    if (bottom >= 0) break;
-  }
-  if (top < 0 || bottom < 0) return { bottom: c.height - 1, height: c.height };
-  return { bottom, height: bottom - top + 1 };
-};
 
 export interface StageAsset {
   id: string;
@@ -206,11 +183,9 @@ export const loadStage = async (id: string): Promise<StageAsset | null> => {
       const loaded = await Promise.all(meta.layers.map(async (lm) => {
         const img = await loadImg(`/stages/${id}/${lm.file}`);
         if (!img) return null;
-        const stretch = lm.stretch ?? false;
-        const ext = stretch ? { bottom: 0, height: 1 } : contentVerticalExtent(img);
         return {
-          img, depth: lm.depth, stretch, worldH: lm.worldH ?? 112,
-          contentBottomPx: ext.bottom, contentHeightPx: ext.height,
+          img, depth: lm.depth, stretch: lm.stretch ?? false,
+          scale: lm.scale ?? 1, offsetX: lm.offsetX ?? 0, offsetY: lm.offsetY ?? 0,
         };
       }));
       layers = loaded
@@ -314,22 +289,26 @@ export const drawStageLayers = (
   ctx.imageSmoothingEnabled = false;
   for (const layer of stage.layers) {
     // Every plane draws its WHOLE source image (never cropped, so soft
-    // edges/fades stay intact) — but backdrop and object planes are scaled
-    // completely differently. Backdrops stretch to the shared bg-fit `scale`
-    // (today's behavior). Object planes (a fence, a row of buildings) use
-    // their OWN scale derived from `worldH` ÷ their actual opaque content
-    // height — a generated "fence" commonly fills its whole canvas
-    // edge-to-edge, and sizing that off the backdrop's width-fit scale would
-    // make it many times a fighter's height. Bottom-anchored to the floor.
-    const layerScale = layer.stretch ? scale : layer.worldH / layer.contentHeightPx;
+    // edges/fades stay intact). Backdrops stretch to the shared bg-fit
+    // `scale` (today's behavior). Object planes (a fence, a row of
+    // buildings) use their own MANUALLY-SET scale/offsetY — set once in the
+    // Studio, not derived from detected content (see StageLayerMeta.scale).
+    const layerScale = layer.stretch ? scale : layer.scale;
     const tileW = layer.img.naturalWidth * layerScale;
     if (tileW < 1) continue;
     const layerH = layer.img.naturalHeight * layerScale;
-    const layerTopY = layer.stretch
-      ? topY
-      : STAGE.floorYPx - (layer.contentBottomPx + 1) * layerScale;
-    const offsetX = (1 - layer.depth) * cam.x;
-    const originX = -offsetX; // world-x where the k=0 tile's left edge sits
+    const layerTopY = layer.stretch ? topY : STAGE.floorYPx + layer.offsetY;
+    // World-x of the k=0 tile's left edge. Derivation (see the function's
+    // doc comment): worldX = nominal + (1-depth)*camX satisfies BOTH
+    // boundary conditions — depth=1 gives a depth-independent constant
+    // (matches drawStageImage's fixed world-x=0, today's pinned behavior),
+    // depth=0 gives worldX=camX+nominal (screen-fixed, tracks the camera
+    // exactly so the layer never appears to move — "infinitely far").
+    // NO leading negation: `originX = -offsetX` here would double the
+    // camera's own subtraction for near-zero depths instead of cancelling
+    // it, making far layers drift FASTER than near ones — backwards.
+    const nominal = layer.stretch ? 0 : layer.offsetX;
+    const originX = nominal + (1 - layer.depth) * cam.x;
     const startK = Math.floor((L - originX) / tileW) - 1;
     const endK = Math.ceil((R - originX) / tileW) + 1;
     for (let k = startK; k <= endK; k++) {

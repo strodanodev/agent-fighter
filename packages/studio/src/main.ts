@@ -367,6 +367,142 @@ const selInput = (value: string, options: string[], onCommit: (v: string) => voi
   return s;
 };
 
+// ------------------------------------------------- modal dialogs
+/**
+ * NEVER use window.prompt/confirm here. Embedded browsers (the in-app preview
+ * pane, and Chrome in some contexts) suppress them: prompt() returns null and
+ * confirm() returns false with no UI, so the action just silently does
+ * nothing. That is exactly why "+ new" looked dead — and it had quietly killed
+ * "flip ALL sprites", "delete move" and "+ new stage" too.
+ */
+let stNewChar: { id: string; name: string; desc: string } | null = null;
+let stNewStage: { id: string } | null = null;
+let stConfirm: { msg: string; onOk: () => void } | null = null;
+
+const askConfirm = (msg: string, onOk: () => void): void => {
+  stConfirm = { msg, onOk };
+  renderAll();
+};
+
+const renderConfirmDialog = (): HTMLElement | null => {
+  if (!stConfirm) return null;
+  const c = stConfirm;
+  return mkEl('div', { class: 'modal' },
+    mkEl('div', { class: 'modalbox' },
+      mkEl('p', {}, c.msg),
+      mkEl('div', { class: 'row' },
+        mkEl('button', {
+          onclick: () => { stConfirm = null; c.onOk(); renderAll(); },
+        }, 'yes, do it'),
+        mkEl('button', { onclick: () => { stConfirm = null; renderAll(); } }, 'cancel'),
+      ),
+    ),
+  );
+};
+
+const renderNewStageDialog = (): HTMLElement | null => {
+  if (!stNewStage) return null;
+  const n = stNewStage;
+  const ok = /^[a-z0-9][a-z0-9-]{0,40}$/.test(n.id);
+  return mkEl('div', { class: 'modal' },
+    mkEl('div', { class: 'modalbox' },
+      mkEl('b', {}, 'new stage'),
+      mkEl('label', { class: 'field' }, 'stage id',
+        mkEl('input', {
+          value: n.id, placeholder: 'e.g. dojo', style: 'width:220px',
+          oninput: (e: Event) => { n.id = (e.target as HTMLInputElement).value.trim(); renderAll(); },
+        })),
+      n.id && !ok ? mkEl('p', { class: 'qc fail' }, 'lowercase letters, numbers and dashes only') : null,
+      mkEl('div', { class: 'row' },
+        mkEl('button', {
+          disabled: ok ? null : '',
+          onclick: () => { const id = n.id; stNewStage = null; newStage(id); },
+        }, 'create'),
+        mkEl('button', { onclick: () => { stNewStage = null; renderAll(); } }, 'cancel'),
+      ),
+    ),
+  );
+};
+
+/**
+ * Create a character by cloning the CURRENT bundle's frame data — the whole
+ * point of the archetype library is that move timings/boxes are reusable — but
+ * stripping everything that makes it *that* character: sprites, and the meta
+ * identity block (reference palette, facing mask, chroma, pose overrides).
+ * Inheriting those silently would lock the new fighter to the old one's
+ * reference image.
+ */
+const createCharacter = async (id: string, name: string, desc: string): Promise<void> => {
+  const copy = structuredClone(stBundle!) as CharacterBundle & { meta?: StudioMeta; versionHash?: string };
+  copy.name = name || id;
+  for (const mv of copy.moves) for (const s of mv.steps) delete s.sprite;
+  delete copy.versionHash;
+  copy.meta = desc ? { desc } : {};
+
+  stBundle = copy;
+  stCharId = id;
+  stMoveIdx = 0;
+  stStepIdx = 0;
+  stSel = null;
+  stGenResults = new Map();
+  stRefPreview = null;
+  stUpload = null;
+  stAudit = null;
+  spriteImgs.clear();
+  stDirty = true;
+
+  await saveChar();
+  stCharList = await apiJson<string[]>('/api/characters');
+  stTab = 'generate'; // next step is always: give it a reference
+  stStatus = `created "${id}" — now generate or upload a reference image`;
+  renderAll();
+};
+
+const renderNewCharDialog = (): HTMLElement | null => {
+  if (!stNewChar) return null;
+  const n = stNewChar;
+  const idOk = /^[a-z0-9][a-z0-9-]{0,40}$/.test(n.id);
+  const taken = stCharList.includes(n.id);
+  const err = n.id === '' ? '' : !idOk ? 'id must be lowercase letters, numbers and dashes'
+    : taken ? `"${n.id}" already exists` : '';
+  return mkEl('div', { class: 'modal' },
+    mkEl('div', { class: 'modalbox' },
+      mkEl('b', {}, 'new character'),
+      mkEl('p', { class: 'hint' },
+        `frame data (moves, timings, hitboxes, cancels) is copied from ${stBundle?.name ?? 'the current character'} `
+        + 'as an archetype — sprites and the reference identity are NOT.'),
+      mkEl('label', { class: 'field' }, 'id',
+        mkEl('input', {
+          value: n.id, placeholder: 'e.g. blaze', style: 'width:220px',
+          oninput: (e: Event) => { n.id = (e.target as HTMLInputElement).value.trim(); renderAll(); },
+        })),
+      mkEl('label', { class: 'field' }, 'display name',
+        mkEl('input', {
+          value: n.name, placeholder: 'e.g. Blaze', style: 'width:220px',
+          oninput: (e: Event) => { n.name = (e.target as HTMLInputElement).value; },
+        })),
+      mkEl('label', { class: 'field' }, 'description',
+        mkEl('input', {
+          value: n.desc, style: 'width:360px',
+          placeholder: 'anime muay thai fighter, blue mohawk, gold arm wraps…',
+          oninput: (e: Event) => { n.desc = (e.target as HTMLInputElement).value; },
+        })),
+      err ? mkEl('p', { class: 'qc fail' }, err) : null,
+      mkEl('div', { class: 'row' },
+        mkEl('button', {
+          disabled: !idOk || taken ? '' : null,
+          onclick: () => {
+            const { id, name, desc } = n;
+            stNewChar = null;
+            void createCharacter(id, name || id, desc);
+          },
+        }, 'create'),
+        mkEl('button', { onclick: () => { stNewChar = null; renderAll(); } }, 'cancel'),
+      ),
+    ),
+  );
+};
+
 // ------------------------------------------------------------------ header
 const renderHeader = (): HTMLElement => {
   const tabs: TabName[] = ['character', 'frames', 'moves', 'cancels', 'test', 'generate', 'stage'];
@@ -374,18 +510,8 @@ const renderHeader = (): HTMLElement => {
     mkEl('span', { class: 'logo' }, 'AF STUDIO'),
     selInput(stCharId, stCharList, (id) => { void loadChar(id).then(renderAll); }),
     mkEl('button', {
-      onclick: () => {
-        const id = prompt('new character id (lowercase, dashes):');
-        if (!id || !/^[a-z0-9][a-z0-9-]{0,40}$/.test(id)) return;
-        // New characters start as a copy of the current bundle (archetype reuse).
-        const copy = structuredClone(stBundle!);
-        copy.name = id[0]!.toUpperCase() + id.slice(1);
-        for (const mv of copy.moves) for (const s of mv.steps) delete s.sprite;
-        stBundle = copy;
-        stCharId = id;
-        stDirty = true;
-        void saveChar().then(() => apiJson<string[]>('/api/characters')).then((l) => { stCharList = l; renderAll(); });
-      },
+      title: 'create a character (copies this one\'s frame data as an archetype)',
+      onclick: () => { stNewChar = { id: '', name: '', desc: '' }; renderAll(); },
     }, '+ new'),
     ...tabs.map((t) => mkEl('button', {
       class: stTab === t ? 'tab active' : 'tab',
@@ -884,11 +1010,9 @@ const renderFramesTab = (): HTMLElement => {
       mkEl('button', {
         disabled: stGenBusy ? '' : null,
         title: 'mirror EVERY sprite of this character (incl. reference) — fixes wrong default orientation',
-        onclick: () => {
-          if (confirm(`Flip ALL of ${b.name}'s sprites horizontally? Use when the whole character faces the wrong way.`)) {
-            void flipAllSprites();
-          }
-        },
+        onclick: () => askConfirm(
+          `Flip ALL of ${b.name}'s sprites horizontally? Use when the whole character faces the wrong way.`,
+          () => { void flipAllSprites(); }),
       }, stGenBusy ? '…' : '↔ flip ALL sprites'),
     ),
     timeline,
@@ -946,14 +1070,16 @@ const renderMovesTab = (): HTMLElement => {
         }, 'dup'),
         mkEl('button', {
           onclick: () => {
-            if (!confirm(`delete ${mv.id}?`)) return;
-            b.moves.splice(i, 1);
-            const gone = mv.id;
-            b.cancels = b.cancels
-              .filter((edge) => edge.from !== gone)
-              .map((edge) => ({ ...edge, to: edge.to.filter((t) => t !== gone) }))
-              .filter((edge) => edge.to.length > 0);
-            stMoveIdx = 0; stDirty = true; renderAll();
+            askConfirm(`Delete move "${mv.id}"? Its cancel-graph edges go too.`, () => {
+              b.moves.splice(i, 1);
+              const gone = mv.id;
+              b.cancels = b.cancels
+                .filter((edge) => edge.from !== gone)
+                .map((edge) => ({ ...edge, to: edge.to.filter((t) => t !== gone) }))
+                .filter((edge) => edge.to.length > 0);
+              stMoveIdx = 0;
+              stDirty = true;
+            });
           },
         }, 'del'),
       ),
@@ -2198,7 +2324,10 @@ const renderGenerateTab = (): HTMLElement => {
 
 // ------------------------------------------------------------------ root
 // ------------------------------------------------------------------ stage tab
-interface StageLayerMetaEd { file: string; depth: number; stretch?: boolean; worldH?: number }
+interface StageLayerMetaEd {
+  file: string; depth: number; stretch?: boolean;
+  scale?: number; offsetX?: number; offsetY?: number;
+}
 interface StageMetaEd {
   name: string;
   imageW: number;
@@ -2223,29 +2352,38 @@ interface StageLayerEd {
   depth: number;
   img: HTMLImageElement | HTMLCanvasElement | null;
   keyBg: boolean; // strip the flat generation background so lower planes show through
-  /** World-px height of the layer's OWN opaque content (object planes only —
-   * a generated "fence" or "buildings" image commonly fills its canvas
-   * edge-to-edge, so sizing must be independent of the backdrop's scale.
-   * Compare against a fighter's ~112 world-px body height. Ignored for the
-   * backdrop plane (keyBg:false), which always stretches to the shared frame. */
-  worldH: number;
+  /**
+   * MANUAL positioning (object planes only — the backdrop plane always
+   * stretches to the shared frame). Auto-detecting these from the image's
+   * opaque content was tried and abandoned: one stray shape in a generation
+   * (an unrelated ledge alongside a requested fence, say) silently wrecks
+   * the whole layer's scale/anchor with no way to correct it. These are set
+   * by dragging in the preview (or typing values) and persisted as-is —
+   * auto-detect only ever SUGGESTS a starting point, never decides alone.
+   */
+  scale: number; // world px per source px
+  offsetX: number; // world px, added on top of the parallax depth offset
+  offsetY: number; // world px, source image's TOP edge relative to the floor line
 }
 
 const freshLayerSlots = (): StageLayerEd[] => [
   {
     file: 'layer-bg.png', label: 'Background (far)',
     hint: 'e.g. distant city skyline silhouette against a purple sunset sky, no foreground objects',
-    defaultDepth: 0.15, depth: 0.15, img: null, keyBg: false, worldH: 0, // stretched — worldH unused
+    defaultDepth: 0.15, depth: 0.15, img: null, keyBg: false,
+    scale: 1, offsetX: 0, offsetY: 0, // stretched — position fields unused
   },
   {
     file: 'layer-mid.png', label: 'Midground',
     hint: 'e.g. row of mid-distance rooftop buildings and water towers, isolated so the sky shows through',
-    defaultDepth: 0.45, depth: 0.45, img: null, keyBg: true, worldH: 240,
+    defaultDepth: 0.45, depth: 0.45, img: null, keyBg: true,
+    scale: 0.35, offsetX: 0, offsetY: -240,
   },
   {
     file: 'layer-fg.png', label: 'Foreground (near)',
     hint: 'e.g. close chain-link fence and pipe silhouettes, isolated so everything behind shows through',
-    defaultDepth: 0.75, depth: 0.75, img: null, keyBg: true, worldH: 150,
+    defaultDepth: 0.75, depth: 0.75, img: null, keyBg: true,
+    scale: 0.22, offsetX: 0, offsetY: -150,
   },
 ];
 
@@ -2255,8 +2393,20 @@ let stStageMeta: StageMetaEd | null = null;
 let stStageImg: HTMLImageElement | HTMLCanvasElement | null = null;
 let stStageLayers: StageLayerEd[] = freshLayerSlots();
 let stStageLayerBusy: boolean[] = [false, false, false];
+/** Which layer the preview canvas drag currently targets. -1 = floor line. */
+let stStageSelLayer = -1;
 let stStageBusy = false;
 let stStageDirty = false;
+
+/** Start a blank stage (called by the new-stage dialog). */
+const newStage = (id: string): void => {
+  stStageId = id;
+  stStageImg = null;
+  stStageLayers = freshLayerSlots();
+  stStageMeta = { name: id, imageW: 1536, imageH: 640, floorY: 520, skyColor: '#2b1b4d', deckColor: '#3a3644' };
+  stStageDirty = true;
+  renderAll();
+};
 
 const loadStageEd = async (id: string): Promise<void> => {
   stStageId = id;
@@ -2276,7 +2426,9 @@ const loadStageEd = async (id: string): Promise<void> => {
         const slot = stStageLayers.find((s) => s.file === lm.file);
         if (!slot) return;
         slot.depth = lm.depth;
-        if (lm.worldH !== undefined) slot.worldH = lm.worldH;
+        if (lm.scale !== undefined) slot.scale = lm.scale;
+        if (lm.offsetX !== undefined) slot.offsetX = lm.offsetX;
+        if (lm.offsetY !== undefined) slot.offsetY = lm.offsetY;
         const limg = new Image();
         limg.src = `/stages/${id}/${lm.file}?v=${Math.random()}`;
         await new Promise<void>((res) => { limg.onload = () => res(); limg.onerror = () => res(); });
@@ -2327,11 +2479,11 @@ const saveStageEd = async (): Promise<void> => {
       });
     }));
     // stretch: true only for the opaque backdrop plane (keyBg:false) — object
-    // planes (keyBg:true) anchor to their own content's floor line instead
+    // planes (keyBg:true) use the MANUALLY-set scale/offsetX/offsetY instead
     // of stretching into a wall (see chrome.ts drawStageLayers).
     stStageMeta.layers = filled.map((l) => ({
       file: l.file, depth: l.depth, stretch: !l.keyBg,
-      ...(l.keyBg ? { worldH: l.worldH } : {}),
+      ...(l.keyBg ? { scale: l.scale, offsetX: l.offsetX, offsetY: l.offsetY } : {}),
     }));
   } else {
     delete stStageMeta.layers;
@@ -2342,6 +2494,28 @@ const saveStageEd = async (): Promise<void> => {
   stStageDirty = false;
   stStatus = `stage "${stStageId}" saved${filled.length > 0 ? ` · ${filled.length} parallax plane(s)` : ''}`;
   if (!stStageList.includes(stStageId)) stStageList.push(stStageId);
+  renderAll();
+};
+
+/**
+ * Suggest scale/offsetY from the layer's actual opaque content bounds — a
+ * STARTING POINT only, never the final word (see StageLayerEd.scale doc:
+ * one stray shape in a generation throws this off, which is exactly why
+ * positioning is manual/draggable and this is just a convenience button).
+ * `targetWorldH` compares against a fighter's ~112 world-px body height.
+ */
+const autoDetectLayer = (idx: number, targetWorldH: number): void => {
+  const layer = stStageLayers[idx]!;
+  if (!layer.img) return;
+  const c = canvasOf(layer.img);
+  const bb = alphaBounds(c);
+  if (!bb) { stStatus = `${layer.label}: no opaque content found to detect`; renderAll(); return; }
+  const contentH = bb.b - bb.t + 1;
+  layer.scale = targetWorldH / contentH;
+  layer.offsetX = 0;
+  layer.offsetY = -Math.round((bb.b + 1) * layer.scale);
+  stStageDirty = true;
+  stStatus = `${layer.label}: auto-detected (content ${contentH}px → ${targetWorldH} world px) — drag to fine-tune`;
   renderAll();
 };
 
@@ -2365,6 +2539,7 @@ const generateStageLayer = async (idx: number): Promise<void> => {
     layer.img = layer.keyBg ? removeBackground(img).canvas : img;
     stStageDirty = true;
     stStatus = `${layer.label} generated`;
+    if (layer.keyBg) autoDetectLayer(idx, idx === 1 ? 240 : 150); // suggest a starting position
   } catch (e) {
     stStatus = `${layer.label} generation failed: ${(e as Error).message}`;
   }
@@ -2383,23 +2558,73 @@ const renderStageTab = (): HTMLElement => {
   const m = stStageMeta;
   if (!m) return mkEl('div', { class: 'pane' }, 'loading stage…');
 
-  // Preview canvas with a draggable floor line. Composites every plane
-  // (legacy background + bg/mid/fg layers, in back-to-front order) stacked
-  // at rest — the point is to check they line up and read well together;
-  // actual PARALLAX only appears in-game as the camera moves (see
-  // drawStageLayers in chrome.ts for the runtime math this approximates).
+  // Preview canvas: composites every plane at its REAL configured world
+  // position (not just stretched to fill the box) — this is what makes the
+  // preview trustworthy for manual positioning. World px <-> preview px
+  // conversion: the backdrop plane always fills the whole `pw`-wide canvas
+  // and by definition spans the FULL stage width (STAGE.widthPx), so
+  // 1 world px = pw/STAGE.widthPx preview px, uniformly for X and Y (the
+  // engine never scales the two axes independently).
   const pw = 768;
   const ph = Math.round(pw * (m.imageH / m.imageW));
-  const cv = mkEl('canvas', { width: pw, height: ph, class: 'frcanvas', style: 'cursor:row-resize' });
+  const worldToPx = pw / STAGE.widthPx;
+  const cv = mkEl('canvas', { width: pw, height: ph, class: 'frcanvas', style: 'cursor:crosshair' });
+
+  /** Selected layer's on-screen draw rect (preview px), or null (backdrop/none). */
+  const selRect = (): { x: number; y: number; w: number; h: number } | null => {
+    if (stStageSelLayer < 0) return null;
+    const l = stStageLayers[stStageSelLayer]!;
+    if (!l.img || l.keyBg === false) return null;
+    const iw = l.img instanceof HTMLCanvasElement ? l.img.width : l.img.naturalWidth;
+    const ih = l.img instanceof HTMLCanvasElement ? l.img.height : l.img.naturalHeight;
+    const fy = (m.floorY / m.imageH) * ph;
+    return {
+      x: l.offsetX * worldToPx,
+      y: fy + l.offsetY * worldToPx,
+      w: iw * l.scale * worldToPx,
+      h: ih * l.scale * worldToPx,
+    };
+  };
+
   const paint = (): void => {
     const ctx = cv.getContext('2d')!;
     ctx.fillStyle = m.skyColor;
     ctx.fillRect(0, 0, pw, ph);
     const anyArt = stStageImg || stStageLayers.some((l) => l.img);
+    ctx.imageSmoothingEnabled = false;
     if (anyArt) {
-      ctx.imageSmoothingEnabled = false;
       if (stStageImg) ctx.drawImage(stStageImg, 0, 0, pw, ph);
-      for (const l of stStageLayers) if (l.img) ctx.drawImage(l.img, 0, 0, pw, ph);
+      for (const l of stStageLayers) {
+        if (!l.img) continue;
+        if (!l.keyBg) { ctx.drawImage(l.img, 0, 0, pw, ph); continue; } // backdrop: stretch to frame
+        const iw = l.img instanceof HTMLCanvasElement ? l.img.width : l.img.naturalWidth;
+        const ih = l.img instanceof HTMLCanvasElement ? l.img.height : l.img.naturalHeight;
+        const fy = (m.floorY / m.imageH) * ph;
+        const x = l.offsetX * worldToPx;
+        const y = fy + l.offsetY * worldToPx;
+        const tileW = iw * l.scale * worldToPx;
+        const h = ih * l.scale * worldToPx;
+        if (tileW < 1) continue;
+        // Ping-pong tile across the whole preview, matching the runtime's
+        // in-game tiling (chrome.ts drawStageLayers) — a single un-tiled
+        // instance made narrow layers (a fence) look broken/cut off here
+        // even though the real game repeats them seamlessly.
+        const startK = Math.floor(-x / tileW) - 1;
+        const endK = Math.ceil((pw - x) / tileW) + 1;
+        for (let k = startK; k <= endK; k++) {
+          const tx = x + k * tileW;
+          const mirrored = (((k % 2) + 2) % 2) === 1;
+          ctx.save();
+          if (mirrored) {
+            ctx.translate(tx + tileW, y);
+            ctx.scale(-1, 1);
+            ctx.drawImage(l.img, 0, 0, tileW, h);
+          } else {
+            ctx.drawImage(l.img, tx, y, tileW, h);
+          }
+          ctx.restore();
+        }
+      }
     } else {
       ctx.fillStyle = '#8a91a8';
       ctx.font = '14px monospace';
@@ -2419,20 +2644,64 @@ const renderStageTab = (): HTMLElement => {
     ctx.fillStyle = '#ffd166';
     ctx.font = 'bold 12px monospace';
     ctx.textAlign = 'left';
-    ctx.fillText(`floor y=${m.floorY} (drag)`, 8, fy - 6);
+    ctx.fillText(`floor y=${m.floorY}${stStageSelLayer < 0 ? ' (drag)' : ''}`, 8, fy - 6);
+    // Selection box + resize handle for the layer being positioned.
+    const sr = selRect();
+    if (sr) {
+      ctx.strokeStyle = '#e94560';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(sr.x + 1, sr.y + 1, sr.w - 2, sr.h - 2);
+      ctx.fillStyle = '#e94560';
+      ctx.fillRect(sr.x + sr.w - 6, sr.y + sr.h - 6, 12, 12);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(`${stStageLayers[stStageSelLayer]!.label} — drag to move, corner to resize`, sr.x + 2, sr.y - 4);
+    }
   };
   // setTimeout, NOT rAF — hidden tabs throttle rAF to zero (automation runs headless).
   setTimeout(paint, 0);
-  let dragging = false;
-  cv.onmousedown = () => { dragging = true; };
-  cv.onmousemove = (e) => {
-    if (!dragging) return;
+
+  type DragMode = 'floor' | 'move' | 'scale' | null;
+  let dragMode: DragMode = null;
+  let dragStart = { x: 0, y: 0, offsetX: 0, offsetY: 0, scale: 0 };
+  cv.onmousedown = (e) => {
     const r = cv.getBoundingClientRect();
-    m.floorY = Math.max(0, Math.min(m.imageH, Math.round(((e.clientY - r.top) / ph) * m.imageH)));
+    const px_ = e.clientX - r.left, py_ = e.clientY - r.top;
+    const sr = selRect();
+    if (sr && px_ >= sr.x + sr.w - 10 && px_ <= sr.x + sr.w + 4 && py_ >= sr.y + sr.h - 10 && py_ <= sr.y + sr.h + 4) {
+      dragMode = 'scale';
+    } else if (sr) {
+      dragMode = 'move';
+    } else {
+      dragMode = 'floor';
+    }
+    const l = stStageSelLayer >= 0 ? stStageLayers[stStageSelLayer]! : null;
+    dragStart = { x: px_, y: py_, offsetX: l?.offsetX ?? 0, offsetY: l?.offsetY ?? 0, scale: l?.scale ?? 1 };
+  };
+  cv.onmousemove = (e) => {
+    if (!dragMode) return;
+    const r = cv.getBoundingClientRect();
+    const px_ = e.clientX - r.left, py_ = e.clientY - r.top;
+    if (dragMode === 'floor') {
+      m.floorY = Math.max(0, Math.min(m.imageH, Math.round((py_ / ph) * m.imageH)));
+      stStageDirty = true;
+      paint();
+      return;
+    }
+    const l = stStageLayers[stStageSelLayer]!;
+    if (dragMode === 'move') {
+      l.offsetX = Math.round(dragStart.offsetX + (px_ - dragStart.x) / worldToPx);
+      l.offsetY = Math.round(dragStart.offsetY + (py_ - dragStart.y) / worldToPx);
+    } else if (dragMode === 'scale') {
+      const dy = (py_ - dragStart.y) / worldToPx;
+      const iw = l.img instanceof HTMLCanvasElement ? l.img.height : (l.img?.naturalHeight ?? 1);
+      l.scale = Math.max(0.02, dragStart.scale + dy / Math.max(1, iw));
+    }
     stStageDirty = true;
     paint();
   };
-  cv.onmouseup = cv.onmouseleave = () => { dragging = false; };
+  cv.onmouseup = cv.onmouseleave = () => { dragMode = null; };
 
   const upload = mkEl('input', {
     type: 'file', accept: 'image/png,image/svg+xml,image/jpeg',
@@ -2456,16 +2725,7 @@ const renderStageTab = (): HTMLElement => {
     mkEl('div', { class: 'row' },
       mkEl('label', {}, 'stage ', selInput(stStageId, [...new Set([...stStageList, stStageId])], (id) => { void loadStageEd(id); })),
       mkEl('button', {
-        onclick: () => {
-          const id = prompt('new stage id (lowercase, dashes):');
-          if (!id || !/^[a-z0-9][a-z0-9-]{0,40}$/.test(id)) return;
-          stStageId = id;
-          stStageImg = null;
-          stStageLayers = freshLayerSlots();
-          stStageMeta = { name: id, imageW: 1536, imageH: 640, floorY: 520, skyColor: '#2b1b4d', deckColor: '#3a3644' };
-          stStageDirty = true;
-          renderAll();
-        },
+        onclick: () => { stNewStage = { id: '' }; renderAll(); },
       }, '+ new'),
       mkEl('button', {
         class: stStageDirty ? 'save dirty' : 'save',
@@ -2575,6 +2835,7 @@ const renderStageTab = (): HTMLElement => {
             img.onload = () => {
               layer.img = layer.keyBg ? removeBackground(img).canvas : img;
               stStageDirty = true;
+              if (layer.keyBg) autoDetectLayer(idx, idx === 1 ? 240 : 150);
               renderAll();
             };
             img.src = URL.createObjectURL(file);
@@ -2595,15 +2856,31 @@ const renderStageTab = (): HTMLElement => {
               ),
               mkEl('div', { class: 'row' },
                 mkEl('label', { class: 'field' }, 'depth', numInput(layer.depth, (v) => { layer.depth = v; stStageDirty = true; }, 54)),
-                layer.keyBg ? mkEl('label', {
-                  class: 'field',
-                  title: 'world-px height of this plane\'s own content — compare against a fighter\'s ~112px body height. '
-                    + 'A generated image often fills its whole canvas, so this is sized independently of the backdrop.',
-                }, 'height (world px)', numInput(layer.worldH, (v) => { layer.worldH = Math.max(10, v); stStageDirty = true; }, 54)) : null,
                 layer.img ? mkEl('button', {
                   onclick: () => { layer.img = null; stStageDirty = true; renderAll(); },
                 }, 'clear') : null,
               ),
+              layer.keyBg ? mkEl('div', { class: 'row' },
+                mkEl('button', {
+                  class: stStageSelLayer === idx ? 'tab active' : 'tab',
+                  disabled: layer.img ? null : '',
+                  title: 'select this plane, then drag it in the preview above to move — drag its corner to resize',
+                  onclick: () => { stStageSelLayer = stStageSelLayer === idx ? -1 : idx; renderAll(); },
+                }, stStageSelLayer === idx ? '● positioning (click to stop)' : '◌ position in preview'),
+                mkEl('button', {
+                  disabled: layer.img ? null : '',
+                  title: 'suggest scale/position from this image\'s actual opaque content — a starting point, not the final word',
+                  onclick: () => autoDetectLayer(idx, idx === 1 ? 240 : 150),
+                }, 'auto-detect'),
+              ) : null,
+              layer.keyBg ? mkEl('div', { class: 'row' },
+                mkEl('label', { class: 'field', title: 'world px per source px' }, 'scale',
+                  numInput(layer.scale, (v) => { layer.scale = Math.max(0.01, v); stStageDirty = true; }, 54)),
+                mkEl('label', { class: 'field', title: 'world-px horizontal position' }, 'x',
+                  numInput(layer.offsetX, (v) => { layer.offsetX = v; stStageDirty = true; }, 54)),
+                mkEl('label', { class: 'field', title: 'world-px position of the image\'s top edge, relative to the floor line' }, 'y',
+                  numInput(layer.offsetY, (v) => { layer.offsetY = v; stStageDirty = true; }, 54)),
+              ) : null,
             ),
           ),
         );
@@ -2629,6 +2906,9 @@ const renderAll = (): void => {
     case 'test': app.append(renderTestTab()); break;
     case 'generate': app.append(renderGenerateTab()); break;
     case 'stage': app.append(renderStageTab()); break;
+  }
+  for (const dlg of [renderNewCharDialog(), renderNewStageDialog(), renderConfirmDialog()]) {
+    if (dlg) app.append(dlg);
   }
 };
 
