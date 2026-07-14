@@ -17,7 +17,8 @@ import type {
 } from '@af/core';
 import {
   CELL_W, PIVOT_X, PIVOT_Y, autoHurtboxes, canvasToPngDataUrl,
-  decodeBase64Image, diffHitboxDraft, extractPalette, normalizeFrame, qcScore,
+  decodeBase64Image, diffHitboxDraft, enclosedWhitePockets, extractPalette,
+  flipCanvasH, maskDiff, mirrorMask16, normalizeFrame, qcScore, silhouetteMask16,
 } from './pipeline.js';
 import type { NormalizedFrame, QCResult, RGB } from './pipeline.js';
 
@@ -25,6 +26,7 @@ interface StudioMeta {
   desc?: string;
   palette?: RGB[];
   refBodyW?: number;
+  refMask?: number[]; // 16×16 silhouette of the reference (facing detection)
   moveDesc?: Record<string, string>;
 }
 
@@ -45,7 +47,7 @@ let stRaf = 0;
 let stSeed = 1;
 const spriteImgs = new Map<string, HTMLCanvasElement | HTMLImageElement>();
 
-interface GenResult { norm: NormalizedFrame; qc: QCResult; accepted: boolean }
+interface GenResult { norm: NormalizedFrame; qc: QCResult; accepted: boolean; flipped?: boolean }
 let stGenResults = new Map<number, GenResult>();
 let stGenBusy = false;
 let stRefPreview: NormalizedFrame | null = null;
@@ -548,6 +550,20 @@ const renderFramesTab = (): HTMLElement => {
       onchange: (e: Event) => { stOnion = (e.target as HTMLInputElement).checked; renderAll(); },
     })),
     mkEl('button', {
+      title: 'mirror the sprite horizontally (fixes wrong facing)',
+      onclick: () => {
+        if (!stp.sprite) { stStatus = 'no sprite on this step'; renderAll(); return; }
+        const c = spriteCanvas(stp.sprite);
+        if (!c) { stStatus = 'sprite not loaded yet — try again'; renderAll(); return; }
+        const flipped = flipCanvasH(c);
+        void saveSprite(stp.sprite, flipped).then(() => {
+          stDirty = true; // atlas repacks on save
+          stStatus = `flipped ${stp.sprite}`;
+          renderAll();
+        });
+      },
+    }, '↔ flip sprite'),
+    mkEl('button', {
       title: 'hurtbox draft from sprite alpha (head/torso/legs bands)',
       onclick: () => {
         if (!stp.sprite) { stStatus = 'no sprite on this step'; renderAll(); return; }
@@ -926,9 +942,11 @@ const renderTestTab = (): HTMLElement => {
 };
 
 // ------------------------------------------------------------------ generate tab
-const SPRITE_STYLE = 'flat solid white background, 2D fighting game sprite, full body, '
-  + 'side view facing right, feet on the ground at the bottom, sharp pixel art style, '
-  + 'crisp outlines, vibrant colors, centered, no text, no watermark';
+const SPRITE_STYLE = 'perfectly flat solid pure white background, no shadows, no floor, '
+  + 'no gradient, 2D fighting game sprite, single character only, full body in strict '
+  + 'profile view facing right, nose chest and toes all pointing toward the right edge '
+  + 'of the image, feet at the bottom, sharp pixel art style, crisp outlines, vibrant '
+  + 'colors, centered, no text, no watermark';
 
 /**
  * Archetype pose library (spec §5.1: "archetype pose libraries are the big
@@ -1023,13 +1041,25 @@ const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | n
   const img = await generateImage(prompt, seedFor(mv.id, i, salt));
   const norm = normalizeFrame(img, m.palette ?? null);
   if (!norm) return null;
+  // Facing check: if the MIRRORED reference silhouette matches decisively
+  // better, the model drew the character facing left — flip (lossless).
+  let flipped = false;
+  if (m.refMask && mv.id !== 'sys.knockdown' && mv.id !== 'sys.ko') {
+    const mask = silhouetteMask16(norm.cell);
+    const dRef = maskDiff(mask, m.refMask);
+    const dMir = maskDiff(mask, mirrorMask16(m.refMask));
+    if (dMir < dRef * 0.8) {
+      norm.cell = flipCanvasH(norm.cell);
+      flipped = true;
+    }
+  }
   // Horizontal poses (knockdown/KO) legitimately violate the standing-width
   // proportion check — QC them on palette only.
   const refW = mv.id === 'sys.knockdown' || mv.id === 'sys.ko' ? null : m.refBodyW ?? null;
   // Specials/supers carry energy VFX that legitimately drift from the body
   // palette — lower bar; the palette lock still normalizes the colors.
   const passAt = mv.type === 'special' || mv.type === 'super' ? 45 : 55;
-  return { norm, qc: qcScore(norm, refW, passAt), accepted: false };
+  return { norm, qc: qcScore(norm, refW, passAt), accepted: false, flipped };
 };
 
 const acceptFrame = async (mv: MoveDef, i: number, r: GenResult): Promise<void> => {
@@ -1119,6 +1149,117 @@ const runGenerateAll = async (): Promise<void> => {
   renderAll();
 };
 
+// ---- sprite audit: rescan SAVED sprites for facing / background-bleed suspects
+interface AuditRow {
+  moveIdx: number;
+  step: number;
+  name: string;
+  facingSus: boolean;
+  facingStrong: boolean;
+  pockets: number;
+  fixed?: string;
+}
+let stAudit: AuditRow[] | null = null;
+let stAuditBusy = false;
+
+const runAudit = async (): Promise<void> => {
+  if (stAuditBusy || !stBundle) return;
+  stAuditBusy = true;
+  stAudit = [];
+  const m = meta();
+  // Ensure a facing mask exists (older bundles: derive from saved reference).
+  // The reference Image loads async — wait for it like any other sprite.
+  if (!m.refMask) {
+    let ref = spriteCanvas('_reference.png');
+    for (let w = 0; w < 30 && !ref; w++) {
+      await new Promise((r) => setTimeout(r, 100));
+      ref = spriteCanvas('_reference.png');
+    }
+    if (ref) { m.refMask = silhouetteMask16(ref); stDirty = true; }
+    else { stStatus = 'audit warning: no reference sprite — facing checks skipped'; }
+  }
+  const mir = m.refMask ? mirrorMask16(m.refMask) : null;
+  try {
+    for (let mi = 0; mi < stBundle.moves.length; mi++) {
+      const mv = stBundle.moves[mi]!;
+      const lying = mv.id === 'sys.knockdown' || mv.id === 'sys.ko';
+      for (let i = 0; i < mv.steps.length; i++) {
+        const name = mv.steps[i]!.sprite;
+        if (!name) continue;
+        stStatus = `auditing ${name}…`;
+        // Force-load as canvas (may need a beat for the Image to arrive).
+        let cell = spriteCanvas(name);
+        for (let w = 0; w < 20 && !cell; w++) {
+          await new Promise((r) => setTimeout(r, 100));
+          cell = spriteCanvas(name);
+        }
+        if (!cell) continue;
+        let facingSus = false, facingStrong = false;
+        if (m.refMask && mir && !lying) {
+          const mask = silhouetteMask16(cell);
+          const dRef = maskDiff(mask, m.refMask);
+          const dMir = maskDiff(mask, mir);
+          facingStrong = dMir < dRef * 0.8;
+          facingSus = !facingStrong && dMir < dRef * 0.95;
+        }
+        const pockets = enclosedWhitePockets(cell);
+        if (facingStrong || facingSus || pockets > 0) {
+          stAudit.push({ moveIdx: mi, step: i, name, facingSus, facingStrong, pockets });
+        }
+      }
+    }
+    stStatus = `audit: ${stAudit.length} suspect frame(s) of ${stBundle.moves.reduce((n, mv) => n + mv.steps.filter((s) => s.sprite).length, 0)} sprited`;
+  } catch (e) {
+    stStatus = `audit failed: ${(e as Error).message}`;
+  }
+  stAuditBusy = false;
+  renderAll();
+};
+
+const auditFlip = async (row: AuditRow): Promise<void> => {
+  const c = spriteCanvas(row.name);
+  if (!c) return;
+  await saveSprite(row.name, flipCanvasH(c));
+  row.fixed = 'flipped';
+  stDirty = true;
+  renderAll();
+};
+
+const auditRegen = async (row: AuditRow): Promise<void> => {
+  const mv = stBundle!.moves[row.moveIdx]!;
+  stAuditBusy = true;
+  stStatus = `regenerating ${row.name}…`; renderAll();
+  try {
+    let r: GenResult | null = null;
+    for (let att = 0; att < 3 && !(r && r.qc.pass); att++) {
+      try {
+        r = (await genFrame(mv, row.step, att === 0 ? 7 : 2 + ((Math.random() * 1e6) | 0))) ?? r;
+      } catch { /* retry */ }
+    }
+    if (r && r.qc.pass) {
+      await acceptFrame(mv, row.step, r);
+      row.fixed = `regen QC${r.qc.score}`;
+    } else {
+      row.fixed = `regen failed${r ? ` QC${r.qc.score}` : ''}`;
+    }
+  } catch (e) {
+    row.fixed = 'regen error';
+  }
+  stAuditBusy = false;
+  renderAll();
+};
+
+const auditFixAll = async (): Promise<void> => {
+  if (!stAudit) return;
+  for (const row of stAudit) {
+    if (row.fixed) continue;
+    if (row.facingStrong) await auditFlip(row);
+    else if (row.pockets > 0) await auditRegen(row);
+  }
+  stStatus = 'audit auto-fix complete — SAVE to persist sprite refs + atlas';
+  renderAll();
+};
+
 const renderGenerateTab = (): HTMLElement => {
   const b = stBundle!;
   const m = meta();
@@ -1152,9 +1293,10 @@ const renderGenerateTab = (): HTMLElement => {
           const pal = extractPalette(stRefPreview!.cell, 16);
           m.palette = pal;
           m.refBodyW = stRefPreview!.bodyW;
+          m.refMask = silhouetteMask16(stRefPreview!.cell);
           void saveSprite('_reference.png', stRefPreview!.cell);
           stDirty = true;
-          stStatus = `reference locked: ${pal.length}-color palette, body ${stRefPreview!.bodyW}×${stRefPreview!.bodyH}`;
+          stStatus = `reference locked: ${pal.length}-color palette, body ${stRefPreview!.bodyW}×${stRefPreview!.bodyH}, facing mask stored`;
           renderAll();
         },
       }, 'use as reference'),
@@ -1175,7 +1317,7 @@ const renderGenerateTab = (): HTMLElement => {
         mkEl('div', { class: 'hint' }, `step ${i} · ${mv.steps[i]!.phase}`),
         r ? thumb(r.norm.cell) : mkEl('div', { class: 'thumb empty' }, '—'),
         r ? mkEl('div', { class: r.qc.pass ? 'qc pass' : 'qc fail' },
-          `QC ${r.qc.score} · pal ${(r.qc.paletteMatch * 100).toFixed(0)}%`) : null,
+          `QC ${r.qc.score} · pal ${(r.qc.paletteMatch * 100).toFixed(0)}%${r.flipped ? ' · ↔auto-flipped' : ''}`) : null,
         r ? mkEl('div', {},
           mkEl('button', {
             disabled: r.accepted ? '' : null,
@@ -1237,7 +1379,36 @@ const renderGenerateTab = (): HTMLElement => {
       'accept a frame → it becomes the step sprite; then Frames tab → auto-hurtbox / auto-hitbox drafts. Save when done.'),
   );
 
-  return mkEl('div', { class: 'pane' }, refSection, moveSection);
+  const auditSection = mkEl('div', { class: 'genblock' },
+    mkEl('b', {}, '3 · sprite audit (facing + background bleed on saved frames)'),
+    mkEl('div', { class: 'row' },
+      mkEl('button', { disabled: stAuditBusy ? '' : null, onclick: () => void runAudit() },
+        stAuditBusy ? 'auditing…' : 'audit sprites'),
+      stAudit && stAudit.length > 0 ? mkEl('button', {
+        disabled: stAuditBusy ? '' : null,
+        title: 'strong wrong-facing → flip · bleed pockets → regenerate',
+        onclick: () => void auditFixAll(),
+      }, 'auto-fix all') : null,
+    ),
+    stAudit ? (stAudit.length === 0
+      ? mkEl('p', { class: 'hint' }, 'no suspects found ✓')
+      : mkEl('table', { class: 'movetable' },
+        mkEl('tr', {}, ...['frame', 'flags', 'fix', ''].map((hh) => mkEl('th', {}, hh))),
+        ...stAudit.map((row) => mkEl('tr', {},
+          mkEl('td', {}, row.name),
+          mkEl('td', {},
+            [row.facingStrong ? 'FACING' : row.facingSus ? 'facing?' : '',
+              row.pockets > 0 ? `bleed×${row.pockets}` : ''].filter(Boolean).join(' · ')),
+          mkEl('td', {}, row.fixed ?? '—'),
+          mkEl('td', {},
+            mkEl('button', { disabled: stAuditBusy ? '' : null, onclick: () => void auditFlip(row) }, '↔ flip'),
+            mkEl('button', { disabled: stAuditBusy ? '' : null, onclick: () => void auditRegen(row) }, 'regen'),
+          ),
+        )),
+      )) : mkEl('p', { class: 'hint' }, 'scans every saved sprite against the reference silhouette (mirror match = wrong facing) and for enclosed white pockets (bad keying)'),
+  );
+
+  return mkEl('div', { class: 'pane' }, refSection, moveSection, auditSection);
 };
 
 // ------------------------------------------------------------------ root

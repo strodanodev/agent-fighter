@@ -43,10 +43,14 @@ const dist2 = (r: number, g: number, b: number, c: RGB): number => {
 
 /**
  * Background removal: flood-fill transparency from every border pixel whose
- * color is close to the border median. Handles the flat/near-flat backgrounds
- * the prompts ask for; interior holes are left alone (they're usually detail).
+ * color is close to the border median, THEN clear enclosed background
+ * pockets — bg-colored regions the flood can't reach (between legs, under
+ * arms). A pocket is safe to clear precisely because it never touches
+ * transparency; character details that reach the silhouette edge do.
+ * Returns the canvas plus a bleed fraction (bg-colored pixels that survived)
+ * as a QC signal.
  */
-export const removeBackground = (img: HTMLImageElement): HTMLCanvasElement => {
+export const removeBackground = (img: HTMLImageElement): { canvas: HTMLCanvasElement; bleed: number } => {
   const w = img.naturalWidth, h = img.naturalHeight;
   const c = mkCanvas(w, h);
   const ctx = c.getContext('2d', { willReadFrequently: true })!;
@@ -54,7 +58,7 @@ export const removeBackground = (img: HTMLImageElement): HTMLCanvasElement => {
   const im = ctx.getImageData(0, 0, w, h);
   const d = im.data;
 
-  // Border median color.
+  // Border median color + spread (adaptive tolerance for non-flat backgrounds).
   const rs: number[] = [], gs: number[] = [], bs: number[] = [];
   const sampleAt = (x: number, y: number): void => {
     const i = (y * w + x) * 4;
@@ -63,9 +67,17 @@ export const removeBackground = (img: HTMLImageElement): HTMLCanvasElement => {
   for (let x = 0; x < w; x += 4) { sampleAt(x, 0); sampleAt(x, h - 1); }
   for (let y = 0; y < h; y += 4) { sampleAt(0, y); sampleAt(w - 1, y); }
   const med = (a: number[]): number => a.sort((p, q) => p - q)[a.length >> 1]!;
+  const spread = (a: number[]): number => a[Math.floor(a.length * 0.9)]! - a[Math.floor(a.length * 0.1)]!;
   const bg: RGB = [med(rs), med(gs), med(bs)];
+  const tol = Math.min(96, 62 + Math.max(spread(rs), spread(gs), spread(bs)));
+  const TOL2 = tol * tol;
 
-  const TOL2 = 62 * 62;
+  const isBg = (p: number): boolean => {
+    const i = p * 4;
+    return dist2(d[i]!, d[i + 1]!, d[i + 2]!, bg) < TOL2;
+  };
+
+  // Pass 1: border flood fill.
   const visited = new Uint8Array(w * h);
   const queue: number[] = [];
   const tryPush = (x: number, y: number): void => {
@@ -73,8 +85,7 @@ export const removeBackground = (img: HTMLImageElement): HTMLCanvasElement => {
     const p = y * w + x;
     if (visited[p]) return;
     visited[p] = 1;
-    const i = p * 4;
-    if (dist2(d[i]!, d[i + 1]!, d[i + 2]!, bg) < TOL2) queue.push(p);
+    if (isBg(p)) queue.push(p);
   };
   for (let x = 0; x < w; x++) { tryPush(x, 0); tryPush(x, h - 1); }
   for (let y = 0; y < h; y++) { tryPush(0, y); tryPush(w - 1, y); }
@@ -84,8 +95,115 @@ export const removeBackground = (img: HTMLImageElement): HTMLCanvasElement => {
     const x = p % w, y = (p / w) | 0;
     tryPush(x + 1, y); tryPush(x - 1, y); tryPush(x, y + 1); tryPush(x, y - 1);
   }
+
+  // Pass 2: enclosed pockets. Components of surviving bg-colored pixels that
+  // never touch transparency are keyed out (min size guards small highlights).
+  const seen = new Uint8Array(w * h);
+  const stack: number[] = [];
+  let bleedPx = 0, opaquePx = 0;
+  for (let p = 0; p < w * h; p++) if (d[p * 4 + 3]! > 40) opaquePx++;
+  for (let start = 0; start < w * h; start++) {
+    if (seen[start] || d[start * 4 + 3]! <= 40 || !isBg(start)) continue;
+    const comp: number[] = [];
+    let touchesAlpha = false;
+    stack.push(start);
+    seen[start] = 1;
+    while (stack.length > 0) {
+      const p = stack.pop()!;
+      comp.push(p);
+      const x = p % w;
+      for (const q of [p - 1, p + 1, p - w, p + w]) {
+        if (q < 0 || q >= w * h || Math.abs((q % w) - x) > 1) continue;
+        if (d[q * 4 + 3]! <= 40) { touchesAlpha = true; continue; }
+        if (!seen[q] && isBg(q)) { seen[q] = 1; stack.push(q); }
+      }
+    }
+    if (!touchesAlpha && comp.length >= 24) {
+      for (const p of comp) d[p * 4 + 3] = 0;
+    } else if (comp.length >= 24) {
+      bleedPx += comp.length; // survived bg-colored area → QC signal
+    }
+  }
   ctx.putImageData(im, 0, 0);
-  return c;
+  return { canvas: c, bleed: opaquePx > 0 ? bleedPx / opaquePx : 0 };
+};
+
+/** Horizontal mirror (facing fix — sprites are right-facing by convention). */
+export const flipCanvasH = (c: HTMLCanvasElement): HTMLCanvasElement => {
+  const out = mkCanvas(c.width, c.height);
+  const ctx = out.getContext('2d', { willReadFrequently: true })!;
+  ctx.imageSmoothingEnabled = false;
+  ctx.translate(c.width, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(c, 0, 0);
+  return out;
+};
+
+/** 16×16 binary silhouette over the alpha bbox — cheap pose/facing signature. */
+export const silhouetteMask16 = (c: HTMLCanvasElement): number[] => {
+  const bb = alphaBBox(c);
+  const out = new Array(256).fill(0);
+  if (!bb) return out;
+  const ctx = c.getContext('2d', { willReadFrequently: true })!;
+  const d = ctx.getImageData(0, 0, c.width, c.height).data;
+  const bw = bb.r - bb.l + 1, bh = bb.b - bb.t + 1;
+  for (let gy = 0; gy < 16; gy++) {
+    for (let gx = 0; gx < 16; gx++) {
+      // Sample the center of each grid cell.
+      const x = bb.l + Math.floor(((gx + 0.5) / 16) * bw);
+      const y = bb.t + Math.floor(((gy + 0.5) / 16) * bh);
+      if (d[(y * c.width + x) * 4 + 3]! > 40) out[gy * 16 + gx] = 1;
+    }
+  }
+  return out;
+};
+
+export const mirrorMask16 = (m: number[]): number[] => {
+  const out = new Array(256).fill(0);
+  for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) out[y * 16 + x] = m[y * 16 + (15 - x)]!;
+  return out;
+};
+
+/** Fraction of differing cells between two masks (0 = identical). */
+export const maskDiff = (a: number[], b: number[]): number => {
+  let n = 0;
+  for (let i = 0; i < 256; i++) if (a[i] !== b[i]) n++;
+  return n / 256;
+};
+
+/**
+ * Audit helper for SAVED cells (raw image long gone): count enclosed
+ * bright/white pockets — the signature of legacy background bleed.
+ */
+export const enclosedWhitePockets = (c: HTMLCanvasElement): number => {
+  const w = c.width, h = c.height;
+  const d = c.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, w, h).data;
+  const isWhite = (p: number): boolean => {
+    const i = p * 4;
+    return d[i + 3]! > 40 && d[i]! > 205 && d[i + 1]! > 205 && d[i + 2]! > 205;
+  };
+  const seen = new Uint8Array(w * h);
+  const stack: number[] = [];
+  let pockets = 0;
+  for (let start = 0; start < w * h; start++) {
+    if (seen[start] || !isWhite(start)) continue;
+    const comp: number[] = [];
+    let touchesAlpha = false;
+    stack.push(start);
+    seen[start] = 1;
+    while (stack.length > 0) {
+      const p = stack.pop()!;
+      comp.push(p);
+      const x = p % w;
+      for (const q of [p - 1, p + 1, p - w, p + w]) {
+        if (q < 0 || q >= w * h || Math.abs((q % w) - x) > 1) continue;
+        if (d[q * 4 + 3]! <= 40) { touchesAlpha = true; continue; }
+        if (!seen[q] && isWhite(q)) { seen[q] = 1; stack.push(q); }
+      }
+    }
+    if (!touchesAlpha && comp.length >= 12) pockets++;
+  }
+  return pockets;
 };
 
 /**
@@ -208,6 +326,7 @@ export interface NormalizedFrame {
   bodyW: number;
   paletteMatch: number; // 0..1 pre-quantize conformity
   majorBlobs: number; // major connected components (>1 = probably two figures)
+  bleed: number; // 0..1 fraction of surviving bg-colored pixels (key failure)
 }
 
 /**
@@ -216,7 +335,7 @@ export interface NormalizedFrame {
  * feet-anchor into the fixed cell → optional palette lock.
  */
 export const normalizeFrame = (img: HTMLImageElement, palette: RGB[] | null): NormalizedFrame | null => {
-  const cut = removeBackground(img);
+  const { canvas: cut, bleed } = removeBackground(img);
   const majorBlobs = filterComponents(cut);
   const bb = alphaBBox(cut);
   if (!bb) return null;
@@ -231,7 +350,7 @@ export const normalizeFrame = (img: HTMLImageElement, palette: RGB[] | null): No
   ctx.drawImage(cut, bb.l, bb.t, srcW, srcH, PIVOT_X - (dw >> 1), PIVOT_Y - dh, dw, dh);
 
   const paletteMatch = palette ? quantizeToPalette(cell, palette) : 1;
-  return { cell, bodyH: dh, bodyW: dw, paletteMatch, majorBlobs };
+  return { cell, bodyH: dh, bodyW: dw, paletteMatch, majorBlobs, bleed };
 };
 
 export interface QCResult {
@@ -251,6 +370,8 @@ export const qcScore = (frame: NormalizedFrame, refBodyW: number | null, passAt 
     paletteMatch * 70 + (proportionOK ? 30 : Math.max(0, 30 - Math.abs(1 - heightRatio) * 30)));
   // Two comparable figures in frame = the model drew a second character.
   if (frame.majorBlobs > 1) score = Math.min(score, 35);
+  // Surviving background-colored area = key failure (bleed).
+  if (frame.bleed > 0.06) score = Math.min(score, Math.round(50 - frame.bleed * 100));
   return { score, paletteMatch, heightRatio, pass: score >= passAt };
 };
 
