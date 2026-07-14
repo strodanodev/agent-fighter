@@ -15,7 +15,7 @@ export type {
 export { HIST_LEN, numpadDir, detectMotion, downTappedRecently } from './motion.js';
 export { ANALOG } from './characters/analog.js';
 export {
-  Action, Phase, PROJECTILE_SLOTS, characters,
+  Action, Phase, PROJECTILE_SLOTS, characters, setCharacters,
   createGameState, resetRound, snapshot, restore, serialize, stateHash,
 } from './state.js';
 export type { GameState, FighterState, ProjectileState } from './state.js';

@@ -52,6 +52,8 @@ export interface MoveStep {
   /** Self velocity impulse applied when this step begins. px/tick, x is facing-relative. */
   velX?: number;
   velY?: number;
+  /** Sprite frame name (atlas key / sprites/<name>.png). Cosmetic only — never read by the sim. */
+  sprite?: string;
 }
 
 export interface ProjectileDef {

@@ -21,8 +21,24 @@ damage scaling ×0.9 floor 20%, hitstun decay, hitstop, best-of-3 rounds,
 35 tests green (`test/determinism.test.ts` + `test/combat.test.ts`).
 
 **Remaining M1 gate (human):** MvC players confirm the feel; tune TUNING +
-Analog frame data from playtests. After that: Milestone 2 — Studio MVP
-(AI sprite pipeline + editors, spec §5).
+Analog frame data from playtests.
+
+**Milestone 2 (Studio MVP) in progress.** `packages/studio`:
+- `server.mjs` — zero-dep Node server: serves the SPA, proxies image
+  generation to NVIDIA build API (flux.2-klein-4b; key in gitignored `.env`
+  as NVAPI_KEY — NEVER commit it or ship it to the browser), character
+  bundle CRUD with sha256 content hash on save.
+- `src/main.ts` — SPA embedding @af/core: Character/Frames/Moves/Cancels
+  editors, live Test tab (real engine preview vs dummy), Generate tab.
+- `src/pipeline.ts` — deterministic sprite post-processing (spec §5.1):
+  bg removal → palette lock → nearest downscale into 192×192 cell (feet
+  pivot 96,176) → QC score vs reference → auto-hurtbox/hitbox drafts.
+- Bundles on disk: `characters/<id>/character.json` + `sprites/*.png`.
+  `loadCharacter()` validates; `setCharacters()` swaps bundles between
+  matches (never mid-sim). Sprites are cosmetic — the sim never reads them.
+- Run: `npm run studio` → http://localhost:8474.
+- Remaining for M2 exit: atlas packing, pose-conditioned generation /
+  archetype pose libraries, then build character #2 fully in Studio < 2 days.
 
 ## Layout
 

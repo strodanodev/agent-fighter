@@ -1,0 +1,10 @@
+{
+  "name": "@af/studio",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Agent Fighter Studio — character authoring tool (editors + AI sprite pipeline).",
+  "scripts": {
+    "build": "node tools/bundle.mjs",
+    "start": "node tools/bundle.mjs && node server.mjs"
+  }
+}

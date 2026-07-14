@@ -2,3 +2,5 @@ node_modules/
 dist/
 .bundle-tmp/
 *.log
+.env
+characters/*/frames-raw/

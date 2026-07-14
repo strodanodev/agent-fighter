@@ -110,6 +110,17 @@ export const characters: [LoadedCharacter, LoadedCharacter] = [
   loadCharacter(ANALOG),
 ];
 
+/**
+ * Swap the active character bundles (Studio live preview; later, match
+ * setup). Must be called between matches, never mid-sim — the loaded
+ * character is part of the deterministic contract, so both netplay peers
+ * must install identical bundles (hash-checked at match setup, spec §3.1).
+ */
+export const setCharacters = (c0: LoadedCharacter, c1: LoadedCharacter): void => {
+  characters[0] = c0;
+  characters[1] = c1;
+};
+
 const SPAWN_OFFSET = 180;
 
 const spawnFighter = (x: number, facing: 1 | -1, ch: LoadedCharacter): FighterState => ({

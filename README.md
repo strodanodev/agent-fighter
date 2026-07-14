@@ -3,7 +3,23 @@
 Browser 2D fighting game (MvC-style) with a deterministic custom engine.
 Full design: see `docs/build-spec.md`.
 
-## Status: Milestone 1 — "It feels like MvC" ✅ (feel-gate pending)
+## Status: Milestone 2 — Studio MVP (in progress)
+
+Studio (character authoring tool) is up: frames/moves/cancels editors with
+visual hitbox editing, a live playable Test tab (the real engine renders the
+preview), and the AI sprite pipeline — flux.2-klein-4b via NVIDIA build API →
+background removal → palette lock → nearest-neighbor downscale → QC scoring →
+auto-hurtbox/hitbox drafts. Character bundles live in `characters/<id>/` with
+content hashes.
+
+```
+npm run studio             # build + serve → http://localhost:8474
+                           # needs .env with NVAPI_KEY=... (gitignored)
+```
+
+**M2 exit test:** character #2 built entirely through Studio in < 2 days.
+
+## Milestone 1 — "It feels like MvC" ✅ (feel-gate pending)
 
 Full combat system on the deterministic core: 6 buttons, magic-series chains,
 launcher + super-jump air combos with juggle points, motion specials
