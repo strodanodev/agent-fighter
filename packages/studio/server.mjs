@@ -202,7 +202,7 @@ const readBody = (req) => new Promise((resolve, reject) => {
 });
 
 const safeId = (id) => /^[a-z0-9][a-z0-9-]{0,40}$/.test(id);
-const safeSprite = (name) => /^[a-zA-Z0-9._-]{1,80}\.(png|json)$/.test(name);
+const safeSprite = (name) => /^[a-zA-Z0-9._-]{1,80}\.(png|webp|json)$/.test(name);
 
 /** Canonical content hash: bundle JSON minus the hash field itself. */
 const bundleHash = (bundle) => {
@@ -212,7 +212,7 @@ const bundleHash = (bundle) => {
 
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json',
-  '.png': 'image/png', '.css': 'text/css', '.svg': 'image/svg+xml',
+  '.png': 'image/png', '.webp': 'image/webp', '.css': 'text/css', '.svg': 'image/svg+xml',
 };
 
 // ---- server ----------------------------------------------------------------
@@ -324,8 +324,8 @@ const server = createServer(async (req, res) => {
       if (name.endsWith('.json')) {
         writeFileSync(join(dir, name), raw); // atlas.json etc — stored verbatim
       } else {
-        // Body is a base64 data URL or raw base64.
-        const b64 = raw.toString('utf8').replace(/^data:image\/png;base64,/, '');
+        // Body is a base64 data URL (png or webp) or raw base64.
+        const b64 = raw.toString('utf8').replace(/^data:image\/\w+;base64,/, '');
         writeFileSync(join(dir, name), Buffer.from(b64, 'base64'));
       }
       return json(res, 200, { ok: true });

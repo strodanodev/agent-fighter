@@ -358,6 +358,7 @@ Object.assign(globalThis, {
   afGame: () => game,
   afRosters: () => allRosters,
   afScreen: () => screen,
+  afCam: () => ({ ...cam }),
   afStep: (n = 1) => { for (let k = 0; k < n; k++) frame(); },
   afPress: (code: string) => { pressedThisFrame.add(code); keys.add(code); },
   afRelease: (code: string) => { keys.delete(code); },

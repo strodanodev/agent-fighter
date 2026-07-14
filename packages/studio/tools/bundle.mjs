@@ -96,6 +96,10 @@ const html = `<!DOCTYPE html>
   .genframe{display:flex;flex-direction:column;gap:4px;align-items:center}
   .thumb{border:1px solid #262b40;border-radius:4px;image-rendering:pixelated}
   .thumb.empty{width:150px;height:150px;display:flex;align-items:center;justify-content:center;color:#3d4260}
+  .upload{background:#222738;border:1px solid #3d4260;border-radius:4px;padding:4px 10px;cursor:pointer;display:inline-block}
+  .upload:hover{background:#2c3350}
+  .genframe .thumb{transition:outline .1s}
+  .genframe[style*="cursor:pointer"]:hover .thumb{outline:2px solid #ffd166}
   .qc{font-size:11px;padding:1px 6px;border-radius:3px}
   .qc.pass{background:#284034;color:#4ade80}
   .qc.fail{background:#452531;color:#f87171}

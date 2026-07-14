@@ -109,6 +109,23 @@ export const clipPoly = (
 export interface StageLayerMeta {
   file: string; // e.g. "layer-bg.png", relative to stages/<id>/
   depth: number;
+  /**
+   * true (backdrop, e.g. sky/skyline): stretch the WHOLE source image to
+   * the stage's shared imageH/floorY framing, same as the legacy single
+   * background. false/absent (a keyed object plane, e.g. a fence or a row
+   * of buildings): scaled to its OWN `worldH` (below) and anchored so its
+   * opaque content's bottom edge sits on the world floor line.
+   */
+  stretch?: boolean;
+  /**
+   * Object planes only: the WORLD-PX height their own opaque content should
+   * occupy (independent of the backdrop's width-fit scale — a generated
+   * "fence" image commonly fills its whole canvas edge-to-edge, and sizing
+   * it off the backdrop's scale would make it many times a fighter's
+   * height). Compare against a fighter's ~112 world-px body height when
+   * choosing this. Ignored when `stretch` is true.
+   */
+  worldH?: number;
 }
 
 export interface StageMeta {
@@ -126,7 +143,39 @@ export interface StageMeta {
 export interface StageLayer {
   img: HTMLImageElement;
   depth: number;
+  stretch: boolean;
+  worldH: number;
+  /** Row index (source px) of the lowest opaque pixel. */
+  contentBottomPx: number;
+  /** Opaque content height in source px (bottom - top + 1). */
+  contentHeightPx: number;
 }
+
+/** Opaque content's vertical extent (source px), or the full image height if
+ * fully opaque/undetectable (degrades to today's stretch-like sizing). */
+const contentVerticalExtent = (img: HTMLImageElement): { bottom: number; height: number } => {
+  const c = document.createElement('canvas');
+  c.width = img.naturalWidth;
+  c.height = img.naturalHeight;
+  const ctx = c.getContext('2d', { willReadFrequently: true })!;
+  ctx.drawImage(img, 0, 0);
+  const d = ctx.getImageData(0, 0, c.width, c.height).data;
+  let top = -1, bottom = -1;
+  for (let y = 0; y < c.height; y++) {
+    for (let x = 0; x < c.width; x++) {
+      if (d[(y * c.width + x) * 4 + 3]! > 10) { top = y; break; }
+    }
+    if (top >= 0) break;
+  }
+  for (let y = c.height - 1; y >= 0; y--) {
+    for (let x = 0; x < c.width; x++) {
+      if (d[(y * c.width + x) * 4 + 3]! > 10) { bottom = y; break; }
+    }
+    if (bottom >= 0) break;
+  }
+  if (top < 0 || bottom < 0) return { bottom: c.height - 1, height: c.height };
+  return { bottom, height: bottom - top + 1 };
+};
 
 export interface StageAsset {
   id: string;
@@ -154,10 +203,18 @@ export const loadStage = async (id: string): Promise<StageAsset | null> => {
     const image = await loadImg(`/stages/${id}/background.png`);
     let layers: StageLayer[] = [];
     if (meta.layers?.length) {
-      const loaded = await Promise.all(
-        meta.layers.map(async (lm) => ({ img: await loadImg(`/stages/${id}/${lm.file}`), depth: lm.depth })));
+      const loaded = await Promise.all(meta.layers.map(async (lm) => {
+        const img = await loadImg(`/stages/${id}/${lm.file}`);
+        if (!img) return null;
+        const stretch = lm.stretch ?? false;
+        const ext = stretch ? { bottom: 0, height: 1 } : contentVerticalExtent(img);
+        return {
+          img, depth: lm.depth, stretch, worldH: lm.worldH ?? 112,
+          contentBottomPx: ext.bottom, contentHeightPx: ext.height,
+        };
+      }));
       layers = loaded
-        .filter((l): l is { img: HTMLImageElement; depth: number } => !!l.img)
+        .filter((l): l is StageLayer => !!l)
         .sort((a, b) => a.depth - b.depth); // back (far) to front (near)
     }
     return { id, meta, image, layers };
@@ -256,8 +313,21 @@ export const drawStageLayers = (
 
   ctx.imageSmoothingEnabled = false;
   for (const layer of stage.layers) {
-    const tileW = layer.img.naturalWidth * scale;
+    // Every plane draws its WHOLE source image (never cropped, so soft
+    // edges/fades stay intact) — but backdrop and object planes are scaled
+    // completely differently. Backdrops stretch to the shared bg-fit `scale`
+    // (today's behavior). Object planes (a fence, a row of buildings) use
+    // their OWN scale derived from `worldH` ÷ their actual opaque content
+    // height — a generated "fence" commonly fills its whole canvas
+    // edge-to-edge, and sizing that off the backdrop's width-fit scale would
+    // make it many times a fighter's height. Bottom-anchored to the floor.
+    const layerScale = layer.stretch ? scale : layer.worldH / layer.contentHeightPx;
+    const tileW = layer.img.naturalWidth * layerScale;
     if (tileW < 1) continue;
+    const layerH = layer.img.naturalHeight * layerScale;
+    const layerTopY = layer.stretch
+      ? topY
+      : STAGE.floorYPx - (layer.contentBottomPx + 1) * layerScale;
     const offsetX = (1 - layer.depth) * cam.x;
     const originX = -offsetX; // world-x where the k=0 tile's left edge sits
     const startK = Math.floor((L - originX) / tileW) - 1;
@@ -267,11 +337,11 @@ export const drawStageLayers = (
       const mirrored = (((k % 2) + 2) % 2) === 1; // non-negative mod
       ctx.save();
       if (mirrored) {
-        ctx.translate(x + tileW, topY);
+        ctx.translate(x + tileW, layerTopY);
         ctx.scale(-1, 1);
-        ctx.drawImage(layer.img, 0, 0, tileW, drawH);
+        ctx.drawImage(layer.img, 0, 0, tileW, layerH);
       } else {
-        ctx.drawImage(layer.img, x, topY, tileW, drawH);
+        ctx.drawImage(layer.img, x, layerTopY, tileW, layerH);
       }
       ctx.restore();
     }

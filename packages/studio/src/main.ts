@@ -145,36 +145,78 @@ const saveChar = async (): Promise<void> => {
 
 /**
  * Pack all referenced sprites into atlas.png + atlas.json (spec §3: the
- * bundle ships a packed atlas, never hand-made). Cells are fixed-size so a
- * simple grid is optimal enough. Returns frame count, or 0 if no sprites.
+ * bundle ships a packed atlas, never hand-made).
+ *
+ * TRIMMED packing: a sprite cell is 384² but the figure occupies a fraction of
+ * it, so storing whole cells wasted ~4x the pixels (a 98-frame character was a
+ * 3840² / 5 MB atlas). Each frame is cropped to its alpha bounds and
+ * shelf-packed; the pivot is stored RELATIVE to the crop, which is exactly what
+ * the renderer already blits against, so nothing downstream changes.
+ * Returns frame count, or 0 if no sprites.
  */
+const ATLAS_W = 2048;
+const ATLAS_PAD = 2; // guards against bilinear filtering bleeding between frames
+
 const packAtlas = async (): Promise<number> => {
   const names = [...new Set(
     stBundle!.moves.flatMap((mv) => mv.steps.map((s) => s.sprite)).filter((s): s is string => !!s))];
   if (names.length === 0) return 0;
-  // Ensure every sprite is loaded (accepted-this-session ones are canvases already).
+
+  // Ensure every sprite is loaded as a canvas we can measure + crop.
   const cells = await Promise.all(names.map(async (name) => {
-    const cached = spriteImgs.get(`${stCharId}/${name}`);
-    if (cached instanceof HTMLCanvasElement) return { name, img: cached as CanvasImageSource };
-    const img = new Image();
-    img.src = `/characters/${stCharId}/sprites/${name}`;
-    await new Promise((res, rej) => { img.onload = res; img.onerror = () => rej(new Error(`missing sprite ${name}`)); });
-    return { name, img: img as CanvasImageSource };
+    let cell = spriteCanvas(name);
+    for (let w = 0; w < 40 && !cell; w++) {
+      await new Promise((r) => setTimeout(r, 50));
+      cell = spriteCanvas(name);
+    }
+    if (!cell) throw new Error(`missing sprite ${name}`);
+    return { name, cell, box: alphaBounds(cell) };
   }));
-  const cols = Math.ceil(Math.sqrt(cells.length));
-  const rows = Math.ceil(cells.length / cols);
+
+  // Shelf-pack tallest-first: near-optimal for same-ish sprites, ~10 lines.
+  interface Placed { name: string; cell: HTMLCanvasElement; sx: number; sy: number; w: number; h: number; px: number; py: number; }
+  const sorted = [...cells].sort((a, b) => {
+    const ha = a.box ? a.box.b - a.box.t : 0;
+    const hb = b.box ? b.box.b - b.box.t : 0;
+    return hb - ha;
+  });
+  const placed: Placed[] = [];
+  let penX = ATLAS_PAD, penY = ATLAS_PAD, shelfH = 0;
+  for (const c of sorted) {
+    // A fully transparent frame still needs a slot; give it 1px.
+    const bx = c.box ?? { l: PIVOT_X, t: PIVOT_Y, r: PIVOT_X, b: PIVOT_Y };
+    const w = bx.r - bx.l + 1;
+    const h = bx.b - bx.t + 1;
+    if (penX + w + ATLAS_PAD > ATLAS_W) {
+      penX = ATLAS_PAD;
+      penY += shelfH + ATLAS_PAD;
+      shelfH = 0;
+    }
+    placed.push({
+      name: c.name, cell: c.cell, sx: penX, sy: penY, w, h,
+      // Pivot relative to the CROP — the renderer draws at (-pivotX, -pivotY).
+      px: PIVOT_X - bx.l, py: PIVOT_Y - bx.t,
+    });
+    // Remember the source crop origin on the cell for the blit below.
+    (placed[placed.length - 1] as Placed & { cx: number; cy: number }).cx = bx.l;
+    (placed[placed.length - 1] as Placed & { cx: number; cy: number }).cy = bx.t;
+    penX += w + ATLAS_PAD;
+    shelfH = Math.max(shelfH, h);
+  }
+  const atlasH = penY + shelfH + ATLAS_PAD;
+
   const atlas = document.createElement('canvas');
-  atlas.width = cols * CELL_W;
-  atlas.height = rows * CELL_W;
+  atlas.width = ATLAS_W;
+  atlas.height = atlasH;
   const ctx = atlas.getContext('2d')!;
   ctx.imageSmoothingEnabled = false;
+
   const frames: Record<string, { x: number; y: number; w: number; h: number; pivotX: number; pivotY: number }> = {};
-  cells.forEach((c, k) => {
-    const x = (k % cols) * CELL_W;
-    const y = Math.floor(k / cols) * CELL_W;
-    ctx.drawImage(c.img, x, y);
-    frames[c.name] = { x, y, w: CELL_W, h: CELL_W, pivotX: PIVOT_X, pivotY: PIVOT_Y };
-  });
+  for (const p of placed as (Placed & { cx: number; cy: number })[]) {
+    ctx.drawImage(p.cell, p.cx, p.cy, p.w, p.h, p.sx, p.sy, p.w, p.h);
+    frames[p.name] = { x: p.sx, y: p.sy, w: p.w, h: p.h, pivotX: p.px, pivotY: p.py };
+  }
+
   await apiJson(`/api/characters/${stCharId}/sprites/atlas.png`, {
     method: 'PUT', body: canvasToPngDataUrl(atlas),
   });
@@ -187,7 +229,7 @@ const packAtlas = async (): Promise<number> => {
       cellW: CELL_W, cellH: CELL_W, scale: SPRITE_SCALE, smooth: true, frames,
     }, null, 2),
   });
-  return cells.length;
+  return placed.length;
 };
 
 /** Server capability: can the active image provider accept a reference image? */
@@ -217,14 +259,18 @@ const referenceB64 = async (): Promise<string | null> => {
 
 const generateImage = async (
   prompt: string, seed: number, width = 1024, height = 1024, useRef = false, provider?: string,
+  imageOverride?: string,
 ): Promise<HTMLImageElement> => {
   // With an img2img provider, every frame is conditioned on the reference
   // sheet — that is the ONLY way to truly hold a character's identity across
   // images. NVIDIA's flux cannot do this (see server.mjs) — useRef and an
   // explicit `provider` override are mutually exclusive by construction
   // (only the Stage tab passes `provider`, and it never passes useRef).
-  let image: string | null = null;
-  if (useRef && stImg2Img) {
+  //
+  // `imageOverride` conditions on some OTHER image than the locked reference —
+  // used to stylize a user's upload into a reference in the first place.
+  let image: string | null = imageOverride ?? null;
+  if (!image && useRef && stImg2Img) {
     image = await referenceB64();
     if (!image) {
       throw new Error('reference sprite not available — generate + lock a reference first '
@@ -1336,6 +1382,85 @@ const finishFrame = (
 };
 
 /** Generate + normalize + QC ONE frame as its own image (fallback path). */
+// ---- uploaded artwork (bring your own character) ---------------------------
+let stUpload: NormalizedFrame | null = null;
+
+const fileToImage = (file: File): Promise<HTMLImageElement> =>
+  new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onerror = () => reject(new Error('could not read file'));
+    fr.onload = () => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('not a readable image'));
+      img.src = String(fr.result);
+    };
+    fr.readAsDataURL(file);
+  });
+
+/** Run an uploaded image through the same normalize pass as generated art. */
+const loadUploadedReference = async (file: File): Promise<void> => {
+  try {
+    stStatus = `reading ${file.name}…`; renderAll();
+    const img = await fileToImage(file);
+    // No palette yet: normalize on its own colours (this image DEFINES them).
+    const norm = normalizeFrame(img, null);
+    if (!norm) throw new Error('no subject found (is the background flat?)');
+    stUpload = norm;
+    stRefPreview = null;
+    stStatus = `uploaded ${file.name} · ${norm.bodyW}×${norm.bodyH}`;
+  } catch (e) {
+    stStatus = `upload failed: ${(e as Error).message}`;
+  }
+  renderAll();
+};
+
+/**
+ * Redraw an uploaded image in the game's art style, conditioned on the upload
+ * itself — so a photo, a sketch or off-style art becomes a usable reference
+ * without losing the character.
+ */
+const stylizeUpload = async (): Promise<void> => {
+  if (!stUpload || stGenBusy) return;
+  stGenBusy = true;
+  stStatus = 'stylizing upload into a reference…'; renderAll();
+  try {
+    const prompt = `The attached image shows ONE character. Redraw THAT character — same outfit, `
+      + `same colours, same hair, same build — standing in a neutral idle fighting stance. `
+      + `${SPRITE_STYLE}`;
+    const img = await generateImage(prompt.slice(0, promptMax()), seedFor('_stylize', 0, stSeed++),
+      1024, 1024, false, undefined, canvasToPngDataUrl(stUpload.cell));
+    const norm = normalizeFrame(img, null);
+    if (!norm) throw new Error('normalize failed');
+    stRefPreview = norm;
+    stUpload = null;
+    stStatus = 'stylized — review, then "use as reference"';
+  } catch (e) {
+    stStatus = `stylize failed: ${(e as Error).message}`;
+  }
+  stGenBusy = false;
+  renderAll();
+};
+
+/** Re-lock palette / facing mask / chroma / body size from the SAVED reference. */
+const refreshPaletteFromSaved = async (): Promise<void> => {
+  const m = meta();
+  let ref = spriteCanvas('_reference.png');
+  for (let w = 0; w < 30 && !ref; w++) {
+    await new Promise((r) => setTimeout(r, 100));
+    ref = spriteCanvas('_reference.png');
+  }
+  if (!ref) { stStatus = 'no saved reference found'; renderAll(); return; }
+  m.palette = extractPalette(ref, PALETTE_N);
+  m.refMask = silhouetteMask16(ref);
+  m.refChroma = Math.round(meanChroma(ref));
+  const bb = alphaBounds(ref);
+  if (bb) m.refBodyW = bb.r - bb.l + 1;
+  stDirty = true;
+  stStatus = `palette refreshed from saved reference (${m.palette.length} colors)`;
+  renderAll();
+};
+
 const ANCHOR_POSE = 'standing upright in a neutral idle fighting stance';
 
 const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | null> => {
@@ -1787,13 +1912,36 @@ const renderGenerateTab = (): HTMLElement => {
   const m = meta();
   const mv = curMove();
 
-  const thumb = (c: HTMLCanvasElement, size = 150): HTMLCanvasElement => {
+  const thumb = (c: CanvasImageSource, size = 150): HTMLCanvasElement => {
     const t = mkEl('canvas', { width: size, height: size, class: 'thumb' });
     const tc = t.getContext('2d')!;
-    tc.imageSmoothingEnabled = false;
+    tc.imageSmoothingEnabled = true;
+    tc.imageSmoothingQuality = 'high';
     tc.fillStyle = '#12141f';
     tc.fillRect(0, 0, size, size);
     tc.drawImage(c, 0, 0, size, size);
+    return t;
+  };
+
+  /**
+   * Thumbnail of the sprite CURRENTLY saved on a step (what the game ships),
+   * or null when that step has no sprite yet. Images stream in async, so this
+   * repaints itself once the PNG lands rather than showing a blank forever.
+   */
+  const savedThumb = (name: string | undefined, size = 150): HTMLElement | null => {
+    if (!name) return null;
+    const t = mkEl('canvas', { width: size, height: size, class: 'thumb' });
+    const tc = t.getContext('2d')!;
+    const paint = (): void => {
+      const spr = getSprite(name);
+      tc.imageSmoothingEnabled = true;
+      tc.imageSmoothingQuality = 'high';
+      tc.fillStyle = '#12141f';
+      tc.fillRect(0, 0, size, size);
+      if (spr) tc.drawImage(spr, 0, 0, size, size);
+      else if (document.body.contains(t)) setTimeout(paint, 120);
+    };
+    paint();
     return t;
   };
 
@@ -1813,7 +1961,50 @@ const renderGenerateTab = (): HTMLElement => {
       })),
       mkEl('button', { disabled: stGenBusy ? '' : null, onclick: () => void runGeneration('reference') },
         stGenBusy ? '…' : 'generate reference'),
+      // Bring your own art: use a real image as the character's contract.
+      mkEl('label', { class: 'upload', title: 'use your own artwork as the reference (or as the basis to stylize one)' },
+        stGenBusy ? '…' : '⬆ upload image',
+        mkEl('input', {
+          type: 'file', accept: 'image/*', style: 'display:none',
+          onchange: (e: Event) => {
+            const file = (e.target as HTMLInputElement).files?.[0];
+            if (file) void loadUploadedReference(file);
+            (e.target as HTMLInputElement).value = '';
+          },
+        })),
     ),
+    // The locked reference, shown by default — it IS the character contract,
+    // so it should never be invisible just because you haven't regenerated it.
+    !stRefPreview && stUpload === null ? mkEl('div', { class: 'row' },
+      savedThumb('_reference.png') ?? mkEl('div', { class: 'thumb empty' }, 'no reference'),
+      mkEl('div', {},
+        mkEl('p', { class: 'hint' }, m.palette
+          ? `locked reference in use · ${m.palette.length}-colour palette · every frame is generated from this image`
+          : 'no reference locked yet — generate or upload one, then "use as reference"'),
+        mkEl('button', {
+          title: 're-extract palette/facing/chroma from the saved reference',
+          onclick: () => { void refreshPaletteFromSaved(); },
+        }, '⟳ refresh palette'),
+      ),
+    ) : null,
+    // An uploaded image: use it verbatim, or have the model redraw it in the
+    // game's art style first (keeping the character).
+    stUpload ? mkEl('div', { class: 'row' },
+      thumb(stUpload.cell),
+      mkEl('div', {},
+        mkEl('p', { class: 'hint' }, 'uploaded image (normalized). Use it as-is, or stylize it into the game\'s look first.'),
+        mkEl('button', {
+          onclick: () => { stRefPreview = stUpload; stUpload = null; stStatus = 'upload staged — click "use as reference" to lock it'; renderAll(); },
+        }, 'use this image'),
+        mkEl('button', {
+          disabled: stGenBusy || !stImg2Img ? '' : null,
+          title: stImg2Img ? 'redraw the uploaded character in the game art style'
+            : 'needs an img2img provider (IMAGE_PROVIDER=gemini)',
+          onclick: () => { void stylizeUpload(); },
+        }, stGenBusy ? '…' : '✨ stylize into reference'),
+        mkEl('button', { onclick: () => { stUpload = null; renderAll(); } }, 'discard'),
+      ),
+    ) : null,
     stRefPreview ? mkEl('div', { class: 'row' },
       thumb(stRefPreview.cell),
       mkEl('button', {
@@ -1845,24 +2036,7 @@ const renderGenerateTab = (): HTMLElement => {
       })),
       mkEl('button', {
         title: 're-extract palette + facing mask + body size from the SAVED reference sprite (use after a palette-extraction fix)',
-        onclick: () => {
-          void (async () => {
-            let ref = spriteCanvas('_reference.png');
-            for (let w = 0; w < 30 && !ref; w++) {
-              await new Promise((r) => setTimeout(r, 100));
-              ref = spriteCanvas('_reference.png');
-            }
-            if (!ref) { stStatus = 'no saved reference found'; renderAll(); return; }
-            m.palette = extractPalette(ref, PALETTE_N);
-            m.refMask = silhouetteMask16(ref);
-            m.refChroma = Math.round(meanChroma(ref));
-            const bb = alphaBounds(ref);
-            if (bb) m.refBodyW = bb.r - bb.l + 1;
-            stDirty = true;
-            stStatus = `palette refreshed from saved reference (${m.palette.length} colors)`;
-            renderAll();
-          })();
-        },
+        onclick: () => { void refreshPaletteFromSaved(); },
       }, '⟳ refresh palette'),
     ) : mkEl('p', { class: 'hint' }, 'no reference yet — frames will skip palette lock + QC'),
   );
@@ -1871,11 +2045,17 @@ const renderGenerateTab = (): HTMLElement => {
   if (mv) {
     for (let i = 0; i < mv.steps.length; i++) {
       const r = stGenResults.get(i);
+      // With no fresh generation, show the sprite this step CURRENTLY uses —
+      // the panel should reflect the character as it actually ships, not an
+      // empty box until you regenerate.
+      const saved = mv.steps[i]!.sprite;
       results.push(mkEl('div', { class: 'genframe' },
         mkEl('div', { class: 'hint' }, `step ${i} · ${mv.steps[i]!.phase}`),
-        r ? thumb(r.norm.cell) : mkEl('div', { class: 'thumb empty' }, '—'),
+        r ? thumb(r.norm.cell)
+          : savedThumb(saved) ?? mkEl('div', { class: 'thumb empty' }, 'no sprite'),
         r ? mkEl('div', { class: r.qc.pass ? 'qc pass' : 'qc fail' },
-          `QC ${r.qc.score} · pal ${(r.qc.paletteMatch * 100).toFixed(0)}%${r.flipped ? ' · ↔auto-flipped' : ''}`) : null,
+          `QC ${r.qc.score} · pal ${(r.qc.paletteMatch * 100).toFixed(0)}%${r.flipped ? ' · ↔auto-flipped' : ''}`)
+          : saved ? mkEl('div', { class: 'hint' }, 'in use') : null,
         r ? mkEl('div', {},
           mkEl('button', {
             disabled: r.accepted ? '' : null,
@@ -1957,8 +2137,10 @@ const renderGenerateTab = (): HTMLElement => {
     stAudit ? (stAudit.length === 0
       ? mkEl('p', { class: 'hint' }, 'no suspects found ✓')
       : mkEl('table', { class: 'movetable' },
-        mkEl('tr', {}, ...['frame', 'flags', 'fix', ''].map((hh) => mkEl('th', {}, hh))),
+        mkEl('tr', {}, ...['', 'frame', 'flags', 'fix', ''].map((hh) => mkEl('th', {}, hh))),
         ...stAudit.map((row) => mkEl('tr', {},
+          // The frame itself — judging a flag without seeing the art is guesswork.
+          mkEl('td', {}, savedThumb(row.name, 72) ?? mkEl('span', {}, '—')),
           mkEl('td', {}, row.name),
           mkEl('td', {},
             [row.facingStrong ? 'FACING' : row.facingSus ? 'facing?' : '',
@@ -1971,7 +2153,35 @@ const renderGenerateTab = (): HTMLElement => {
             mkEl('button', { disabled: stAuditBusy ? '' : null, onclick: () => void auditRegen(row) }, 'regen'),
           ),
         )),
-      )) : mkEl('p', { class: 'hint' }, 'scans every saved sprite against the reference silhouette (mirror match = wrong facing) and for enclosed white pockets (bad keying)'),
+      )) : null,
+    // Contact sheet of every sprite the character currently ships — visible by
+    // default, so you can eyeball the whole roster of frames without running
+    // anything. Click a frame to jump to it in the Frames editor.
+    !stAudit ? (() => {
+      const all = b.moves.flatMap((m2) => m2.steps.map((s2, si) => ({ m2, s2, si })))
+        .filter((x) => !!x.s2.sprite);
+      if (all.length === 0) {
+        return mkEl('p', { class: 'hint' }, 'no sprites yet — generate some frames first');
+      }
+      return mkEl('div', {},
+        mkEl('p', { class: 'hint' },
+          `${all.length} sprites in use · click one to edit its boxes · "audit sprites" scans them for `
+          + 'wrong facing (mirror-matches the reference), background bleed, greyscale and duplicates'),
+        mkEl('div', { class: 'genrow' }, ...all.map(({ m2, s2, si }) => mkEl('div', {
+          class: 'genframe', style: 'cursor:pointer',
+          title: `${m2.id} step ${si} — click to edit`,
+          onclick: () => {
+            stMoveIdx = b.moves.indexOf(m2);
+            stStepIdx = si;
+            stSel = null;
+            stTab = 'frames';
+            renderAll();
+          },
+        },
+        savedThumb(s2.sprite, 96)!,
+        mkEl('div', { class: 'hint' }, `${m2.id}#${si}`)))),
+      );
+    })() : null,
   );
 
   return mkEl('div', { class: 'pane' }, refSection, moveSection, auditSection);
@@ -1979,7 +2189,7 @@ const renderGenerateTab = (): HTMLElement => {
 
 // ------------------------------------------------------------------ root
 // ------------------------------------------------------------------ stage tab
-interface StageLayerMetaEd { file: string; depth: number }
+interface StageLayerMetaEd { file: string; depth: number; stretch?: boolean; worldH?: number }
 interface StageMetaEd {
   name: string;
   imageW: number;
@@ -2004,23 +2214,29 @@ interface StageLayerEd {
   depth: number;
   img: HTMLImageElement | HTMLCanvasElement | null;
   keyBg: boolean; // strip the flat generation background so lower planes show through
+  /** World-px height of the layer's OWN opaque content (object planes only —
+   * a generated "fence" or "buildings" image commonly fills its canvas
+   * edge-to-edge, so sizing must be independent of the backdrop's scale.
+   * Compare against a fighter's ~112 world-px body height. Ignored for the
+   * backdrop plane (keyBg:false), which always stretches to the shared frame. */
+  worldH: number;
 }
 
 const freshLayerSlots = (): StageLayerEd[] => [
   {
     file: 'layer-bg.png', label: 'Background (far)',
     hint: 'e.g. distant city skyline silhouette against a purple sunset sky, no foreground objects',
-    defaultDepth: 0.15, depth: 0.15, img: null, keyBg: false,
+    defaultDepth: 0.15, depth: 0.15, img: null, keyBg: false, worldH: 0, // stretched — worldH unused
   },
   {
     file: 'layer-mid.png', label: 'Midground',
     hint: 'e.g. row of mid-distance rooftop buildings and water towers, isolated so the sky shows through',
-    defaultDepth: 0.45, depth: 0.45, img: null, keyBg: true,
+    defaultDepth: 0.45, depth: 0.45, img: null, keyBg: true, worldH: 240,
   },
   {
     file: 'layer-fg.png', label: 'Foreground (near)',
     hint: 'e.g. close chain-link fence and pipe silhouettes, isolated so everything behind shows through',
-    defaultDepth: 0.75, depth: 0.75, img: null, keyBg: true,
+    defaultDepth: 0.75, depth: 0.75, img: null, keyBg: true, worldH: 150,
   },
 ];
 
@@ -2051,6 +2267,7 @@ const loadStageEd = async (id: string): Promise<void> => {
         const slot = stStageLayers.find((s) => s.file === lm.file);
         if (!slot) return;
         slot.depth = lm.depth;
+        if (lm.worldH !== undefined) slot.worldH = lm.worldH;
         const limg = new Image();
         limg.src = `/stages/${id}/${lm.file}?v=${Math.random()}`;
         await new Promise<void>((res) => { limg.onload = () => res(); limg.onerror = () => res(); });
@@ -2100,7 +2317,13 @@ const saveStageEd = async (): Promise<void> => {
         method: 'PUT', body: canvasOf(l.img!).toDataURL('image/png'),
       });
     }));
-    stStageMeta.layers = filled.map((l) => ({ file: l.file, depth: l.depth }));
+    // stretch: true only for the opaque backdrop plane (keyBg:false) — object
+    // planes (keyBg:true) anchor to their own content's floor line instead
+    // of stretching into a wall (see chrome.ts drawStageLayers).
+    stStageMeta.layers = filled.map((l) => ({
+      file: l.file, depth: l.depth, stretch: !l.keyBg,
+      ...(l.keyBg ? { worldH: l.worldH } : {}),
+    }));
   } else {
     delete stStageMeta.layers;
   }
@@ -2363,6 +2586,11 @@ const renderStageTab = (): HTMLElement => {
               ),
               mkEl('div', { class: 'row' },
                 mkEl('label', { class: 'field' }, 'depth', numInput(layer.depth, (v) => { layer.depth = v; stStageDirty = true; }, 54)),
+                layer.keyBg ? mkEl('label', {
+                  class: 'field',
+                  title: 'world-px height of this plane\'s own content — compare against a fighter\'s ~112px body height. '
+                    + 'A generated image often fills its whole canvas, so this is sized independently of the backdrop.',
+                }, 'height (world px)', numInput(layer.worldH, (v) => { layer.worldH = Math.max(10, v); stStageDirty = true; }, 54)) : null,
                 layer.img ? mkEl('button', {
                   onclick: () => { layer.img = null; stStageDirty = true; renderAll(); },
                 }, 'clear') : null,
