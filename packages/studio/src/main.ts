@@ -192,6 +192,12 @@ const packAtlas = async (): Promise<number> => {
 
 /** Server capability: can the active image provider accept a reference image? */
 let stImg2Img = false;
+/** Which text-to-image providers are configured (have a key in .env). */
+let stAvailable: Record<string, boolean> = { nvidia: false, gemini: false, bfl: false, fal: false };
+/** Stage tab's explicit engine choice — set-dressing art needs no identity
+ * lock, so NVIDIA (cheap, fast, no reference support required) is a fine
+ * default even when Gemini is the character pipeline's default provider. */
+let stStageProvider = 'nvidia';
 
 /** The locked reference sheet as base64 PNG (for reference-conditioned gen). */
 /**
@@ -210,11 +216,13 @@ const referenceB64 = async (): Promise<string | null> => {
 };
 
 const generateImage = async (
-  prompt: string, seed: number, width = 1024, height = 1024, useRef = false,
+  prompt: string, seed: number, width = 1024, height = 1024, useRef = false, provider?: string,
 ): Promise<HTMLImageElement> => {
   // With an img2img provider, every frame is conditioned on the reference
   // sheet — that is the ONLY way to truly hold a character's identity across
-  // images. NVIDIA's flux cannot do this (see server.mjs).
+  // images. NVIDIA's flux cannot do this (see server.mjs) — useRef and an
+  // explicit `provider` override are mutually exclusive by construction
+  // (only the Stage tab passes `provider`, and it never passes useRef).
   let image: string | null = null;
   if (useRef && stImg2Img) {
     image = await referenceB64();
@@ -223,9 +231,11 @@ const generateImage = async (
         + '(generating without it would silently drift the costume)');
     }
   }
-  const body = image
-    ? { prompt, width, height, steps: 4, seed, image }
-    : { prompt, width, height, steps: 4, seed };
+  const body = {
+    prompt, width, height, steps: 4, seed,
+    ...(image ? { image } : {}),
+    ...(provider ? { provider } : {}),
+  };
   const r = await apiJson<{ artifacts?: { base64: string }[]; b64_json?: string }>(
     '/api/generate',
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -2073,9 +2083,14 @@ const renderStageTab = (): HTMLElement => {
       mkEl('b', {}, 'background · generate or upload (PNG/SVG)'),
       mkEl('div', { class: 'row' },
         mkEl('input', {
-          id: 'stageprompt', style: 'width:520px',
-          placeholder: 'e.g. pixel art city rooftop at dusk, purple sunset sky, empty concrete floor at the bottom',
+          id: 'stageprompt', style: 'width:460px',
+          placeholder: 'e.g. anime city rooftop at dusk, purple sunset sky, empty concrete floor at the bottom',
         }),
+        mkEl('label', {}, ' engine ', selInput(
+          stStageProvider,
+          Object.entries(stAvailable).filter(([, ok]) => ok).map(([p]) => p),
+          (v) => { stStageProvider = v; },
+        )),
         mkEl('button', {
           disabled: stStageBusy ? '' : null,
           onclick: () => {
@@ -2083,10 +2098,14 @@ const renderStageTab = (): HTMLElement => {
               const p = (document.getElementById('stageprompt') as HTMLInputElement).value.trim();
               if (!p) { stStatus = 'enter a stage prompt'; renderAll(); return; }
               stStageBusy = true;
-              stStatus = 'generating stage…'; renderAll();
+              stStatus = `generating stage via ${stStageProvider}…`; renderAll();
               try {
-                // Keep it terse: long prompts trip the 800-char cap + filter.
-                const img = await generateImage(`${p}, retro 16-bit style, no text`, (Math.random() * 1e6) | 0, 1536, 640);
+                // No reference to condition on — set dressing has no identity
+                // to hold, so this is a plain text-to-image call on whichever
+                // engine is picked (NVIDIA is fine and cheap for this).
+                const img = await generateImage(
+                  `${p}, anime background art, no text`, (Math.random() * 1e6) | 0,
+                  1536, 640, false, stStageProvider);
                 stStageImg = img;
                 stStageMeta!.imageW = img.naturalWidth;
                 stStageMeta!.imageH = img.naturalHeight;
@@ -2142,8 +2161,13 @@ const renderAll = (): void => {
 // boot
 void (async () => {
   try {
-    const caps = await apiJson<{ provider: string; img2img: boolean }>('/api/capabilities');
+    const caps = await apiJson<{ provider: string; img2img: boolean; available: Record<string, boolean> }>('/api/capabilities');
     stImg2Img = caps.img2img;
+    stAvailable = caps.available;
+    // Default the Stage engine to whatever's actually configured: prefer
+    // NVIDIA (cheaper, no identity needed for backgrounds) if its key is
+    // set, else fall back to the character pipeline's provider.
+    stStageProvider = stAvailable.nvidia ? 'nvidia' : caps.provider;
     stCharList = await apiJson<string[]>('/api/characters');
     if (stCharList.length === 0) throw new Error('no characters found');
     await loadChar(stCharList.includes('analog') ? 'analog' : stCharList[0]!);

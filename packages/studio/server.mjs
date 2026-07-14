@@ -223,60 +223,62 @@ const server = createServer(async (req, res) => {
 
     // ------------------------------------------------ capabilities
     if (req.method === 'GET' && path === '/api/capabilities') {
-      return json(res, 200, { provider: PROVIDER, img2img: SUPPORTS_IMG2IMG });
+      return json(res, 200, {
+        provider: PROVIDER,
+        img2img: SUPPORTS_IMG2IMG,
+        // Every provider usable for TEXT-to-image right now (nvidia needs
+        // only NVAPI_KEY; it's the fallback default so it's "available" iff
+        // the key is set — same bar as the others).
+        available: {
+          nvidia: !!NVAPI_KEY,
+          gemini: !!GEMINI_API_KEY,
+          bfl: !!BFL_API_KEY,
+          fal: !!FAL_KEY,
+        },
+      });
     }
 
     // ------------------------------------------------ generation proxy
     if (req.method === 'POST' && path === '/api/generate') {
       const raw = await readBody(req);
       const req0 = JSON.parse(raw.toString('utf8'));
+      // Per-request override (e.g. Stage tab explicitly picking NVIDIA for
+      // one-off set-dressing art). Falls back to the configured default.
+      const provider = (req0.provider || PROVIDER).toLowerCase();
+      const canImg2Img = (p) => (p === 'bfl' && !!BFL_API_KEY)
+        || (p === 'fal' && !!FAL_KEY) || (p === 'gemini' && !!GEMINI_API_KEY);
 
       // Reference-conditioned path (only providers that accept our image).
-      if (req0.image && SUPPORTS_IMG2IMG) {
+      if (req0.image) {
+        if (!canImg2Img(provider)) {
+          return json(res, 400, {
+            error: `provider "${provider}" cannot accept a reference image `
+              + `(NVIDIA's flux endpoints only take gallery example_ids — that is true for `
+              + `EVERY nvidia model, not fixable per-request). `
+              + `Use gemini, bfl, or fal (+ key) in .env for true reference conditioning.`,
+          });
+        }
         const image = String(req0.image).replace(/^data:image\/\w+;base64,/, '');
         try {
-          const b64 = PROVIDER === 'bfl' ? await generateBfl({ ...req0, image })
-            : PROVIDER === 'gemini' ? await generateGemini({ ...req0, image })
+          const b64 = provider === 'bfl' ? await generateBfl({ ...req0, image })
+            : provider === 'gemini' ? await generateGemini({ ...req0, image })
             : await generateFal({ ...req0, image });
           return json(res, 200, { artifacts: [{ base64: b64 }] });
         } catch (err) {
           return json(res, 502, { error: String(err?.message ?? err) });
         }
       }
-      // A reference was sent but the provider cannot use it — say so loudly
-      // rather than silently generating an unconditioned image.
-      if (req0.image && !SUPPORTS_IMG2IMG) {
-        return json(res, 400, {
-          error: `provider "${PROVIDER}" cannot accept a reference image `
-            + `(NVIDIA's flux endpoints only take gallery example_ids). `
-            + `Set IMAGE_PROVIDER=bfl|fal + key in .env for true reference conditioning.`,
-        });
-      }
 
-      // Text-to-image.
-      if (PROVIDER === 'bfl' || PROVIDER === 'fal' || PROVIDER === 'gemini') {
-        try {
-          const b64 = PROVIDER === 'bfl' ? await generateBfl(req0)
-            : PROVIDER === 'gemini' ? await generateGemini(req0)
-            : await generateFal(req0);
-          return json(res, 200, { artifacts: [{ base64: b64 }] });
-        } catch (err) {
-          return json(res, 502, { error: String(err?.message ?? err) });
-        }
+      // Text-to-image — any configured provider can do this.
+      try {
+        const b64 = provider === 'bfl' ? await generateBfl(req0)
+          : provider === 'fal' ? await generateFal(req0)
+          : provider === 'gemini' ? await generateGemini(req0)
+          : await generateNvidia(req0);
+        return json(res, 200, { artifacts: [{ base64: b64 }] });
+      } catch (err) {
+        return json(res, 502, { error: String(err?.message ?? err) });
       }
-      if (!NVAPI_KEY) return json(res, 500, { error: 'NVAPI_KEY missing from .env' });
-      const upstream = await fetch(NV_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${NVAPI_KEY}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: raw,
-      });
-      const text = await upstream.text();
-      res.writeHead(upstream.status, { 'Content-Type': 'application/json' });
-      return res.end(text);
     }
 
     // ------------------------------------------------ character bundles
