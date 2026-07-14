@@ -5,6 +5,7 @@
   "description": "Browser client. M0: dependency-free Canvas 2D renderer behind a swap-ready interface (PixiJS planned).",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "demo": "node tools/bundle.mjs"
   },
   "dependencies": {

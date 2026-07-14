@@ -1,0 +1,51 @@
+{
+  "_comment": "GOLDEN HASHES — do not hand-edit. Regenerate with `npm run golden:bless -w @af/core` only when a behavior change is intentional. A diff here = the game plays differently.",
+  "neutral-short": {
+    "finalHash": 2764517414,
+    "traceHash": 3635678014,
+    "endTick": 600,
+    "endPhase": 1,
+    "roundsWon0": 0,
+    "roundsWon1": 0
+  },
+  "exchange-mid": {
+    "finalHash": 3941646762,
+    "traceHash": 1213075356,
+    "endTick": 1800,
+    "endPhase": 1,
+    "roundsWon0": 0,
+    "roundsWon1": 0
+  },
+  "full-match-a": {
+    "finalHash": 1695075029,
+    "traceHash": 3494989590,
+    "endTick": 7200,
+    "endPhase": 1,
+    "roundsWon0": 1,
+    "roundsWon1": 1
+  },
+  "full-match-b": {
+    "finalHash": 2087924012,
+    "traceHash": 2778328604,
+    "endTick": 7200,
+    "endPhase": 1,
+    "roundsWon0": 1,
+    "roundsWon1": 0
+  },
+  "mash-heavy": {
+    "finalHash": 543375333,
+    "traceHash": 781585929,
+    "endTick": 3600,
+    "endPhase": 1,
+    "roundsWon0": 0,
+    "roundsWon1": 0
+  },
+  "long-run": {
+    "finalHash": 3274114431,
+    "traceHash": 3298516308,
+    "endTick": 14400,
+    "endPhase": 1,
+    "roundsWon0": 1,
+    "roundsWon1": 1
+  }
+}

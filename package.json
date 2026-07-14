@@ -8,6 +8,9 @@
   ],
   "scripts": {
     "test": "npm run test -w @af/core",
+    "typecheck": "npm run typecheck -w @af/core && npm run typecheck -w @af/client && npm run typecheck -w @af/studio",
+    "verify": "npm run typecheck && npm run test",
+    "golden:bless": "npm run golden:bless -w @af/core",
     "build": "npm run build -w @af/core && npm run build -w @af/client",
     "demo": "npm run demo -w @af/client",
     "studio": "npm run start -w @af/studio"

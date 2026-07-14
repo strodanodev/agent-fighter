@@ -1,11 +1,18 @@
 # Agent Fighter — Claude Code project context
 
+> **The canonical, tool-neutral working contract is [`AGENTS.md`](AGENTS.md).**
+> Read it first. It is shared with Cursor/Grok and any other agent via
+> `.cursor/rules/`. If this file and `AGENTS.md` ever disagree, `AGENTS.md`
+> wins. The one rule: **run `npm run verify` before you start and before you
+> call any change done** — typecheck + tests + golden replay + determinism
+> guards. A red `verify` is a wall, not a suggestion.
+
 Browser 2D fighting game (Marvel vs Capcom feel) with a custom deterministic
 engine. Online multiplayer with rollback netcode, single-player vs AI, and a
 phased crypto layer (pay-to-play credits, then P2P wagering) are planned.
 The full build spec lives in `docs/build-spec.md` — read it before large
 changes. Architecture rationale (why not IkemenGO/Phaser, prior art) is in
-`docs/architecture-recommendation.md`.
+`docs/architecture-recommendation.md`. Locked decisions: `docs/decisions/`.
 
 ## Current status
 

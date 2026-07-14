@@ -1,0 +1,22 @@
+name: verify
+
+# The guardrails only work if they run automatically. This runs the same
+# `npm run verify` gate on every push/PR — typecheck (all packages) + full
+# test suite (gameplay + determinism + golden replay + invariant guards).
+# A red run = the change broke a contract; do not merge.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm run verify

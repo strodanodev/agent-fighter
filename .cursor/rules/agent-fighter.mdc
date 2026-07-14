@@ -1,0 +1,44 @@
+---
+description: Agent Fighter working contract — read before any change
+alwaysApply: true
+---
+
+# Agent Fighter — read `AGENTS.md` at the repo root first
+
+`AGENTS.md` is the authoritative, tool-neutral working contract for this repo.
+Everything below is a summary; when in doubt, open `AGENTS.md`.
+
+## The one rule
+
+Run **`npm run verify`** before you start and before you call any change done.
+It runs typecheck + the full test suite (gameplay + determinism + golden
+replay + invariant guards). A red `verify` means you are NOT done. Never edit
+tests or `packages/core/test/golden/hashes.json` to make it pass unless
+changing them is literally the task.
+
+## `@af/core` is a deterministic simulation — do not break it
+
+- The sim must be **bit-identical** across browsers, Node, and re-simulation
+  (rollback netcode + server verification depend on it).
+- Integer fixed-point math only (24.8, `fp.ts`). **Banned in `@af/core`:**
+  `Math.random`, `Date`, `performance`, DOM (`window`/`document`), timers,
+  `fetch`, `process`, transcendental `Math.*` (sqrt/trig/pow/log/exp). These
+  are enforced by `guards.test.ts` — they will fail `verify`.
+- Every `GameState` field must be in `serialize()` and round-trip through
+  `snapshot`/`restore` (state.ts). `serialize.test.ts` enforces this.
+- Cosmetic effects live in client/studio, never in the sim.
+- `@af/core` has ZERO dependencies. Keep it that way.
+
+## Changing gameplay on purpose
+
+The golden test pins current behavior. If you intend a balance/mechanic change,
+run `npm run golden:bless` and commit the regenerated `hashes.json` in the same
+commit. If you did NOT intend to change behavior and golden is red, you have a
+regression — fix the code.
+
+## Design
+
+Characters are DATA (frame-data tables + cancel graphs in `characters/<id>/`
+and `data.ts`/`TUNING`), never per-character code. `packages/core/src/index.ts`
+is the public API contract — read it before adding core APIs; don't reach into
+core internals from client/studio.

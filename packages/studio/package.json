@@ -5,6 +5,7 @@
   "description": "Agent Fighter Studio — character authoring tool (editors + AI sprite pipeline).",
   "scripts": {
     "build": "node tools/bundle.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node tools/bundle.mjs && node server.mjs"
   }
 }

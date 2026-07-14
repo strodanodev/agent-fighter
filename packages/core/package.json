@@ -9,6 +9,8 @@
   },
   "scripts": {
     "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "golden:bless": "tsx tools/bless-golden.ts",
     "build": "tsc -p tsconfig.json"
   }
 }
