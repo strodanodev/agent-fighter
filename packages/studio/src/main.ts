@@ -19,7 +19,7 @@ import {
   CELL_W, PIVOT_X, PIVOT_Y, alphaBounds, autoHurtboxes, canvasToPngDataUrl,
   decodeBase64Image, diffHitboxDraft, enclosedWhitePockets, extractPalette,
   flipCanvasH, maskDiff, meanChroma, mirrorMask16, normalizeFrame, qcScore,
-  silhouetteMask16,
+  silhouetteMask16, sliceStrip,
 } from './pipeline.js';
 import type { NormalizedFrame, QCResult, RGB } from './pipeline.js';
 
@@ -183,8 +183,10 @@ const packAtlas = async (): Promise<number> => {
   return cells.length;
 };
 
-const generateImage = async (prompt: string, seed: number): Promise<HTMLImageElement> => {
-  const body = { prompt, width: 1024, height: 1024, steps: 4, seed };
+const generateImage = async (
+  prompt: string, seed: number, width = 1024, height = 1024,
+): Promise<HTMLImageElement> => {
+  const body = { prompt, width, height, steps: 4, seed };
   const r = await apiJson<{ artifacts?: { base64: string }[]; b64_json?: string }>(
     '/api/generate',
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -1092,6 +1094,29 @@ const SPRITE_STYLE = 'perfectly flat solid pure white background, no shadows, no
   + 'colors, centered, no text, no watermark';
 
 /**
+ * HARD LIMIT: the endpoint rejects prompts over 800 chars (422
+ * string_too_long). Everything below budgets against this — a prompt that
+ * overflows fails the whole request, so strips must be built to fit.
+ */
+const PROMPT_MAX = 800;
+
+/** Build a strip prompt that fits the budget, trimming pose text if needed. */
+const buildStripPrompt = (desc: string, poses: string[]): string => {
+  const head = `${desc}. Sprite sheet: ${poses.length} poses of ONE character, identical `
+    + `outfit and colors, one horizontal row, evenly spaced, not touching. Poses: `;
+  const tail = `. Each pose: same full-body character, profile facing right, feet on one `
+    + `ground line. Flat pure white background, no shadow, no floor, no borders. Pixel art `
+    + `fighting game sprite sheet, crisp outlines, vibrant colors, no text.`;
+  const budget = PROMPT_MAX - head.length - tail.length;
+  let body = poses.map((p, k) => `${k + 1}) ${p}`).join('; ');
+  if (body.length > budget) {
+    const per = Math.max(14, Math.floor(budget / poses.length) - 5);
+    body = poses.map((p, k) => `${k + 1}) ${p.slice(0, per).trim()}`).join('; ');
+  }
+  return (head + body + tail).slice(0, PROMPT_MAX);
+};
+
+/**
  * Archetype pose library (spec §5.1: "archetype pose libraries are the big
  * cost saver" — built once per archetype, reused across the roster). Keyed by
  * canonical move id; characters override via meta.moveDesc.
@@ -1171,18 +1196,18 @@ const seedFor = (moveId: string, stepIdx: number, salt: number): number => {
 const spriteName = (moveId: string, stepIdx: number): string =>
   `${moveId.replace(/[^a-zA-Z0-9_-]/g, '_')}_s${stepIdx}.png`;
 
-/** Generate + normalize + QC one frame of a move. */
-const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | null> => {
-  const m = meta();
-  const desc = m.desc || stBundle!.name;
+/** Pose text for one step of a move (archetype library + per-step overrides). */
+const poseForStep = (mv: MoveDef, i: number): string => {
   const stp = mv.steps[i]!;
   const pose = STEP_POSES[mv.id]?.[i] ?? poseFor(mv);
-  const phaseHint = mv.type === 'system' ? '' : `${PHASE_HINTS[stp.phase] ?? ''}, `;
-  const frameHint = mv.steps.length > 1 && !STEP_POSES[mv.id]
-    ? `animation frame ${i + 1} of ${mv.steps.length}, ` : '';
-  const prompt = `${desc}, ${pose}, ${frameHint}${phaseHint}${SPRITE_STYLE}`;
-  const img = await generateImage(prompt, seedFor(mv.id, i, salt));
-  const norm = normalizeFrame(img, m.palette ?? null);
+  const phaseHint = mv.type === 'system' || STEP_POSES[mv.id] ? '' : `, ${PHASE_HINTS[stp.phase] ?? ''}`;
+  return `${pose}${phaseHint}`;
+};
+
+/** Normalize → facing-correct → QC a generated (or sliced) frame image. */
+const finishFrame = (mv: MoveDef, src: HTMLImageElement | HTMLCanvasElement): GenResult | null => {
+  const m = meta();
+  const norm = normalizeFrame(src, m.palette ?? null);
   if (!norm) return null;
   // Facing check: if the MIRRORED reference silhouette matches decisively
   // better, the model drew the character facing left — flip (lossless).
@@ -1203,6 +1228,76 @@ const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | n
   // palette — lower bar; the palette lock still normalizes the colors.
   const passAt = mv.type === 'special' || mv.type === 'super' ? 45 : 55;
   return { norm, qc: qcScore(norm, refW, passAt, m.refChroma ?? null), accepted: false, flipped };
+};
+
+/** Generate + normalize + QC ONE frame as its own image (fallback path). */
+const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | null> => {
+  const desc = meta().desc || stBundle!.name;
+  const frameHint = mv.steps.length > 1 && !STEP_POSES[mv.id]
+    ? `, animation frame ${i + 1} of ${mv.steps.length}` : '';
+  const prompt = `${desc}, ${poseForStep(mv, i)}${frameHint}, ${SPRITE_STYLE}`.slice(0, PROMPT_MAX);
+  const img = await generateImage(prompt, seedFor(mv.id, i, salt));
+  return finishFrame(mv, img);
+};
+
+/**
+ * STRIP GENERATION — the fix for costume drift (spec §5.1 stage 2:
+ * "animation generation per move, not per frame").
+ *
+ * Generating each frame as its own image makes the model re-invent the
+ * character's outfit on every call — the animation looks like the fighter is
+ * changing clothes mid-punch. Inside ONE image the model draws ONE character
+ * wearing ONE costume, so we ask for all the poses of a move side by side and
+ * cut them apart. The whole character also shares a single seed across every
+ * strip, which keeps costumes consistent between moves too.
+ */
+const STRIP_W = 1536;
+const STRIP_H = 640;
+const STRIP_MAX = 4; // poses per image — beyond this each pose gets too few px
+
+/** Strip telemetry: a silent fallback to per-frame means costume drift. */
+let stStripsUsed = 0;
+let stStripFallbacks = 0;
+let stStripError = '';
+
+/** One seed per character: every strip inherits the same design lottery ticket. */
+const charSeed = (salt: number): number => seedFor('_character', 0, salt);
+
+/** Generate every frame of a move. Strip-first, per-frame only as fallback. */
+const genMoveFrames = async (mv: MoveDef, salt = 0): Promise<(GenResult | null)[]> => {
+  const n = mv.steps.length;
+  const out: (GenResult | null)[] = new Array(n).fill(null);
+  if (n === 1) {
+    out[0] = await genFrame(mv, 0, salt);
+    return out;
+  }
+  const desc = meta().desc || stBundle!.name;
+  for (let start = 0; start < n; start += STRIP_MAX) {
+    const idxs: number[] = [];
+    for (let i = start; i < Math.min(start + STRIP_MAX, n); i++) idxs.push(i);
+    if (idxs.length === 1) {
+      out[idxs[0]!] = await genFrame(mv, idxs[0]!, salt);
+      continue;
+    }
+    const prompt = buildStripPrompt(desc, idxs.map((i) => poseForStep(mv, i)));
+    let slices: HTMLCanvasElement[] | null = null;
+    try {
+      const img = await generateImage(prompt, charSeed(salt), STRIP_W, STRIP_H);
+      slices = sliceStrip(img, idxs.length);
+      if (!slices) stStripFallbacks++; // model drew overlapping/merged figures
+    } catch (e) {
+      stStripFallbacks++;
+      stStripError = (e as Error).message;
+    }
+    if (slices) {
+      stStripsUsed++;
+      idxs.forEach((i, k) => { out[i] = finishFrame(mv, slices![k]!); });
+    } else {
+      // Strip unusable — per-frame (costume may drift for these frames).
+      for (const i of idxs) out[i] = await genFrame(mv, i, salt);
+    }
+  }
+  return out;
 };
 
 const acceptFrame = async (mv: MoveDef, i: number, r: GenResult): Promise<void> => {
@@ -1232,13 +1327,14 @@ const runGeneration = async (which: 'reference' | 'move'): Promise<void> => {
       const mv = curMove();
       if (!mv) throw new Error('no move selected');
       const n = mv.steps.length;
-      for (let i = 0; i < n; i++) {
-        stStatus = `generating ${mv.id} frame ${i + 1}/${n}…`; renderAll();
-        const r = await genFrame(mv, i);
-        if (r) stGenResults.set(i, r);
-        renderAll();
-      }
-      stStatus = `generated ${stGenResults.size}/${n} frames — review QC + accept`;
+      stStripsUsed = 0; stStripFallbacks = 0; stStripError = '';
+      stStatus = `generating ${mv.id} as a ${n}-pose strip…`; renderAll();
+      const frames = await genMoveFrames(mv);
+      frames.forEach((r, i) => { if (r) stGenResults.set(i, r); });
+      const how = stStripFallbacks > 0
+        ? `⚠ per-frame fallback (${stStripError || 'strip could not be sliced'}) — costume may drift`
+        : 'strip mode (one costume)';
+      stStatus = `generated ${stGenResults.size}/${n} frames · ${how} — review QC + accept`;
     }
   } catch (e) {
     stStatus = `generation failed: ${(e as Error).message}`;
@@ -1256,35 +1352,45 @@ const runGenerateAll = async (): Promise<void> => {
   if (stGenBusy || !stBundle) return;
   stGenBusy = true;
   const failures: string[] = [];
+  stStripsUsed = 0; stStripFallbacks = 0; stStripError = '';
   const want = (mv: MoveDef, i: number): boolean => !stMissingOnly || !mv.steps[i]!.sprite;
   const total = stBundle.moves.reduce(
     (n, mv) => n + mv.steps.filter((_, i) => want(mv, i)).length, 0);
   let done = 0;
   try {
     for (const mv of stBundle.moves) {
-      for (let i = 0; i < mv.steps.length; i++) {
-        if (!want(mv, i)) continue;
-        done++;
-        stStatus = `batch ${done}/${total} · ${mv.id} step ${i}…`; renderAll();
-        // Up to 3 attempts: first with the stable seed, then random salts.
-        // Retries cover ALL failure modes — QC fail, normalize-null, API error.
-        let r: GenResult | null = null;
-        for (let att = 0; att < 3 && !(r && r.qc.pass); att++) {
-          const salt = att === 0 ? 0 : 2 + ((Math.random() * 1e6) | 0);
+      const wanted = mv.steps.map((_, i) => i).filter((i) => want(mv, i));
+      if (wanted.length === 0) continue;
+      done += wanted.length;
+      stStatus = `batch ${done}/${total} · ${mv.id} (${mv.steps.length}-pose strip)…`; renderAll();
+
+      // Whole-move strip first: one image, one costume (see genMoveFrames).
+      let frames: (GenResult | null)[] = [];
+      try {
+        frames = await genMoveFrames(mv);
+      } catch { frames = new Array(mv.steps.length).fill(null); }
+
+      for (const i of wanted) {
+        let r = frames[i] ?? null;
+        // Per-frame reroll only for the frames the strip failed on.
+        for (let att = 0; att < 2 && !(r && r.qc.pass); att++) {
           try {
-            r = (await genFrame(mv, i, salt)) ?? r;
-          } catch { /* transient generation error — next attempt */ }
+            r = (await genFrame(mv, i, 2 + ((Math.random() * 1e6) | 0))) ?? r;
+          } catch { /* transient — next attempt */ }
         }
         if (r && r.qc.pass) {
           await acceptFrame(mv, i, r);
         } else {
           failures.push(`${mv.id}#${i}${r ? ` QC${r.qc.score}` : ' ERR'}`);
         }
+        renderAll();
       }
     }
+    const strips = `strips ${stStripsUsed} ok / ${stStripFallbacks} fell back to per-frame`
+      + (stStripError ? ` (${stStripError})` : '');
     stStatus = failures.length === 0
-      ? `batch complete: all ${total} frames accepted — SAVE to persist`
-      : `batch done, ${total - failures.length}/${total} accepted · needs review: ${failures.join(' ')}`;
+      ? `batch complete: all ${total} frames accepted · ${strips} — SAVE to persist`
+      : `batch done, ${total - failures.length}/${total} accepted · ${strips} · needs review: ${failures.join(' ')}`;
   } catch (e) {
     stStatus = `batch aborted: ${(e as Error).message}`;
   }

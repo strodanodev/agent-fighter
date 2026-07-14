@@ -29,6 +29,9 @@ const ORDER = [
   'core/src/motion.js',
   'core/src/state.js',
   'core/src/sim.js',
+  'core/src/anim.js',
+  'client/src/atlas.js',
+  'client/src/ui.js',
   'client/src/main.js',
 ];
 
@@ -55,16 +58,15 @@ const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Agent Fighter — Milestone 1</title>
+<title>Agent Fighter</title>
 <style>
-  html,body{margin:0;height:100%;background:#0b0c14;display:flex;align-items:center;justify-content:center;flex-direction:column;font-family:monospace;color:#666}
-  canvas{image-rendering:pixelated;box-shadow:0 8px 40px #0009;max-width:98vw}
-  p{margin:10px 0 0;font-size:12px}
+  html,body{margin:0;height:100%;background:#07050d;display:flex;align-items:center;justify-content:center;font-family:"Courier New",monospace;color:#666;overflow:hidden}
+  canvas{image-rendering:pixelated;box-shadow:0 0 0 3px #d9a441,0 0 0 6px #14121f,0 10px 60px #000c;
+         width:min(96vw, calc(96vh * 16 / 9));height:auto;aspect-ratio:16/9}
 </style>
 </head>
 <body>
 <canvas id="game" width="960" height="540"></canvas>
-<p>AGENT FIGHTER · milestone 1 · full MvC-style combat: chains · launcher · air combos · specials · super · pushblock · throws</p>
 <script>
 ${js}
 </script>
@@ -73,6 +75,6 @@ ${js}
 `;
 
 mkdirSync(join(pkg, 'demo'), { recursive: true });
-const out = join(pkg, 'demo', 'agent-fighter-m1.html');
+const out = join(pkg, 'demo', 'agent-fighter.html');
 writeFileSync(out, html);
 console.log(`bundled → ${out} (${(html.length / 1024).toFixed(1)} KB)`);

@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "demo": "node tools/bundle.mjs"
+    "demo": "node tools/bundle.mjs",
+    "play": "node tools/bundle.mjs && node server.mjs"
   },
   "dependencies": {
     "@af/core": "*"

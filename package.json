@@ -13,6 +13,7 @@
     "golden:bless": "npm run golden:bless -w @af/core",
     "build": "npm run build -w @af/core && npm run build -w @af/client",
     "demo": "npm run demo -w @af/client",
+    "play": "npm run play -w @af/client",
     "studio": "npm run start -w @af/studio"
   },
   "devDependencies": {

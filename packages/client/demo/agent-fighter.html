@@ -1,0 +1,2674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Agent Fighter</title>
+<style>
+  html,body{margin:0;height:100%;background:#07050d;display:flex;align-items:center;justify-content:center;font-family:"Courier New",monospace;color:#666;overflow:hidden}
+  canvas{image-rendering:pixelated;box-shadow:0 0 0 3px #d9a441,0 0 0 6px #14121f,0 10px 60px #000c;
+         width:min(96vw, calc(96vh * 16 / 9));height:auto;aspect-ratio:16/9}
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+// ---- core/src/fp.js ----
+/**
+ * Fixed-point math. All sim positions/velocities are integers in 1/256 px
+ * ("subpixels", 24.8 fixed point). Determinism rule: the sim NEVER stores or
+ * computes with floats. JS doubles represent integers exactly up to 2^53,
+ * and all our products stay far below that, so integer math here is
+ * bit-identical across engines/platforms.
+ */
+const FP = 256;
+/** Convert whole pixels to fixed-point. */
+const fp = (px) => Math.trunc(px * FP);
+/** Fixed-point multiply: (a * b) / FP, truncated toward zero. */
+const fpMul = (a, b) => Math.trunc((a * b) / FP);
+/** Truncate toward zero to pixels (for rendering / hitbox rects only). */
+const fpToPx = (v) => Math.trunc(v / FP);
+/** Clamp integer value. */
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+/**
+ * Deterministic PRNG (mulberry32-style, integer-only variant).
+ * Lives inside GameState; never use Math.random in the sim.
+ */
+const nextRand = (seed) => {
+    let t = (seed + 0x6d2b79f5) | 0;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t = (t + Math.imul(t ^ (t >>> 7), t | 61)) | 0;
+    return (t ^ (t >>> 14)) >>> 0;
+};
+
+// ---- core/src/input.js ----
+const PUNCH_MASK = 16 /* Btn.LP */ | 32 /* Btn.MP */ | 64 /* Btn.HP */;
+const KICK_MASK = 128 /* Btn.LK */ | 256 /* Btn.MK */ | 512 /* Btn.HK */;
+const ATTACK_MASK = PUNCH_MASK | KICK_MASK;
+const DIR_MASK = 1 /* Btn.Left */ | 2 /* Btn.Right */ | 4 /* Btn.Up */ | 8 /* Btn.Down */;
+const held = (f, b) => (f & b) !== 0;
+/** Rising edge: pressed this frame, not held last frame. */
+const pressed = (now, prev, b) => (now & b) !== 0 && (prev & b) === 0;
+/** All attack buttons newly pressed this frame, as a mask. */
+const pressedAttacks = (now, prev) => now & ~prev & ATTACK_MASK;
+/** Popcount for small masks (attack buttons). Deterministic integer loop. */
+const countBits = (v) => {
+    let n = 0;
+    while (v !== 0) {
+        n += v & 1;
+        v >>>= 1;
+    }
+    return n;
+};
+
+// ---- core/src/data.js ----
+// ---------------------------------------------------------------------------
+// Loaded character: bundle + precomputed lookup tables the sim uses per tick.
+// Built once at load; all lookups by integer index (deterministic).
+// ---------------------------------------------------------------------------
+const BUTTON_BITS = {
+    LP: 16 /* Btn.LP */, MP: 32 /* Btn.MP */, HP: 64 /* Btn.HP */, LK: 128 /* Btn.LK */, MK: 256 /* Btn.MK */, HK: 512 /* Btn.HK */,
+};
+/** Resolution priority when several buttons are pressed the same frame. */
+const BUTTON_PRIORITY = ['HP', 'HK', 'MP', 'MK', 'LP', 'LK'];
+const STANCE_IDX = { stand: 0, crouch: 1, air: 2 };
+const bitPos = (bit) => {
+    let p = 0;
+    while ((bit >>= 1) !== 0)
+        p++;
+    return p;
+};
+/** Validate + index a character bundle. Throws on malformed data. */
+const loadCharacter = (b) => {
+    const n = b.moves.length;
+    const moveIdxById = {};
+    b.moves.forEach((m, i) => {
+        if (moveIdxById[m.id] !== undefined)
+            throw new Error(`duplicate move id: ${m.id}`);
+        if (m.steps.length === 0)
+            throw new Error(`move ${m.id} has no steps`);
+        for (const st of m.steps) {
+            if (!Number.isInteger(st.frames) || st.frames <= 0) {
+                throw new Error(`move ${m.id}: step frames must be positive integers`);
+            }
+        }
+        moveIdxById[m.id] = i;
+    });
+    const normals = [new Int32Array(10).fill(-1), new Int32Array(10).fill(-1), new Int32Array(10).fill(-1)];
+    const specials = [];
+    let superIdx = -1;
+    const totalFrames = new Int32Array(n);
+    const firstActiveStep = new Int32Array(n).fill(-1);
+    b.moves.forEach((m, i) => {
+        totalFrames[i] = m.steps.reduce((acc, s) => acc + s.frames, 0);
+        const act = m.steps.findIndex((s) => s.phase === 'active');
+        firstActiveStep[i] = act;
+        if (m.type === 'normal') {
+            if (!m.button)
+                throw new Error(`normal ${m.id} missing button`);
+            normals[STANCE_IDX[m.stance]][bitPos(BUTTON_BITS[m.button])] = i;
+        }
+        else if (m.type === 'special') {
+            if (!m.motion || !m.buttons || m.buttons === 'PP')
+                throw new Error(`special ${m.id} needs motion + P/K`);
+            specials.push({ motion: m.motion, kind: m.buttons, idx: i });
+        }
+        else if (m.type === 'super') {
+            if (!m.motion || m.buttons !== 'PP')
+                throw new Error(`super ${m.id} needs motion + PP`);
+            if (m.meterCost === undefined)
+                throw new Error(`super ${m.id} missing meterCost`);
+            superIdx = i;
+        }
+    });
+    const cancelHit = new Uint8Array(n * n);
+    const cancelBlock = new Uint8Array(n * n);
+    for (const edge of b.cancels) {
+        const from = moveIdxById[edge.from];
+        if (from === undefined)
+            throw new Error(`cancel edge from unknown move: ${edge.from}`);
+        for (const toId of edge.to) {
+            const to = moveIdxById[toId];
+            if (to === undefined)
+                throw new Error(`cancel edge to unknown move: ${toId}`);
+            if (edge.on.includes('hit'))
+                cancelHit[from * n + to] = 1;
+            if (edge.on.includes('block'))
+                cancelBlock[from * n + to] = 1;
+        }
+    }
+    return { b, moveIdxById, normals, specials, superIdx, totalFrames, firstActiveStep, cancelHit, cancelBlock };
+};
+// ---------------------------------------------------------------------------
+// Stage + global tuning. These are the knobs that make it feel like MvC —
+// they live here (data), not scattered through sim logic.
+// ---------------------------------------------------------------------------
+const STAGE = {
+    widthPx: 1600, // ~2.5 viewport-widths of 960 minus margins; camera scrolls
+    floorYPx: 460,
+    wallPad: 24,
+    viewportW: 960,
+    viewportH: 540,
+};
+const TICKS_PER_SEC = 60;
+const ROUND_SECONDS = 99;
+const TUNING = {
+    roundsToWin: 2, // best of 3
+    preRoundTicks: 60,
+    roundOverTicks: 120,
+    meterMax: 3000, // 3 bars
+    meterBar: 1000,
+    superFlashTicks: 28,
+    inputBufferTicks: 8,
+    motionWindowTicks: 14,
+    doubleTapWindowTicks: 11,
+    superJumpDownWindow: 10, // ticks between down-tap and up for super jump
+    jumpSquatTicks: 4,
+    landingRecovers: true,
+    juggleBudget: 8,
+    scalingStart: 1000, // per-mille
+    scalingMult: 900, // compounding ×0.9 per hit
+    scalingFloor: 200, // 20% floor
+    minHitstun: 8,
+    hitstunDecayShift: 1, // effective stun = base - (comboHits >> shift)
+    knockdownTicks: 36,
+    getupTicks: 14,
+    grabTicks: 18, // throw connects at end unless teched
+    throwTechWindow: 10,
+    pushblockSelfVel: 12, // px/tick the blocker slides back (must clearly beat heavy pushbackBlock)
+    pushblockAttackerVel: 7, // applied to attacker when blocker is cornered
+    victimMeterDivisor: 20, // victim gains damage/20 meter
+    blockMeterGain: 10,
+    friction: 0.5, // px/tick² ground slide decel
+    cornerThresholdPx: 26, // "at the wall" for pushback transfer
+    throwStartsComboScaling: true,
+};
+
+// ---- core/src/characters/analog.js ----
+/**
+ * ANALOG — launch character #1, shoto archetype. 100% declarative data
+ * (build-spec §3): the engine interprets this table; there is no Analog code.
+ * This module is the in-repo stand-in for a character bundle's moves.json +
+ * cancels.json until the M2 Studio exports real files.
+ *
+ * Frame data tuned for MvC pacing: lights 3-4f startup and chainable,
+ * launcher (2HP) → super jump → air chain → j.HP/j.HK finisher.
+ */
+const STAND = { x: -26, y: -108, w: 52, h: 108 };
+const CROUCH = { x: -26, y: -80, w: 52, h: 80 };
+const AIR = { x: -26, y: -98, w: 52, h: 88 };
+/** Standard single-hit strike: startup / active / recovery with one hitbox. */
+const mkStrike = (id, stance, button, sp) => {
+    const base = stance === 'crouch' ? CROUCH : stance === 'air' ? AIR : STAND;
+    const activeHurt = sp.extendHurt
+        ? [base, { x: sp.rect.x, y: sp.rect.y, w: sp.rect.w, h: sp.rect.h }]
+        : [base];
+    const hit = {
+        rect: sp.rect,
+        damage: sp.damage,
+        chip: sp.chip ?? 0,
+        hitstun: sp.hitstun,
+        blockstun: sp.blockstun,
+        hitstopFrames: sp.hitstop,
+        pushbackHit: sp.pushHit,
+        pushbackBlock: sp.pushBlock,
+        guard: sp.guard ?? 'mid',
+        juggleCost: sp.juggleCost ?? 1,
+        launcher: sp.launcher,
+        launchVelY: sp.launchVelY,
+        knockdown: sp.knockdown,
+    };
+    return {
+        id, type: 'normal', stance, button,
+        steps: [
+            { frames: sp.startup, phase: 'startup', hurtboxes: [base] },
+            { frames: sp.active, phase: 'active', hurtboxes: activeHurt, hitboxes: [hit] },
+            { frames: sp.recovery, phase: 'recovery', hurtboxes: [base] },
+        ],
+        meterGainWhiff: sp.meterWhiff ?? 5,
+        meterGainHit: sp.meterHit ?? 40,
+    };
+};
+const MOVES = [
+    // -------------------------------------------------- standing normals
+    mkStrike('5LP', 'stand', 'LP', {
+        startup: 3, active: 3, recovery: 6,
+        rect: { x: 22, y: -96, w: 44, h: 22 },
+        damage: 300, hitstun: 14, blockstun: 10, hitstop: 5, pushHit: 4.5, pushBlock: 5,
+        meterWhiff: 5, meterHit: 40, extendHurt: 1,
+    }),
+    mkStrike('5MP', 'stand', 'MP', {
+        startup: 6, active: 4, recovery: 10,
+        rect: { x: 24, y: -100, w: 52, h: 28 },
+        damage: 550, hitstun: 17, blockstun: 13, hitstop: 6, pushHit: 5.5, pushBlock: 6.5,
+        meterWhiff: 8, meterHit: 70, extendHurt: 1,
+    }),
+    mkStrike('5HP', 'stand', 'HP', {
+        startup: 9, active: 4, recovery: 16,
+        rect: { x: 26, y: -104, w: 60, h: 34 },
+        damage: 800, hitstun: 21, blockstun: 16, hitstop: 8, pushHit: 6.5, pushBlock: 8,
+        meterWhiff: 12, meterHit: 100, extendHurt: 1,
+    }),
+    mkStrike('5LK', 'stand', 'LK', {
+        startup: 4, active: 3, recovery: 8,
+        rect: { x: 20, y: -60, w: 46, h: 24 },
+        damage: 320, hitstun: 14, blockstun: 10, hitstop: 5, pushHit: 4.5, pushBlock: 5,
+        meterWhiff: 5, meterHit: 40, extendHurt: 1,
+    }),
+    mkStrike('5MK', 'stand', 'MK', {
+        startup: 7, active: 4, recovery: 12,
+        rect: { x: 24, y: -74, w: 54, h: 26 },
+        damage: 570, hitstun: 17, blockstun: 13, hitstop: 6, pushHit: 5.5, pushBlock: 6.5,
+        meterWhiff: 8, meterHit: 70, extendHurt: 1,
+    }),
+    mkStrike('5HK', 'stand', 'HK', {
+        startup: 10, active: 5, recovery: 18,
+        rect: { x: 26, y: -92, w: 62, h: 40 },
+        damage: 830, hitstun: 22, blockstun: 17, hitstop: 8, pushHit: 7, pushBlock: 8.5,
+        meterWhiff: 12, meterHit: 100, extendHurt: 1,
+    }),
+    // -------------------------------------------------- crouching normals
+    mkStrike('2LP', 'crouch', 'LP', {
+        startup: 3, active: 3, recovery: 6,
+        rect: { x: 20, y: -66, w: 42, h: 20 },
+        damage: 280, hitstun: 14, blockstun: 10, hitstop: 5, pushHit: 4.5, pushBlock: 5,
+        meterWhiff: 5, meterHit: 40, extendHurt: 1,
+    }),
+    mkStrike('2MP', 'crouch', 'MP', {
+        startup: 6, active: 4, recovery: 11,
+        rect: { x: 20, y: -84, w: 48, h: 30 },
+        damage: 520, hitstun: 17, blockstun: 13, hitstop: 6, pushHit: 5.5, pushBlock: 6.5,
+        meterWhiff: 8, meterHit: 70, extendHurt: 1,
+    }),
+    // THE launcher. Pops up for super-jump air combos (magic series apex).
+    mkStrike('2HP', 'crouch', 'HP', {
+        startup: 10, active: 4, recovery: 20,
+        rect: { x: 14, y: -120, w: 44, h: 70 },
+        damage: 750, hitstun: 90, blockstun: 16, hitstop: 9, pushHit: 2, pushBlock: 8,
+        launcher: true, launchVelY: -17, knockdown: true, juggleCost: 1,
+        meterWhiff: 12, meterHit: 100, extendHurt: 1,
+    }),
+    mkStrike('2LK', 'crouch', 'LK', {
+        startup: 4, active: 3, recovery: 7,
+        rect: { x: 18, y: -26, w: 44, h: 22 },
+        damage: 260, hitstun: 13, blockstun: 10, hitstop: 5, pushHit: 4, pushBlock: 4.5,
+        guard: 'low', meterWhiff: 5, meterHit: 40, extendHurt: 1,
+    }),
+    mkStrike('2MK', 'crouch', 'MK', {
+        startup: 7, active: 4, recovery: 13,
+        rect: { x: 22, y: -28, w: 56, h: 24 },
+        damage: 500, hitstun: 16, blockstun: 13, hitstop: 6, pushHit: 5.5, pushBlock: 6.5,
+        guard: 'low', meterWhiff: 8, meterHit: 70, extendHurt: 1,
+    }),
+    // Sweep: low + knockdown.
+    mkStrike('2HK', 'crouch', 'HK', {
+        startup: 11, active: 5, recovery: 22,
+        rect: { x: 20, y: -24, w: 66, h: 22 },
+        damage: 780, hitstun: 30, blockstun: 17, hitstop: 8, pushHit: 5, pushBlock: 8,
+        guard: 'low', knockdown: true, meterWhiff: 12, meterHit: 100, extendHurt: 1,
+    }),
+    // -------------------------------------------------- air normals (overheads)
+    mkStrike('j.LP', 'air', 'LP', {
+        startup: 3, active: 8, recovery: 4,
+        rect: { x: 16, y: -86, w: 42, h: 26 },
+        damage: 300, hitstun: 15, blockstun: 11, hitstop: 5, pushHit: 4, pushBlock: 4.5,
+        guard: 'overhead', meterWhiff: 5, meterHit: 40,
+    }),
+    mkStrike('j.MP', 'air', 'MP', {
+        startup: 5, active: 6, recovery: 6,
+        rect: { x: 18, y: -92, w: 50, h: 30 },
+        damage: 540, hitstun: 18, blockstun: 13, hitstop: 6, pushHit: 5, pushBlock: 5.5,
+        guard: 'overhead', meterWhiff: 8, meterHit: 70,
+    }),
+    // Air finisher: knocks down out of air combos.
+    mkStrike('j.HP', 'air', 'HP', {
+        startup: 7, active: 6, recovery: 8,
+        rect: { x: 18, y: -96, w: 56, h: 38 },
+        damage: 820, hitstun: 24, blockstun: 16, hitstop: 8, pushHit: 6.5, pushBlock: 7,
+        guard: 'overhead', knockdown: true, juggleCost: 2, meterWhiff: 12, meterHit: 100,
+    }),
+    mkStrike('j.LK', 'air', 'LK', {
+        startup: 4, active: 8, recovery: 4,
+        rect: { x: 14, y: -60, w: 44, h: 26 },
+        damage: 310, hitstun: 15, blockstun: 11, hitstop: 5, pushHit: 4, pushBlock: 4.5,
+        guard: 'overhead', meterWhiff: 5, meterHit: 40,
+    }),
+    mkStrike('j.MK', 'air', 'MK', {
+        startup: 6, active: 7, recovery: 6,
+        rect: { x: 16, y: -66, w: 52, h: 30 },
+        damage: 560, hitstun: 18, blockstun: 13, hitstop: 6, pushHit: 5, pushBlock: 5.5,
+        guard: 'overhead', meterWhiff: 8, meterHit: 70,
+    }),
+    mkStrike('j.HK', 'air', 'HK', {
+        startup: 8, active: 6, recovery: 8,
+        rect: { x: 20, y: -80, w: 60, h: 42 },
+        damage: 850, hitstun: 24, blockstun: 16, hitstop: 8, pushHit: 6.5, pushBlock: 7,
+        guard: 'overhead', knockdown: true, juggleCost: 2, meterWhiff: 12, meterHit: 100,
+    }),
+    // -------------------------------------------------- specials
+    // 236P — Analog Wave (fireball). Projectile spawns at first active frame.
+    {
+        id: '236P', type: 'special', stance: 'stand', motion: 236, buttons: 'P',
+        steps: [
+            { frames: 12, phase: 'startup', hurtboxes: [STAND] },
+            { frames: 2, phase: 'active', hurtboxes: [STAND] },
+            { frames: 18, phase: 'recovery', hurtboxes: [STAND] },
+        ],
+        projectile: {
+            spawnX: 50, spawnY: -78, velX: 8, lifetime: 90,
+            rect: { x: -18, y: -14, w: 36, h: 28 },
+            hit: {
+                rect: { x: -18, y: -14, w: 36, h: 28 },
+                damage: 700, chip: 90, hitstun: 20, blockstun: 15, hitstopFrames: 6,
+                pushbackHit: 6, pushbackBlock: 7, guard: 'mid', juggleCost: 2,
+                airPopVelY: -6,
+            },
+        },
+        meterGainWhiff: 20, meterGainHit: 120,
+    },
+    // 623P — Rising Glitch (dragon punch). Self-launches, knocks down.
+    {
+        id: '623P', type: 'special', stance: 'stand', motion: 623, buttons: 'P',
+        steps: [
+            { frames: 4, phase: 'startup', hurtboxes: [STAND] },
+            {
+                frames: 10, phase: 'active', velX: 3.5, velY: -13,
+                hurtboxes: [STAND],
+                hitboxes: [{
+                        rect: { x: 6, y: -128, w: 46, h: 92 },
+                        damage: 900, chip: 110, hitstun: 40, blockstun: 18, hitstopFrames: 9,
+                        pushbackHit: 3, pushbackBlock: 8, guard: 'mid', juggleCost: 3,
+                        launcher: true, launchVelY: -14, knockdown: true,
+                    }],
+            },
+            { frames: 14, phase: 'recovery', hurtboxes: [STAND] },
+        ],
+        meterGainWhiff: 20, meterGainHit: 140,
+    },
+    // 214K — Scanline Sweep (advancing two-hit kick).
+    {
+        id: '214K', type: 'special', stance: 'stand', motion: 214, buttons: 'K',
+        steps: [
+            { frames: 8, phase: 'startup', hurtboxes: [STAND] },
+            {
+                frames: 8, phase: 'active', velX: 6,
+                hurtboxes: [STAND],
+                hitboxes: [{
+                        rect: { x: 16, y: -84, w: 52, h: 40 },
+                        damage: 400, chip: 50, hitstun: 18, blockstun: 13, hitstopFrames: 6,
+                        pushbackHit: 3, pushbackBlock: 5, guard: 'mid', juggleCost: 2, airPopVelY: -7,
+                    }],
+            },
+            {
+                frames: 8, phase: 'active', velX: 6,
+                hurtboxes: [STAND],
+                hitboxes: [{
+                        rect: { x: 16, y: -84, w: 52, h: 40 },
+                        damage: 420, chip: 50, hitstun: 24, blockstun: 14, hitstopFrames: 7,
+                        pushbackHit: 6, pushbackBlock: 7, guard: 'mid', juggleCost: 2,
+                        knockdown: true, airPopVelY: -6,
+                    }],
+            },
+            { frames: 16, phase: 'recovery', velX: 0, hurtboxes: [STAND] },
+        ],
+        meterGainWhiff: 20, meterGainHit: 130,
+    },
+    // -------------------------------------------------- super
+    // 236PP — SYSTEM CRASH. 5-hit rushing super, 1 bar, super-flash freeze.
+    {
+        id: '236PP', type: 'super', stance: 'stand', motion: 236, buttons: 'PP', meterCost: 1000,
+        steps: [
+            { frames: 6, phase: 'startup', hurtboxes: [STAND] },
+            ...Array.from({ length: 4 }, (_, k) => ({
+                frames: 4,
+                phase: 'active',
+                velX: 7,
+                hurtboxes: [STAND],
+                hitboxes: [{
+                        rect: { x: 14, y: -104, w: 62, h: 74 },
+                        damage: 500, chip: 70, hitstun: 22, blockstun: 14, hitstopFrames: 5,
+                        pushbackHit: 1.5, pushbackBlock: 4, guard: 'mid', juggleCost: 0,
+                        airPopVelY: -6,
+                    }],
+            })),
+            {
+                frames: 5, phase: 'active', velX: 4,
+                hurtboxes: [STAND],
+                hitboxes: [{
+                        rect: { x: 14, y: -110, w: 70, h: 84 },
+                        damage: 1000, chip: 120, hitstun: 30, blockstun: 18, hitstopFrames: 10,
+                        pushbackHit: 9, pushbackBlock: 10, guard: 'mid', juggleCost: 0,
+                        launcher: true, launchVelY: -12, knockdown: true,
+                    }],
+            },
+            { frames: 24, phase: 'recovery', velX: 0, hurtboxes: [STAND] },
+        ],
+        meterGainWhiff: 0, meterGainHit: 0,
+    },
+];
+// ---------------------------------------------------------------------------
+// Cancel graph — MvC magic series (any L → any M → any H → launcher) plus
+// special cancels on hit/block and super cancels from anything.
+// ---------------------------------------------------------------------------
+const L = ['5LP', '5LK', '2LP', '2LK'];
+const M = ['5MP', '5MK', '2MP', '2MK'];
+const H = ['5HP', '5HK', '2HK'];
+const LAUNCHER = ['2HP'];
+const SPECIALS = ['236P', '623P', '214K'];
+const SUPER = ['236PP'];
+const AIR_L = ['j.LP', 'j.LK'];
+const AIR_M = ['j.MP', 'j.MK'];
+const AIR_H = ['j.HP', 'j.HK'];
+const edges = (from, to, on) => from.map((f) => ({ from: f, to, on }));
+const CANCELS = [
+    // Ground magic series: L → (other Ls) → M → H → launcher, on hit or block.
+    ...edges(L, [...L, ...M, ...H, ...LAUNCHER], ['hit', 'block']),
+    ...edges(M, [...H, ...LAUNCHER], ['hit', 'block']),
+    ...edges(H, LAUNCHER, ['hit', 'block']),
+    // Any ground normal cancels into specials and super.
+    ...edges([...L, ...M, ...H, ...LAUNCHER], [...SPECIALS, ...SUPER], ['hit', 'block']),
+    // Specials cancel into super.
+    ...edges(SPECIALS, SUPER, ['hit', 'block']),
+    // Air series: L → M → H (finisher ends the combo).
+    ...edges(AIR_L, [...AIR_M, ...AIR_H], ['hit', 'block']),
+    ...edges(AIR_M, AIR_H, ['hit', 'block']),
+];
+const ANALOG = {
+    name: 'Analog',
+    maxHealth: 10000,
+    walkFSpeed: 4.2,
+    walkBSpeed: 3.2,
+    dashFSpeed: 9,
+    dashFTicks: 14,
+    dashBSpeed: 7.5,
+    dashBTicks: 12,
+    jumpVelY: -14,
+    superJumpVelY: -19.5,
+    jumpVelX: 5,
+    gravity: 0.8,
+    doubleJump: true,
+    airDash: true,
+    airDashSpeed: 8.5,
+    airDashTicks: 12,
+    bodyWidth: 52,
+    standHurtbox: STAND,
+    crouchHurtbox: CROUCH,
+    airHurtbox: AIR,
+    throwRange: 72,
+    throwDamage: 1000,
+    throwTossVelX: 9,
+    throwTossVelY: -8,
+    moves: MOVES,
+    cancels: CANCELS,
+};
+
+// ---- core/src/motion.js ----
+/**
+ * Motion input parsing. Each fighter keeps a ring buffer of numpad-notation
+ * directions (facing-relative, 6 = toward opponent) in GameState. On every
+ * attack-button press the parser scans the recent window for 623 / 236 / 214
+ * — lenient, MvC style: the motion matches as a subsequence, diagonals
+ * optional. All integer math over serialized state; fully deterministic.
+ */
+const HIST_LEN = 16; // ring buffer length (> motionWindowTicks)
+/** Current direction as numpad notation, relative to facing (6 = forward). */
+const numpadDir = (input, facing) => {
+    const rawX = (held(input, 2 /* Btn.Right */) ? 1 : 0) - (held(input, 1 /* Btn.Left */) ? 1 : 0);
+    const fx = rawX * facing; // +1 = toward opponent
+    const base = held(input, 4 /* Btn.Up */) ? 8 : held(input, 8 /* Btn.Down */) ? 2 : 5;
+    return base + fx;
+};
+/**
+ * Does the last `window` entries of the ring buffer contain `pattern` as a
+ * subsequence (oldest → newest)? Diagonal-tolerant variants are expressed by
+ * passing alternate accepted dirs per slot (bitmask of numpad dirs 1-9).
+ */
+const matchesPattern = (hist, histIdx, window, pattern) => {
+    let p = 0;
+    for (let k = window - 1; k >= 0 && p < pattern.length; k--) {
+        const dir = hist[(histIdx - k + HIST_LEN * 2) % HIST_LEN];
+        if ((pattern[p] & (1 << dir)) !== 0)
+            p++;
+    }
+    return p === pattern.length;
+};
+const D = (...dirs) => dirs.reduce((m, d) => m | (1 << d), 0);
+// Lenient patterns (each slot is a set of accepted dirs):
+// 623 (DP): forward, down(-ish), down-forward — classic f, d, df.
+const PAT_623 = [D(6), D(2, 1), D(3)];
+// 236 (QCF): down, forward — diagonal optional (2,3,6 or sloppy 2,6).
+const PAT_236 = [D(2), D(3, 6)];
+const PAT_236_STRICT_END = [D(2), D(6)];
+// 214 (QCB): mirrored.
+const PAT_214 = [D(2), D(1, 4)];
+const PAT_214_STRICT_END = [D(2), D(4)];
+/**
+ * Detect the strongest motion ending at the current history position.
+ * Priority: 623 > 236 > 214 (DP wins ambiguous overlaps, as in the genre).
+ * Returns 623 | 236 | 214 | 0.
+ */
+const detectMotion = (hist, histIdx) => {
+    const w = TUNING.motionWindowTicks;
+    if (matchesPattern(hist, histIdx, w, PAT_623))
+        return 623;
+    if (matchesPattern(hist, histIdx, w, PAT_236) || matchesPattern(hist, histIdx, w, PAT_236_STRICT_END))
+        return 236;
+    if (matchesPattern(hist, histIdx, w, PAT_214) || matchesPattern(hist, histIdx, w, PAT_214_STRICT_END))
+        return 214;
+    return 0;
+};
+/** Was a down input seen recently (tap-down → up = super jump)? */
+const downTappedRecently = (hist, histIdx) => {
+    for (let k = 1; k <= TUNING.superJumpDownWindow; k++) {
+        const dir = hist[(histIdx - k + HIST_LEN * 2) % HIST_LEN];
+        if (dir >= 1 && dir <= 3)
+            return true;
+    }
+    return false;
+};
+
+// ---- core/src/state.js ----
+const PROJECTILE_SLOTS = 4;
+/** M1: both players run the Analog bundle. Later: per-match selection. */
+const characters = [
+    loadCharacter(ANALOG),
+    loadCharacter(ANALOG),
+];
+/**
+ * Swap the active character bundles (Studio live preview; later, match
+ * setup). Must be called between matches, never mid-sim — the loaded
+ * character is part of the deterministic contract, so both netplay peers
+ * must install identical bundles (hash-checked at match setup, spec §3.1).
+ */
+const setCharacters = (c0, c1) => {
+    characters[0] = c0;
+    characters[1] = c1;
+};
+const SPAWN_OFFSET = 180;
+const spawnFighter = (x, facing, ch) => ({
+    x: fp(x),
+    y: fp(STAGE.floorYPx),
+    velX: 0,
+    velY: 0,
+    facing,
+    health: ch.b.maxHealth,
+    meter: 0,
+    action: 0 /* Action.Idle */,
+    actionFrame: 0,
+    moveIdx: -1,
+    attackConnected: 0,
+    hitConsumedStep: -1,
+    hitstunLeft: 0,
+    blockstunLeft: 0,
+    knockdownOnLand: 0,
+    jumpsLeft: 0,
+    airdashLeft: 0,
+    superJumped: 0,
+    airLocked: 0,
+    juggleBudget: 0,
+    comboHits: 0,
+    comboScaling: TUNING.scalingStart,
+    bufMotion: 0,
+    bufButtons: 0,
+    bufLeft: 0,
+    tapDir: 0,
+    tapTimer: 0,
+    dashBuf: 0,
+    dashBufLeft: 0,
+    pushblocked: 0,
+    techLeft: 0,
+    throwBack: 0,
+    launchJC: 0,
+    wantThrow: 0,
+    histIdx: 0,
+    prevInput: 0,
+    dirHist: new Array(HIST_LEN).fill(5),
+});
+const emptyProjectile = () => ({
+    active: 0, owner: 0, moveIdx: -1, x: 0, y: 0, velX: 0, life: 0, hasHit: 0,
+});
+const createGameState = (seed) => ({
+    tick: 0,
+    rngSeed: seed | 0,
+    phase: 0 /* Phase.PreRound */,
+    winner: -1,
+    roundWinner: -1,
+    roundsWon0: 0,
+    roundsWon1: 0,
+    roundNum: 0,
+    timerTicks: ROUND_SECONDS * TICKS_PER_SEC,
+    phaseTimer: TUNING.preRoundTicks,
+    hitstopLeft: 0,
+    superFlashLeft: 0,
+    fighters: [
+        spawnFighter(STAGE.widthPx / 2 - SPAWN_OFFSET, 1, characters[0]),
+        spawnFighter(STAGE.widthPx / 2 + SPAWN_OFFSET, -1, characters[1]),
+    ],
+    projectiles: Array.from({ length: PROJECTILE_SLOTS }, emptyProjectile),
+});
+/** Between rounds: reset positions/health/actions; meter and score persist. */
+const resetRound = (s) => {
+    for (const i of [0, 1]) {
+        const keepMeter = s.fighters[i].meter;
+        const fresh = spawnFighter(STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET), i === 0 ? 1 : -1, characters[i]);
+        fresh.meter = keepMeter;
+        s.fighters[i] = fresh;
+    }
+    for (let i = 0; i < PROJECTILE_SLOTS; i++)
+        s.projectiles[i] = emptyProjectile();
+    s.timerTicks = ROUND_SECONDS * TICKS_PER_SEC;
+    s.phase = 0 /* Phase.PreRound */;
+    s.phaseTimer = TUNING.preRoundTicks;
+    s.hitstopLeft = 0;
+    s.superFlashLeft = 0;
+    s.roundNum++;
+};
+/** Cheap deep copy — the whole state is flat numbers. Required for rollback. */
+const snapshot = (s) => ({
+    ...s,
+    fighters: [
+        { ...s.fighters[0], dirHist: s.fighters[0].dirHist.slice() },
+        { ...s.fighters[1], dirHist: s.fighters[1].dirHist.slice() },
+    ],
+    projectiles: s.projectiles.map((p) => ({ ...p })),
+});
+const restore = (dst, snap) => {
+    Object.assign(dst, snap, { fighters: dst.fighters, projectiles: dst.projectiles });
+    for (const i of [0, 1]) {
+        const keepHist = dst.fighters[i].dirHist;
+        Object.assign(dst.fighters[i], snap.fighters[i], { dirHist: keepHist });
+        for (let k = 0; k < HIST_LEN; k++)
+            keepHist[k] = snap.fighters[i].dirHist[k];
+    }
+    for (let i = 0; i < PROJECTILE_SLOTS; i++) {
+        Object.assign(dst.projectiles[i], snap.projectiles[i]);
+    }
+};
+const FIGHTER_FIELDS = [
+    'x', 'y', 'velX', 'velY', 'facing', 'health', 'meter',
+    'action', 'actionFrame', 'moveIdx', 'attackConnected', 'hitConsumedStep',
+    'hitstunLeft', 'blockstunLeft', 'knockdownOnLand',
+    'jumpsLeft', 'airdashLeft', 'superJumped', 'airLocked',
+    'juggleBudget', 'comboHits', 'comboScaling',
+    'bufMotion', 'bufButtons', 'bufLeft',
+    'tapDir', 'tapTimer', 'dashBuf', 'dashBufLeft',
+    'pushblocked', 'techLeft', 'throwBack', 'launchJC', 'wantThrow',
+    'histIdx', 'prevInput',
+];
+const PROJECTILE_FIELDS = [
+    'active', 'owner', 'moveIdx', 'x', 'y', 'velX', 'life', 'hasHit',
+];
+const GLOBAL_FIELDS = [
+    'tick', 'rngSeed', 'phase', 'winner', 'roundWinner',
+    'roundsWon0', 'roundsWon1', 'roundNum',
+    'timerTicks', 'phaseTimer', 'hitstopLeft', 'superFlashLeft',
+];
+/** Deterministic flat serialization — field order is part of the protocol. */
+const serialize = (s) => {
+    const size = GLOBAL_FIELDS.length
+        + (FIGHTER_FIELDS.length + HIST_LEN) * 2
+        + PROJECTILE_FIELDS.length * PROJECTILE_SLOTS;
+    const out = new Int32Array(size);
+    let i = 0;
+    for (const k of GLOBAL_FIELDS)
+        out[i++] = s[k];
+    for (const f of s.fighters) {
+        for (const k of FIGHTER_FIELDS)
+            out[i++] = f[k];
+        for (let h = 0; h < HIST_LEN; h++)
+            out[i++] = f.dirHist[h];
+    }
+    for (const p of s.projectiles) {
+        for (const k of PROJECTILE_FIELDS)
+            out[i++] = p[k];
+    }
+    return out;
+};
+/** FNV-1a over the serialized state. Used for desync detection + CI replay tests. */
+const stateHash = (s) => {
+    const data = serialize(s);
+    let h = 0x811c9dc5;
+    for (let i = 0; i < data.length; i++) {
+        const v = data[i];
+        h ^= v & 0xff;
+        h = Math.imul(h, 0x01000193);
+        h ^= (v >>> 8) & 0xff;
+        h = Math.imul(h, 0x01000193);
+        h ^= (v >>> 16) & 0xff;
+        h = Math.imul(h, 0x01000193);
+        h ^= (v >>> 24) & 0xff;
+        h = Math.imul(h, 0x01000193);
+    }
+    return h >>> 0;
+};
+
+// ---- core/src/sim.js ----
+const FLOOR = fp(STAGE.floorYPx);
+const WALL_L = fp(STAGE.wallPad);
+const WALL_R = fp(STAGE.widthPx - STAGE.wallPad);
+const FRICTION = fp(TUNING.friction);
+const CORNER = fp(TUNING.cornerThresholdPx);
+/** Mirror a character-space rect into world space based on facing. */
+const worldRect = (x, y, facing, rc) => {
+    const rx = fp(rc.x);
+    const rw = fp(rc.w);
+    const l = facing === 1 ? x + rx : x - rx - rw;
+    return { l, t: y + fp(rc.y), r: l + rw, b: y + fp(rc.y) + fp(rc.h) };
+};
+const overlaps = (a, b) => a.l < b.r && b.l < a.r && a.t < b.b && b.t < a.b;
+const grounded = (f) => f.y >= FLOOR;
+const setAction = (f, a) => {
+    f.action = a;
+    f.actionFrame = 0;
+};
+// ---------------------------------------------------------------------------
+// Move-step resolution
+// ---------------------------------------------------------------------------
+const currentMove = (f, ch) => f.action === 9 /* Action.Attack */ && f.moveIdx >= 0 ? ch.b.moves[f.moveIdx] : null;
+/** Step index for a frame counter within a move; -1 past the end. */
+const stepIndexAt = (move, frame) => {
+    let acc = 0;
+    for (let i = 0; i < move.steps.length; i++) {
+        acc += move.steps[i].frames;
+        if (frame < acc)
+            return i;
+    }
+    return -1;
+};
+const hurtboxesOf = (f, ch) => {
+    switch (f.action) {
+        case 19 /* Action.KO */:
+        case 15 /* Action.Knockdown */:
+        case 16 /* Action.Getup */:
+        case 18 /* Action.Thrown */:
+            return []; // invulnerable
+        case 9 /* Action.Attack */: {
+            const move = currentMove(f, ch);
+            const si = stepIndexAt(move, f.actionFrame);
+            return si >= 0 ? move.steps[si].hurtboxes : [ch.b.standHurtbox];
+        }
+        case 3 /* Action.Crouch */:
+        case 13 /* Action.BlockCrouch */:
+            return [ch.b.crouchHurtbox];
+        case 5 /* Action.Air */:
+        case 8 /* Action.AirDash */:
+        case 11 /* Action.AirHitstun */:
+        case 14 /* Action.BlockAir */:
+            return [ch.b.airHurtbox];
+        default:
+            return [ch.b.standHurtbox];
+    }
+};
+const gatherInputs = (f, input) => {
+    const prev = f.prevInput;
+    const upEdge = held(input, 4 /* Btn.Up */) && !held(prev, 4 /* Btn.Up */);
+    // Direction history (numpad, facing-relative).
+    f.histIdx = (f.histIdx + 1) % 16;
+    f.dirHist[f.histIdx] = numpadDir(input, f.facing);
+    // Attack-button buffer with motion detected at press time.
+    const edges = pressedAttacks(input, prev);
+    if (edges !== 0) {
+        f.bufButtons = f.bufLeft > 0 ? f.bufButtons | edges : edges;
+        f.bufMotion = detectMotion(f.dirHist, f.histIdx);
+        f.bufLeft = TUNING.inputBufferTicks;
+    }
+    // Dash double-tap: two taps of the same pure horizontal within the window.
+    const tapL = held(input, 1 /* Btn.Left */) && !held(prev, 1 /* Btn.Left */);
+    const tapR = held(input, 2 /* Btn.Right */) && !held(prev, 2 /* Btn.Right */);
+    if (tapL || tapR) {
+        const dir = tapR ? 1 : -1;
+        if (f.tapDir === dir && f.tapTimer > 0) {
+            f.dashBuf = dir;
+            f.dashBufLeft = 4;
+            f.tapDir = 0;
+            f.tapTimer = 0;
+        }
+        else {
+            f.tapDir = dir;
+            f.tapTimer = TUNING.doubleTapWindowTicks;
+        }
+    }
+    if (f.tapTimer > 0)
+        f.tapTimer--;
+    if (f.dashBufLeft > 0 && --f.dashBufLeft === 0)
+        f.dashBuf = 0;
+    f.prevInput = input;
+    return { input, edges, upEdge };
+};
+// ---------------------------------------------------------------------------
+// Attack startup — buffer consumption, move selection, cancels
+// ---------------------------------------------------------------------------
+const startMove = (s, f, ch, idx) => {
+    const move = ch.b.moves[idx];
+    f.moveIdx = idx;
+    f.attackConnected = 0;
+    f.hitConsumedStep = -1;
+    setAction(f, 9 /* Action.Attack */);
+    if (move.stance !== 'air')
+        f.velX = 0;
+    const s0 = move.steps[0];
+    if (s0.velX !== undefined)
+        f.velX = f.facing * fp(s0.velX);
+    if (s0.velY !== undefined)
+        f.velY = fp(s0.velY);
+    f.meter = clamp(f.meter + move.meterGainWhiff - (move.meterCost ?? 0), 0, TUNING.meterMax);
+    if (move.type === 'super')
+        s.superFlashLeft = TUNING.superFlashTicks;
+    f.bufButtons = 0;
+    f.bufMotion = 0;
+    f.bufLeft = 0;
+    f.launchJC = 0;
+};
+/**
+ * Try to start a buffered attack. `cancelFromIdx >= 0` restricts targets to
+ * the cancel graph of that move given how it connected (1 hit / 2 block).
+ */
+const tryStartAttack = (s, f, ch, io, cancelFromIdx, connected) => {
+    if (f.bufLeft <= 0 || f.bufButtons === 0)
+        return false;
+    const isAir = !grounded(f);
+    const stance = isAir ? 2 : held(io.input, 8 /* Btn.Down */) ? 1 : 0;
+    const n = ch.b.moves.length;
+    const canCancel = (to) => {
+        if (cancelFromIdx < 0)
+            return true;
+        const m = connected === 2 ? ch.cancelBlock : ch.cancelHit;
+        return m[cancelFromIdx * n + to] === 1;
+    };
+    // 1. Super: 236 + two punches, ground only, needs a bar.
+    if (ch.superIdx >= 0) {
+        const sup = ch.b.moves[ch.superIdx];
+        if (!isAir && f.bufMotion === sup.motion
+            && countBits(f.bufButtons & PUNCH_MASK) >= 2
+            && f.meter >= (sup.meterCost ?? 0)
+            && canCancel(ch.superIdx)) {
+            startMove(s, f, ch, ch.superIdx);
+            return true;
+        }
+    }
+    // 2. Specials, in data order.
+    if (f.bufMotion !== 0) {
+        for (const sp of ch.specials) {
+            const move = ch.b.moves[sp.idx];
+            const stanceOk = move.stance === 'air' ? isAir : !isAir;
+            const mask = sp.kind === 'P' ? PUNCH_MASK : KICK_MASK;
+            if (sp.motion === f.bufMotion && stanceOk && (f.bufButtons & mask) !== 0 && canCancel(sp.idx)) {
+                startMove(s, f, ch, sp.idx);
+                return true;
+            }
+        }
+    }
+    // 3. Normals by button priority for the current stance.
+    for (const name of BUTTON_PRIORITY) {
+        const bit = BUTTON_BITS[name];
+        if ((f.bufButtons & bit) === 0)
+            continue;
+        let pos = 0;
+        let b = bit;
+        while ((b >>= 1) !== 0)
+            pos++;
+        const idx = ch.normals[stance][pos];
+        if (idx >= 0 && canCancel(idx)) {
+            startMove(s, f, ch, idx);
+            return true;
+        }
+    }
+    return false;
+};
+const startJump = (f, superJump) => {
+    setAction(f, 4 /* Action.JumpSquat */);
+    f.superJumped = superJump ? 1 : 0;
+    f.velX = 0;
+};
+// ---------------------------------------------------------------------------
+// Per-fighter update
+// ---------------------------------------------------------------------------
+const updateFighter = (s, f, other, ch, io) => {
+    // The input buffer expires in sim time (not during hitstop/super flash),
+    // so inputs buffered through a freeze still come out afterward.
+    if (f.bufLeft > 0 && --f.bufLeft === 0) {
+        f.bufButtons = 0;
+        f.bufMotion = 0;
+    }
+    switch (f.action) {
+        case 19 /* Action.KO */:
+            break; // physics only
+        case 15 /* Action.Knockdown */:
+            f.actionFrame++;
+            if (f.actionFrame >= TUNING.knockdownTicks)
+                setAction(f, 16 /* Action.Getup */);
+            break;
+        case 16 /* Action.Getup */:
+            f.actionFrame++;
+            if (f.actionFrame >= TUNING.getupTicks)
+                setAction(f, 0 /* Action.Idle */);
+            break;
+        case 18 /* Action.Thrown */:
+            // Held by the opponent. Tech input: HP press inside the window.
+            if (f.techLeft > 0) {
+                f.techLeft--;
+                if ((io.edges & 64 /* Btn.HP */) !== 0)
+                    f.techLeft = -1; // teched — resolved by grab owner
+            }
+            break;
+        case 17 /* Action.Grab */:
+            f.actionFrame++; // outcome resolved in resolveGrabs (needs both fighters)
+            break;
+        case 10 /* Action.Hitstun */:
+            f.hitstunLeft--;
+            if (f.hitstunLeft <= 0)
+                setAction(f, 0 /* Action.Idle */);
+            break;
+        case 11 /* Action.AirHitstun */:
+            if (f.hitstunLeft > 0)
+                f.hitstunLeft--;
+            if (f.hitstunLeft <= 0 && !f.knockdownOnLand) {
+                // Air recover: fell out of the combo, can act again.
+                setAction(f, 5 /* Action.Air */);
+                f.airLocked = 0;
+            }
+            break;
+        case 12 /* Action.BlockStand */:
+        case 13 /* Action.BlockCrouch */:
+        case 14 /* Action.BlockAir */: {
+            f.blockstunLeft--;
+            // Pushblock (advancing guard): two punches during blockstun, once per
+            // string. Reads the input buffer so presses during hitstop still count.
+            const pbButtons = io.edges | (f.bufLeft > 0 ? f.bufButtons : 0);
+            if (!f.pushblocked && countBits(pbButtons & PUNCH_MASK) >= 2) {
+                f.bufButtons = 0;
+                f.bufMotion = 0;
+                f.bufLeft = 0;
+                f.pushblocked = 1;
+                f.velX = -f.facing * fp(TUNING.pushblockSelfVel);
+                // Cornered blockers can't slide back — shove the attacker out instead.
+                const atWall = f.x <= WALL_L + CORNER || f.x >= WALL_R - CORNER;
+                if (atWall && grounded(other)) {
+                    other.velX = (other.x >= f.x ? 1 : -1) * fp(TUNING.pushblockAttackerVel);
+                }
+            }
+            if (f.blockstunLeft <= 0) {
+                setAction(f, f.action === 13 /* Action.BlockCrouch */ ? 3 /* Action.Crouch */
+                    : f.action === 14 /* Action.BlockAir */ ? 5 /* Action.Air */ : 0 /* Action.Idle */);
+            }
+            break;
+        }
+        case 4 /* Action.JumpSquat */:
+            f.actionFrame++;
+            if (f.actionFrame >= TUNING.jumpSquatTicks) {
+                setAction(f, 5 /* Action.Air */);
+                f.velY = fp(f.superJumped ? ch.b.superJumpVelY : ch.b.jumpVelY);
+                const dir = (held(io.input, 2 /* Btn.Right */) ? 1 : 0) - (held(io.input, 1 /* Btn.Left */) ? 1 : 0);
+                f.velX = dir * fp(ch.b.jumpVelX);
+                f.jumpsLeft = ch.b.doubleJump ? 1 : 0;
+                f.airdashLeft = ch.b.airDash ? 1 : 0;
+            }
+            break;
+        case 6 /* Action.DashF */:
+            f.actionFrame++;
+            f.velX = f.facing * fp(ch.b.dashFSpeed);
+            if (tryStartAttack(s, f, ch, io, -1, 0))
+                break; // dashes cancel into attacks
+            if (f.actionFrame >= ch.b.dashFTicks) {
+                f.velX = 0;
+                setAction(f, 0 /* Action.Idle */);
+            }
+            break;
+        case 7 /* Action.DashB */:
+            f.actionFrame++;
+            f.velX = -f.facing * fp(ch.b.dashBSpeed);
+            if (f.actionFrame >= ch.b.dashBTicks) {
+                f.velX = 0;
+                setAction(f, 0 /* Action.Idle */);
+            }
+            break;
+        case 8 /* Action.AirDash */:
+            f.actionFrame++;
+            if (tryStartAttack(s, f, ch, io, -1, 0))
+                break;
+            if (f.actionFrame >= ch.b.airDashTicks)
+                setAction(f, 5 /* Action.Air */);
+            break;
+        case 9 /* Action.Attack */: {
+            const move = currentMove(f, ch);
+            const prevStep = stepIndexAt(move, f.actionFrame);
+            f.actionFrame++;
+            if (f.launchJC > 0)
+                f.launchJC--;
+            const total = ch.totalFrames[f.moveIdx];
+            if (f.actionFrame >= total) {
+                // Move over. Airborne specials fall locked until landing.
+                f.moveIdx = -1;
+                if (grounded(f)) {
+                    f.velX = 0;
+                    setAction(f, 0 /* Action.Idle */);
+                }
+                else {
+                    setAction(f, 5 /* Action.Air */);
+                    if (move.type !== 'normal')
+                        f.airLocked = 1;
+                }
+                break;
+            }
+            // Step-boundary velocity impulses.
+            const si = stepIndexAt(move, f.actionFrame);
+            if (si !== prevStep && si >= 0) {
+                const st = move.steps[si];
+                if (st.velX !== undefined)
+                    f.velX = f.facing * fp(st.velX);
+                if (st.velY !== undefined)
+                    f.velY = fp(st.velY);
+            }
+            // Air moves cancel on landing.
+            if (move.stance === 'air' && grounded(f) && f.velY >= 0) {
+                f.moveIdx = -1;
+                f.velX = 0;
+                setAction(f, 0 /* Action.Idle */);
+                break;
+            }
+            // Launcher jump-cancel: super jump after the launcher connects.
+            if (f.attackConnected === 1 && f.launchJC > 0 && grounded(f) && held(io.input, 4 /* Btn.Up */)) {
+                f.moveIdx = -1;
+                startJump(f, true);
+                break;
+            }
+            // Chain / special / super cancels once the move has connected.
+            if (f.attackConnected !== 0) {
+                tryStartAttack(s, f, ch, io, f.moveIdx, f.attackConnected);
+            }
+            break;
+        }
+        case 5 /* Action.Air */: {
+            if (f.airLocked)
+                break;
+            if (tryStartAttack(s, f, ch, io, -1, 0))
+                break;
+            if (io.upEdge && f.jumpsLeft > 0) {
+                f.jumpsLeft--;
+                f.velY = fp(ch.b.jumpVelY);
+                const dir = (held(io.input, 2 /* Btn.Right */) ? 1 : 0) - (held(io.input, 1 /* Btn.Left */) ? 1 : 0);
+                f.velX = dir * fp(ch.b.jumpVelX);
+                break;
+            }
+            if (f.dashBuf !== 0 && f.airdashLeft > 0) {
+                f.airdashLeft--;
+                f.velX = f.dashBuf * fp(ch.b.airDashSpeed);
+                f.velY = 0;
+                f.dashBuf = 0;
+                setAction(f, 8 /* Action.AirDash */);
+            }
+            break;
+        }
+        case 0 /* Action.Idle */:
+        case 1 /* Action.WalkF */:
+        case 2 /* Action.WalkB */:
+        case 3 /* Action.Crouch */: {
+            // Throw intent: close + 4/6 + fresh HP. Resolved after both update.
+            const holdF = held(io.input, f.facing === 1 ? 2 /* Btn.Right */ : 1 /* Btn.Left */);
+            const holdB = held(io.input, f.facing === 1 ? 1 /* Btn.Left */ : 2 /* Btn.Right */);
+            if ((io.edges & 64 /* Btn.HP */) !== 0 && (holdF || holdB) && grounded(f) && !held(io.input, 8 /* Btn.Down */)) {
+                const dx = other.x - f.x;
+                const dist = dx < 0 ? -dx : dx;
+                const throwable = grounded(other) && (other.action === 0 /* Action.Idle */ || other.action === 1 /* Action.WalkF */
+                    || other.action === 2 /* Action.WalkB */ || other.action === 3 /* Action.Crouch */
+                    || other.action === 9 /* Action.Attack */ || other.action === 6 /* Action.DashF */
+                    || other.action === 7 /* Action.DashB */);
+                if (dist <= fp(ch.b.throwRange) && throwable) {
+                    f.wantThrow = holdB ? 2 : 1;
+                    f.bufButtons &= ~64 /* Btn.HP */; // the press is spent on the throw
+                    break;
+                }
+            }
+            if (tryStartAttack(s, f, ch, io, -1, 0))
+                break;
+            if (f.dashBuf !== 0 && grounded(f)) {
+                const fwd = f.dashBuf === f.facing;
+                f.dashBuf = 0;
+                setAction(f, fwd ? 6 /* Action.DashF */ : 7 /* Action.DashB */);
+                break;
+            }
+            if (held(io.input, 4 /* Btn.Up */) && grounded(f)) {
+                startJump(f, downTappedRecently(f.dirHist, f.histIdx));
+                break;
+            }
+            if (held(io.input, 8 /* Btn.Down */)) {
+                f.velX = 0;
+                if (f.action !== 3 /* Action.Crouch */)
+                    setAction(f, 3 /* Action.Crouch */);
+                else
+                    f.actionFrame++;
+                break;
+            }
+            const dir = (held(io.input, 2 /* Btn.Right */) ? 1 : 0) - (held(io.input, 1 /* Btn.Left */) ? 1 : 0);
+            const fwd = dir === f.facing;
+            f.velX = dir === 0 ? 0 : dir * fp(fwd ? ch.b.walkFSpeed : ch.b.walkBSpeed);
+            const next = dir === 0 ? 0 /* Action.Idle */ : fwd ? 1 /* Action.WalkF */ : 2 /* Action.WalkB */;
+            if (f.action !== next)
+                setAction(f, next);
+            else
+                f.actionFrame++;
+            break;
+        }
+    }
+    // ------------------------------------------------------------- physics
+    const skipPhysics = f.action === 18 /* Action.Thrown */ || f.action === 17 /* Action.Grab */
+        || f.action === 8 /* Action.AirDash */ || f.action === 4 /* Action.JumpSquat */;
+    if (!skipPhysics) {
+        if (!grounded(f) || f.velY < 0)
+            f.velY += fp(ch.b.gravity);
+        f.x += f.velX;
+        f.y += f.velY;
+        if (f.y >= FLOOR && f.velY >= 0) {
+            const wasAirborne = f.y - f.velY < FLOOR || f.velY > 0;
+            f.y = FLOOR;
+            f.velY = 0;
+            if (wasAirborne)
+                landFighter(f);
+        }
+    }
+    else if (f.action === 8 /* Action.AirDash */) {
+        f.x += f.velX; // air dash: horizontal only, gravity suspended
+    }
+    f.x = clamp(f.x, WALL_L, WALL_R);
+    // Ground slide friction for passive states.
+    if (grounded(f) && (f.action === 10 /* Action.Hitstun */ || f.action === 19 /* Action.KO */
+        || f.action === 15 /* Action.Knockdown */ || f.action === 16 /* Action.Getup */
+        || f.action === 12 /* Action.BlockStand */ || f.action === 13 /* Action.BlockCrouch */)) {
+        if (f.velX > 0)
+            f.velX = Math.max(0, f.velX - FRICTION);
+        else if (f.velX < 0)
+            f.velX = Math.min(0, f.velX + FRICTION);
+    }
+};
+/** Landing transitions (called once when feet touch the floor). */
+const landFighter = (f) => {
+    switch (f.action) {
+        case 5 /* Action.Air */:
+        case 14 /* Action.BlockAir */:
+            f.velX = 0;
+            f.superJumped = 0;
+            f.airLocked = 0;
+            setAction(f, 0 /* Action.Idle */);
+            break;
+        case 11 /* Action.AirHitstun */:
+            f.velX = 0;
+            f.superJumped = 0;
+            f.airLocked = 0;
+            f.hitstunLeft = 0;
+            f.knockdownOnLand = 0;
+            setAction(f, 15 /* Action.Knockdown */);
+            break;
+        case 19 /* Action.KO */:
+            f.velY = 0;
+            break;
+        default:
+            break; // Attack landing handled in the attack branch
+    }
+};
+// ---------------------------------------------------------------------------
+// Strike resolution (melee + projectiles share this)
+// ---------------------------------------------------------------------------
+const canBlock = (vic, threatX, guard) => {
+    if (guard === 'unblockable')
+        return false;
+    const a = vic.action;
+    const blockableState = a === 0 /* Action.Idle */ || a === 2 /* Action.WalkB */ || a === 3 /* Action.Crouch */
+        || a === 12 /* Action.BlockStand */ || a === 13 /* Action.BlockCrouch */ || a === 14 /* Action.BlockAir */
+        || (a === 5 /* Action.Air */ && !vic.airLocked);
+    if (!blockableState)
+        return false;
+    const backBtn = threatX >= vic.x ? 1 /* Btn.Left */ : 2 /* Btn.Right */;
+    if (!held(vic.prevInput, backBtn))
+        return false;
+    if (!grounded(vic))
+        return guard !== 'low'; // air block: everything but lows
+    const crouching = held(vic.prevInput, 8 /* Btn.Down */);
+    if (guard === 'low')
+        return crouching;
+    if (guard === 'overhead')
+        return !crouching;
+    return true;
+};
+/** Apply one hit/block. Returns 0 none, 1 hit, 2 block. */
+const strike = (s, src, vic, hb) => {
+    if (vic.action === 19 /* Action.KO */ || vic.action === 15 /* Action.Knockdown */
+        || vic.action === 16 /* Action.Getup */ || vic.action === 18 /* Action.Thrown */)
+        return 0;
+    const vicAir = !grounded(vic);
+    const inCombo = vic.action === 10 /* Action.Hitstun */ || vic.action === 11 /* Action.AirHitstun */;
+    // Juggle points: an exhausted budget means air hits whiff (bounds infinites).
+    if (vicAir && inCombo && hb.juggleCost > vic.juggleBudget)
+        return 0;
+    const dir = src.facing;
+    if (canBlock(vic, src.x, hb.guard)) {
+        vic.health = Math.max(0, vic.health - hb.chip);
+        vic.blockstunLeft = hb.blockstun;
+        vic.velX = dir * fp(hb.pushbackBlock);
+        vic.pushblocked = 0;
+        setAction(vic, vicAir ? 14 /* Action.BlockAir */
+            : held(vic.prevInput, 8 /* Btn.Down */) ? 13 /* Action.BlockCrouch */ : 12 /* Action.BlockStand */);
+        cornerTransfer(vic, src, hb.pushbackBlock, dir);
+        s.hitstopLeft = Math.max(s.hitstopLeft, hb.hitstopFrames);
+        if (src.attacker) {
+            src.attacker.meter = clamp(src.attacker.meter + (src.move.meterGainHit >> 1), 0, TUNING.meterMax);
+        }
+        vic.meter = clamp(vic.meter + TUNING.blockMeterGain, 0, TUNING.meterMax);
+        if (vic.health <= 0)
+            koFighter(vic, dir); // chip can KO
+        return 2;
+    }
+    // --- clean hit
+    if (!inCombo) {
+        vic.comboHits = 0;
+        vic.comboScaling = TUNING.scalingStart;
+        vic.juggleBudget = TUNING.juggleBudget;
+    }
+    vic.comboHits++;
+    const dmg = Math.max(Math.trunc((hb.damage * Math.max(vic.comboScaling, TUNING.scalingFloor)) / 1000), 1);
+    vic.comboScaling = Math.max(Math.trunc((vic.comboScaling * TUNING.scalingMult) / 1000), TUNING.scalingFloor);
+    if (vicAir)
+        vic.juggleBudget -= hb.juggleCost;
+    vic.health = Math.max(0, vic.health - dmg);
+    const stun = Math.max(hb.hitstun - (vic.comboHits >> TUNING.hitstunDecayShift), TUNING.minHitstun);
+    vic.moveIdx = -1;
+    if (hb.launcher) {
+        vic.velY = fp(hb.launchVelY ?? -16);
+        vic.velX = dir * fp(hb.pushbackHit);
+        vic.hitstunLeft = Math.max(stun, 60);
+        vic.knockdownOnLand = 1;
+        setAction(vic, 11 /* Action.AirHitstun */);
+    }
+    else if (vicAir) {
+        vic.velY = fp(hb.airPopVelY ?? -7);
+        vic.velX = dir * fp(hb.pushbackHit);
+        vic.hitstunLeft = stun;
+        if (hb.knockdown)
+            vic.knockdownOnLand = 1;
+        setAction(vic, 11 /* Action.AirHitstun */);
+    }
+    else if (hb.knockdown) {
+        vic.velY = fp(-6);
+        vic.velX = dir * fp(hb.pushbackHit);
+        vic.hitstunLeft = stun;
+        vic.knockdownOnLand = 1;
+        setAction(vic, 11 /* Action.AirHitstun */);
+    }
+    else {
+        vic.velX = dir * fp(hb.pushbackHit);
+        vic.hitstunLeft = stun;
+        setAction(vic, 10 /* Action.Hitstun */);
+    }
+    cornerTransfer(vic, src, hb.pushbackHit, dir);
+    s.hitstopLeft = Math.max(s.hitstopLeft, hb.hitstopFrames);
+    if (src.attacker) {
+        src.attacker.meter = clamp(src.attacker.meter + src.move.meterGainHit, 0, TUNING.meterMax);
+        if (hb.launcher)
+            src.attacker.launchJC = 24;
+    }
+    vic.meter = clamp(vic.meter + Math.trunc(dmg / TUNING.victimMeterDivisor), 0, TUNING.meterMax);
+    if (vic.health <= 0)
+        koFighter(vic, dir);
+    return 1;
+};
+/** Cornered victims transfer pushback to a grounded melee attacker. */
+const cornerTransfer = (vic, src, push, dir) => {
+    const atWall = (dir < 0 && vic.x <= WALL_L + CORNER) || (dir > 0 && vic.x >= WALL_R - CORNER);
+    if (atWall && src.attacker && grounded(src.attacker)) {
+        src.attacker.velX = -dir * fp(push);
+    }
+};
+const koFighter = (f, dir) => {
+    f.velY = fp(-8);
+    f.velX = dir * fp(4);
+    setAction(f, 19 /* Action.KO */);
+};
+// ---------------------------------------------------------------------------
+// Projectiles
+// ---------------------------------------------------------------------------
+const spawnProjectile = (s, owner, f, moveIdx) => {
+    const move = characters[owner].b.moves[moveIdx];
+    const pd = move.projectile;
+    // One live projectile per player (classic fireball rule).
+    for (const p of s.projectiles)
+        if (p.active && p.owner === owner)
+            return;
+    for (const p of s.projectiles) {
+        if (!p.active) {
+            p.active = 1;
+            p.owner = owner;
+            p.moveIdx = moveIdx;
+            p.x = f.x + f.facing * fp(pd.spawnX);
+            p.y = f.y + fp(pd.spawnY);
+            p.velX = f.facing * fp(pd.velX);
+            p.life = pd.lifetime;
+            p.hasHit = 0;
+            return;
+        }
+    }
+};
+const projectileRect = (p) => {
+    const pd = characters[p.owner].b.moves[p.moveIdx].projectile;
+    const facing = p.velX >= 0 ? 1 : -1;
+    return worldRect(p.x, p.y, facing, pd.rect);
+};
+const updateProjectiles = (s) => {
+    for (const p of s.projectiles) {
+        if (!p.active)
+            continue;
+        p.x += p.velX;
+        if (--p.life <= 0 || p.x < WALL_L - fp(60) || p.x > WALL_R + fp(60))
+            p.active = 0;
+    }
+    // Opposing projectiles neutralize each other.
+    for (let i = 0; i < PROJECTILE_SLOTS; i++) {
+        const a = s.projectiles[i];
+        if (!a.active)
+            continue;
+        for (let j = i + 1; j < PROJECTILE_SLOTS; j++) {
+            const b = s.projectiles[j];
+            if (!b.active || a.owner === b.owner)
+                continue;
+            if (overlaps(projectileRect(a), projectileRect(b))) {
+                a.active = 0;
+                b.active = 0;
+            }
+        }
+    }
+};
+// ---------------------------------------------------------------------------
+// Throws
+// ---------------------------------------------------------------------------
+const resolveThrows = (s) => {
+    const [f0, f1] = s.fighters;
+    const w0 = f0.wantThrow;
+    const w1 = f1.wantThrow;
+    f0.wantThrow = 0;
+    f1.wantThrow = 0;
+    if (w0 && w1) {
+        // Simultaneous throws: instant tech, push apart.
+        f0.velX = -f0.facing * fp(6);
+        f1.velX = -f1.facing * fp(6);
+        setAction(f0, 0 /* Action.Idle */);
+        setAction(f1, 0 /* Action.Idle */);
+        return;
+    }
+    const att = w0 ? f0 : w1 ? f1 : null;
+    if (!att)
+        return;
+    const vic = att === f0 ? f1 : f0;
+    att.throwBack = (w0 || w1) === 2 ? 1 : 0;
+    att.velX = 0;
+    setAction(att, 17 /* Action.Grab */);
+    vic.velX = 0;
+    vic.velY = 0;
+    vic.moveIdx = -1;
+    vic.techLeft = TUNING.throwTechWindow;
+    setAction(vic, 18 /* Action.Thrown */);
+};
+const resolveGrabs = (s) => {
+    for (const i of [0, 1]) {
+        const att = s.fighters[i];
+        if (att.action !== 17 /* Action.Grab */)
+            continue;
+        const vic = s.fighters[1 - i];
+        const ch = characters[i];
+        if (vic.techLeft === -1) {
+            // Teched: break apart, no damage.
+            vic.techLeft = 0;
+            att.velX = -att.facing * fp(7);
+            vic.velX = -vic.facing * fp(7);
+            setAction(att, 0 /* Action.Idle */);
+            setAction(vic, 0 /* Action.Idle */);
+            continue;
+        }
+        if (att.actionFrame >= TUNING.grabTicks) {
+            // Throw connects: damage + untechable toss.
+            const dir = att.throwBack ? -att.facing : att.facing;
+            vic.techLeft = 0;
+            vic.comboHits = 1;
+            vic.comboScaling = Math.max(Math.trunc((TUNING.scalingStart * TUNING.scalingMult) / 1000), TUNING.scalingFloor);
+            vic.juggleBudget = TUNING.juggleBudget;
+            vic.health = Math.max(0, vic.health - ch.b.throwDamage);
+            vic.velX = dir * fp(ch.b.throwTossVelX);
+            vic.velY = fp(ch.b.throwTossVelY);
+            vic.hitstunLeft = 60;
+            vic.knockdownOnLand = 1;
+            setAction(vic, vic.health <= 0 ? 19 /* Action.KO */ : 11 /* Action.AirHitstun */);
+            vic.meter = clamp(vic.meter + Math.trunc(ch.b.throwDamage / TUNING.victimMeterDivisor), 0, TUNING.meterMax);
+            setAction(att, 0 /* Action.Idle */);
+        }
+    }
+};
+// ---------------------------------------------------------------------------
+// The tick
+// ---------------------------------------------------------------------------
+/**
+ * Advance the simulation exactly one tick. Mutates `s` in place.
+ * This is the ONLY way state changes. Deterministic by construction.
+ */
+const step = (s, inputs) => {
+    s.tick++;
+    const [f0, f1] = s.fighters;
+    const [c0, c1] = characters;
+    // Inputs are gathered every tick — even frozen ones — so buffered motions
+    // survive hitstop and super flash.
+    const io0 = gatherInputs(f0, inputs[0]);
+    const io1 = gatherInputs(f1, inputs[1]);
+    if (s.phase === 3 /* Phase.MatchOver */)
+        return;
+    if (s.phase === 0 /* Phase.PreRound */) {
+        if (--s.phaseTimer <= 0)
+            s.phase = 1 /* Phase.Fighting */;
+        autoFace(f0, f1);
+        return;
+    }
+    if (s.phase === 2 /* Phase.RoundOver */) {
+        // Bodies settle (KO'd fighters fall) but nobody acts.
+        settlePhysics(f0, c0);
+        settlePhysics(f1, c1);
+        if (--s.phaseTimer <= 0) {
+            if (s.roundsWon0 >= TUNING.roundsToWin || s.roundsWon1 >= TUNING.roundsToWin) {
+                s.phase = 3 /* Phase.MatchOver */;
+                s.winner = s.roundsWon0 >= TUNING.roundsToWin && s.roundsWon1 >= TUNING.roundsToWin ? 2
+                    : s.roundsWon0 >= TUNING.roundsToWin ? 0 : 1;
+            }
+            else {
+                resetRound(s);
+            }
+        }
+        return;
+    }
+    // --- Fighting ---
+    if (s.superFlashLeft > 0) {
+        s.superFlashLeft--;
+        return;
+    }
+    if (s.hitstopLeft > 0) {
+        s.hitstopLeft--;
+        return;
+    }
+    autoFace(f0, f1);
+    updateFighter(s, f0, f1, c0, io0);
+    updateFighter(s, f1, f0, c1, io1);
+    resolveThrows(s);
+    resolveGrabs(s);
+    // Body push: fighters cannot fully overlap.
+    bodyPush(f0, f1, c0, c1);
+    // Projectile spawn (a move entering its first active step) + travel.
+    for (const [i, f, ch] of [[0, f0, c0], [1, f1, c1]]) {
+        const move = currentMove(f, ch);
+        if (move?.projectile) {
+            const si = stepIndexAt(move, f.actionFrame);
+            if (si === ch.firstActiveStep[f.moveIdx] && stepStartFrame(move, si) === f.actionFrame) {
+                spawnProjectile(s, i, f, f.moveIdx);
+            }
+        }
+    }
+    updateProjectiles(s);
+    // Melee hit detection — symmetric, trades allowed. Boxes post-movement.
+    const hitPlan = [];
+    for (const [f, other, ch, otherCh] of [[f0, f1, c0, c1], [f1, f0, c1, c0]]) {
+        const move = currentMove(f, ch);
+        if (!move)
+            continue;
+        const si = stepIndexAt(move, f.actionFrame);
+        if (si < 0 || si <= f.hitConsumedStep)
+            continue;
+        const st = move.steps[si];
+        if (!st.hitboxes)
+            continue;
+        const vicBoxes = hurtboxesOf(other, otherCh);
+        outer: for (const hb of st.hitboxes) {
+            const hbw = worldRect(f.x, f.y, f.facing, hb.rect);
+            for (const vb of vicBoxes) {
+                if (overlaps(hbw, worldRect(other.x, other.y, other.facing, vb))) {
+                    hitPlan.push({ src: { facing: f.facing, x: f.x, attacker: f, move }, vic: other, hb, stepIdx: si });
+                    break outer;
+                }
+            }
+        }
+    }
+    for (const plan of hitPlan) {
+        const result = strike(s, plan.src, plan.vic, plan.hb);
+        if (result !== 0) {
+            plan.src.attacker.hitConsumedStep = plan.stepIdx;
+            plan.src.attacker.attackConnected = result;
+        }
+    }
+    // Projectile hits.
+    for (const p of s.projectiles) {
+        if (!p.active || p.hasHit)
+            continue;
+        const vic = s.fighters[(1 - p.owner)];
+        const vicCh = characters[(1 - p.owner)];
+        const move = characters[p.owner].b.moves[p.moveIdx];
+        const pd = move.projectile;
+        const rectW = projectileRect(p);
+        for (const vb of hurtboxesOf(vic, vicCh)) {
+            if (overlaps(rectW, worldRect(vic.x, vic.y, vic.facing, vb))) {
+                const owner = s.fighters[p.owner];
+                const result = strike(s, { facing: p.velX >= 0 ? 1 : -1, x: p.x, attacker: null, move }, vic, pd.hit);
+                if (result !== 0) {
+                    p.hasHit = 1;
+                    p.active = 0;
+                    owner.meter = clamp(owner.meter + (result === 1 ? move.meterGainHit : move.meterGainHit >> 1), 0, TUNING.meterMax);
+                }
+                break;
+            }
+        }
+    }
+    // Round end: KO or timeout.
+    s.timerTicks--;
+    const dead0 = f0.health <= 0;
+    const dead1 = f1.health <= 0;
+    if (dead0 || dead1) {
+        endRound(s, dead0 && dead1 ? 2 : dead0 ? 1 : 0);
+    }
+    else if (s.timerTicks <= 0) {
+        endRound(s, f0.health === f1.health ? 2 : f0.health > f1.health ? 0 : 1);
+    }
+};
+const stepStartFrame = (move, stepIdx) => {
+    let acc = 0;
+    for (let i = 0; i < stepIdx; i++)
+        acc += move.steps[i].frames;
+    return acc;
+};
+const autoFace = (f0, f1) => {
+    for (const [me, other] of [[f0, f1], [f1, f0]]) {
+        const a = me.action;
+        if ((a === 0 /* Action.Idle */ || a === 1 /* Action.WalkF */ || a === 2 /* Action.WalkB */ || a === 3 /* Action.Crouch */)
+            && grounded(me)) {
+            const newFacing = other.x >= me.x ? 1 : -1;
+            if (newFacing !== me.facing) {
+                me.facing = newFacing;
+                // Walk direction semantics flip with facing; recompute next tick.
+                if (a === 1 /* Action.WalkF */ || a === 2 /* Action.WalkB */)
+                    setAction(me, 0 /* Action.Idle */);
+            }
+        }
+    }
+};
+const bodyPush = (f0, f1, c0, c1) => {
+    const noBody = (f) => f.action === 19 /* Action.KO */ || f.action === 15 /* Action.Knockdown */
+        || f.action === 16 /* Action.Getup */ || f.action === 18 /* Action.Thrown */;
+    if (noBody(f0) || noBody(f1))
+        return;
+    const halfBodies = fp((c0.b.bodyWidth + c1.b.bodyWidth) / 2);
+    const dx = f1.x - f0.x;
+    const absDx = dx < 0 ? -dx : dx;
+    if (absDx < halfBodies && Math.abs(fpToPx(f0.y - f1.y)) < 100) {
+        const pushAmt = Math.trunc((halfBodies - absDx) / 2);
+        const sign = dx === 0 ? f0.facing : dx > 0 ? 1 : -1;
+        f0.x = clamp(f0.x - sign * pushAmt, WALL_L, WALL_R);
+        f1.x = clamp(f1.x + sign * pushAmt, WALL_L, WALL_R);
+    }
+};
+/** RoundOver physics: falling bodies land, sliders stop. */
+const settlePhysics = (f, ch) => {
+    if (!grounded(f) || f.velY < 0)
+        f.velY += fp(ch.b.gravity);
+    f.x += f.velX;
+    f.y += f.velY;
+    if (f.y >= FLOOR && f.velY >= 0) {
+        f.y = FLOOR;
+        f.velY = 0;
+        if (f.action === 11 /* Action.AirHitstun */)
+            setAction(f, 15 /* Action.Knockdown */);
+    }
+    f.x = clamp(f.x, WALL_L, WALL_R);
+    if (grounded(f)) {
+        if (f.velX > 0)
+            f.velX = Math.max(0, f.velX - FRICTION);
+        else if (f.velX < 0)
+            f.velX = Math.min(0, f.velX + FRICTION);
+    }
+};
+const endRound = (s, winner) => {
+    s.roundWinner = winner;
+    if (winner === 0 || winner === 2)
+        s.roundsWon0++;
+    if (winner === 1 || winner === 2)
+        s.roundsWon1++;
+    s.phase = 2 /* Phase.RoundOver */;
+    s.phaseTimer = TUNING.roundOverTicks;
+};
+const debugBoxes = (s) => {
+    const toPx = (r) => ({
+        x: fpToPx(r.l), y: fpToPx(r.t), w: fpToPx(r.r - r.l), h: fpToPx(r.b - r.t),
+    });
+    return s.fighters.map((f, i) => {
+        const ch = characters[i];
+        const hurtboxes = hurtboxesOf(f, ch).map((r) => toPx(worldRect(f.x, f.y, f.facing, r)));
+        const hitboxes = [];
+        const move = currentMove(f, ch);
+        if (move) {
+            const si = stepIndexAt(move, f.actionFrame);
+            if (si >= 0 && si > f.hitConsumedStep) {
+                for (const hb of move.steps[si].hitboxes ?? []) {
+                    hitboxes.push(toPx(worldRect(f.x, f.y, f.facing, hb.rect)));
+                }
+            }
+        }
+        return { hurtboxes, hitboxes };
+    });
+};
+const debugInfo = (s) => s.fighters.map((f, i) => {
+    const ch = characters[i];
+    const move = currentMove(f, ch);
+    const si = move ? stepIndexAt(move, f.actionFrame) : -1;
+    return {
+        action: f.action,
+        moveId: move?.id ?? '',
+        moveFrame: f.actionFrame,
+        phase: move && si >= 0 ? move.steps[si].phase : '',
+        meter: f.meter,
+        comboHitsTaken: f.comboHits,
+        juggleBudget: f.juggleBudget,
+        lastMotion: f.bufMotion,
+    };
+});
+
+// ---- core/src/anim.js ----
+/**
+ * Animation resolution: map ANY fighter state to a sprite frame name from the
+ * character bundle. Attack states use their own move's steps; every other
+ * action maps to a system move (`type: "system"`, ids below — spec §4:
+ * "round intro/KO/win poses are just Moves in the data format").
+ *
+ * Purely cosmetic: the sim never calls this; hurtboxes stay driven by the
+ * engine's stand/crouch/air boxes. Deterministic pure function so client,
+ * studio, and future replay viewers all resolve identical frames.
+ */
+/** Canonical system animation ids. Characters may omit any (renderer falls back). */
+const SYS = {
+    idle: 'sys.idle',
+    walkF: 'sys.walkF',
+    walkB: 'sys.walkB',
+    crouch: 'sys.crouch',
+    jump: 'sys.jump', // 3 steps: rising / apex / falling (picked by velY)
+    dashF: 'sys.dashF',
+    dashB: 'sys.dashB',
+    block: 'sys.block',
+    blockCrouch: 'sys.blockCrouch',
+    blockAir: 'sys.blockAir',
+    hitstun: 'sys.hitstun',
+    airHitstun: 'sys.airHitstun',
+    knockdown: 'sys.knockdown',
+    getup: 'sys.getup',
+    ko: 'sys.ko',
+};
+const stepSpriteAt = (ch, moveIdx, frame) => {
+    const move = ch.b.moves[moveIdx];
+    if (!move)
+        return null;
+    let acc = 0;
+    for (const s of move.steps) {
+        acc += s.frames;
+        if (frame < acc)
+            return s.sprite ?? null;
+    }
+    return move.steps[move.steps.length - 1]?.sprite ?? null;
+};
+/** Looping animation: counter wraps over the move's total frames. */
+const loopSprite = (ch, id, counter) => {
+    const idx = ch.moveIdxById[id];
+    if (idx === undefined)
+        return null;
+    const total = ch.totalFrames[idx];
+    return stepSpriteAt(ch, idx, total > 0 ? counter % total : 0);
+};
+/** One-shot animation: clamps to the last step. */
+const onceSprite = (ch, id, counter) => {
+    const idx = ch.moveIdxById[id];
+    if (idx === undefined)
+        return null;
+    return stepSpriteAt(ch, idx, Math.min(counter, ch.totalFrames[idx] - 1));
+};
+/** Fixed step of a multi-step system move (e.g. jump rise/apex/fall). */
+const stepOf = (ch, id, step) => {
+    const idx = ch.moveIdxById[id];
+    if (idx === undefined)
+        return null;
+    const move = ch.b.moves[idx];
+    const s = move.steps[Math.min(step, move.steps.length - 1)];
+    return s?.sprite ?? null;
+};
+const VEL_EPS = fp(2);
+/**
+ * Resolve the sprite for a fighter's current state, or null (render fallback).
+ * `tick` drives loops for states whose actionFrame does not advance.
+ */
+const spriteForFighter = (f, ch, tick) => {
+    const airFrame = () => f.velY < -VEL_EPS ? stepOf(ch, SYS.jump, 0)
+        : f.velY <= VEL_EPS ? stepOf(ch, SYS.jump, 1)
+            : stepOf(ch, SYS.jump, 2);
+    switch (f.action) {
+        case 9 /* Action.Attack */:
+            return f.moveIdx >= 0 ? stepSpriteAt(ch, f.moveIdx, f.actionFrame) : null;
+        case 0 /* Action.Idle */:
+            return loopSprite(ch, SYS.idle, f.actionFrame);
+        case 1 /* Action.WalkF */:
+            return loopSprite(ch, SYS.walkF, f.actionFrame);
+        case 2 /* Action.WalkB */:
+            return loopSprite(ch, SYS.walkB, f.actionFrame);
+        case 3 /* Action.Crouch */:
+            return loopSprite(ch, SYS.crouch, f.actionFrame);
+        case 4 /* Action.JumpSquat */:
+            return stepOf(ch, SYS.crouch, 0);
+        case 5 /* Action.Air */:
+            return airFrame();
+        case 8 /* Action.AirDash */:
+            return stepOf(ch, SYS.dashF, 0) ?? airFrame();
+        case 6 /* Action.DashF */:
+            return stepOf(ch, SYS.dashF, 0);
+        case 7 /* Action.DashB */:
+            return stepOf(ch, SYS.dashB, 0);
+        case 12 /* Action.BlockStand */:
+            return stepOf(ch, SYS.block, 0);
+        case 13 /* Action.BlockCrouch */:
+            return stepOf(ch, SYS.blockCrouch, 0);
+        case 14 /* Action.BlockAir */:
+            return stepOf(ch, SYS.blockAir, 0);
+        case 10 /* Action.Hitstun */:
+        case 18 /* Action.Thrown */:
+            return stepOf(ch, SYS.hitstun, 0);
+        case 11 /* Action.AirHitstun */:
+            return stepOf(ch, SYS.airHitstun, 0);
+        case 15 /* Action.Knockdown */:
+            return stepOf(ch, SYS.knockdown, 0);
+        case 16 /* Action.Getup */:
+            return onceSprite(ch, SYS.getup, f.actionFrame);
+        case 17 /* Action.Grab */:
+            return stepOf(ch, SYS.idle, 0);
+        case 19 /* Action.KO */:
+            return f.velY !== 0 ? stepOf(ch, SYS.airHitstun, 0)
+                : stepOf(ch, SYS.ko, 0) ?? stepOf(ch, SYS.knockdown, 0);
+        default:
+            return loopSprite(ch, SYS.idle, tick);
+    }
+};
+
+// ---- client/src/atlas.js ----
+/** Tight alpha bounds of an image (computed once at load). */
+const alphaBounds = (img) => {
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth;
+    c.height = img.naturalHeight;
+    const cx = c.getContext('2d', { willReadFrequently: true });
+    if (!cx)
+        return null;
+    cx.drawImage(img, 0, 0);
+    const d = cx.getImageData(0, 0, c.width, c.height).data;
+    let l = c.width, t = c.height, r = -1, b = -1;
+    for (let y = 0; y < c.height; y++) {
+        for (let x = 0; x < c.width; x++) {
+            if (d[(y * c.width + x) * 4 + 3] > 40) {
+                if (x < l)
+                    l = x;
+                if (x > r)
+                    r = x;
+                if (y < t)
+                    t = y;
+                if (y > b)
+                    b = y;
+            }
+        }
+    }
+    return r < 0 ? null : { x: l, y: t, w: r - l + 1, h: b - t + 1 };
+};
+const loadImage = (src) => new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null); // missing art is survivable — we fall back to a rect
+    img.src = src;
+});
+const fetchJson = async (url) => {
+    try {
+        const r = await fetch(url);
+        return r.ok ? (await r.json()) : null;
+    }
+    catch {
+        return null;
+    }
+};
+const listCharacters = async () => (await fetchJson('/api/characters')) ?? [];
+const loadRoster = async (id) => {
+    const bundle = await fetchJson(`/characters/${id}/character.json`);
+    if (!bundle)
+        throw new Error(`character "${id}" not found`);
+    const [atlas, sheet, portrait] = await Promise.all([
+        fetchJson(`/characters/${id}/sprites/atlas.json`),
+        loadImage(`/characters/${id}/sprites/atlas.png`),
+        loadImage(`/characters/${id}/sprites/_reference.png`),
+    ]);
+    return {
+        id, bundle, ch: loadCharacter(bundle), atlas, sheet, portrait,
+        portraitBox: portrait ? alphaBounds(portrait) : null,
+    };
+};
+/**
+ * Draw a fighter at world position (x, y = feet), mirrored by facing.
+ * Falls back to a colored rectangle if the frame is missing, so a
+ * half-authored character is still playable.
+ */
+const drawFighter = (ctx, roster, f, tick, x, y, fallback) => {
+    const name = spriteForFighter(f, roster.ch, tick);
+    const frame = name && roster.atlas ? roster.atlas.frames[name] : undefined;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(f.facing, 1);
+    ctx.imageSmoothingEnabled = false;
+    if (frame && roster.sheet) {
+        ctx.drawImage(roster.sheet, frame.x, frame.y, frame.w, frame.h, -frame.pivotX, -frame.pivotY, frame.w, frame.h);
+    }
+    else {
+        ctx.fillStyle = fallback;
+        ctx.fillRect(-26, -108, 52, 108);
+    }
+    ctx.restore();
+};
+/**
+ * Draw the reference art as a portrait: a square crop centered on the head and
+ * chest of the actual figure (the reference cell is mostly empty space), scaled
+ * to fill the frame.
+ */
+const drawPortrait = (ctx, roster, x, y, w, h) => {
+    const img = roster.portrait;
+    const box = roster.portraitBox;
+    if (!img || !box) {
+        ctx.fillStyle = '#1b1e30';
+        ctx.fillRect(x, y, w, h);
+        return;
+    }
+    // Square crop around the upper body, sized to the figure's width.
+    const side = Math.max(box.w * 1.15, box.h * 0.55);
+    const cropX = box.x + box.w / 2 - side / 2;
+    const cropY = box.y - side * 0.05;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(img, cropX, cropY, side, side, x, y, w, h);
+    ctx.restore();
+};
+
+// ---- client/src/ui.js ----
+/**
+ * Arcade presentation layer: rooftop stage, framed HUD, title / select /
+ * results screens. Pure drawing — zero game logic, zero sim reads beyond the
+ * exported GameState fields. Everything is procedural (no art assets): the
+ * only images in the game are the character sprites.
+ */
+const VW = STAGE.viewportW; // 960
+const VH = STAGE.viewportH; // 540
+// ---------------------------------------------------------------- palette
+const GOLD = '#d9a441';
+const GOLD_LT = '#f7e0a3';
+const GOLD_DK = '#8a5f1e';
+const PANEL = '#14121f';
+const PANEL_LT = '#2a2438';
+const HP_HI = '#7ee85a';
+const HP_LO = '#3fa22c';
+const HP_DANGER = '#e94560';
+const METER_HI = '#6fd3ff';
+const METER_FULL = '#ffd166';
+const P_COLORS = ['#e94560', '#4ea8de'];
+// ---------------------------------------------------------------- helpers
+/** Beveled plate: the workhorse of the arcade frame look. */
+const bevel = (ctx, x, y, w, h, fill, light = GOLD_LT, dark = GOLD_DK, t = 2) => {
+    ctx.fillStyle = fill;
+    ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = light;
+    ctx.fillRect(x, y, w, t); // top
+    ctx.fillRect(x, y, t, h); // left
+    ctx.fillStyle = dark;
+    ctx.fillRect(x, y + h - t, w, t); // bottom
+    ctx.fillRect(x + w - t, y, t, h); // right
+};
+const text = (ctx, s, x, y, size, color, align = 'center', shadow = true) => {
+    ctx.font = `bold ${size}px "Courier New", monospace`;
+    ctx.textAlign = align;
+    if (shadow) {
+        ctx.fillStyle = '#00000099';
+        ctx.fillText(s, x + 2, y + 2);
+    }
+    ctx.fillStyle = color;
+    ctx.fillText(s, x, y);
+};
+// ---------------------------------------------------------------- stage
+/** Rooftop at sunset: parallax skyline, fence, tiled deck. Camera-aware. */
+const drawStage = (ctx, camX, camY) => {
+    const sy = (v) => v + camY;
+    // Sky.
+    const sky = ctx.createLinearGradient(0, 0, 0, sy(STAGE.floorYPx));
+    sky.addColorStop(0, '#2b1b4d');
+    sky.addColorStop(0.45, '#6a2f6b');
+    sky.addColorStop(0.78, '#c05a5a');
+    sky.addColorStop(1, '#f0a35e');
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, VW, sy(STAGE.floorYPx) + 2);
+    // Sun.
+    ctx.fillStyle = '#ffd9a0';
+    ctx.beginPath();
+    ctx.arc(VW * 0.62 - camX * 0.05, sy(330), 46, 0, Math.PI * 2);
+    ctx.fill();
+    // Far skyline (slow parallax).
+    const far = (wx) => wx - camX * 0.25;
+    ctx.fillStyle = '#3a2352';
+    for (let i = 0; i < 26; i++) {
+        const wx = i * 90;
+        const bw = 54 + ((i * 37) % 40);
+        const bh = 90 + ((i * 53) % 120);
+        ctx.fillRect(far(wx), sy(STAGE.floorYPx - bh), bw, bh);
+    }
+    // Near skyline + lit windows.
+    const near = (wx) => wx - camX * 0.5;
+    for (let i = 0; i < 22; i++) {
+        const wx = i * 110 + 30;
+        const bw = 70 + ((i * 29) % 46);
+        const bh = 140 + ((i * 71) % 130);
+        const bx = near(wx);
+        const by = sy(STAGE.floorYPx - bh);
+        ctx.fillStyle = '#241638';
+        ctx.fillRect(bx, by, bw, bh);
+        ctx.fillStyle = '#ffcf7a44';
+        for (let wy = by + 12; wy < by + bh - 10; wy += 22) {
+            for (let wxx = bx + 8; wxx < bx + bw - 10; wxx += 18) {
+                if ((wxx * 7 + wy * 13 + i) % 3 === 0)
+                    ctx.fillRect(wxx, wy, 7, 10);
+            }
+        }
+    }
+    // Chain-link fence along the roof edge (world-locked).
+    const fenceTop = sy(STAGE.floorYPx - 120);
+    const fenceBot = sy(STAGE.floorYPx);
+    ctx.strokeStyle = '#2a2438aa';
+    ctx.lineWidth = 1;
+    for (let wx = 0; wx < STAGE.widthPx; wx += 14) {
+        const x = wx - camX;
+        if (x < -20 || x > VW + 20)
+            continue;
+        ctx.beginPath();
+        ctx.moveTo(x, fenceTop);
+        ctx.lineTo(x + 14, fenceBot);
+        ctx.moveTo(x + 14, fenceTop);
+        ctx.lineTo(x, fenceBot);
+        ctx.stroke();
+    }
+    ctx.strokeStyle = '#4a4260';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(0, fenceTop);
+    ctx.lineTo(VW, fenceTop);
+    ctx.stroke();
+    // Fence posts.
+    ctx.fillStyle = '#3a3450';
+    for (let wx = 0; wx < STAGE.widthPx; wx += 180) {
+        const x = wx - camX;
+        if (x > -10 && x < VW + 10)
+            ctx.fillRect(x, fenceTop, 6, fenceBot - fenceTop);
+    }
+    // Roof deck: tiles in perspective.
+    const floorY = sy(STAGE.floorYPx);
+    ctx.fillStyle = '#4a4358';
+    ctx.fillRect(0, floorY, VW, VH - floorY + 40);
+    ctx.fillStyle = '#3e384a';
+    ctx.fillRect(0, floorY, VW, 6);
+    // Receding seam lines.
+    ctx.strokeStyle = '#5a5370';
+    ctx.lineWidth = 1;
+    for (let wx = -200; wx < STAGE.widthPx + 200; wx += 96) {
+        const x = wx - camX;
+        ctx.beginPath();
+        ctx.moveTo(x, floorY + 6);
+        ctx.lineTo(x - 70, VH + 40);
+        ctx.stroke();
+    }
+    for (let k = 1; k < 5; k++) {
+        const y = floorY + 6 + k * k * 8;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(VW, y);
+        ctx.stroke();
+    }
+    // Puddles catching the sunset.
+    ctx.fillStyle = '#c07a6a33';
+    for (const [wx, wy, ww] of [[240, 40, 90], [900, 74, 130], [1420, 34, 70]]) {
+        ctx.beginPath();
+        ctx.ellipse(wx - camX, floorY + wy, ww / 2, 7, 0, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.lineWidth = 1;
+};
+// ---------------------------------------------------------------- HUD
+/**
+ * HUD layout (rows, top-down): health bar · nameplate · round pips · meter.
+ * Kept as named constants so nothing silently overlaps when tuned.
+ */
+const HUD = {
+    edge: 96, // inner edge of the bars (portraits live outside this)
+    barW: 330,
+    barH: 26,
+    barY: 30,
+    nameY: 64,
+    nameH: 21,
+    pipY: 92,
+    pipS: 12,
+    meterY: 110,
+    meterH: 9,
+};
+const drawHealthBar = (ctx, i, ratio, flashRatio) => {
+    const barW = HUD.barW, barH = HUD.barH;
+    const x = i === 0 ? HUD.edge : VW - HUD.edge - barW;
+    const y = HUD.barY;
+    // Frame.
+    bevel(ctx, x - 4, y - 4, barW + 8, barH + 8, '#3a3244', '#6f6480', '#1a1626', 2);
+    bevel(ctx, x - 2, y - 2, barW + 4, barH + 4, PANEL, GOLD, GOLD_DK, 2);
+    // Damage flash (recent damage drains behind the bar).
+    const fw = Math.round(barW * Math.max(0, ratio));
+    const flashW = Math.round(barW * Math.max(0, flashRatio));
+    const barX = (w) => (i === 0 ? x + barW - w : x);
+    ctx.fillStyle = '#ffffff55';
+    ctx.fillRect(barX(flashW), y, flashW, barH);
+    // Fill (drains toward the center of the screen, MvC style).
+    const grad = ctx.createLinearGradient(0, y, 0, y + barH);
+    const danger = ratio < 0.25;
+    grad.addColorStop(0, danger ? HP_DANGER : HP_HI);
+    grad.addColorStop(1, danger ? '#8a1f30' : HP_LO);
+    ctx.fillStyle = grad;
+    ctx.fillRect(barX(fw), y, fw, barH);
+    // Gloss.
+    ctx.fillStyle = '#ffffff33';
+    ctx.fillRect(barX(fw), y + 2, fw, 5);
+    // Arrow cap on the inner edge (reference art has angled bar tips).
+    ctx.fillStyle = GOLD;
+    const tip = i === 0 ? x + barW : x - 12;
+    ctx.beginPath();
+    if (i === 0) {
+        ctx.moveTo(tip, y - 2);
+        ctx.lineTo(tip + 12, y + barH / 2);
+        ctx.lineTo(tip, y + barH + 2);
+    }
+    else {
+        ctx.moveTo(tip + 12, y - 2);
+        ctx.lineTo(tip, y + barH / 2);
+        ctx.lineTo(tip + 12, y + barH + 2);
+    }
+    ctx.closePath();
+    ctx.fill();
+};
+const drawMeter = (ctx, i, meter) => {
+    const bars = Math.round(TUNING.meterMax / TUNING.meterBar);
+    const gap = 5;
+    const segW = Math.floor((HUD.barW - (bars - 1) * gap) / bars);
+    const total = bars * segW + (bars - 1) * gap;
+    const startX = i === 0 ? HUD.edge : VW - HUD.edge - total;
+    const y = HUD.meterY;
+    for (let b = 0; b < bars; b++) {
+        const x = startX + b * (segW + gap);
+        const seg = Math.max(0, Math.min(TUNING.meterBar, meter - b * TUNING.meterBar));
+        const ratio = seg / TUNING.meterBar;
+        bevel(ctx, x, y, segW, HUD.meterH, '#191524', '#4a4260', '#0d0a14', 1);
+        const full = ratio >= 1;
+        ctx.fillStyle = full ? METER_FULL : METER_HI;
+        ctx.fillRect(x + 1, y + 1, Math.round((segW - 2) * ratio), HUD.meterH - 2);
+    }
+};
+const drawPortraitFrame = (ctx, i, roster, lowHealth) => {
+    const s = 76;
+    const x = i === 0 ? 12 : VW - 12 - s;
+    const y = HUD.barY - 6;
+    bevel(ctx, x - 3, y - 3, s + 6, s + 6, PANEL, GOLD, GOLD_DK, 3);
+    ctx.save();
+    if (lowHealth)
+        ctx.filter = 'saturate(0.4) brightness(0.8)';
+    drawPortrait(ctx, roster, x, y, s, s);
+    ctx.restore();
+    // Player tag.
+    ctx.fillStyle = P_COLORS[i];
+    ctx.fillRect(x, y + s - 14, 26, 14);
+    text(ctx, `P${i + 1}`, x + 13, y + s - 3, 11, '#fff', 'center', false);
+};
+const drawNameplate = (ctx, i, name) => {
+    const w = 216, h = HUD.nameH;
+    const x = i === 0 ? HUD.edge : VW - HUD.edge - w;
+    const y = HUD.nameY;
+    bevel(ctx, x, y, w, h, PANEL, GOLD, GOLD_DK, 2);
+    // Angled inner tip toward the center.
+    ctx.fillStyle = GOLD;
+    if (i === 0)
+        ctx.fillRect(x + w - 4, y, 4, h);
+    else
+        ctx.fillRect(x, y, 4, h);
+    text(ctx, name.toUpperCase(), i === 0 ? x + 14 : x + w - 14, y + 15, 13, GOLD_LT, i === 0 ? 'left' : 'right');
+};
+const drawRoundPips = (ctx, i, wins) => {
+    const need = TUNING.roundsToWin;
+    const s = HUD.pipS, gap = 6;
+    const y = HUD.pipY;
+    for (let r = 0; r < need; r++) {
+        const x = i === 0
+            ? HUD.edge + r * (s + gap)
+            : VW - HUD.edge - s - r * (s + gap);
+        bevel(ctx, x, y, s, s, r < wins ? GOLD : '#191524', r < wins ? GOLD_LT : '#4a4260', GOLD_DK, 1);
+    }
+};
+const drawTimer = (ctx, secs) => {
+    const cx = VW / 2, cy = 52, r = 42;
+    // Octagon frame.
+    const oct = (rr) => {
+        ctx.beginPath();
+        for (let k = 0; k < 8; k++) {
+            const a = (Math.PI / 4) * k + Math.PI / 8;
+            const x = cx + Math.cos(a) * rr;
+            const y = cy + Math.sin(a) * rr;
+            if (k === 0)
+                ctx.moveTo(x, y);
+            else
+                ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+    };
+    oct(r);
+    ctx.fillStyle = GOLD;
+    ctx.fill();
+    oct(r - 4);
+    ctx.fillStyle = PANEL;
+    ctx.fill();
+    const urgent = secs <= 10;
+    text(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, cy + 12, 34, urgent ? HP_DANGER : '#ffffff');
+};
+const drawHud = (ctx, g, rosters, fx) => {
+    for (const i of [0, 1]) {
+        const f = g.fighters[i];
+        const max = rosters[i].ch.b.maxHealth;
+        const ratio = Math.max(0, f.health) / max;
+        drawHealthBar(ctx, i, ratio, fx.flash[i]);
+        drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
+        drawNameplate(ctx, i, rosters[i].bundle.name);
+        drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
+        drawMeter(ctx, i, f.meter);
+    }
+    drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC));
+    // Combo counter.
+    if (fx.comboOwner >= 0 && fx.comboHits >= 2) {
+        const i = fx.comboOwner;
+        const x = i === 0 ? 110 : VW - 110;
+        const align = i === 0 ? 'left' : 'right';
+        text(ctx, `${fx.comboHits}`, x, 200, 46, GOLD_LT, align);
+        text(ctx, 'HITS', i === 0 ? x + 62 : x - 62, 200, 20, '#fff', align);
+    }
+    // Center announcements (ROUND 1 / FIGHT! / KO).
+    if (fx.announce) {
+        const t = Math.min(1, fx.announceAge / 8);
+        const size = 64 * (0.6 + 0.4 * t);
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, Math.min(1, 1.6 - fx.announceAge / 60));
+        text(ctx, fx.announce, VW / 2, VH / 2 - 40, size, GOLD_LT);
+        ctx.restore();
+    }
+    // Controls hint.
+    text(ctx, 'P1: WASD · TYU/GHJ      P2: ARROWS · IOP/KL;      B: HITBOXES', VW / 2, VH - 10, 11, '#ffffff66');
+};
+// ---------------------------------------------------------------- title
+const drawTitle = (ctx, rosters, tick) => {
+    drawStage(ctx, 300, 0);
+    // Vignette so the logo reads.
+    const vig = ctx.createLinearGradient(0, 0, 0, VH);
+    vig.addColorStop(0, '#0a0616dd');
+    vig.addColorStop(0.55, '#0a061633');
+    vig.addColorStop(1, '#0a0616cc');
+    ctx.fillStyle = vig;
+    ctx.fillRect(0, 0, VW, VH);
+    // Two fighters flanking the logo (idle frames of the first two characters).
+    const floor = STAGE.floorYPx;
+    rosters.slice(0, 2).forEach((r, i) => {
+        const img = r.portrait;
+        if (!img)
+            return;
+        ctx.save();
+        ctx.translate(i === 0 ? 200 : VW - 200, floor + 20);
+        ctx.scale(i === 0 ? 1.55 : -1.55, 1.55);
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(img, -96, -176);
+        ctx.restore();
+    });
+    // Logo.
+    const cx = VW / 2;
+    ctx.save();
+    ctx.textAlign = 'center';
+    const logo = (s, y, size) => {
+        ctx.font = `bold ${size}px "Courier New", monospace`;
+        ctx.lineJoin = 'round';
+        ctx.strokeStyle = '#0d1b3a';
+        ctx.lineWidth = 12;
+        ctx.strokeText(s, cx, y);
+        ctx.strokeStyle = '#8fb8ff';
+        ctx.lineWidth = 5;
+        ctx.strokeText(s, cx, y);
+        const g = ctx.createLinearGradient(0, y - size, 0, y + 8);
+        g.addColorStop(0, '#ffffff');
+        g.addColorStop(0.45, '#cfe3ff');
+        g.addColorStop(0.5, '#4d7fd4');
+        g.addColorStop(1, '#e8f1ff');
+        ctx.fillStyle = g;
+        ctx.fillText(s, cx, y);
+    };
+    logo('AGENT', 150, 82);
+    logo('FIGHTER', 235, 82);
+    ctx.restore();
+    if (tick % 60 < 40) {
+        text(ctx, 'PRESS ANY KEY TO BEGIN', cx, VH - 90, 20, GOLD_LT);
+    }
+    text(ctx, 'MILESTONE 2 · STUDIO BUILD', cx, VH - 40, 12, '#ffffff77');
+};
+// ---------------------------------------------------------------- select
+const drawSelect = (ctx, rosters, cursors, locked, tick) => {
+    drawStage(ctx, 600, 0);
+    ctx.fillStyle = '#0a0616cc';
+    ctx.fillRect(0, 0, VW, VH);
+    text(ctx, 'SELECT YOUR FIGHTER', VW / 2, 62, 30, GOLD_LT);
+    // Portrait grid.
+    const cell = 132, gap = 18;
+    const cols = Math.min(rosters.length, 5);
+    const gridW = cols * cell + (cols - 1) * gap;
+    const gx = (VW - gridW) / 2;
+    const gy = 110;
+    rosters.forEach((r, k) => {
+        const x = gx + (k % cols) * (cell + gap);
+        const y = gy + Math.floor(k / cols) * (cell + gap + 26);
+        bevel(ctx, x - 3, y - 3, cell + 6, cell + 6, PANEL, GOLD, GOLD_DK, 3);
+        drawPortrait(ctx, r, x, y, cell, cell);
+        text(ctx, r.bundle.name.toUpperCase(), x + cell / 2, y + cell + 20, 14, '#fff');
+        // Selection cursors.
+        for (const i of [0, 1]) {
+            if (cursors[i] !== k)
+                continue;
+            const blink = locked[i] || tick % 30 < 20;
+            if (!blink)
+                continue;
+            ctx.strokeStyle = P_COLORS[i];
+            ctx.lineWidth = 4;
+            const o = i === 0 ? 0 : 5; // offset so both cursors are visible on the same cell
+            ctx.strokeRect(x - 6 - o, y - 6 - o, cell + 12 + o * 2, cell + 12 + o * 2);
+            ctx.lineWidth = 1;
+            ctx.fillStyle = P_COLORS[i];
+            const tagX = i === 0 ? x - 6 : x + cell + 6;
+            ctx.fillRect(tagX - (i === 0 ? 0 : 30), y - 26, 30, 18);
+            text(ctx, locked[i] ? `P${i + 1}✓` : `P${i + 1}`, tagX + (i === 0 ? 15 : -15), y - 12, 12, '#fff', 'center', false);
+        }
+    });
+    // Big preview of each player's pick.
+    rosters.forEach((r, k) => {
+        for (const i of [0, 1]) {
+            if (cursors[i] !== k || !r.portrait)
+                continue;
+            ctx.save();
+            ctx.globalAlpha = locked[i] ? 1 : 0.75;
+            ctx.translate(i === 0 ? 120 : VW - 120, VH - 40);
+            ctx.scale(i === 0 ? 1.15 : -1.15, 1.15);
+            ctx.imageSmoothingEnabled = false;
+            ctx.drawImage(r.portrait, -96, -176);
+            ctx.restore();
+        }
+    });
+    const bothLocked = locked[0] && locked[1];
+    if (bothLocked) {
+        if (tick % 60 < 42)
+            text(ctx, 'PRESS START TO FIGHT', VW / 2, VH - 30, 20, GOLD_LT);
+    }
+    else {
+        text(ctx, 'P1: A/D MOVE · F CONFIRM      P2: ←/→ MOVE · K CONFIRM', VW / 2, VH - 30, 13, '#ffffffaa');
+    }
+};
+// ---------------------------------------------------------------- results
+const drawResults = (ctx, g, rosters, tick) => {
+    ctx.fillStyle = '#0a0616bb';
+    ctx.fillRect(0, 0, VW, VH);
+    const w = g.winner;
+    const title = w === 2 ? 'DRAW GAME' : `${rosters[w].bundle.name.toUpperCase()} WINS`;
+    bevel(ctx, VW / 2 - 300, VH / 2 - 80, 600, 120, PANEL, GOLD, GOLD_DK, 3);
+    text(ctx, title, VW / 2, VH / 2 - 20, 44, GOLD_LT);
+    text(ctx, `${g.roundsWon0} — ${g.roundsWon1}`, VW / 2, VH / 2 + 22, 24, '#fff');
+    if (tick % 60 < 42) {
+        text(ctx, 'ENTER: REMATCH    ESC: CHARACTER SELECT', VW / 2, VH / 2 + 90, 16, '#ffffffcc');
+    }
+};
+
+// ---- client/src/main.js ----
+/**
+ * Agent Fighter — game client.
+ * Fixed-timestep 60Hz loop; the renderer is a pure function of GameState plus
+ * cosmetic juice that lives OUTSIDE the sim (safe under future rollback).
+ * Characters are loaded from `characters/<id>/` bundles + packed atlases —
+ * the client interprets no frame data, it only asks the engine which sprite
+ * to draw (`spriteForFighter`) and blits it.
+ */
+
+
+
+const TICK_MS = 1000 / TICKS_PER_SEC;
+// ---------------------------------------------------------------- input
+const keys = new Set();
+const pressedThisFrame = new Set();
+addEventListener('keydown', (e) => {
+    if (!keys.has(e.code))
+        pressedThisFrame.add(e.code);
+    keys.add(e.code);
+    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].includes(e.code))
+        e.preventDefault();
+});
+addEventListener('keyup', (e) => keys.delete(e.code));
+const P0_MAP = [
+    ['KeyA', 1 /* Btn.Left */], ['KeyD', 2 /* Btn.Right */], ['KeyW', 4 /* Btn.Up */], ['KeyS', 8 /* Btn.Down */],
+    ['KeyT', 16 /* Btn.LP */], ['KeyY', 32 /* Btn.MP */], ['KeyU', 64 /* Btn.HP */],
+    ['KeyG', 128 /* Btn.LK */], ['KeyH', 256 /* Btn.MK */], ['KeyJ', 512 /* Btn.HK */],
+];
+const P1_MAP = [
+    ['ArrowLeft', 1 /* Btn.Left */], ['ArrowRight', 2 /* Btn.Right */], ['ArrowUp', 4 /* Btn.Up */], ['ArrowDown', 8 /* Btn.Down */],
+    ['KeyI', 16 /* Btn.LP */], ['KeyO', 32 /* Btn.MP */], ['KeyP', 64 /* Btn.HP */],
+    ['KeyK', 128 /* Btn.LK */], ['KeyL', 256 /* Btn.MK */], ['Semicolon', 512 /* Btn.HK */],
+    ['Numpad4', 16 /* Btn.LP */], ['Numpad5', 32 /* Btn.MP */], ['Numpad6', 64 /* Btn.HP */],
+    ['Numpad1', 128 /* Btn.LK */], ['Numpad2', 256 /* Btn.MK */], ['Numpad3', 512 /* Btn.HK */],
+];
+const CONFIRM = [['KeyT', 'KeyY', 'KeyU', 'KeyG', 'KeyH', 'KeyJ'], ['KeyI', 'KeyO', 'KeyP', 'KeyK', 'KeyL', 'Semicolon']];
+const pollPad = (map) => {
+    let f = 0;
+    for (const [code, bit] of map)
+        if (keys.has(code))
+            f |= bit;
+    return f;
+};
+let screen = 'loading';
+let uiTick = 0;
+let allRosters = [];
+let picks = [0, 0];
+let locked = [false, false];
+let fighters = null;
+let game = null;
+let showBoxes = false;
+let seed = 1;
+let loadError = '';
+let sparks = [];
+let shake = 0;
+let camX = 0;
+let camY = 0;
+let hitStopFlash = 0;
+const fx = { flash: [1, 1], comboOwner: -1, comboHits: 0, announce: '', announceAge: 0 };
+let prevHealth = [0, 0];
+let prevPhase = 0 /* Phase.PreRound */;
+// ---------------------------------------------------------------- canvas
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const px = (v) => Math.trunc(v / 256);
+// ---------------------------------------------------------------- boot
+const boot = async () => {
+    try {
+        const ids = await listCharacters();
+        if (ids.length === 0)
+            throw new Error('no characters found in characters/');
+        allRosters = await Promise.all(ids.map(loadRoster));
+        picks = [0, Math.min(1, allRosters.length - 1)];
+        screen = 'title';
+    }
+    catch (e) {
+        loadError = e.message;
+    }
+};
+const startFight = () => {
+    fighters = [allRosters[picks[0]], allRosters[picks[1]]];
+    setCharacters(fighters[0].ch, fighters[1].ch);
+    game = createGameState(seed++);
+    prevHealth = [game.fighters[0].health, game.fighters[1].health];
+    prevPhase = game.phase;
+    fx.flash = [1, 1];
+    fx.comboOwner = -1;
+    fx.comboHits = 0;
+    fx.announce = `ROUND ${game.roundNum + 1}`;
+    fx.announceAge = 0;
+    sparks = [];
+    shake = 0;
+    screen = 'fight';
+};
+// ---------------------------------------------------------------- camera
+const updateCamera = (g) => {
+    const midX = (px(g.fighters[0].x) + px(g.fighters[1].x)) / 2;
+    const targetX = Math.max(0, Math.min(STAGE.widthPx - VW, midX - VW / 2));
+    const highest = Math.min(px(g.fighters[0].y), px(g.fighters[1].y));
+    const targetY = Math.max(0, (STAGE.floorYPx - highest - 250) * 0.8);
+    camX += (targetX - camX) * 0.16;
+    camY += (targetY - camY) * 0.1;
+};
+// ---------------------------------------------------------------- juice
+const updateJuice = (g) => {
+    for (const i of [0, 1]) {
+        const f = g.fighters[i];
+        if (f.health < prevHealth[i]) {
+            const dmg = prevHealth[i] - f.health;
+            const big = dmg > 600;
+            sparks.push({ x: px(f.x) + f.facing * -22, y: px(f.y) - 78, age: 0, big });
+            shake = big ? 11 : 6;
+            hitStopFlash = big ? 3 : 0;
+        }
+        prevHealth[i] = f.health;
+        // Health bar lag (white flash draining behind the real bar).
+        const max = fighters[i].ch.b.maxHealth;
+        const target = Math.max(0, f.health) / max;
+        fx.flash[i] = fx.flash[i] > target ? Math.max(target, fx.flash[i] - 0.006) : target;
+    }
+    // Combo counter tracks whoever is being hit.
+    const v0 = g.fighters[0], v1 = g.fighters[1];
+    const inCombo = (a) => a === 10 /* Action.Hitstun */ || a === 11 /* Action.AirHitstun */;
+    if (inCombo(v1.action) && v1.comboHits >= 2) {
+        fx.comboOwner = 0;
+        fx.comboHits = v1.comboHits;
+    }
+    else if (inCombo(v0.action) && v0.comboHits >= 2) {
+        fx.comboOwner = 1;
+        fx.comboHits = v0.comboHits;
+    }
+    else if (!inCombo(v0.action) && !inCombo(v1.action))
+        fx.comboOwner = -1;
+    // Announcements on phase changes.
+    if (g.phase !== prevPhase) {
+        if (g.phase === 1 /* Phase.Fighting */) {
+            fx.announce = 'FIGHT!';
+            fx.announceAge = 0;
+        }
+        else if (g.phase === 2 /* Phase.RoundOver */) {
+            fx.announce = g.roundWinner === 2 ? 'DOUBLE KO' : 'K.O.';
+            fx.announceAge = 0;
+        }
+        else if (g.phase === 0 /* Phase.PreRound */) {
+            fx.announce = `ROUND ${g.roundNum + 1}`;
+            fx.announceAge = 0;
+        }
+        prevPhase = g.phase;
+    }
+    fx.announceAge++;
+    sparks = sparks.filter((s) => ++s.age < 9);
+    shake = Math.max(0, shake - 0.7);
+    if (hitStopFlash > 0)
+        hitStopFlash--;
+};
+// ---------------------------------------------------------------- render
+const renderFight = (g) => {
+    ctx.save();
+    if (shake > 0)
+        ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    drawStage(ctx, camX, camY);
+    // Fighters (draw the one being hit last so it reads on top).
+    const order = g.fighters[0].action === 10 /* Action.Hitstun */ ? [1, 0] : [0, 1];
+    for (const i of order) {
+        const f = g.fighters[i];
+        // Ground shadow.
+        ctx.fillStyle = '#00000055';
+        ctx.beginPath();
+        ctx.ellipse(px(f.x) - camX, STAGE.floorYPx + camY + 2, 26, 6, 0, 0, Math.PI * 2);
+        ctx.fill();
+        drawFighter(ctx, fighters[i], f, g.tick, px(f.x) - camX, px(f.y) + camY, P_COLORS[i]);
+    }
+    // Projectiles.
+    for (const p of g.projectiles) {
+        if (!p.active)
+            continue;
+        const x = px(p.x) - camX;
+        const y = px(p.y) + camY;
+        const grd = ctx.createRadialGradient(x, y, 2, x, y, 20);
+        grd.addColorStop(0, '#ffffff');
+        grd.addColorStop(0.5, P_COLORS[p.owner]);
+        grd.addColorStop(1, '#ffffff00');
+        ctx.fillStyle = grd;
+        ctx.beginPath();
+        ctx.arc(x, y, 20, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    // Super flash.
+    if (g.superFlashLeft > 0) {
+        ctx.fillStyle = g.superFlashLeft % 4 < 2 ? '#ffffff22' : '#000018aa';
+        ctx.fillRect(0, 0, VW, VH);
+    }
+    // Impact flash.
+    if (hitStopFlash > 0) {
+        ctx.fillStyle = '#ffffff33';
+        ctx.fillRect(0, 0, VW, VH);
+    }
+    // Hit sparks.
+    for (const s of sparks) {
+        const r = (s.big ? 10 : 5) + s.age * (s.big ? 6 : 3.5);
+        ctx.strokeStyle = `rgba(255, 224, 130, ${1 - s.age / 9})`;
+        ctx.lineWidth = s.big ? 5 : 3;
+        ctx.beginPath();
+        ctx.arc(s.x - camX, s.y + camY, r, 0, Math.PI * 2);
+        ctx.stroke();
+    }
+    ctx.lineWidth = 1;
+    // Debug boxes.
+    if (showBoxes) {
+        for (const b of debugBoxes(g)) {
+            ctx.strokeStyle = '#4ade80';
+            for (const r of b.hurtboxes)
+                ctx.strokeRect(r.x - camX + 0.5, r.y + camY + 0.5, r.w, r.h);
+            ctx.strokeStyle = '#f87171';
+            for (const r of b.hitboxes)
+                ctx.strokeRect(r.x - camX + 0.5, r.y + camY + 0.5, r.w, r.h);
+        }
+    }
+    ctx.restore();
+    drawHud(ctx, g, fighters, fx);
+};
+// ---------------------------------------------------------------- screens
+const tickSelect = () => {
+    const n = allRosters.length;
+    const move = (i, d) => {
+        if (locked[i])
+            return;
+        picks[i] = (picks[i] + d + n) % n;
+    };
+    if (pressedThisFrame.has('KeyA'))
+        move(0, -1);
+    if (pressedThisFrame.has('KeyD'))
+        move(0, 1);
+    if (pressedThisFrame.has('ArrowLeft'))
+        move(1, -1);
+    if (pressedThisFrame.has('ArrowRight'))
+        move(1, 1);
+    for (const i of [0, 1]) {
+        if (CONFIRM[i].some((k) => pressedThisFrame.has(k)))
+            locked[i] = true;
+    }
+    if (pressedThisFrame.has('Escape'))
+        locked = [false, false];
+    if (locked[0] && locked[1] && (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space'))) {
+        startFight();
+    }
+};
+const frame = () => {
+    uiTick++;
+    if (screen === 'loading') {
+        ctx.fillStyle = '#0a0616';
+        ctx.fillRect(0, 0, VW, VH);
+        ctx.fillStyle = loadError ? '#e94560' : '#ffffffaa';
+        ctx.font = 'bold 18px "Courier New", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(loadError || 'LOADING CHARACTERS…', VW / 2, VH / 2);
+        if (loadError) {
+            ctx.font = '13px "Courier New", monospace';
+            ctx.fillStyle = '#ffffff88';
+            ctx.fillText('run `npm run play` from the repo root so characters/ is served', VW / 2, VH / 2 + 28);
+        }
+    }
+    else if (screen === 'title') {
+        drawTitle(ctx, allRosters, uiTick);
+        if (pressedThisFrame.size > 0) {
+            screen = 'select';
+            locked = [false, false];
+        }
+    }
+    else if (screen === 'select') {
+        tickSelect();
+        drawSelect(ctx, allRosters, picks, locked, uiTick);
+    }
+    else if (screen === 'fight' && game) {
+        if (pressedThisFrame.has('KeyB'))
+            showBoxes = !showBoxes;
+        if (pressedThisFrame.has('Escape')) {
+            screen = 'select';
+            locked = [false, false];
+        }
+        step(game, [pollPad(P0_MAP), pollPad(P1_MAP)]);
+        updateJuice(game);
+        updateCamera(game);
+        renderFight(game);
+        if (game.phase === 3 /* Phase.MatchOver */)
+            screen = 'results';
+    }
+    else if (screen === 'results' && game) {
+        renderFight(game);
+        drawResults(ctx, game, fighters, uiTick);
+        if (pressedThisFrame.has('Enter'))
+            startFight();
+        if (pressedThisFrame.has('Escape')) {
+            screen = 'select';
+            locked = [false, false];
+        }
+    }
+    pressedThisFrame.clear();
+};
+// ---------------------------------------------------------------- loop
+let last = performance.now();
+let acc = 0;
+const loop = (now) => {
+    acc = Math.min(acc + (now - last), 200); // tab-switch guard
+    last = now;
+    let ran = false;
+    while (acc >= TICK_MS) {
+        frame();
+        acc -= TICK_MS;
+        ran = true;
+    }
+    if (!ran && screen === 'loading')
+        frame(); // keep the loading screen painted
+    requestAnimationFrame(loop);
+};
+void boot();
+requestAnimationFrame(loop);
+/**
+ * Console/automation hooks. `afStep(n)` advances exactly n frames without
+ * rAF — the hook automated visual tests and headless screenshots drive
+ * (browsers throttle rAF to zero in hidden tabs). Replay export lands here
+ * later; the input log is already the full match record.
+ */
+Object.assign(globalThis, {
+    afGame: () => game,
+    afRosters: () => allRosters,
+    afScreen: () => screen,
+    afStep: (n = 1) => { for (let k = 0; k < n; k++)
+        frame(); },
+    afPress: (code) => { pressedThisFrame.add(code); keys.add(code); },
+    afRelease: (code) => { keys.delete(code); },
+});
+</script>
+</body>
+</html>

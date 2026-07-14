@@ -50,8 +50,11 @@ const dist2 = (r: number, g: number, b: number, c: RGB): number => {
  * Returns the canvas plus a bleed fraction (bg-colored pixels that survived)
  * as a QC signal.
  */
-export const removeBackground = (img: HTMLImageElement): { canvas: HTMLCanvasElement; bleed: number } => {
-  const w = img.naturalWidth, h = img.naturalHeight;
+export const removeBackground = (
+  img: HTMLImageElement | HTMLCanvasElement,
+): { canvas: HTMLCanvasElement; bleed: number } => {
+  const w = img instanceof HTMLCanvasElement ? img.width : img.naturalWidth;
+  const h = img instanceof HTMLCanvasElement ? img.height : img.naturalHeight;
   const c = mkCanvas(w, h);
   const ctx = c.getContext('2d', { willReadFrequently: true })!;
   ctx.drawImage(img, 0, 0);
@@ -337,6 +340,94 @@ export const extractPalette = (c: HTMLCanvasElement, n = 16): RGB[] => {
 export const alphaBounds = (c: HTMLCanvasElement): { l: number; t: number; r: number; b: number } | null =>
   alphaBBox(c);
 
+/**
+ * Slice a generated animation STRIP (one image, N poses of the same character
+ * side by side) into N single-pose canvases.
+ *
+ * This is the spec's §5.1 stage-2 answer to costume drift: generating each
+ * frame as its own image makes the model re-invent the outfit every call.
+ * Inside ONE image it draws ONE character, so the costume is consistent by
+ * construction — we just have to cut it apart.
+ *
+ * Cutting is done on the background-removed image: columns with no opaque
+ * pixels are gaps. Runs of occupied columns are figure candidates; we merge
+ * across the narrowest gaps (detached limbs) or split at the deepest interior
+ * minima until exactly `n` slices remain.
+ */
+export const sliceStrip = (img: HTMLImageElement, n: number): HTMLCanvasElement[] | null => {
+  const { canvas: cut } = removeBackground(img);
+  const w = cut.width, h = cut.height;
+  const d = cut.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, w, h).data;
+
+  const colCount = new Int32Array(w);
+  for (let x = 0; x < w; x++) {
+    let k = 0;
+    for (let y = 0; y < h; y++) if (d[(y * w + x) * 4 + 3]! > 40) k++;
+    colCount[x] = k;
+  }
+  const MIN_COL = Math.max(2, Math.round(h * 0.01)); // ignore speck rows
+  const occupied = (x: number): boolean => colCount[x]! >= MIN_COL;
+
+  // Runs of occupied columns.
+  interface Run { l: number; r: number }
+  const runs: Run[] = [];
+  for (let x = 0; x < w; x++) {
+    if (!occupied(x)) continue;
+    if (runs.length > 0 && x - runs[runs.length - 1]!.r <= 1) runs[runs.length - 1]!.r = x;
+    else runs.push({ l: x, r: x });
+  }
+  if (runs.length === 0) return null;
+
+  // Too many runs → merge across the narrowest gaps (a detached fist/leg).
+  while (runs.length > n) {
+    let best = -1, bestGap = Infinity;
+    for (let i = 0; i + 1 < runs.length; i++) {
+      const gap = runs[i + 1]!.l - runs[i]!.r;
+      if (gap < bestGap) { bestGap = gap; best = i; }
+    }
+    if (best < 0) break;
+    runs[best]!.r = runs[best + 1]!.r;
+    runs.splice(best + 1, 1);
+  }
+  // Too few runs → figures touch. Split the widest run at its emptiest column.
+  while (runs.length < n) {
+    let best = -1, bestW = 0;
+    for (let i = 0; i < runs.length; i++) {
+      const rw = runs[i]!.r - runs[i]!.l;
+      if (rw > bestW) { bestW = rw; best = i; }
+    }
+    if (best < 0 || bestW < 16) return null; // cannot split further
+    const run = runs[best]!;
+    // Deepest interior minimum, avoiding the outer 25% (that's the bodies).
+    const lo = run.l + Math.floor(bestW * 0.25);
+    const hi = run.r - Math.floor(bestW * 0.25);
+    let cut2 = -1, cutVal = Infinity;
+    for (let x = lo; x <= hi; x++) {
+      if (colCount[x]! < cutVal) { cutVal = colCount[x]!; cut2 = x; }
+    }
+    if (cut2 < 0) return null;
+    const right: Run = { l: cut2 + 1, r: run.r };
+    run.r = cut2;
+    runs.splice(best + 1, 0, right);
+  }
+  if (runs.length !== n) return null;
+
+  // Emit each run as its own canvas (padded so normalize sees a clean subject).
+  return runs.map((run) => {
+    const rw = run.r - run.l + 1;
+    const pad = Math.round(rw * 0.15);
+    const cw = rw + pad * 2;
+    const out = mkCanvas(cw, h);
+    const octx = out.getContext('2d', { willReadFrequently: true })!;
+    // White background so the downstream keyer behaves identically to a
+    // freshly generated image.
+    octx.fillStyle = '#ffffff';
+    octx.fillRect(0, 0, cw, h);
+    octx.drawImage(cut, run.l, 0, rw, h, pad, 0, rw, h);
+    return out;
+  });
+};
+
 /** Mean chroma (max-min channel) of opaque pixels — 0 for grayscale art. */
 export const meanChroma = (c: HTMLCanvasElement): number => {
   const d = c.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, c.width, c.height).data;
@@ -392,7 +483,9 @@ export interface NormalizedFrame {
  * (nearest-neighbor: the pixelation IS the consistency trick, spec §5.1) →
  * feet-anchor into the fixed cell → optional palette lock.
  */
-export const normalizeFrame = (img: HTMLImageElement, palette: RGB[] | null): NormalizedFrame | null => {
+export const normalizeFrame = (
+  img: HTMLImageElement | HTMLCanvasElement, palette: RGB[] | null,
+): NormalizedFrame | null => {
   const { canvas: cut, bleed } = removeBackground(img);
   const majorBlobs = filterComponents(cut);
   const bb = alphaBBox(cut);

@@ -52,12 +52,27 @@ Analog frame data from playtests.
 - Atlas packed on every save (browser-side grid of fixed 192px cells) →
   characters/<id>/sprites/atlas.png + atlas.json — the spec §3 ship format.
 - Test tab has a P2 character select for versus matches between bundles.
+- **STRIP GENERATION is how costume consistency is achieved (spec §5.1
+  stage 2).** Generating each frame as its own image makes the model
+  re-invent the outfit every call — the fighter appears to change clothes
+  mid-animation. Instead each move is ONE image (1536×640) containing all
+  its poses side by side, sliced back apart by `sliceStrip()` (column-gap
+  analysis). Inside one image the model draws one character in one costume.
+  All strips of a character also share one seed (`charSeed`), which keeps
+  costumes consistent BETWEEN moves. Moves with >4 steps are chunked into
+  strips of ≤4. Falls back to per-frame only if slicing fails — and that
+  fallback is REPORTED in the status line (`strips N ok / M fell back`),
+  never silent.
+- **API CONSTRAINTS (learned the hard way):** prompts are capped at **800
+  characters** (422 `string_too_long` beyond it) — `buildStripPrompt()`
+  budgets against `PROMPT_MAX` and trims pose text to fit. Width/height
+  must come from a discrete list, max 1536. An over-long prompt fails the
+  whole request, which is why strip mode silently degraded to per-frame
+  before the budget existed.
 - NOTE: flux.2-klein-4b on NVIDIA build does NOT accept user reference
   images (`image` param only takes their gallery example_ids; NVCF asset
-  upload works but is rejected with "Expected: example_id"). Consistency
-  relies on palette lock + pixelation + archetype poses + QC gate. If
-  drift is unacceptable, options: different model endpoint with image
-  input, or flux.1-dev canny/depth with archetype pose control images.
+  upload works but is rejected with "Expected: example_id"). So strips +
+  one seed + palette lock + QC gate are the consistency toolkit.
 - **System animations (2026-07-15):** every non-attack state has a sprite
   track. Bundles carry `sys.*` moves (type:"system" — idle/walkF/walkB/
   crouch/jump(3-step)/dash/block×3/hitstun/airHitstun/knockdown/getup/ko);
