@@ -1,13 +1,20 @@
 # Agent Fighter
 
 Browser 2D fighting game (MvC-style) with a deterministic custom engine.
-Full design: see `build-spec.md` in the Agent Fighter project docs.
+Full design: see `docs/build-spec.md`.
 
-## Status: Milestone 0 — deterministic sim skeleton ✅
+## Status: Milestone 1 — "It feels like MvC" ✅ (feel-gate pending)
 
-Two rectangle fighters, walk/jump/one attack, hit detection, health, KO,
-timer, local 2-player on one keyboard. Snapshot/restore (the rollback
-primitive) and replay-hash determinism tests are green.
+Full combat system on the deterministic core: 6 buttons, magic-series chains,
+launcher + super-jump air combos with juggle points, motion specials
+(236 fireball / 623 DP / 214 advancing kick), 1-bar super with flash freeze,
+blocking (mid/low/overhead) + chip, pushblock, throws + techs, damage scaling
++ hitstun decay, hitstop, best-of-3 rounds, scrolling camera stage.
+35 tests green (determinism, rollback, all mechanics).
+
+**Remaining M1 gate:** people who play MvC say it feels right — tune
+`TUNING` in `packages/core/src/data.ts` + the Analog frame data from
+playtests.
 
 ## Layout
 
@@ -16,24 +23,36 @@ packages/core     @af/core   — deterministic simulation. Pure TS. No DOM, no
                                Date, no Math.random, integer-only (24.8 fixed
                                point). step(state, inputs) is the only way
                                state changes.
-packages/client   @af/client — Canvas 2D renderer + fixed-timestep loop.
+  src/data.ts                — character bundle format (spec §3) + TUNING knobs
+  src/characters/analog.ts   — character #1, 100% declarative data
+  src/motion.ts              — 236/214/623 motion parser + input history
+  src/sim.ts                 — the combat engine
+packages/client   @af/client — Canvas 2D renderer + camera + HUD + input.
                                Renderer is a pure function of GameState;
-                               swap-ready for PixiJS (M0 runs dependency-free
-                               because this build env has no npm access).
+                               swap-ready for PixiJS in M2+.
 ```
 
 ## Commands
 
 ```
-npm test                   # determinism + rollback + gameplay tests (tsx --test)
+npm test                   # determinism + rollback + combat mechanics (tsx --test)
 npm run demo               # bundle single-file playable demo → packages/client/demo/
 ```
 
-Requires global `typescript` + `tsx` (or `npm i -g typescript tsx`).
+## Controls (M1 demo)
 
-## Controls (M0 demo)
+|        | Move | LP MP HP | LK MK HK |
+|--------|------|----------|----------|
+| **P1** | WASD | T Y U    | G H J    |
+| **P2** | Arrows | I O P (or Num 4/5/6) | K L ; (or Num 1/2/3) |
 
-P1: WASD move/jump, F attack · P2: Arrows, K attack · H toggle hitboxes · Enter rematch
+- **Chains:** L → M → H → 2HP (launcher) → hold up → air chain → j.HP/j.HK
+- **Specials:** 236+P fireball · 623+P dragon punch · 214+K advancing kick
+- **Super:** 236+PP (needs 1 bar)
+- **Defense:** hold back (down-back for lows) · pushblock: 2 punches in blockstun
+- **Throw:** close + 4/6 + HP (HP inside the window techs)
+- **Movement:** double-tap dash · tap down→up super jump · double jump · air dash
+- **B** toggles hitbox/frame-data debug overlay · **Enter** rematch
 
 ## Determinism rules (enforced; see build-spec §2.1)
 
@@ -43,8 +62,8 @@ P1: WASD move/jump, F attack · P2: Arrows, K attack · H toggle hitboxes · Ent
 - All state serializable; `stateHash()` for desync detection + CI replay tests
 - Cosmetic juice (sparks, screen shake) lives in the client, never in the sim
 
-## Next: Milestone 1 — "It feels like MvC"
+## Next: Milestone 2 — Studio MVP
 
-Full combat per spec §4: 6 buttons, chains/magic series, launcher + air
-combos, motion-input specials, super + meter, pushblock, throws, hitstop
-tuning, real character data loaded from the declarative bundle format (§3).
+Character authoring web tool: AI sprite generate → normalize → QC → auto-hitbox
+pipeline + timeline/frame-data/cancel-graph editors. Exit test: character #2
+built entirely through Studio in < 2 days. (Spec §5.)

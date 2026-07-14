@@ -9,17 +9,20 @@ changes. Architecture rationale (why not IkemenGO/Phaser, prior art) is in
 
 ## Current status
 
-Milestone 0 complete: deterministic sim skeleton, two rectangle fighters,
-walk/jump/one attack, hit detection, KO, timer, local 2P on one keyboard,
-snapshot/restore + replay-hash tests green (8/8).
+Milestone 1 code-complete (2026-07-14): full MvC combat system on the
+deterministic core — 6 buttons, magic-series chains via cancel graph,
+launcher + super-jump air combos with juggle points, motion specials
+(236P fireball projectile, 623P DP, 214K), 236PP super (1 bar of 3, flash
+freeze), blocking mid/low/overhead + chip, pushblock, throws + techs,
+damage scaling ×0.9 floor 20%, hitstun decay, hitstop, best-of-3 rounds,
+1600px scrolling stage. Character data is declarative (spec §3 shape):
+`src/data.ts` defines the bundle format + `TUNING` knobs;
+`src/characters/analog.ts` is character #1 (pure data, zero code).
+35 tests green (`test/determinism.test.ts` + `test/combat.test.ts`).
 
-**Now building Milestone 1 — "It feels like MvC"** (spec §4): 6 buttons
-(LP/MP/HP/LK/MK/HK), magic-series chains (L→M→H→launcher), launcher + air
-combos with juggle points, motion-input specials (236/214/623 + input
-buffer), one super + 3-bar meter, blocking (mid/low/overhead) + chip +
-pushblock, throws + techs, damage scaling, hitstop. Gate: MvC players say it
-feels right. Character data must move from hardcoded `data.ts` into the
-declarative JSON bundle format (spec §3) as part of M1.
+**Remaining M1 gate (human):** MvC players confirm the feel; tune TUNING +
+Analog frame data from playtests. After that: Milestone 2 — Studio MVP
+(AI sprite pipeline + editors, spec §5).
 
 ## Layout
 
@@ -32,11 +35,9 @@ declarative JSON bundle format (spec §3) as part of M1.
 
 - `npm test` — full test suite (`tsx --test`, no framework deps)
 - `npm run demo` — bundle single-file playable demo → `packages/client/demo/`
-- Requires global `typescript` + `tsx`; no other deps in M0.
-- This repo was scaffolded in a sandbox without npm registry access. Now that
-  you have registry access: vitest may replace `tsx --test`, and the client
-  renderer is designed to move to PixiJS v8 — but keep `@af/core`
-  dependency-free forever.
+- `typescript` + `tsx` are devDependencies (npm install at the root).
+- The client renderer is designed to move to PixiJS v8 in M2+ — but keep
+  `@af/core` dependency-free forever.
 
 ## Determinism rules — NON-NEGOTIABLE in `@af/core`
 
