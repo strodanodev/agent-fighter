@@ -627,13 +627,27 @@ export interface NormalizedFrame {
  */
 export const normalizeFrame = (
   img: HTMLImageElement | HTMLCanvasElement, palette: RGB[] | null,
+  refFigureH?: number,
 ): NormalizedFrame | null => {
   const { canvas: cut, bleed } = removeBackground(img);
   const majorBlobs = filterComponents(cut);
   const bb = alphaBBox(cut);
   if (!bb) return null;
   const srcW = bb.r - bb.l + 1, srcH = bb.b - bb.t + 1;
-  const scale = TARGET_BODY_H / srcH;
+
+  /**
+   * Scale reference. Using THIS frame's own bbox height forces every pose to
+   * the same total extent — a crouch gets inflated to full height and a high
+   * kick gets shrunk, so the fighter visibly changes size as it moves. When
+   * the caller knows the character's true on-image height (the median across
+   * a sheet, where the model drew one character at one scale), pass it as
+   * `refFigureH`: all poses then share one scale and only the POSE differs.
+   */
+  let scale = TARGET_BODY_H / (refFigureH ?? srcH);
+  // Guard: an extreme pose (a full sweep) must still fit its cell.
+  const maxUp = PIVOT_Y; // headroom above the feet pivot
+  scale = Math.min(scale, maxUp / srcH, CELL_W / srcW);
+
   const dw = Math.max(1, Math.round(srcW * scale));
   const dh = Math.max(1, Math.round(srcH * scale));
 
@@ -646,6 +660,18 @@ export const normalizeFrame = (
   // Score colour conformity; never repaint (see quantizeToPalette).
   const paletteMatch = palette ? quantizeToPalette(cell, palette, false) : 1;
   return { cell, bodyH: dh, bodyW: dw, paletteMatch, majorBlobs, bleed };
+};
+
+/**
+ * Height of the figure in a raw (un-normalized) image, in that image's own px.
+ * The batch takes the MEDIAN of these across a sheet's panels to get the
+ * character's true drawn size, independent of how far any one pose reaches.
+ */
+export const measureFigureH = (img: HTMLImageElement | HTMLCanvasElement): number | null => {
+  const { canvas: cut } = removeBackground(img);
+  filterComponents(cut);
+  const bb = alphaBBox(cut);
+  return bb ? bb.b - bb.t + 1 : null;
 };
 
 export interface QCResult {
@@ -707,11 +733,12 @@ export const autoHurtboxes = (cell: HTMLCanvasElement): Rect[] => {
       }
     }
     if (r < 0) continue;
+    // Boxes live in WORLD px; the cell is supersampled sprite px. Convert.
     out.push({
-      x: l - PIVOT_X,
-      y: y0 - PIVOT_Y,
-      w: r - l + 1,
-      h: y1 - y0 + 1,
+      x: Math.round((l - PIVOT_X) * SPRITE_SCALE),
+      y: Math.round((y0 - PIVOT_Y) * SPRITE_SCALE),
+      w: Math.max(1, Math.round((r - l + 1) * SPRITE_SCALE)),
+      h: Math.max(1, Math.round((y1 - y0 + 1) * SPRITE_SCALE)),
     });
   }
   return out;
@@ -739,7 +766,13 @@ export const diffHitboxDraft = (prev: HTMLCanvasElement, cur: HTMLCanvasElement)
     }
   }
   if (r < 0 || count < 40) return null; // noise, not a limb
-  return { x: l - PIVOT_X, y: t - PIVOT_Y, w: r - l + 1, h: b - t + 1 };
+  // World px, not sprite px (the cell is supersampled).
+  return {
+    x: Math.round((l - PIVOT_X) * SPRITE_SCALE),
+    y: Math.round((t - PIVOT_Y) * SPRITE_SCALE),
+    w: Math.max(1, Math.round((r - l + 1) * SPRITE_SCALE)),
+    h: Math.max(1, Math.round((b - t + 1) * SPRITE_SCALE)),
+  };
 };
 
 export const canvasToPngDataUrl = (c: HTMLCanvasElement): string => c.toDataURL('image/png');

@@ -346,7 +346,11 @@ const server = createServer(async (req, res) => {
     const stageApi = path.match(/^\/api\/stages\/([^/]+)\/([^/]+)$/);
     if (stageApi && req.method === 'PUT') {
       const [, id, name] = stageApi;
-      if (!safeId(id) || !/^(background\.(png|svg)|stage\.json)$/.test(name)) {
+      // background.(png|svg) = legacy single flat plane. layer-*.png = one
+      // parallax plane (Studio writes layer-bg/layer-mid/layer-fg by
+      // convention; the id after "layer-" is free-form so custom plane
+      // counts/names work too).
+      if (!safeId(id) || !/^(background\.(png|svg)|layer-[a-z0-9-]{1,40}\.png|stage\.json)$/.test(name)) {
         return json(res, 400, { error: 'bad stage path' });
       }
       const dir = join(STAGES, id);

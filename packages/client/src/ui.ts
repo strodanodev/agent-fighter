@@ -2,7 +2,7 @@ import { STAGE, TICKS_PER_SEC, TUNING } from '@af/core';
 import type { GameState } from '@af/core';
 import { drawPortrait } from './atlas.js';
 import type { Roster } from './atlas.js';
-import { HUD_GEO, clipPoly, drawChrome, drawStageImage } from './chrome.js';
+import { HUD_GEO, clipPoly, drawChrome, drawStageLayers } from './chrome.js';
 import type { StageAsset, UiKit } from './chrome.js';
 
 // Injected at boot (null = procedural fallbacks everywhere).
@@ -110,10 +110,11 @@ export const drawStage = (ctx: CanvasRenderingContext2D, cam: Cam): void => {
   const L = cam.x, R = cam.x + viewW, T = cam.y, B = cam.y + viewH;
   const floorY = STAGE.floorYPx;
 
-  // Image stage (stages/<id>/background.png) — the procedural rooftop below
-  // is only the fallback for a checkout with no stage assets.
-  if (stageAsset?.image) {
-    drawStageImage(ctx, stageAsset, cam, VW, VH);
+  // Image stage (stages/<id>/, single flat background OR parallax layers) —
+  // the procedural rooftop below is only the fallback for a checkout with
+  // no stage assets at all.
+  if (stageAsset && (stageAsset.image || stageAsset.layers.length > 0)) {
+    drawStageLayers(ctx, stageAsset, cam, VW, VH);
     ctx.fillStyle = 'rgba(16, 10, 28, 0.18)'; // veil: fighters pop
     ctx.fillRect(L - 10, T - 10, viewW + 20, viewH + 20);
     return;

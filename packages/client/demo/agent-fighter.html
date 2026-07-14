@@ -1981,7 +1981,14 @@ const loadStage = async (id) => {
             return null;
         const meta = (await r.json());
         const image = await loadImg(`/stages/${id}/background.png`);
-        return { id, meta, image };
+        let layers = [];
+        if (meta.layers?.length) {
+            const loaded = await Promise.all(meta.layers.map(async (lm) => ({ img: await loadImg(`/stages/${id}/${lm.file}`), depth: lm.depth })));
+            layers = loaded
+                .filter((l) => !!l.img)
+                .sort((a, b) => a.depth - b.depth); // back (far) to front (near)
+        }
+        return { id, meta, image, layers };
     }
     catch {
         return null;
@@ -2014,6 +2021,76 @@ const drawStageImage = (ctx, stage, cam, vw, vh) => {
     }
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(img, 0, topY, drawW, drawH);
+};
+/**
+ * Draw a multi-plane parallax stage in WORLD coordinates. Falls back to the
+ * single-image `drawStageImage` when the stage has no layers, so legacy
+ * stages (and stages with only a plain `background.png`) render identically
+ * to before this existed.
+ *
+ * PARALLAX MATH: everything is drawn once, under one `worldTransform` that
+ * subtracts `cam.x` uniformly. A layer at depth 1 (the gameplay plane) needs
+ * zero extra offset to reproduce today's pinned-to-world behavior. A layer
+ * is drawn `(1 - depth) * cam.x` world px further along than its nominal
+ * position: at depth 0 that fully cancels the camera's own subtraction
+ * (screen-fixed — "infinitely far"); at depth < 1 it partially cancels
+ * (drifts slower — distant); at depth > 1 the term goes negative and ADDS to
+ * the camera's shift (drifts faster — nearer than the subject).
+ *
+ * TILING: rather than author oversized art or estimate exact camera travel,
+ * each layer is tiled edge-to-edge using PING-PONG (mirror) tiling — every
+ * other copy is horizontally flipped, so the touching edges are always the
+ * same pixel column reflected onto itself. That makes the seam invisible
+ * for ANY source image, with no special authoring and no visible repeat
+ * pattern, so a handful of tiles safely cover the whole camera range.
+ */
+const drawStageLayers = (ctx, stage, cam, vw, vh) => {
+    if (stage.layers.length === 0) {
+        if (stage.image)
+            drawStageImage(ctx, stage, cam, vw, vh);
+        return;
+    }
+    const viewW = vw / cam.zoom;
+    const viewH = vh / cam.zoom;
+    const L = cam.x, R = cam.x + viewW, T = cam.y, B = T + viewH;
+    const m = stage.meta;
+    const scale = STAGE.widthPx / m.imageW;
+    const topY = STAGE.floorYPx - m.floorY * scale;
+    const drawH = m.imageH * scale;
+    // Sky/deck fill ONCE behind every layer — cheaper than per-layer, and
+    // guards the same vertical-excursion edges the legacy path guarded.
+    if (topY > T - 10) {
+        ctx.fillStyle = m.skyColor;
+        ctx.fillRect(L - 10, T - 10, viewW + 20, topY - (T - 10) + 1);
+    }
+    if (topY + drawH < B + 10) {
+        ctx.fillStyle = m.deckColor;
+        ctx.fillRect(L - 10, topY + drawH - 1, viewW + 20, B + 10 - (topY + drawH) + 1);
+    }
+    ctx.imageSmoothingEnabled = false;
+    for (const layer of stage.layers) {
+        const tileW = layer.img.naturalWidth * scale;
+        if (tileW < 1)
+            continue;
+        const offsetX = (1 - layer.depth) * cam.x;
+        const originX = -offsetX; // world-x where the k=0 tile's left edge sits
+        const startK = Math.floor((L - originX) / tileW) - 1;
+        const endK = Math.ceil((R - originX) / tileW) + 1;
+        for (let k = startK; k <= endK; k++) {
+            const x = originX + k * tileW;
+            const mirrored = (((k % 2) + 2) % 2) === 1; // non-negative mod
+            ctx.save();
+            if (mirrored) {
+                ctx.translate(x + tileW, topY);
+                ctx.scale(-1, 1);
+                ctx.drawImage(layer.img, 0, 0, tileW, drawH);
+            }
+            else {
+                ctx.drawImage(layer.img, x, topY, tileW, drawH);
+            }
+            ctx.restore();
+        }
+    }
 };
 
 // ---- client/src/ui.js ----
@@ -2091,10 +2168,11 @@ const drawStage = (ctx, cam) => {
     const viewH = VH / cam.zoom;
     const L = cam.x, R = cam.x + viewW, T = cam.y, B = cam.y + viewH;
     const floorY = STAGE.floorYPx;
-    // Image stage (stages/<id>/background.png) — the procedural rooftop below
-    // is only the fallback for a checkout with no stage assets.
-    if (stageAsset?.image) {
-        drawStageImage(ctx, stageAsset, cam, VW, VH);
+    // Image stage (stages/<id>/, single flat background OR parallax layers) —
+    // the procedural rooftop below is only the fallback for a checkout with
+    // no stage assets at all.
+    if (stageAsset && (stageAsset.image || stageAsset.layers.length > 0)) {
+        drawStageLayers(ctx, stageAsset, cam, VW, VH);
         ctx.fillStyle = 'rgba(16, 10, 28, 0.18)'; // veil: fighters pop
         ctx.fillRect(L - 10, T - 10, viewW + 20, viewH + 20);
         return;

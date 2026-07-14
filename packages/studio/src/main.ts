@@ -21,7 +21,7 @@ import {
   decodeBase64Image, diffHitboxDraft, enclosedWhitePockets, extractPalette,
   sliceSheet,
   flipCanvasH, maskDiff, meanChroma, mirrorMask16, normalizeFrame, qcScore,
-  silhouetteMask16, sliceStrip,
+  measureFigureH, removeBackground, silhouetteMask16, sliceStrip,
 } from './pipeline.js';
 import type { NormalizedFrame, QCResult, RGB } from './pipeline.js';
 
@@ -484,11 +484,15 @@ const frPaint = (cv: HTMLCanvasElement): void => {
   if (!stp) return;
 
   // Sprite (or body silhouette). frSpriteScale previews a pending resize.
+  // Boxes are drawn in WORLD px × FR_SC, so the sprite must be scaled from
+  // supersampled sprite px into world px too — otherwise the art appears twice
+  // the size of the hitboxes it is supposed to describe.
   if (stp.sprite) {
     const spr = getSprite(stp.sprite);
     if (spr) {
-      const s = frSpriteScale;
-      ctx.imageSmoothingEnabled = false;
+      const s = frSpriteScale * SPRITE_SCALE; // sprite px → world px (× pending resize)
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
       ctx.drawImage(spr, FR_CX - PIVOT_X * FR_SC * s, FR_CY - PIVOT_Y * FR_SC * s,
         CELL_W * FR_SC * s, CELL_W * FR_SC * s);
       // Sprite bounds + scale handle (top-forward corner). Drag = uniform
@@ -565,10 +569,12 @@ const frMouse = (cv: HTMLCanvasElement): void => {
     const stp = curStep();
     if (!stp) return;
     // Sprite scale handle takes priority (top-forward corner of sprite bounds).
+    // `p` is in world px, the bbox in sprite px — convert, matching frPaint.
     const bb = frSpriteBBox();
     if (bb && stp.sprite) {
-      const hx = (bb.r + 1 - PIVOT_X) * frSpriteScale;
-      const hy = (bb.t - PIVOT_Y) * frSpriteScale;
+      const hs = frSpriteScale * SPRITE_SCALE;
+      const hx = (bb.r + 1 - PIVOT_X) * hs;
+      const hy = (bb.t - PIVOT_Y) * hs;
       if (Math.abs(p.x - hx) < 8 && Math.abs(p.y - hy) < 8) {
         const r = cv.getBoundingClientRect();
         frSpriteDrag = { startY: e.clientY - r.top };
@@ -1044,12 +1050,17 @@ const testPaint = (cv: HTMLCanvasElement): void => {
         ctx.save();
         ctx.translate(x, y);
         ctx.scale(f.facing, 1);
-        ctx.imageSmoothingEnabled = false;
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
         // Hit flash: brighten the sprite during hitstun.
         if ((f.action === Action.Hitstun || f.action === Action.AirHitstun) && g.tick % 4 < 2) {
           ctx.filter = 'brightness(2.5)';
         }
-        ctx.drawImage(spr, -PIVOT_X, -PIVOT_Y);
+        // Sprites are supersampled; the sim is in WORLD px. Scale down to
+        // world size or the fighter renders bigger than its own hitboxes.
+        ctx.drawImage(spr,
+          -PIVOT_X * SPRITE_SCALE, -PIVOT_Y * SPRITE_SCALE,
+          CELL_W * SPRITE_SCALE, CELL_W * SPRITE_SCALE);
         ctx.restore();
         drew = true;
       }
@@ -1290,10 +1301,18 @@ const poseForStep = (mv: MoveDef, i: number): string => {
   return `${pose}${phaseHint}`;
 };
 
-/** Normalize → facing-correct → QC a generated (or sliced) frame image. */
-const finishFrame = (mv: MoveDef, src: HTMLImageElement | HTMLCanvasElement): GenResult | null => {
+/**
+ * Normalize → facing-correct → QC a generated (or sliced) frame image.
+ * `refFigureH` is the character's true drawn height in the SOURCE image's px
+ * (median across a sheet). Pass it so every pose shares one character scale —
+ * without it each frame is sized by its own extent and the fighter grows when
+ * it crouches and shrinks when it kicks.
+ */
+const finishFrame = (
+  mv: MoveDef, src: HTMLImageElement | HTMLCanvasElement, refFigureH?: number,
+): GenResult | null => {
   const m = meta();
-  const norm = normalizeFrame(src, m.palette ?? null);
+  const norm = normalizeFrame(src, m.palette ?? null, refFigureH);
   if (!norm) return null;
   // Facing check: if the MIRRORED reference silhouette matches decisively
   // better, the model drew the character facing left — flip (lossless).
@@ -1317,17 +1336,39 @@ const finishFrame = (mv: MoveDef, src: HTMLImageElement | HTMLCanvasElement): Ge
 };
 
 /** Generate + normalize + QC ONE frame as its own image (fallback path). */
+const ANCHOR_POSE = 'standing upright in a neutral idle fighting stance';
+
 const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | null> => {
   const desc = meta().desc || stBundle!.name;
   const frameHint = mv.steps.length > 1 && !STEP_POSES[mv.id]
     ? `, animation frame ${i + 1} of ${mv.steps.length}` : '';
-  // img2img: instruct an edit of the attached reference instead of describing
-  // the character from scratch — identity comes from the pixels.
-  const prompt = (stImg2Img
-    ? `The attached image is the reference for ONE character. Redraw THAT EXACT character — `
-      + `identical outfit, identical colors, identical hair, identical face and build — in a `
-      + `single new pose: ${poseForStep(mv, i)}${frameHint}. Do not redesign the character. ${SPRITE_STYLE}`
-    : `${desc}, ${poseForStep(mv, i)}${frameHint}, ${SPRITE_STYLE}`).slice(0, promptMax());
+  const pose = `${poseForStep(mv, i)}${frameHint}`;
+
+  /**
+   * img2img: draw the wanted pose NEXT TO a neutral standing anchor of the
+   * same character, in one image (same cost — output billing is per image).
+   * The anchor gives the character's true standing height in that image's own
+   * pixels, so a lone regenerated frame is scaled exactly like the sheet
+   * frames around it instead of being sized by its own pose extent.
+   */
+  if (stImg2Img) {
+    const prompt = buildSheetPrompt([ANCHOR_POSE, pose]);
+    const img = await generateImage(prompt, seedFor(mv.id, i, salt), 1024, 1024, true);
+    const slices = sliceSheet(img, 2);
+    if (slices) {
+      const anchorH = measureFigureH(slices[0]!);
+      return finishFrame(mv, slices[1]!, anchorH ?? undefined);
+    }
+    // Anchor couldn't be separated — fall back to a lone pose (own-extent scale).
+    const solo = `The attached image is the reference for ONE character. Redraw THAT EXACT `
+      + `character — identical outfit, identical colors, identical hair, identical face and `
+      + `build — in a single new pose: ${pose}. Do not redesign the character. ${SPRITE_STYLE}`;
+    const img2 = await generateImage(solo.slice(0, promptMax()),
+      seedFor(mv.id, i, salt + 1), 1024, 1024, true);
+    return finishFrame(mv, img2);
+  }
+
+  const prompt = `${desc}, ${pose}, ${SPRITE_STYLE}`.slice(0, promptMax());
   const img = await generateImage(prompt, seedFor(mv.id, i, salt), 1024, 1024, true);
   return finishFrame(mv, img);
 };
@@ -1515,13 +1556,22 @@ const runGenerateAll = async (): Promise<void> => {
         renderAll();
 
         let slices: HTMLCanvasElement[] | null = null;
+        let sheetFigureH: number | undefined;
         if (chunk.length > 1) {
           try {
             const img = await generateImage(
               buildSheetPrompt(chunk.map((c) => poseForStep(c.mv, c.i))),
               seedFor('_sheet', s, 0), 1024, 1024, true);
             slices = sliceSheet(img, chunk.length);
-            if (slices) stStripsUsed++; else stStripFallbacks++;
+            if (slices) {
+              stStripsUsed++;
+              // ONE character scale for the whole sheet: the median figure
+              // height. Inside an image the model draws the character at a
+              // single size, so height differences are POSE, not scale.
+              const hs = slices.map(measureFigureH).filter((h): h is number => h !== null)
+                .sort((a, b) => a - b);
+              if (hs.length > 0) sheetFigureH = hs[hs.length >> 1];
+            } else stStripFallbacks++;
           } catch (e) {
             stStripFallbacks++;
             stStripError = (e as Error).message;
@@ -1531,7 +1581,7 @@ const runGenerateAll = async (): Promise<void> => {
         for (let k = 0; k < chunk.length; k++) {
           const { mv, i } = chunk[k]!;
           done++;
-          let r = slices ? finishFrame(mv, slices[k]!) : null;
+          let r = slices ? finishFrame(mv, slices[k]!, sheetFigureH) : null;
           // Anything the sheet failed on gets its own single-pose call.
           for (let att = 0; att < 2 && !(r && r.qc.pass); att++) {
             try {
@@ -1929,6 +1979,7 @@ const renderGenerateTab = (): HTMLElement => {
 
 // ------------------------------------------------------------------ root
 // ------------------------------------------------------------------ stage tab
+interface StageLayerMetaEd { file: string; depth: number }
 interface StageMetaEd {
   name: string;
   imageW: number;
@@ -1936,11 +1987,49 @@ interface StageMetaEd {
   floorY: number;
   skyColor: string;
   deckColor: string;
+  layers?: StageLayerMetaEd[];
 }
+
+/**
+ * One parallax plane in the Studio's editor. `file`/`depth`/`label` are
+ * fixed per slot; `img` is null until generated or uploaded. Depths mirror
+ * chrome.ts's convention: 1 = gameplay plane (today's flat-background
+ * behavior), 0 = infinitely far. See drawStageLayers for the derivation.
+ */
+interface StageLayerEd {
+  file: string;
+  label: string;
+  hint: string;
+  defaultDepth: number;
+  depth: number;
+  img: HTMLImageElement | HTMLCanvasElement | null;
+  keyBg: boolean; // strip the flat generation background so lower planes show through
+}
+
+const freshLayerSlots = (): StageLayerEd[] => [
+  {
+    file: 'layer-bg.png', label: 'Background (far)',
+    hint: 'e.g. distant city skyline silhouette against a purple sunset sky, no foreground objects',
+    defaultDepth: 0.15, depth: 0.15, img: null, keyBg: false,
+  },
+  {
+    file: 'layer-mid.png', label: 'Midground',
+    hint: 'e.g. row of mid-distance rooftop buildings and water towers, isolated so the sky shows through',
+    defaultDepth: 0.45, depth: 0.45, img: null, keyBg: true,
+  },
+  {
+    file: 'layer-fg.png', label: 'Foreground (near)',
+    hint: 'e.g. close chain-link fence and pipe silhouettes, isolated so everything behind shows through',
+    defaultDepth: 0.75, depth: 0.75, img: null, keyBg: true,
+  },
+];
+
 let stStageId = 'rooftop';
 let stStageList: string[] = [];
 let stStageMeta: StageMetaEd | null = null;
 let stStageImg: HTMLImageElement | HTMLCanvasElement | null = null;
+let stStageLayers: StageLayerEd[] = freshLayerSlots();
+let stStageLayerBusy: boolean[] = [false, false, false];
 let stStageBusy = false;
 let stStageDirty = false;
 
@@ -1948,6 +2037,7 @@ const loadStageEd = async (id: string): Promise<void> => {
   stStageId = id;
   stStageMeta = null;
   stStageImg = null;
+  stStageLayers = freshLayerSlots();
   try {
     const r = await fetch(`/stages/${id}/stage.json`);
     if (r.ok) stStageMeta = (await r.json()) as StageMetaEd;
@@ -1955,6 +2045,18 @@ const loadStageEd = async (id: string): Promise<void> => {
     img.src = `/stages/${id}/background.png?v=${Math.random()}`;
     await new Promise<void>((res) => { img.onload = () => res(); img.onerror = () => res(); });
     if (img.naturalWidth > 0) stStageImg = img;
+    // Hydrate any parallax planes this stage already has.
+    if (stStageMeta?.layers?.length) {
+      await Promise.all(stStageMeta.layers.map(async (lm) => {
+        const slot = stStageLayers.find((s) => s.file === lm.file);
+        if (!slot) return;
+        slot.depth = lm.depth;
+        const limg = new Image();
+        limg.src = `/stages/${id}/${lm.file}?v=${Math.random()}`;
+        await new Promise<void>((res) => { limg.onload = () => res(); limg.onerror = () => res(); });
+        if (limg.naturalWidth > 0) slot.img = limg;
+      }));
+    }
   } catch { /* new stage */ }
   stStageMeta ??= {
     name: id, imageW: 1536, imageH: 640, floorY: 520,
@@ -1964,25 +2066,77 @@ const loadStageEd = async (id: string): Promise<void> => {
   renderAll();
 };
 
+const canvasOf = (img: HTMLImageElement | HTMLCanvasElement): HTMLCanvasElement => {
+  if (img instanceof HTMLCanvasElement) return img;
+  const c = document.createElement('canvas');
+  c.width = img.naturalWidth;
+  c.height = img.naturalHeight;
+  c.getContext('2d')!.drawImage(img, 0, 0);
+  return c;
+};
+
 const saveStageEd = async (): Promise<void> => {
   if (!stStageMeta) return;
+  const filled = stStageLayers.filter((l) => l.img);
   if (stStageImg) {
-    const c = document.createElement('canvas');
-    c.width = stStageImg instanceof HTMLCanvasElement ? stStageImg.width : stStageImg.naturalWidth;
-    c.height = stStageImg instanceof HTMLCanvasElement ? stStageImg.height : stStageImg.naturalHeight;
-    c.getContext('2d')!.drawImage(stStageImg, 0, 0);
+    const c = canvasOf(stStageImg);
     stStageMeta.imageW = c.width;
     stStageMeta.imageH = c.height;
     await apiJson(`/api/stages/${stStageId}/background.png`, {
       method: 'PUT', body: c.toDataURL('image/png'),
     });
   }
+  if (filled.length > 0) {
+    // A layer stack sets the reference framing once no plain background was
+    // ever provided (a layers-only stage still needs imageW/imageH/floorY
+    // scale reference — use the bg plane, or whichever plane exists first).
+    if (!stStageImg) {
+      const ref = canvasOf(filled[0]!.img!);
+      stStageMeta.imageW = ref.width;
+      stStageMeta.imageH = ref.height;
+    }
+    await Promise.all(filled.map(async (l) => {
+      await apiJson(`/api/stages/${stStageId}/${l.file}`, {
+        method: 'PUT', body: canvasOf(l.img!).toDataURL('image/png'),
+      });
+    }));
+    stStageMeta.layers = filled.map((l) => ({ file: l.file, depth: l.depth }));
+  } else {
+    delete stStageMeta.layers;
+  }
   await apiJson(`/api/stages/${stStageId}/stage.json`, {
     method: 'PUT', body: JSON.stringify(stStageMeta, null, 2),
   });
   stStageDirty = false;
-  stStatus = `stage "${stStageId}" saved`;
+  stStatus = `stage "${stStageId}" saved${filled.length > 0 ? ` · ${filled.length} parallax plane(s)` : ''}`;
   if (!stStageList.includes(stStageId)) stStageList.push(stStageId);
+  renderAll();
+};
+
+/** Generate one parallax plane: text-to-image, then key out the flat
+ * generation background so lower planes show through (skip for bg — it
+ * IS the backdrop, so it should stay opaque). */
+const generateStageLayer = async (idx: number): Promise<void> => {
+  const layer = stStageLayers[idx]!;
+  const promptEl = document.getElementById(`stagelayer-${idx}`) as HTMLInputElement;
+  const p = promptEl.value.trim();
+  if (!p) { stStatus = `enter a prompt for ${layer.label}`; renderAll(); return; }
+  stStageLayerBusy[idx] = true;
+  stStatus = `generating ${layer.label} via ${stStageProvider}…`; renderAll();
+  try {
+    const img = await generateImage(
+      layer.keyBg
+        ? `${p}. Isolated on a perfectly flat solid pure white background, no shadows, no gradient — `
+          + `only the described objects, nothing else. Anime background art, no text.`
+        : `${p}, anime background art, no text`,
+      (Math.random() * 1e6) | 0, 1536, 640, false, stStageProvider);
+    layer.img = layer.keyBg ? removeBackground(img).canvas : img;
+    stStageDirty = true;
+    stStatus = `${layer.label} generated`;
+  } catch (e) {
+    stStatus = `${layer.label} generation failed: ${(e as Error).message}`;
+  }
+  stStageLayerBusy[idx] = false;
   renderAll();
 };
 
@@ -1997,7 +2151,11 @@ const renderStageTab = (): HTMLElement => {
   const m = stStageMeta;
   if (!m) return mkEl('div', { class: 'pane' }, 'loading stage…');
 
-  // Preview canvas with a draggable floor line.
+  // Preview canvas with a draggable floor line. Composites every plane
+  // (legacy background + bg/mid/fg layers, in back-to-front order) stacked
+  // at rest — the point is to check they line up and read well together;
+  // actual PARALLAX only appears in-game as the camera moves (see
+  // drawStageLayers in chrome.ts for the runtime math this approximates).
   const pw = 768;
   const ph = Math.round(pw * (m.imageH / m.imageW));
   const cv = mkEl('canvas', { width: pw, height: ph, class: 'frcanvas', style: 'cursor:row-resize' });
@@ -2005,14 +2163,16 @@ const renderStageTab = (): HTMLElement => {
     const ctx = cv.getContext('2d')!;
     ctx.fillStyle = m.skyColor;
     ctx.fillRect(0, 0, pw, ph);
-    if (stStageImg) {
+    const anyArt = stStageImg || stStageLayers.some((l) => l.img);
+    if (anyArt) {
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(stStageImg, 0, 0, pw, ph);
+      if (stStageImg) ctx.drawImage(stStageImg, 0, 0, pw, ph);
+      for (const l of stStageLayers) if (l.img) ctx.drawImage(l.img, 0, 0, pw, ph);
     } else {
       ctx.fillStyle = '#8a91a8';
       ctx.font = '14px monospace';
       ctx.textAlign = 'center';
-      ctx.fillText('no background yet — generate or upload one', pw / 2, ph / 2);
+      ctx.fillText('no background yet — generate or upload one below', pw / 2, ph / 2);
     }
     // Floor line: where the fighters' feet sit.
     const fy = (m.floorY / m.imageH) * ph;
@@ -2069,6 +2229,7 @@ const renderStageTab = (): HTMLElement => {
           if (!id || !/^[a-z0-9][a-z0-9-]{0,40}$/.test(id)) return;
           stStageId = id;
           stStageImg = null;
+          stStageLayers = freshLayerSlots();
           stStageMeta = { name: id, imageW: 1536, imageH: 640, floorY: 520, skyColor: '#2b1b4d', deckColor: '#3a3644' };
           stStageDirty = true;
           renderAll();
@@ -2080,7 +2241,10 @@ const renderStageTab = (): HTMLElement => {
       }, stStageDirty ? 'save stage *' : 'save stage'),
     ),
     mkEl('div', { class: 'genblock' },
-      mkEl('b', {}, 'background · generate or upload (PNG/SVG)'),
+      mkEl('b', {}, 'flat background (legacy single plane) · generate or upload (PNG/SVG)'),
+      mkEl('p', { class: 'hint' },
+        'a simple one-image stage, exactly like before. For a layered/parallax look, use the 3 planes below instead — '
+        + 'they combine with this one if you keep it, or replace it entirely if you leave it empty.'),
       mkEl('div', { class: 'row' },
         mkEl('input', {
           id: 'stageprompt', style: 'width:460px',
@@ -2120,6 +2284,10 @@ const renderStageTab = (): HTMLElement => {
           },
         }, stStageBusy ? 'generating…' : 'generate'),
         mkEl('label', {}, ' or upload ', upload),
+        stStageImg ? mkEl('button', {
+          title: 'clear this plane (keep the layer planes below, if any)',
+          onclick: () => { stStageImg = null; stStageDirty = true; renderAll(); },
+        }, 'clear') : null,
       ),
     ),
     cv,
@@ -2133,7 +2301,76 @@ const renderStageTab = (): HTMLElement => {
         onchange: (e: Event) => { m.deckColor = (e.target as HTMLInputElement).value; stStageDirty = true; renderAll(); },
       })),
       mkEl('span', { class: 'hint' },
-        'floor line = where fighters\' feet sit in the image · sky/deck colors extend the art when the camera sees past it'),
+        'floor line = where fighters\' feet sit in the image · sky/deck colors extend every plane when the camera sees past it'),
+    ),
+    mkEl('div', { class: 'genblock' },
+      mkEl('b', {}, 'parallax planes — depth-scrolling background, midground, foreground'),
+      mkEl('p', { class: 'hint' },
+        'each plane is its own image, drawn at a different scroll speed as the camera moves (far = slower, near = faster). '
+        + 'Background stays opaque; midground/foreground are auto-keyed transparent so the planes behind them show through. '
+        + 'Depth: 1.0 = moves with the fighters, 0 = never moves (infinitely far).'),
+      stStageImg ? mkEl('div', { class: 'row' },
+        mkEl('button', {
+          title: 'copy the flat background above into the Background plane, then clear it — a quick way to turn an existing single-image stage into a layered one',
+          onclick: () => {
+            stStageLayers[0]!.img = canvasOf(stStageImg!);
+            stStageImg = null;
+            stStageDirty = true;
+            stStatus = 'promoted flat background → Background plane';
+            renderAll();
+          },
+        }, '↑ promote flat background to Background plane'),
+      ) : null,
+      ...stStageLayers.map((layer, idx) => {
+        const thumbSize = 140;
+        const thumb = mkEl('canvas', { width: thumbSize, height: thumbSize, class: 'thumb' });
+        const tctx = thumb.getContext('2d')!;
+        tctx.fillStyle = '#12141f';
+        tctx.fillRect(0, 0, thumbSize, thumbSize);
+        if (layer.img) {
+          tctx.imageSmoothingEnabled = false;
+          const iw = layer.img instanceof HTMLCanvasElement ? layer.img.width : layer.img.naturalWidth;
+          const ih = layer.img instanceof HTMLCanvasElement ? layer.img.height : layer.img.naturalHeight;
+          const s = Math.min(thumbSize / iw, thumbSize / ih);
+          tctx.drawImage(layer.img, (thumbSize - iw * s) / 2, (thumbSize - ih * s) / 2, iw * s, ih * s);
+        }
+        const layerUpload = mkEl('input', {
+          type: 'file', accept: 'image/png',
+          onchange: (e: Event) => {
+            const file = (e.target as HTMLInputElement).files?.[0];
+            if (!file) return;
+            const img = new Image();
+            img.onload = () => {
+              layer.img = layer.keyBg ? removeBackground(img).canvas : img;
+              stStageDirty = true;
+              renderAll();
+            };
+            img.src = URL.createObjectURL(file);
+          },
+        });
+        return mkEl('div', { class: 'genblock', style: 'margin-top:10px' },
+          mkEl('div', { class: 'row' },
+            thumb,
+            mkEl('div', {},
+              mkEl('b', {}, layer.label),
+              mkEl('div', { class: 'row' },
+                mkEl('input', { id: `stagelayer-${idx}`, style: 'width:360px', placeholder: layer.hint }),
+                mkEl('button', {
+                  disabled: stStageLayerBusy[idx] ? '' : null,
+                  onclick: () => void generateStageLayer(idx),
+                }, stStageLayerBusy[idx] ? '…' : 'generate'),
+                mkEl('label', {}, ' or upload ', layerUpload),
+              ),
+              mkEl('div', { class: 'row' },
+                mkEl('label', { class: 'field' }, 'depth', numInput(layer.depth, (v) => { layer.depth = v; stStageDirty = true; }, 54)),
+                layer.img ? mkEl('button', {
+                  onclick: () => { layer.img = null; stStageDirty = true; renderAll(); },
+                }, 'clear') : null,
+              ),
+            ),
+          ),
+        );
+      }),
     ),
   );
 };
