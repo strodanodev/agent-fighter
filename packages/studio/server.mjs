@@ -43,18 +43,28 @@ const NV_URL = `https://ai.api.nvidia.com/v1/genai/${NV_MODEL}`;
  * all rejected. So on `nvidia` we can only do text prompts, and character
  * consistency is best-effort (strips + palette lock + QC).
  *
- * To get REAL reference conditioning (FLUX Kontext: "keep this character,
- * change the pose"), put one of these in .env and the Studio uses it
- * automatically for every frame once a reference is locked:
+ * To get REAL reference conditioning ("keep this character, change the pose"),
+ * put one of these in .env and the Studio uses it automatically for every
+ * frame once a reference is locked:
  *
- *   IMAGE_PROVIDER=bfl   BFL_API_KEY=...    (api.bfl.ai — FLUX Kontext)
- *   IMAGE_PROVIDER=fal   FAL_KEY=...        (fal.run — FLUX Pro Kontext)
+ *   IMAGE_PROVIDER=gemini  GEMINI_API_KEY=...  (Google — nano-banana image models)
+ *   IMAGE_PROVIDER=bfl     BFL_API_KEY=...     (api.bfl.ai — FLUX Kontext)
+ *   IMAGE_PROVIDER=fal     FAL_KEY=...         (fal.run — FLUX Pro Kontext)
+ *
+ * NOTE on Gemini: image models have NO free-tier quota — a free-tier key
+ * returns 429 (RESOURCE_EXHAUSTED, quotaId "...FreeTier") on every image
+ * request even though text works. Enable billing on the key's Google Cloud
+ * project (paid tier) and the same key starts generating.
  */
 const PROVIDER = (env.IMAGE_PROVIDER || process.env.IMAGE_PROVIDER || 'nvidia').toLowerCase();
 const BFL_API_KEY = env.BFL_API_KEY || process.env.BFL_API_KEY || '';
 const FAL_KEY = env.FAL_KEY || process.env.FAL_KEY || '';
+const GEMINI_API_KEY = env.GEMINI_API_KEY || process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = env.GEMINI_MODEL || process.env.GEMINI_MODEL || 'gemini-2.5-flash-image';
 /** Does the active provider accept a user-supplied reference image? */
-const SUPPORTS_IMG2IMG = (PROVIDER === 'bfl' && !!BFL_API_KEY) || (PROVIDER === 'fal' && !!FAL_KEY);
+const SUPPORTS_IMG2IMG = (PROVIDER === 'bfl' && !!BFL_API_KEY)
+  || (PROVIDER === 'fal' && !!FAL_KEY)
+  || (PROVIDER === 'gemini' && !!GEMINI_API_KEY);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -85,6 +95,50 @@ const generateBfl = async ({ prompt, image, seed, width, height }) => {
     }
   }
   throw new Error('BFL timed out');
+};
+
+/**
+ * Google Gemini image models (nano-banana family). Native multimodal edit:
+ * the reference image is just another part in the request, so "keep this
+ * character, change the pose" works directly — no asset upload dance.
+ * `image` = raw base64 PNG. Returns base64 PNG.
+ */
+const generateGemini = async ({ prompt, image, seed }) => {
+  const parts = [{ text: prompt }];
+  if (image) parts.push({ inline_data: { mime_type: 'image/png', data: image } });
+  const r = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify({
+        contents: [{ parts }],
+        generationConfig: {
+          responseModalities: ['IMAGE'],
+          ...(seed === undefined ? {} : { seed: Math.trunc(seed) }),
+        },
+      }),
+    });
+  const t = await r.text();
+  if (!r.ok) {
+    let detail = t.slice(0, 200);
+    try {
+      const e = JSON.parse(t).error ?? {};
+      detail = `${e.status ?? r.status}: ${e.message ?? ''}`.slice(0, 300);
+      if (e.status === 'RESOURCE_EXHAUSTED') {
+        detail += ' — Gemini image models have no free-tier quota; enable billing on this key\'s Google Cloud project.';
+      }
+    } catch { /* keep raw */ }
+    throw new Error(`Gemini ${detail}`);
+  }
+  const cand = JSON.parse(t).candidates?.[0];
+  const part = cand?.content?.parts?.find((p) => p.inlineData?.data ?? p.inline_data?.data);
+  const data = part?.inlineData?.data ?? part?.inline_data?.data;
+  if (!data) {
+    const why = cand?.finishReason ? ` (finishReason: ${cand.finishReason})` : '';
+    throw new Error(`Gemini returned no image${why}`);
+  }
+  return data;
 };
 
 /** fal.ai: synchronous run endpoint. `image` = raw base64. */
@@ -159,8 +213,8 @@ const server = createServer(async (req, res) => {
       if (req0.image && SUPPORTS_IMG2IMG) {
         const image = String(req0.image).replace(/^data:image\/\w+;base64,/, '');
         try {
-          const b64 = PROVIDER === 'bfl'
-            ? await generateBfl({ ...req0, image })
+          const b64 = PROVIDER === 'bfl' ? await generateBfl({ ...req0, image })
+            : PROVIDER === 'gemini' ? await generateGemini({ ...req0, image })
             : await generateFal({ ...req0, image });
           return json(res, 200, { artifacts: [{ base64: b64 }] });
         } catch (err) {
@@ -178,9 +232,11 @@ const server = createServer(async (req, res) => {
       }
 
       // Text-to-image.
-      if (PROVIDER === 'bfl' || PROVIDER === 'fal') {
+      if (PROVIDER === 'bfl' || PROVIDER === 'fal' || PROVIDER === 'gemini') {
         try {
-          const b64 = PROVIDER === 'bfl' ? await generateBfl(req0) : await generateFal(req0);
+          const b64 = PROVIDER === 'bfl' ? await generateBfl(req0)
+            : PROVIDER === 'gemini' ? await generateGemini(req0)
+            : await generateFal(req0);
           return json(res, 200, { artifacts: [{ base64: b64 }] });
         } catch (err) {
           return json(res, 502, { error: String(err?.message ?? err) });
@@ -307,10 +363,11 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
+  const modelOf = { nvidia: NV_MODEL, gemini: GEMINI_MODEL };
   console.log(`Agent Fighter Studio → http://localhost:${PORT}`);
-  console.log(`provider: ${PROVIDER}${PROVIDER === 'nvidia' ? ` (${NV_MODEL})` : ''}`);
+  console.log(`provider: ${PROVIDER}${modelOf[PROVIDER] ? ` (${modelOf[PROVIDER]})` : ''}`);
   console.log(SUPPORTS_IMG2IMG
-    ? '✅ reference-image conditioning ENABLED (Kontext img2img)'
+    ? '✅ reference-image conditioning ENABLED — every frame is generated FROM the locked reference'
     : '⚠ text-only: this provider cannot use a reference image — character identity '
-      + 'is best-effort. Set IMAGE_PROVIDER=bfl|fal + key in .env to enable it.');
+      + 'is best-effort. Set IMAGE_PROVIDER=gemini|bfl|fal + key in .env to enable it.');
 });

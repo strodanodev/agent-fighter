@@ -1113,7 +1113,14 @@ const SPRITE_STYLE = 'perfectly flat solid pure white background, no shadows, no
  * string_too_long). Everything below budgets against this — a prompt that
  * overflows fails the whole request, so strips must be built to fit.
  */
-const PROMPT_MAX = 800;
+/**
+ * NVIDIA's flux endpoints hard-reject prompts over 800 chars (422
+ * string_too_long). img2img providers (Gemini/Kontext) have no such cap, and
+ * their prompts need room to be explicit edit instructions.
+ */
+const PROMPT_MAX_TEXT = 800;
+const PROMPT_MAX_REF = 2000;
+const promptMax = (): number => (stImg2Img ? PROMPT_MAX_REF : PROMPT_MAX_TEXT);
 
 /**
  * Build a strip prompt that fits the budget, trimming pose text if needed.
@@ -1128,19 +1135,28 @@ const PROMPT_MAX = 800;
  * IMAGE_PROVIDER).
  */
 const buildStripPrompt = (desc: string, poses: string[]): string => {
-  const head = `${desc}. Sprite sheet: ${poses.length} DIFFERENT action poses of ONE `
-    + `character wearing the identical outfit and colors, one horizontal row, evenly `
-    + `spaced, not touching. Each pose is distinct: `;
+  // img2img: the reference image is attached, so the prompt becomes an EDIT
+  // instruction — "this exact character, these poses". Identity comes from the
+  // pixels, not from the description, which is what finally kills costume drift.
+  const head = stImg2Img
+    ? `The attached image is the reference for ONE character. Redraw THAT EXACT character — `
+      + `identical outfit, identical colors, identical hair, identical face and build — as a `
+      + `sprite sheet of ${poses.length} DIFFERENT action poses in one horizontal row, evenly `
+      + `spaced, not touching. Do not redesign the character. Poses: `
+    : `${desc}. Sprite sheet: ${poses.length} DIFFERENT action poses of ONE `
+      + `character wearing the identical outfit and colors, one horizontal row, evenly `
+      + `spaced, not touching. Each pose is distinct: `;
   const tail = `. Each pose: same full-body character, profile facing right, feet on one `
     + `ground line. Flat pure white background, no shadow, no floor, no borders. Pixel art `
     + `fighting game sprite sheet, crisp outlines, vibrant colors, no text.`;
-  const budget = PROMPT_MAX - head.length - tail.length;
+  const max = promptMax();
+  const budget = max - head.length - tail.length;
   let body = poses.map((p, k) => `${k + 1}) ${p}`).join('; ');
   if (body.length > budget) {
     const per = Math.max(14, Math.floor(budget / poses.length) - 5);
     body = poses.map((p, k) => `${k + 1}) ${p.slice(0, per).trim()}`).join('; ');
   }
-  return (head + body + tail).slice(0, PROMPT_MAX);
+  return (head + body + tail).slice(0, max);
 };
 
 /**
@@ -1262,7 +1278,13 @@ const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | n
   const desc = meta().desc || stBundle!.name;
   const frameHint = mv.steps.length > 1 && !STEP_POSES[mv.id]
     ? `, animation frame ${i + 1} of ${mv.steps.length}` : '';
-  const prompt = `${desc}, ${poseForStep(mv, i)}${frameHint}, ${SPRITE_STYLE}`.slice(0, PROMPT_MAX);
+  // img2img: instruct an edit of the attached reference instead of describing
+  // the character from scratch — identity comes from the pixels.
+  const prompt = (stImg2Img
+    ? `The attached image is the reference for ONE character. Redraw THAT EXACT character — `
+      + `identical outfit, identical colors, identical hair, identical face and build — in a `
+      + `single new pose: ${poseForStep(mv, i)}${frameHint}. Do not redesign the character. ${SPRITE_STYLE}`
+    : `${desc}, ${poseForStep(mv, i)}${frameHint}, ${SPRITE_STYLE}`).slice(0, promptMax());
   const img = await generateImage(prompt, seedFor(mv.id, i, salt), 1024, 1024, true);
   return finishFrame(mv, img);
 };
@@ -1303,6 +1325,14 @@ const genMoveFrames = async (mv: MoveDef, salt = 0): Promise<(GenResult | null)[
   const n = mv.steps.length;
   const out: (GenResult | null)[] = new Array(n).fill(null);
   const desc = meta().desc || stBundle!.name;
+
+  // With an img2img provider the reference image locks identity directly, so
+  // strips lose their purpose — and a full 1024² image per pose beats a
+  // ~380px-wide slice of a strip. Generate frame by frame instead.
+  if (stImg2Img) {
+    for (let i = 0; i < n; i++) out[i] = await genFrame(mv, i, salt);
+    return out;
+  }
 
   for (let start = 0; start < n; start += STRIP_MAX) {
     const idxs: number[] = [];
