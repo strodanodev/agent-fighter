@@ -448,7 +448,8 @@
               "w": 52,
               "h": 108
             }
-          ]
+          ],
+          "sprite": "5HK_s0.png"
         },
         {
           "frames": 5,
@@ -820,7 +821,8 @@
               "w": 52,
               "h": 80
             }
-          ]
+          ],
+          "sprite": "2MK_s0.png"
         },
         {
           "frames": 4,
@@ -857,7 +859,8 @@
               "guard": "low",
               "juggleCost": 1
             }
-          ]
+          ],
+          "sprite": "2MK_s1.png"
         },
         {
           "frames": 13,
@@ -892,7 +895,8 @@
               "w": 52,
               "h": 80
             }
-          ]
+          ],
+          "sprite": "2HK_s0.png"
         },
         {
           "frames": 5,
@@ -930,7 +934,8 @@
               "juggleCost": 1,
               "knockdown": true
             }
-          ]
+          ],
+          "sprite": "2HK_s1.png"
         },
         {
           "frames": 22,
@@ -1101,7 +1106,8 @@
               "w": 52,
               "h": 88
             }
-          ]
+          ],
+          "sprite": "j_HP_s0.png"
         },
         {
           "frames": 6,
@@ -1375,7 +1381,8 @@
               "w": 52,
               "h": 108
             }
-          ]
+          ],
+          "sprite": "236P_s0.png"
         },
         {
           "frames": 2,
@@ -1400,7 +1407,8 @@
               "w": 52,
               "h": 108
             }
-          ]
+          ],
+          "sprite": "236P_s2.png"
         }
       ],
       "projectile": {
@@ -1635,7 +1643,8 @@
               "w": 52,
               "h": 108
             }
-          ]
+          ],
+          "sprite": "236PP_s0.png"
         },
         {
           "frames": 4,
@@ -1702,7 +1711,8 @@
               "juggleCost": 0,
               "airPopVelY": -6
             }
-          ]
+          ],
+          "sprite": "236PP_s2.png"
         },
         {
           "frames": 4,
@@ -1735,7 +1745,8 @@
               "juggleCost": 0,
               "airPopVelY": -6
             }
-          ]
+          ],
+          "sprite": "236PP_s3.png"
         },
         {
           "frames": 4,
@@ -1768,7 +1779,8 @@
               "juggleCost": 0,
               "airPopVelY": -6
             }
-          ]
+          ],
+          "sprite": "236PP_s4.png"
         },
         {
           "frames": 5,
@@ -1803,7 +1815,8 @@
               "launchVelY": -12,
               "knockdown": true
             }
-          ]
+          ],
+          "sprite": "236PP_s5.png"
         },
         {
           "frames": 24,
@@ -1816,7 +1829,494 @@
               "w": 52,
               "h": 108
             }
-          ]
+          ],
+          "sprite": "236PP_s6.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.idle",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_idle_s0.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_idle_s1.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_idle_s2.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_idle_s3.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.walkF",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkF_s0.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkF_s1.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkF_s2.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkF_s3.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.walkB",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkB_s0.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkB_s1.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkB_s2.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkB_s3.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.crouch",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_crouch_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.jump",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_jump_s0.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_jump_s1.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_jump_s2.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.dashF",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 6,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_dashF_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.dashB",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 6,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_dashB_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.block",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_block_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.blockCrouch",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_blockCrouch_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.blockAir",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_blockAir_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.hitstun",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_hitstun_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.airHitstun",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_airHitstun_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.knockdown",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_knockdown_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.getup",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_getup_s0.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_getup_s1.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.ko",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_ko_s0.png"
         }
       ],
       "meterGainWhiff": 0,
@@ -2314,5 +2814,5 @@
       "5LP": "throwing a quick left jab punch"
     }
   },
-  "versionHash": "c746c7b793a6a181"
+  "versionHash": "1289090dbf8b81da"
 }

@@ -21,3 +21,4 @@ export {
 export type { GameState, FighterState, ProjectileState } from './state.js';
 export { step, debugBoxes, debugInfo } from './sim.js';
 export type { DebugBox, DebugFighterInfo } from './sim.js';
+export { SYS, spriteForFighter } from './anim.js';

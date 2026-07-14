@@ -9,7 +9,8 @@
  */
 import {
   Action, Btn, Phase, STAGE, TICKS_PER_SEC, TUNING,
-  characters, createGameState, debugBoxes, loadCharacter, setCharacters, step,
+  characters, createGameState, debugBoxes, loadCharacter, setCharacters,
+  spriteForFighter, step,
 } from '@af/core';
 import type {
   CharacterBundle, GameState, HitboxDef, InputFrame, MoveDef, MoveStep, Rect,
@@ -48,6 +49,7 @@ interface GenResult { norm: NormalizedFrame; qc: QCResult; accepted: boolean }
 let stGenResults = new Map<number, GenResult>();
 let stGenBusy = false;
 let stRefPreview: NormalizedFrame | null = null;
+let stMissingOnly = true; // batch: only generate steps without a sprite
 
 const meta = (): StudioMeta => {
   const b = stBundle as CharacterBundle & { meta?: StudioMeta };
@@ -63,6 +65,47 @@ const apiJson = async <T>(path: string, init?: RequestInit): Promise<T> => {
   return body as T;
 };
 
+/**
+ * System animation set (spec §4: non-attack poses are Moves with
+ * type:"system"). One template per canonical sys.* id — added to any bundle
+ * that lacks them so idle/walk/jump/stun states get sprite tracks. The sim
+ * never selects these; they are pure animation data for spriteForFighter().
+ */
+const SYSTEM_MOVE_SET: { id: string; steps: number; frames: number }[] = [
+  { id: 'sys.idle', steps: 4, frames: 8 },
+  { id: 'sys.walkF', steps: 4, frames: 7 },
+  { id: 'sys.walkB', steps: 4, frames: 7 },
+  { id: 'sys.crouch', steps: 1, frames: 8 },
+  { id: 'sys.jump', steps: 3, frames: 8 }, // rising / apex / falling
+  { id: 'sys.dashF', steps: 1, frames: 6 },
+  { id: 'sys.dashB', steps: 1, frames: 6 },
+  { id: 'sys.block', steps: 1, frames: 8 },
+  { id: 'sys.blockCrouch', steps: 1, frames: 8 },
+  { id: 'sys.blockAir', steps: 1, frames: 8 },
+  { id: 'sys.hitstun', steps: 1, frames: 8 },
+  { id: 'sys.airHitstun', steps: 1, frames: 8 },
+  { id: 'sys.knockdown', steps: 1, frames: 8 },
+  { id: 'sys.getup', steps: 2, frames: 7 },
+  { id: 'sys.ko', steps: 1, frames: 8 },
+];
+
+const ensureSystemMoves = (b: CharacterBundle): number => {
+  const have = new Set(b.moves.map((m) => m.id));
+  let added = 0;
+  for (const t of SYSTEM_MOVE_SET) {
+    if (have.has(t.id)) continue;
+    b.moves.push({
+      id: t.id, type: 'system', stance: 'stand',
+      steps: Array.from({ length: t.steps }, () => ({
+        frames: t.frames, phase: 'active' as const, hurtboxes: [{ ...b.standHurtbox }],
+      })),
+      meterGainWhiff: 0, meterGainHit: 0,
+    });
+    added++;
+  }
+  return added;
+};
+
 const loadChar = async (id: string): Promise<void> => {
   stBundle = await apiJson<CharacterBundle>(`/api/characters/${id}`);
   stCharId = id;
@@ -72,7 +115,9 @@ const loadChar = async (id: string): Promise<void> => {
   stGenResults = new Map();
   stDirty = false;
   spriteImgs.clear();
-  stStatus = `loaded ${id}`;
+  const added = ensureSystemMoves(stBundle);
+  if (added > 0) stDirty = true;
+  stStatus = `loaded ${id}${added ? ` · added ${added} system anims (save to persist)` : ''}`;
 };
 
 const saveChar = async (): Promise<void> => {
@@ -780,24 +825,23 @@ const testPaint = (cv: HTMLCanvasElement): void => {
     const f = g.fighters[i];
     const x = wx(Math.trunc(f.x / 256));
     const y = Math.trunc(f.y / 256);
-    // Sprite during attacks when the step has one; rect otherwise.
+    // Every state resolves through the animation table; rect is the fallback.
     let drew = false;
-    if (f.action === Action.Attack && f.moveIdx >= 0) {
-      const mv = characters[i].b.moves[f.moveIdx]!;
-      let acc = 0;
-      let stp: MoveStep | null = null;
-      for (const s of mv.steps) { acc += s.frames; if (f.actionFrame < acc) { stp = s; break; } }
-      if (stp?.sprite) {
-        const spr = getSprite(stp.sprite, i === 1 && stP2Id ? stP2Id : stCharId);
-        if (spr) {
-          ctx.save();
-          ctx.translate(x, y);
-          ctx.scale(f.facing, 1);
-          ctx.imageSmoothingEnabled = false;
-          ctx.drawImage(spr, -PIVOT_X, -PIVOT_Y);
-          ctx.restore();
-          drew = true;
+    const sprName = spriteForFighter(f, characters[i], g.tick);
+    if (sprName) {
+      const spr = getSprite(sprName, i === 1 && stP2Id ? stP2Id : stCharId);
+      if (spr) {
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.scale(f.facing, 1);
+        ctx.imageSmoothingEnabled = false;
+        // Hit flash: brighten the sprite during hitstun.
+        if ((f.action === Action.Hitstun || f.action === Action.AirHitstun) && g.tick % 4 < 2) {
+          ctx.filter = 'brightness(2.5)';
         }
+        ctx.drawImage(spr, -PIVOT_X, -PIVOT_Y);
+        ctx.restore();
+        drew = true;
       }
     }
     if (!drew) {
@@ -914,6 +958,35 @@ const SHOTO_POSES: Record<string, string> = {
   '623P': 'leaping upward in a rising dragon uppercut, fist extended toward the sky',
   '214K': 'spinning hurricane kick with one leg extended horizontally',
   '236PP': 'dramatic super attack rush, punching forward surrounded by a blazing energy aura',
+  // ---- system animations (idle/movement/reaction states)
+  'sys.idle': 'standing idle in a relaxed fighting stance, fists up, subtle breathing motion',
+  'sys.walkF': 'walking forward in a fighting stance, mid stride, guard up',
+  'sys.walkB': 'stepping backward cautiously in a fighting stance, guard up',
+  'sys.crouch': 'crouching low in a compact defensive fighting stance',
+  'sys.jump': 'jumping vertically', // per-step poses below refine this
+  'sys.dashF': 'dashing forward explosively, body leaning hard into the run',
+  'sys.dashB': 'hopping backward quickly, weight on the back foot',
+  'sys.block': 'standing guard block, both arms raised shielding the face and body',
+  'sys.blockCrouch': 'crouching guard block, arms crossed shielding low',
+  'sys.blockAir': 'guarding in midair, knees tucked, arms shielding, airborne',
+  'sys.hitstun': 'recoiling backward from taking a punch, head snapped back, grimacing',
+  'sys.airHitstun': 'launched into the air by a hit, body reeling backward, airborne',
+  'sys.knockdown': 'lying flat on the back on the ground, knocked down',
+  'sys.getup': 'pushing off the ground, rising back up into fighting stance',
+  'sys.ko': 'utterly defeated, collapsed unconscious on the ground',
+};
+
+/** Per-step pose overrides for multi-step system anims (id → step → pose). */
+const STEP_POSES: Record<string, string[]> = {
+  'sys.jump': [
+    'leaping upward off the ground, body rising, legs extending down, airborne',
+    'at the apex of a high jump, knees tucked, airborne',
+    'falling downward from a jump, legs preparing to land, airborne',
+  ],
+  'sys.getup': [
+    'kneeling on one knee, pushing off the ground to stand',
+    'almost fully risen, returning to fighting stance',
+  ],
 };
 
 const PHASE_HINTS: Record<string, string> = {
@@ -942,12 +1015,21 @@ const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | n
   const m = meta();
   const desc = m.desc || stBundle!.name;
   const stp = mv.steps[i]!;
-  const prompt = `${desc}, ${poseFor(mv)}, animation frame ${i + 1} of ${mv.steps.length}, `
-    + `${PHASE_HINTS[stp.phase] ?? ''}, ${SPRITE_STYLE}`;
+  const pose = STEP_POSES[mv.id]?.[i] ?? poseFor(mv);
+  const phaseHint = mv.type === 'system' ? '' : `${PHASE_HINTS[stp.phase] ?? ''}, `;
+  const frameHint = mv.steps.length > 1 && !STEP_POSES[mv.id]
+    ? `animation frame ${i + 1} of ${mv.steps.length}, ` : '';
+  const prompt = `${desc}, ${pose}, ${frameHint}${phaseHint}${SPRITE_STYLE}`;
   const img = await generateImage(prompt, seedFor(mv.id, i, salt));
   const norm = normalizeFrame(img, m.palette ?? null);
   if (!norm) return null;
-  return { norm, qc: qcScore(norm, m.refBodyW ?? null), accepted: false };
+  // Horizontal poses (knockdown/KO) legitimately violate the standing-width
+  // proportion check — QC them on palette only.
+  const refW = mv.id === 'sys.knockdown' || mv.id === 'sys.ko' ? null : m.refBodyW ?? null;
+  // Specials/supers carry energy VFX that legitimately drift from the body
+  // palette — lower bar; the palette lock still normalizes the colors.
+  const passAt = mv.type === 'special' || mv.type === 'super' ? 45 : 55;
+  return { norm, qc: qcScore(norm, refW, passAt), accepted: false };
 };
 
 const acceptFrame = async (mv: MoveDef, i: number, r: GenResult): Promise<void> => {
@@ -1001,23 +1083,29 @@ const runGenerateAll = async (): Promise<void> => {
   if (stGenBusy || !stBundle) return;
   stGenBusy = true;
   const failures: string[] = [];
-  const total = stBundle.moves.reduce((n, mv) => n + mv.steps.length, 0);
+  const want = (mv: MoveDef, i: number): boolean => !stMissingOnly || !mv.steps[i]!.sprite;
+  const total = stBundle.moves.reduce(
+    (n, mv) => n + mv.steps.filter((_, i) => want(mv, i)).length, 0);
   let done = 0;
   try {
     for (const mv of stBundle.moves) {
       for (let i = 0; i < mv.steps.length; i++) {
+        if (!want(mv, i)) continue;
         done++;
         stStatus = `batch ${done}/${total} · ${mv.id} step ${i}…`; renderAll();
-        try {
-          let r = await genFrame(mv, i);
-          if (r && !r.qc.pass) r = (await genFrame(mv, i, 1)) ?? r; // one retry
-          if (r && r.qc.pass) {
-            await acceptFrame(mv, i, r);
-          } else {
-            failures.push(`${mv.id}#${i}${r ? ` QC${r.qc.score}` : ''}`);
-          }
-        } catch (e) {
-          failures.push(`${mv.id}#${i} ERR`);
+        // Up to 3 attempts: first with the stable seed, then random salts.
+        // Retries cover ALL failure modes — QC fail, normalize-null, API error.
+        let r: GenResult | null = null;
+        for (let att = 0; att < 3 && !(r && r.qc.pass); att++) {
+          const salt = att === 0 ? 0 : 2 + ((Math.random() * 1e6) | 0);
+          try {
+            r = (await genFrame(mv, i, salt)) ?? r;
+          } catch { /* transient generation error — next attempt */ }
+        }
+        if (r && r.qc.pass) {
+          await acceptFrame(mv, i, r);
+        } else {
+          failures.push(`${mv.id}#${i}${r ? ` QC${r.qc.score}` : ' ERR'}`);
         }
       }
     }
@@ -1136,7 +1224,11 @@ const renderGenerateTab = (): HTMLElement => {
         disabled: stGenBusy ? '' : null,
         title: 'every step of every move · QC passes auto-accept, one retry on failure',
         onclick: () => void runGenerateAll(),
-      }, stGenBusy ? '…' : `⚡ batch ALL moves (${b.moves.reduce((n, x) => n + x.steps.length, 0)} frames)`),
+      }, stGenBusy ? '…' : `⚡ batch ${stMissingOnly ? 'MISSING' : 'ALL'} (${b.moves.reduce((n, x) => n + x.steps.filter((s) => !stMissingOnly || !s.sprite).length, 0)} frames)`),
+      mkEl('label', {}, ' missing only ', mkEl('input', {
+        type: 'checkbox', checked: stMissingOnly,
+        onchange: (e: Event) => { stMissingOnly = (e.target as HTMLInputElement).checked; renderAll(); },
+      })),
     ),
     mkEl('p', { class: 'hint' },
       'pose defaults come from the shoto archetype library — blank input = archetype pose; type to override'),

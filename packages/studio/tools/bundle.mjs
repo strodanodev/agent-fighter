@@ -27,6 +27,7 @@ const ORDER = [
   'core/src/motion.js',
   'core/src/state.js',
   'core/src/sim.js',
+  'core/src/anim.js',
   'studio/src/pipeline.js',
   'studio/src/main.js',
 ];

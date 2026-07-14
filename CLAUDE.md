@@ -58,6 +58,21 @@ Analog frame data from playtests.
   relies on palette lock + pixelation + archetype poses + QC gate. If
   drift is unacceptable, options: different model endpoint with image
   input, or flux.1-dev canny/depth with archetype pose control images.
+- **System animations (2026-07-15):** every non-attack state has a sprite
+  track. Bundles carry `sys.*` moves (type:"system" — idle/walkF/walkB/
+  crouch/jump(3-step)/dash/block×3/hitstun/airHitstun/knockdown/getup/ko);
+  Studio auto-adds missing ones on load. `@af/core/src/anim.ts` exports
+  `spriteForFighter(f, ch, tick)` — the ONLY correct way for any renderer
+  to pick a frame. The sim never reads system moves (cosmetic only; they
+  are never selectable as attacks). Analog + Vector both have 98/98 steps
+  sprited. Pipeline hardening: connected-component filter (drops shadows/
+  second figures), multi-figure QC fail, per-type QC thresholds (45 for
+  special/super VFX frames, palette-only for lying poses), batch retries
+  up to 3× with random salts, "missing only" batch mode.
+- Known gap: the single-file M1 demo client still renders rects (it embeds
+  the sprite-less ANALOG TS module). Making the game client load
+  characters/<id>/ bundles + atlas is part of the game-UI phase (title
+  screen/select/HUD per the user's reference art), which comes next.
 
 ## Layout
 

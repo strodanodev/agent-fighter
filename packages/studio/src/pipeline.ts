@@ -88,6 +88,55 @@ export const removeBackground = (img: HTMLImageElement): HTMLCanvasElement => {
   return c;
 };
 
+/**
+ * Connected-component filter: keep only alpha blobs at least `keepRatio` the
+ * size of the largest one. Kills detached drop shadows, watermark chunks, and
+ * stray artifacts so the bbox/feet-anchor lock onto the actual character.
+ * Returns the number of MAJOR blobs kept (>1 usually means the model drew
+ * two figures — a QC failure).
+ */
+export const filterComponents = (c: HTMLCanvasElement, keepRatio = 0.3): number => {
+  const w = c.width, h = c.height;
+  const ctx = c.getContext('2d', { willReadFrequently: true })!;
+  const im = ctx.getImageData(0, 0, w, h);
+  const d = im.data;
+  const label = new Int32Array(w * h); // 0 = unvisited, else component id
+  const sizes: number[] = [0];
+  let nextId = 1;
+  const stack: number[] = [];
+  for (let start = 0; start < w * h; start++) {
+    if (label[start] !== 0 || d[start * 4 + 3]! <= 40) continue;
+    const id = nextId++;
+    let size = 0;
+    stack.push(start);
+    label[start] = id;
+    while (stack.length > 0) {
+      const p = stack.pop()!;
+      size++;
+      const x = p % w, y = (p / w) | 0;
+      for (const q of [p - 1, p + 1, p - w, p + w]) {
+        if (q < 0 || q >= w * h) continue;
+        const qx = q % w;
+        if (Math.abs(qx - x) > 1) continue; // row wrap guard
+        if (label[q] === 0 && d[q * 4 + 3]! > 40) { label[q] = id; stack.push(q); }
+      }
+    }
+    sizes[id] = size;
+  }
+  if (nextId === 1) return 0;
+  const largest = Math.max(...sizes);
+  const keep = new Uint8Array(nextId);
+  let majors = 0;
+  for (let id = 1; id < nextId; id++) {
+    if (sizes[id]! >= largest * keepRatio) { keep[id] = 1; majors++; }
+  }
+  for (let p = 0; p < w * h; p++) {
+    if (label[p] !== 0 && !keep[label[p]!]) d[p * 4 + 3] = 0;
+  }
+  ctx.putImageData(im, 0, 0);
+  return majors;
+};
+
 const alphaBBox = (c: HTMLCanvasElement): { l: number; t: number; r: number; b: number } | null => {
   const ctx = c.getContext('2d', { willReadFrequently: true })!;
   const d = ctx.getImageData(0, 0, c.width, c.height).data;
@@ -158,6 +207,7 @@ export interface NormalizedFrame {
   bodyH: number; // body height in cell px after scaling
   bodyW: number;
   paletteMatch: number; // 0..1 pre-quantize conformity
+  majorBlobs: number; // major connected components (>1 = probably two figures)
 }
 
 /**
@@ -167,6 +217,7 @@ export interface NormalizedFrame {
  */
 export const normalizeFrame = (img: HTMLImageElement, palette: RGB[] | null): NormalizedFrame | null => {
   const cut = removeBackground(img);
+  const majorBlobs = filterComponents(cut);
   const bb = alphaBBox(cut);
   if (!bb) return null;
   const srcW = bb.r - bb.l + 1, srcH = bb.b - bb.t + 1;
@@ -180,7 +231,7 @@ export const normalizeFrame = (img: HTMLImageElement, palette: RGB[] | null): No
   ctx.drawImage(cut, bb.l, bb.t, srcW, srcH, PIVOT_X - (dw >> 1), PIVOT_Y - dh, dw, dh);
 
   const paletteMatch = palette ? quantizeToPalette(cell, palette) : 1;
-  return { cell, bodyH: dh, bodyW: dw, paletteMatch };
+  return { cell, bodyH: dh, bodyW: dw, paletteMatch, majorBlobs };
 };
 
 export interface QCResult {
@@ -191,14 +242,16 @@ export interface QCResult {
 }
 
 /** Per-frame QC vs the reference sheet (spec §5.1 stage 4). */
-export const qcScore = (frame: NormalizedFrame, refBodyW: number | null): QCResult => {
+export const qcScore = (frame: NormalizedFrame, refBodyW: number | null, passAt = 55): QCResult => {
   const paletteMatch = frame.paletteMatch;
   // Height is normalized by construction; width drift is the real proportion signal.
   const heightRatio = refBodyW ? frame.bodyW / refBodyW : 1;
   const proportionOK = heightRatio > 0.45 && heightRatio < 2.2; // poses legitimately widen
-  const score = Math.round(
+  let score = Math.round(
     paletteMatch * 70 + (proportionOK ? 30 : Math.max(0, 30 - Math.abs(1 - heightRatio) * 30)));
-  return { score, paletteMatch, heightRatio, pass: score >= 55 };
+  // Two comparable figures in frame = the model drew a second character.
+  if (frame.majorBlobs > 1) score = Math.min(score, 35);
+  return { score, paletteMatch, heightRatio, pass: score >= passAt };
 };
 
 /**
