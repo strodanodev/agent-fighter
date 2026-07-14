@@ -4,3 +4,6 @@ dist/
 *.log
 .env
 characters/*/frames-raw/
+
+# dev screenshot scratch (automated visual checks)
+packages/client/shots/

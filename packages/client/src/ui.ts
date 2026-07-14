@@ -10,8 +10,35 @@ import type { Roster } from './atlas.js';
  * only images in the game are the character sprites.
  */
 
-export const VW = STAGE.viewportW; // 960
+export const VW = STAGE.viewportW; // 960 — screen px
 export const VH = STAGE.viewportH; // 540
+
+/**
+ * Dynamic camera (the classic fighting-game rig). The sim thinks in world
+ * pixels — a fighter is 112 tall — and the camera frames BOTH fighters:
+ * zoomed in tight during neutral (big, readable characters) and pulling back
+ * on super jumps and air combos so nobody leaves the frame.
+ *
+ * Everything drawn under `worldTransform()` is in WORLD coordinates; the HUD
+ * is drawn afterwards in screen coordinates.
+ */
+export interface Cam { x: number; y: number; zoom: number }
+
+export const ZOOM_MIN = 0.85;
+export const ZOOM_MAX = 1.9;
+/** Fighters must be framed below the HUD and above the bottom edge. */
+export const CONTENT_TOP = 132;
+export const CONTENT_BOT = VH - 12;
+
+export const worldTransform = (ctx: CanvasRenderingContext2D, cam: Cam): void => {
+  ctx.scale(cam.zoom, cam.zoom);
+  ctx.translate(-cam.x, -cam.y);
+};
+
+/** A fixed camera for the menu backdrops. */
+export const menuCam = (x: number): Cam => ({
+  x, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5,
+});
 
 // ---------------------------------------------------------------- palette
 const GOLD = '#d9a441';
@@ -59,111 +86,115 @@ const text = (
 };
 
 // ---------------------------------------------------------------- stage
-/** Rooftop at sunset: parallax skyline, fence, tiled deck. Camera-aware. */
-export const drawStage = (ctx: CanvasRenderingContext2D, camX: number, camY: number): void => {
-  const sy = (v: number): number => v + camY;
+/**
+ * Rooftop at sunset: parallax skyline, chain-link fence, tiled deck.
+ * Drawn in WORLD coordinates — call under worldTransform(). Parallax layers
+ * counter-shift by the camera so distant things drift slower.
+ */
+export const drawStage = (ctx: CanvasRenderingContext2D, cam: Cam): void => {
+  const viewW = VW / cam.zoom;
+  const viewH = VH / cam.zoom;
+  const L = cam.x, R = cam.x + viewW, T = cam.y, B = cam.y + viewH;
+  const floorY = STAGE.floorYPx;
 
   // Sky.
-  const sky = ctx.createLinearGradient(0, 0, 0, sy(STAGE.floorYPx));
+  const sky = ctx.createLinearGradient(0, T, 0, floorY);
   sky.addColorStop(0, '#2b1b4d');
-  sky.addColorStop(0.45, '#6a2f6b');
-  sky.addColorStop(0.78, '#c05a5a');
+  sky.addColorStop(0.42, '#6a2f6b');
+  sky.addColorStop(0.75, '#c05a5a');
   sky.addColorStop(1, '#f0a35e');
   ctx.fillStyle = sky;
-  ctx.fillRect(0, 0, VW, sy(STAGE.floorYPx) + 2);
+  ctx.fillRect(L - 10, T - 10, viewW + 20, floorY - T + 20);
 
-  // Sun.
+  // Sun (very slow parallax).
   ctx.fillStyle = '#ffd9a0';
   ctx.beginPath();
-  ctx.arc(VW * 0.62 - camX * 0.05, sy(330), 46, 0, Math.PI * 2);
+  ctx.arc(STAGE.widthPx * 0.5 + cam.x * 0.72, floorY - 120, 54, 0, Math.PI * 2);
   ctx.fill();
 
-  // Far skyline (slow parallax).
-  const far = (wx: number): number => wx - camX * 0.25;
+  // Far skyline.
   ctx.fillStyle = '#3a2352';
-  for (let i = 0; i < 26; i++) {
-    const wx = i * 90;
+  for (let i = 0; i < 30; i++) {
     const bw = 54 + ((i * 37) % 40);
     const bh = 90 + ((i * 53) % 120);
-    ctx.fillRect(far(wx), sy(STAGE.floorYPx - bh), bw, bh);
+    const x = i * 90 + cam.x * 0.35; // counter-shift = slower drift
+    if (x > R + 60 || x + bw < L - 60) continue;
+    ctx.fillRect(x, floorY - bh, bw, bh);
   }
   // Near skyline + lit windows.
-  const near = (wx: number): number => wx - camX * 0.5;
-  for (let i = 0; i < 22; i++) {
-    const wx = i * 110 + 30;
+  for (let i = 0; i < 26; i++) {
     const bw = 70 + ((i * 29) % 46);
     const bh = 140 + ((i * 71) % 130);
-    const bx = near(wx);
-    const by = sy(STAGE.floorYPx - bh);
+    const bx = i * 110 + 30 + cam.x * 0.16;
+    if (bx > R + 80 || bx + bw < L - 80) continue;
+    const by = floorY - bh;
     ctx.fillStyle = '#241638';
     ctx.fillRect(bx, by, bw, bh);
     ctx.fillStyle = '#ffcf7a44';
     for (let wy = by + 12; wy < by + bh - 10; wy += 22) {
       for (let wxx = bx + 8; wxx < bx + bw - 10; wxx += 18) {
-        if ((wxx * 7 + wy * 13 + i) % 3 === 0) ctx.fillRect(wxx, wy, 7, 10);
+        if ((Math.trunc(wxx) * 7 + Math.trunc(wy) * 13 + i) % 3 === 0) ctx.fillRect(wxx, wy, 7, 10);
       }
     }
   }
 
-  // Chain-link fence along the roof edge (world-locked).
-  const fenceTop = sy(STAGE.floorYPx - 120);
-  const fenceBot = sy(STAGE.floorYPx);
-  ctx.strokeStyle = '#2a2438aa';
+  // Chain-link fence (world-locked, behind the fighters).
+  const fenceTop = floorY - 118;
+  ctx.strokeStyle = '#2a243888';
   ctx.lineWidth = 1;
-  for (let wx = 0; wx < STAGE.widthPx; wx += 14) {
-    const x = wx - camX;
-    if (x < -20 || x > VW + 20) continue;
+  const startX = Math.floor((L - 20) / 14) * 14;
+  for (let wx = startX; wx < R + 20; wx += 14) {
     ctx.beginPath();
-    ctx.moveTo(x, fenceTop);
-    ctx.lineTo(x + 14, fenceBot);
-    ctx.moveTo(x + 14, fenceTop);
-    ctx.lineTo(x, fenceBot);
+    ctx.moveTo(wx, fenceTop);
+    ctx.lineTo(wx + 14, floorY);
+    ctx.moveTo(wx + 14, fenceTop);
+    ctx.lineTo(wx, floorY);
     ctx.stroke();
   }
   ctx.strokeStyle = '#4a4260';
   ctx.lineWidth = 3;
   ctx.beginPath();
-  ctx.moveTo(0, fenceTop);
-  ctx.lineTo(VW, fenceTop);
+  ctx.moveTo(L - 10, fenceTop);
+  ctx.lineTo(R + 10, fenceTop);
   ctx.stroke();
-  // Fence posts.
   ctx.fillStyle = '#3a3450';
-  for (let wx = 0; wx < STAGE.widthPx; wx += 180) {
-    const x = wx - camX;
-    if (x > -10 && x < VW + 10) ctx.fillRect(x, fenceTop, 6, fenceBot - fenceTop);
+  for (let wx = Math.floor(L / 180) * 180; wx < R + 180; wx += 180) {
+    ctx.fillRect(wx, fenceTop, 6, floorY - fenceTop);
   }
 
-  // Roof deck: tiles in perspective.
-  const floorY = sy(STAGE.floorYPx);
+  // Roof deck.
   ctx.fillStyle = '#4a4358';
-  ctx.fillRect(0, floorY, VW, VH - floorY + 40);
+  ctx.fillRect(L - 10, floorY, viewW + 20, Math.max(40, B - floorY + 20));
   ctx.fillStyle = '#3e384a';
-  ctx.fillRect(0, floorY, VW, 6);
-  // Receding seam lines.
+  ctx.fillRect(L - 10, floorY, viewW + 20, 5);
   ctx.strokeStyle = '#5a5370';
   ctx.lineWidth = 1;
-  for (let wx = -200; wx < STAGE.widthPx + 200; wx += 96) {
-    const x = wx - camX;
+  for (let wx = Math.floor((L - 200) / 90) * 90; wx < R + 200; wx += 90) {
     ctx.beginPath();
-    ctx.moveTo(x, floorY + 6);
-    ctx.lineTo(x - 70, VH + 40);
+    ctx.moveTo(wx, floorY + 5);
+    ctx.lineTo(wx - 60, B + 20);
     ctx.stroke();
   }
   for (let k = 1; k < 5; k++) {
-    const y = floorY + 6 + k * k * 8;
+    const y = floorY + 5 + k * k * 6;
+    if (y > B + 10) break;
     ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(VW, y);
+    ctx.moveTo(L - 10, y);
+    ctx.lineTo(R + 10, y);
     ctx.stroke();
   }
   // Puddles catching the sunset.
   ctx.fillStyle = '#c07a6a33';
-  for (const [wx, wy, ww] of [[240, 40, 90], [900, 74, 130], [1420, 34, 70]] as const) {
+  for (const [wx, wy, ww] of [[240, 30, 90], [900, 52, 130], [1420, 24, 70]] as const) {
     ctx.beginPath();
-    ctx.ellipse(wx - camX, floorY + wy, ww / 2, 7, 0, 0, Math.PI * 2);
+    ctx.ellipse(wx, floorY + wy, ww / 2, 6, 0, 0, Math.PI * 2);
     ctx.fill();
   }
   ctx.lineWidth = 1;
+
+  // Atmospheric veil: pushes the stage back so the fighters (drawn next) pop.
+  ctx.fillStyle = 'rgba(20, 12, 34, 0.34)';
+  ctx.fillRect(L - 10, T - 10, viewW + 20, viewH + 20);
 };
 
 // ---------------------------------------------------------------- HUD
@@ -368,7 +399,11 @@ export const drawHud = (
 export const drawTitle = (
   ctx: CanvasRenderingContext2D, rosters: Roster[], tick: number,
 ): void => {
-  drawStage(ctx, 300, 0);
+  ctx.save();
+  const cam = menuCam(500);
+  worldTransform(ctx, cam);
+  drawStage(ctx, cam);
+  ctx.restore();
   // Vignette so the logo reads.
   const vig = ctx.createLinearGradient(0, 0, 0, VH);
   vig.addColorStop(0, '#0a0616dd');
@@ -377,14 +412,13 @@ export const drawTitle = (
   ctx.fillStyle = vig;
   ctx.fillRect(0, 0, VW, VH);
 
-  // Two fighters flanking the logo (idle frames of the first two characters).
-  const floor = STAGE.floorYPx;
+  // Two fighters flanking the logo, squaring off.
   rosters.slice(0, 2).forEach((r, i) => {
     const img = r.portrait;
     if (!img) return;
     ctx.save();
-    ctx.translate(i === 0 ? 200 : VW - 200, floor + 20);
-    ctx.scale(i === 0 ? 1.55 : -1.55, 1.55);
+    ctx.translate(i === 0 ? 210 : VW - 210, VH - 40);
+    ctx.scale(i === 0 ? 1.9 : -1.9, 1.9);
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(img, -96, -176);
     ctx.restore();
@@ -429,7 +463,11 @@ export const drawSelect = (
   locked: [boolean, boolean],
   tick: number,
 ): void => {
-  drawStage(ctx, 600, 0);
+  ctx.save();
+  const cam = menuCam(700);
+  worldTransform(ctx, cam);
+  drawStage(ctx, cam);
+  ctx.restore();
   ctx.fillStyle = '#0a0616cc';
   ctx.fillRect(0, 0, VW, VH);
 

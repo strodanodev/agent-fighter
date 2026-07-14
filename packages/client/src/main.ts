@@ -14,9 +14,10 @@ import type { GameState, InputFrame } from '@af/core';
 import { listCharacters, loadRoster, drawFighter } from './atlas.js';
 import type { Roster } from './atlas.js';
 import {
-  P_COLORS, VH, VW, drawHud, drawResults, drawSelect, drawStage, drawTitle,
+  CONTENT_BOT, CONTENT_TOP, P_COLORS, VH, VW, ZOOM_MAX, ZOOM_MIN,
+  drawHud, drawResults, drawSelect, drawStage, drawTitle, worldTransform,
 } from './ui.js';
-import type { HudFx } from './ui.js';
+import type { Cam, HudFx } from './ui.js';
 
 const TICK_MS = 1000 / TICKS_PER_SEC;
 
@@ -68,8 +69,7 @@ let loadError = '';
 interface Spark { x: number; y: number; age: number; big: boolean }
 let sparks: Spark[] = [];
 let shake = 0;
-let camX = 0;
-let camY = 0;
+let cam: Cam = { x: 0, y: 0, zoom: 1.5 };
 let hitStopFlash = 0;
 const fx: HudFx = { flash: [1, 1], comboOwner: -1, comboHits: 0, announce: '', announceAge: 0 };
 let prevHealth: [number, number] = [0, 0];
@@ -97,6 +97,8 @@ const startFight = (): void => {
   fighters = [allRosters[picks[0]]!, allRosters[picks[1]]!];
   setCharacters(fighters[0].ch, fighters[1].ch);
   game = createGameState(seed++);
+  cam = { x: STAGE.widthPx / 2 - VW / 2 / 1.5, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5 };
+  updateCamera(game); // settle before the first frame so round 1 opens framed
   prevHealth = [game.fighters[0].health, game.fighters[1].health];
   prevPhase = game.phase;
   fx.flash = [1, 1];
@@ -109,14 +111,39 @@ const startFight = (): void => {
   screen = 'fight';
 };
 
-// ---------------------------------------------------------------- camera
+const FIGHTER_H = 112; // world px — sprite body height (see studio TARGET_BODY_H)
+
+/**
+ * Dynamic camera: frame BOTH fighters. Zooms in tight when they're close and
+ * grounded (big, readable characters) and pulls back on super jumps / air
+ * combos so nobody leaves the frame (spec §4: MvC-style vertical follow).
+ * Solves for the zoom that fits the action box, then places the camera so the
+ * box lands between the HUD and the bottom edge.
+ */
 const updateCamera = (g: GameState): void => {
-  const midX = (px(g.fighters[0].x) + px(g.fighters[1].x)) / 2;
-  const targetX = Math.max(0, Math.min(STAGE.widthPx - VW, midX - VW / 2));
-  const highest = Math.min(px(g.fighters[0].y), px(g.fighters[1].y));
-  const targetY = Math.max(0, (STAGE.floorYPx - highest - 250) * 0.8);
-  camX += (targetX - camX) * 0.16;
-  camY += (targetY - camY) * 0.1;
+  const x0 = px(g.fighters[0].x), x1 = px(g.fighters[1].x);
+  const PAD_X = 150; // breathing room either side
+  const boxL = Math.min(x0, x1) - PAD_X;
+  const boxR = Math.max(x0, x1) + PAD_X;
+
+  const highestFeet = Math.min(px(g.fighters[0].y), px(g.fighters[1].y));
+  const boxT = highestFeet - FIGHTER_H - 50; // head + headroom
+  const boxB = STAGE.floorYPx + 24; // a little deck below the feet
+
+  const zoomX = VW / Math.max(1, boxR - boxL);
+  const zoomY = (CONTENT_BOT - CONTENT_TOP) / Math.max(1, boxB - boxT);
+  const targetZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.min(zoomX, zoomY)));
+
+  cam.zoom += (targetZoom - cam.zoom) * 0.08;
+
+  // Place the camera so the action box sits inside the content band.
+  const viewW = VW / cam.zoom;
+  const midX = (x0 + x1) / 2;
+  const targetX = Math.max(0, Math.min(STAGE.widthPx - viewW, midX - viewW / 2));
+  const targetY = boxT - CONTENT_TOP / cam.zoom;
+
+  cam.x += (targetX - cam.x) * 0.16;
+  cam.y += (targetY - cam.y) * 0.12;
 };
 
 // ---------------------------------------------------------------- juice
@@ -162,28 +189,32 @@ const updateJuice = (g: GameState): void => {
 
 // ---------------------------------------------------------------- render
 const renderFight = (g: GameState): void => {
+  // World pass: everything below is in world coordinates.
   ctx.save();
   if (shake > 0) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+  worldTransform(ctx, cam);
 
-  drawStage(ctx, camX, camY);
+  drawStage(ctx, cam);
 
-  // Fighters (draw the one being hit last so it reads on top).
+  // Fighters (draw the one in hitstun last so it reads on top).
   const order: (0 | 1)[] = g.fighters[0].action === Action.Hitstun ? [1, 0] : [0, 1];
   for (const i of order) {
     const f = g.fighters[i];
-    // Ground shadow.
-    ctx.fillStyle = '#00000055';
+    // Ground shadow (shrinks with height — sells the jump arc).
+    const height = STAGE.floorYPx - px(f.y);
+    const sc = Math.max(0.35, 1 - height / 320);
+    ctx.fillStyle = `rgba(0,0,0,${0.42 * sc})`;
     ctx.beginPath();
-    ctx.ellipse(px(f.x) - camX, STAGE.floorYPx + camY + 2, 26, 6, 0, 0, Math.PI * 2);
+    ctx.ellipse(px(f.x), STAGE.floorYPx + 2, 26 * sc, 6 * sc, 0, 0, Math.PI * 2);
     ctx.fill();
-    drawFighter(ctx, fighters![i], f, g.tick, px(f.x) - camX, px(f.y) + camY, P_COLORS[i]);
+    drawFighter(ctx, fighters![i], f, g.tick, px(f.x), px(f.y), P_COLORS[i]);
   }
 
   // Projectiles.
   for (const p of g.projectiles) {
     if (!p.active) continue;
-    const x = px(p.x) - camX;
-    const y = px(p.y) + camY;
+    const x = px(p.x);
+    const y = px(p.y);
     const grd = ctx.createRadialGradient(x, y, 2, x, y, 20);
     grd.addColorStop(0, '#ffffff');
     grd.addColorStop(0.5, P_COLORS[p.owner as 0 | 1]);
@@ -194,39 +225,37 @@ const renderFight = (g: GameState): void => {
     ctx.fill();
   }
 
-  // Super flash.
-  if (g.superFlashLeft > 0) {
-    ctx.fillStyle = g.superFlashLeft % 4 < 2 ? '#ffffff22' : '#000018aa';
-    ctx.fillRect(0, 0, VW, VH);
-  }
-  // Impact flash.
-  if (hitStopFlash > 0) {
-    ctx.fillStyle = '#ffffff33';
-    ctx.fillRect(0, 0, VW, VH);
-  }
-
   // Hit sparks.
   for (const s of sparks) {
     const r = (s.big ? 10 : 5) + s.age * (s.big ? 6 : 3.5);
     ctx.strokeStyle = `rgba(255, 224, 130, ${1 - s.age / 9})`;
-    ctx.lineWidth = s.big ? 5 : 3;
+    ctx.lineWidth = s.big ? 4 : 2.5;
     ctx.beginPath();
-    ctx.arc(s.x - camX, s.y + camY, r, 0, Math.PI * 2);
+    ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
     ctx.stroke();
   }
   ctx.lineWidth = 1;
 
-  // Debug boxes.
+  // Debug boxes (world space — they come from the sim in world px).
   if (showBoxes) {
     for (const b of debugBoxes(g)) {
       ctx.strokeStyle = '#4ade80';
-      for (const r of b.hurtboxes) ctx.strokeRect(r.x - camX + 0.5, r.y + camY + 0.5, r.w, r.h);
+      for (const r of b.hurtboxes) ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w, r.h);
       ctx.strokeStyle = '#f87171';
-      for (const r of b.hitboxes) ctx.strokeRect(r.x - camX + 0.5, r.y + camY + 0.5, r.w, r.h);
+      for (const r of b.hitboxes) ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w, r.h);
     }
   }
-
   ctx.restore();
+
+  // Screen pass: full-frame flashes + HUD.
+  if (g.superFlashLeft > 0) {
+    ctx.fillStyle = g.superFlashLeft % 4 < 2 ? '#ffffff22' : '#000018aa';
+    ctx.fillRect(0, 0, VW, VH);
+  }
+  if (hitStopFlash > 0) {
+    ctx.fillStyle = '#ffffff33';
+    ctx.fillRect(0, 0, VW, VH);
+  }
   drawHud(ctx, g, fighters!, fx);
 };
 
