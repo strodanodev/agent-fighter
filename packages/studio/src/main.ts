@@ -18,6 +18,7 @@ import type {
 import {
   CELL_W, PIVOT_X, PIVOT_Y, alphaBounds, autoHurtboxes, canvasToPngDataUrl,
   decodeBase64Image, diffHitboxDraft, enclosedWhitePockets, extractPalette,
+  sliceSheet,
   flipCanvasH, maskDiff, meanChroma, mirrorMask16, normalizeFrame, qcScore,
   silhouetteMask16, sliceStrip,
 } from './pipeline.js';
@@ -187,8 +188,18 @@ const packAtlas = async (): Promise<number> => {
 let stImg2Img = false;
 
 /** The locked reference sheet as base64 PNG (for reference-conditioned gen). */
-const referenceB64 = (): string | null => {
-  const ref = spriteCanvas('_reference.png');
+/**
+ * The reference sprite as base64. Waits for the PNG to decode — it is loaded
+ * lazily into the sprite cache, and returning null early would silently
+ * downgrade a conditioned generation to a text-only one (i.e. bring costume
+ * drift straight back). Callers treat null as a hard error, never a fallback.
+ */
+const referenceB64 = async (): Promise<string | null> => {
+  let ref = spriteCanvas('_reference.png');
+  for (let w = 0; w < 40 && !ref; w++) {
+    await new Promise((r) => setTimeout(r, 100));
+    ref = spriteCanvas('_reference.png');
+  }
   return ref ? canvasToPngDataUrl(ref) : null;
 };
 
@@ -198,7 +209,14 @@ const generateImage = async (
   // With an img2img provider, every frame is conditioned on the reference
   // sheet — that is the ONLY way to truly hold a character's identity across
   // images. NVIDIA's flux cannot do this (see server.mjs).
-  const image = useRef && stImg2Img ? referenceB64() : null;
+  let image: string | null = null;
+  if (useRef && stImg2Img) {
+    image = await referenceB64();
+    if (!image) {
+      throw new Error('reference sprite not available — generate + lock a reference first '
+        + '(generating without it would silently drift the costume)');
+    }
+  }
   const body = image
     ? { prompt, width, height, steps: 4, seed, image }
     : { prompt, width, height, steps: 4, seed };
@@ -1300,6 +1318,38 @@ const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | n
  * cut them apart. The whole character also shares a single seed across every
  * strip, which keeps costumes consistent between moves too.
  */
+/**
+ * SHEET GENERATION (img2img providers only) — the cost lever.
+ *
+ * A Gemini image response is billed as a flat ~1290 output tokens whether it
+ * contains one figure or nine, so poses-per-call divides the bill directly:
+ * a 98-frame character costs 98 calls per-frame vs 11 at 9-up (~9x cheaper).
+ * Identity is safe because the reference image rides along with every call —
+ * unlike the NVIDIA path, the sheet is a cost trick, not a consistency trick.
+ *
+ * 9 is the sweet spot: a 3x3 grid on a 1024² canvas gives each figure ~340px,
+ * still ~3x the 112px body height we downsample to, and the model reliably
+ * keeps figures separated. Denser grids start overlapping (unsliceable).
+ */
+const SHEET_MAX = 9;
+
+const buildSheetPrompt = (poses: string[]): string => {
+  const cols = Math.min(3, poses.length);
+  const rows = Math.ceil(poses.length / cols);
+  const layout = poses.length <= 3
+    ? `ONE horizontal row of ${poses.length} figures, left to right`
+    : `a ${cols}x${rows} grid of ${poses.length} figures, read left to right, top to bottom`;
+  return (
+    `The attached image is the reference for ONE character. Every figure you draw must be `
+    + `THAT EXACT character: identical outfit, identical colors, identical hair, face and build. `
+    + `Do not redesign the character. Draw a sprite sheet: ${layout}. `
+    + `Each figure is a DIFFERENT pose: ${poses.map((p, k) => `${k + 1}) ${p}`).join('; ')}. `
+    + `Every figure: full body, strict side profile facing right, feet on its own ground line. `
+    + `Flat pure white background, no shadows, no floor, no grid lines, no borders, no text. `
+    + `Figures evenly spaced and clearly separated — never touching or overlapping.`
+  ).slice(0, promptMax());
+};
+
 const STRIP_W = 1536; // ~1MP is the endpoint's cap; wider is rejected
 const STRIP_H = 640;
 const STRIP_MAX = 4; // poses per image — beyond this each figure gets too few px
@@ -1418,6 +1468,67 @@ const runGenerateAll = async (): Promise<void> => {
   const total = stBundle.moves.reduce(
     (n, mv) => n + mv.steps.filter((_, i) => want(mv, i)).length, 0);
   let done = 0;
+
+  // ---- img2img: SHEET batching. Every output image costs the same no matter
+  // how many figures it holds, so pack SHEET_MAX poses per call — spanning
+  // moves, since the reference (not the image) is what holds identity now.
+  // ~9x fewer API calls than one image per frame.
+  if (stImg2Img) {
+    try {
+      const todo: { mv: MoveDef; i: number }[] = [];
+      for (const mv of stBundle.moves) {
+        for (let i = 0; i < mv.steps.length; i++) if (want(mv, i)) todo.push({ mv, i });
+      }
+      const calls = Math.ceil(todo.length / SHEET_MAX);
+      let call = 0;
+      for (let s = 0; s < todo.length; s += SHEET_MAX) {
+        const chunk = todo.slice(s, s + SHEET_MAX);
+        call++;
+        stStatus = `sheet ${call}/${calls} · ${chunk.length} poses (${done}/${total} frames)…`;
+        renderAll();
+
+        let slices: HTMLCanvasElement[] | null = null;
+        if (chunk.length > 1) {
+          try {
+            const img = await generateImage(
+              buildSheetPrompt(chunk.map((c) => poseForStep(c.mv, c.i))),
+              seedFor('_sheet', s, 0), 1024, 1024, true);
+            slices = sliceSheet(img, chunk.length);
+            if (slices) stStripsUsed++; else stStripFallbacks++;
+          } catch (e) {
+            stStripFallbacks++;
+            stStripError = (e as Error).message;
+          }
+        }
+
+        for (let k = 0; k < chunk.length; k++) {
+          const { mv, i } = chunk[k]!;
+          done++;
+          let r = slices ? finishFrame(mv, slices[k]!) : null;
+          // Anything the sheet failed on gets its own single-pose call.
+          for (let att = 0; att < 2 && !(r && r.qc.pass); att++) {
+            try {
+              r = (await genFrame(mv, i, att === 0 ? 0 : 2 + ((Math.random() * 1e6) | 0))) ?? r;
+            } catch { /* transient — next attempt */ }
+          }
+          if (r && r.qc.pass) await acceptFrame(mv, i, r);
+          else failures.push(`${mv.id}#${i}${r ? ` QC${r.qc.score}` : ' ERR'}`);
+          renderAll();
+        }
+      }
+      const summary = `${stStripsUsed} sheets ok, ${stStripFallbacks} fell back`
+        + (stStripError ? ` (${stStripError})` : '');
+      stStatus = failures.length === 0
+        ? `batch complete: all ${total} frames accepted · ${summary} — SAVE to persist`
+        : `batch done, ${total - failures.length}/${total} accepted · ${summary} · needs review: ${failures.join(' ')}`;
+    } catch (e) {
+      stStatus = `batch aborted: ${(e as Error).message}`;
+    }
+    stGenBusy = false;
+    renderAll();
+    return;
+  }
+
   try {
     for (const mv of stBundle.moves) {
       const wanted = mv.steps.map((_, i) => i).filter((i) => want(mv, i));
@@ -1613,9 +1724,10 @@ const renderGenerateTab = (): HTMLElement => {
     mkEl('b', {}, '1 · reference sheet (the consistency contract)'),
     mkEl('p', { class: stImg2Img ? 'qc pass' : 'qc fail' },
       stImg2Img
-        ? '✅ reference-image conditioning ON — every frame is generated FROM the reference (true identity lock)'
+        ? `✅ reference-image conditioning ON — every frame is generated FROM the reference (true identity lock), `
+          + `batched ${SHEET_MAX}-up per API call`
         : '⚠ text-only provider: the reference CANNOT be fed to the model (NVIDIA flux rejects user images). '
-          + 'Identity is best-effort via strips + palette lock. For a real fix set IMAGE_PROVIDER=bfl or fal (+ key) in .env.'),
+          + 'Identity is best-effort via strips + palette lock. For a real fix set IMAGE_PROVIDER=gemini|bfl|fal (+ key) in .env.'),
     mkEl('div', { class: 'row' },
       mkEl('label', {}, 'character description ', mkEl('input', {
         value: m.desc ?? '', style: 'width:420px',
@@ -1735,7 +1847,13 @@ const renderGenerateTab = (): HTMLElement => {
         disabled: stGenBusy ? '' : null,
         title: 'every step of every move · QC passes auto-accept, one retry on failure',
         onclick: () => void runGenerateAll(),
-      }, stGenBusy ? '…' : `⚡ batch ${stMissingOnly ? 'MISSING' : 'ALL'} (${b.moves.reduce((n, x) => n + x.steps.filter((s) => !stMissingOnly || !s.sprite).length, 0)} frames)`),
+      }, stGenBusy ? '…' : (() => {
+        const frames = b.moves.reduce(
+          (n, x) => n + x.steps.filter((s) => !stMissingOnly || !s.sprite).length, 0);
+        // Show API CALLS, not frames — calls are what you're billed for.
+        const calls = stImg2Img ? Math.ceil(frames / SHEET_MAX) : frames;
+        return `⚡ batch ${stMissingOnly ? 'MISSING' : 'ALL'} (${frames} frames · ${calls} API call${calls === 1 ? '' : 's'})`;
+      })()),
       mkEl('label', {}, ' missing only ', mkEl('input', {
         type: 'checkbox', checked: stMissingOnly,
         onchange: (e: Event) => { stMissingOnly = (e.target as HTMLInputElement).checked; renderAll(); },

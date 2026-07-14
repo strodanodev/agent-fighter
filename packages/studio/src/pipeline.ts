@@ -354,6 +354,114 @@ export const alphaBounds = (c: HTMLCanvasElement): { l: number; t: number; r: nu
  * across the narrowest gaps (detached limbs) or split at the deepest interior
  * minima until exactly `n` slices remain.
  */
+/**
+ * SHEET SLICER — cut a multi-row grid of figures into individual frames.
+ *
+ * Column projection (sliceStrip) only works for a single row. A grid needs
+ * connected components: label every figure, drop specks, merge parts that
+ * clearly belong to one body (a detached fist), then order them reading-wise
+ * (rows top→bottom, left→right) so panel k maps to pose k.
+ *
+ * Returns exactly `n` canvases, or null if the figure count doesn't match —
+ * the caller then falls back to per-frame generation rather than saving
+ * mis-sliced junk.
+ */
+export const sliceSheet = (img: HTMLImageElement, n: number): HTMLCanvasElement[] | null => {
+  const { canvas: cut } = removeBackground(img);
+  const w = cut.width, h = cut.height;
+  const d = cut.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, w, h).data;
+
+  // --- label connected components (4-connectivity, iterative flood).
+  interface Box { l: number; t: number; r: number; b: number; n: number }
+  const seen = new Uint8Array(w * h);
+  const stack: number[] = [];
+  let boxes: Box[] = [];
+  for (let start = 0; start < w * h; start++) {
+    if (seen[start] || d[start * 4 + 3]! <= 40) continue;
+    const box: Box = { l: w, t: h, r: -1, b: -1, n: 0 };
+    stack.push(start);
+    seen[start] = 1;
+    while (stack.length > 0) {
+      const p = stack.pop()!;
+      const x = p % w, y = (p / w) | 0;
+      box.n++;
+      if (x < box.l) box.l = x;
+      if (x > box.r) box.r = x;
+      if (y < box.t) box.t = y;
+      if (y > box.b) box.b = y;
+      for (const q of [p - 1, p + 1, p - w, p + w]) {
+        if (q < 0 || q >= w * h) continue;
+        if (Math.abs((q % w) - x) > 1) continue; // row-wrap guard
+        if (!seen[q] && d[q * 4 + 3]! > 40) { seen[q] = 1; stack.push(q); }
+      }
+    }
+    boxes.push(box);
+  }
+  if (boxes.length === 0) return null;
+
+  // --- drop specks (JPEG noise, stray pixels).
+  const biggest = Math.max(...boxes.map((b) => b.n));
+  boxes = boxes.filter((b) => b.n >= biggest * 0.08);
+
+  // --- merge overlapping/adjacent boxes (a fist or foot detached from a body).
+  const near = (a: Box, b: Box): boolean => {
+    const gapX = Math.max(0, Math.max(a.l, b.l) - Math.min(a.r, b.r));
+    const gapY = Math.max(0, Math.max(a.t, b.t) - Math.min(a.b, b.b));
+    const tol = Math.round(Math.min(w, h) * 0.03);
+    return gapX <= tol && gapY <= tol;
+  };
+  let merged = true;
+  while (merged && boxes.length > n) {
+    merged = false;
+    outer:
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        if (!near(boxes[i]!, boxes[j]!)) continue;
+        const a = boxes[i]!, b = boxes[j]!;
+        boxes[i] = {
+          l: Math.min(a.l, b.l), t: Math.min(a.t, b.t),
+          r: Math.max(a.r, b.r), b: Math.max(a.b, b.b), n: a.n + b.n,
+        };
+        boxes.splice(j, 1);
+        merged = true;
+        break outer;
+      }
+    }
+  }
+  // Still too many? keep the n largest (the rest are debris).
+  if (boxes.length > n) {
+    boxes = [...boxes].sort((a, b) => b.n - a.n).slice(0, n);
+  }
+  if (boxes.length !== n) return null; // too few figures — model didn't comply
+
+  // --- reading order: cluster into rows by vertical center, then sort by x.
+  const cy = (b: Box): number => (b.t + b.b) / 2;
+  const medH = [...boxes].map((b) => b.b - b.t).sort((a, b) => a - b)[boxes.length >> 1]!;
+  const byY = [...boxes].sort((a, b) => cy(a) - cy(b));
+  const rows: Box[][] = [];
+  for (const b of byY) {
+    const row = rows[rows.length - 1];
+    if (row && Math.abs(cy(b) - cy(row[0]!)) < medH * 0.6) row.push(b);
+    else rows.push([b]);
+  }
+  const ordered = rows.flatMap((row) => row.sort((a, b) => a.l - b.l));
+
+  // --- emit each figure padded on white (the keyer downstream expects white).
+  return ordered.map((b) => {
+    const bw = b.r - b.l + 1;
+    const bh = b.b - b.t + 1;
+    const pad = Math.round(Math.max(bw, bh) * 0.12);
+    const cw = bw + pad * 2;
+    const ch = bh + pad * 2;
+    const out = mkCanvas(cw, ch);
+    const octx = out.getContext('2d', { willReadFrequently: true })!;
+    octx.fillStyle = '#ffffff';
+    octx.fillRect(0, 0, cw, ch);
+    octx.drawImage(cut, b.l, b.t, bw, bh, pad, pad, bw, bh);
+    return out;
+  });
+};
+
 export const sliceStrip = (img: HTMLImageElement, n: number): HTMLCanvasElement[] | null => {
   const { canvas: cut } = removeBackground(img);
   const w = cut.width, h = cut.height;
