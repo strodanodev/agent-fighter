@@ -98,6 +98,28 @@ const generateBfl = async ({ prompt, image, seed, width, height }) => {
 };
 
 /**
+ * NVIDIA build API (flux.2-klein-4b by default). Text-to-image only — every
+ * flux model hosted here refuses user reference images (see the big comment
+ * above), so this path can never carry a character's identity. It stays
+ * available as an explicit per-request choice for one-off, no-identity art
+ * (stage backgrounds, set dressing) where that limitation doesn't matter and
+ * it's the cheaper/faster engine.
+ */
+const generateNvidia = async ({ prompt, seed, width = 1024, height = 1024 }) => {
+  if (!NVAPI_KEY) throw new Error('NVAPI_KEY missing from .env');
+  const r = await fetch(NV_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${NVAPI_KEY}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ prompt: prompt.slice(0, 800), width, height, steps: 4, seed }),
+  });
+  const t = await r.text();
+  if (!r.ok) throw new Error(`NVIDIA ${r.status}: ${t.slice(0, 200)}`);
+  const b64 = JSON.parse(t).artifacts?.[0]?.base64;
+  if (!b64) throw new Error('NVIDIA returned no image');
+  return b64;
+};
+
+/**
  * Google Gemini image models (nano-banana family). Native multimodal edit:
  * the reference image is just another part in the request, so "keep this
  * character, change the pose" works directly — no asset upload dance.

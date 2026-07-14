@@ -3,21 +3,42 @@
  * The image model is an unreliable artist; everything here is plain code
  * that normalizes and verifies its output:
  *
- *   raw image → background removal → palette lock → nearest-neighbor
+ *   raw image → background removal → (palette conformity check) → smooth
  *   downscale into a fixed sprite cell (feet-anchored pivot) → QC score
  *   → auto hurtbox/hitbox drafts.
+ *
+ * ART STYLE — anime, not 8-bit. The old chunky look came from three
+ * deliberate choices made when the model could NOT see a reference:
+ *   1. "pixel art" in the prompt,
+ *   2. snapping every pixel to a locked 16-colour palette,
+ *   3. nearest-neighbour downscale to a 112px body.
+ * (2) and (3) existed to HIDE frame-to-frame drift — pixelation makes small
+ * inconsistencies invisible. Reference conditioning (see server.mjs) removes
+ * the drift at the source, so the crutches go: sprites are now supersampled
+ * 2x, downscaled smoothly, and keep their full shading. The palette is still
+ * extracted, but only to SCORE colour conformity — it never repaints pixels.
  *
  * All canvas ops, no AI. Runs in the Studio browser app.
  */
 import type { Rect } from '@af/core';
 
-/** Fixed sprite cell: world-px 1:1, pivot = feet center. */
-export const CELL_W = 192;
-export const CELL_H = 192;
-export const PIVOT_X = 96;
-export const PIVOT_Y = 176;
-/** Standing body height sprites are normalized to (stand hurtbox is 108). */
-export const TARGET_BODY_H = 112;
+/**
+ * Sprite cell. Sprites are authored at SUPERSAMPLE× the world size and the
+ * renderer scales them back down (atlas.json carries `scale`), so a fighter
+ * still occupies WORLD_BODY_H world px while carrying 2x the pixel detail.
+ */
+export const SUPERSAMPLE = 2;
+export const WORLD_BODY_H = 112; // world px — must match the client's FIGHTER_H
+export const CELL_W = 192 * SUPERSAMPLE;
+export const CELL_H = 192 * SUPERSAMPLE;
+export const PIVOT_X = 96 * SUPERSAMPLE;
+export const PIVOT_Y = 176 * SUPERSAMPLE;
+/** Body height in SPRITE px (world height × supersample). */
+export const TARGET_BODY_H = WORLD_BODY_H * SUPERSAMPLE;
+/** World px per sprite px — written into atlas.json for the renderer. */
+export const SPRITE_SCALE = 1 / SUPERSAMPLE;
+/** Palette size: generous, since it only scores conformity now (no snapping). */
+export const PALETTE_N = 48;
 
 export type RGB = [number, number, number];
 
@@ -551,15 +572,22 @@ export const meanChroma = (c: HTMLCanvasElement): number => {
 };
 
 /**
- * Snap every opaque pixel to the nearest palette color. Returns the fraction
- * of pixels that were already close to the palette (QC signal: how much the
- * model drifted from the reference colors before we fixed it).
+ * Colour conformity against the locked palette: the fraction of opaque pixels
+ * that sit close to SOME palette entry. Purely a QC score.
+ *
+ * `snap` repaints every pixel to its nearest palette colour. That is what
+ * produced the flat 8-bit look, and it only ever existed to mask drift from
+ * an unconditioned model. With reference conditioning it destroys the anime
+ * shading for no benefit, so it defaults OFF. (Kept switchable — a future
+ * genuinely-retro character can turn it back on.)
  */
-export const quantizeToPalette = (c: HTMLCanvasElement, palette: RGB[]): number => {
+export const quantizeToPalette = (
+  c: HTMLCanvasElement, palette: RGB[], snap = false,
+): number => {
   const ctx = c.getContext('2d', { willReadFrequently: true })!;
   const im = ctx.getImageData(0, 0, c.width, c.height);
   const d = im.data;
-  const CLOSE2 = 42 * 42;
+  const CLOSE2 = 60 * 60; // roomier: shading ramps sit between palette entries
   let opaque = 0, close = 0;
   for (let i = 0; i < d.length; i += 4) {
     if (d[i + 3]! < 128) { d[i + 3] = 0; continue; }
@@ -570,10 +598,12 @@ export const quantizeToPalette = (c: HTMLCanvasElement, palette: RGB[]): number 
       if (dd < bestD) { bestD = dd; best = p; }
     }
     if (bestD < CLOSE2) close++;
-    d[i] = palette[best]![0]; d[i + 1] = palette[best]![1]; d[i + 2] = palette[best]![2];
-    d[i + 3] = 255;
+    if (snap) {
+      d[i] = palette[best]![0]; d[i + 1] = palette[best]![1]; d[i + 2] = palette[best]![2];
+      d[i + 3] = 255;
+    }
   }
-  ctx.putImageData(im, 0, 0);
+  if (snap) ctx.putImageData(im, 0, 0);
   return opaque === 0 ? 0 : close / opaque;
 };
 
@@ -588,8 +618,12 @@ export interface NormalizedFrame {
 
 /**
  * Full normalize pass: bg removal → crop → scale to the standard body height
- * (nearest-neighbor: the pixelation IS the consistency trick, spec §5.1) →
- * feet-anchor into the fixed cell → optional palette lock.
+ * → feet-anchor into the fixed cell → colour conformity score.
+ *
+ * The downscale is SMOOTH (high-quality bilinear), not nearest-neighbour:
+ * we are shrinking a ~700px anime figure into a 224px cell, and nearest
+ * sampling throws away exactly the shading and line work that make it read as
+ * anime rather than as a mosaic.
  */
 export const normalizeFrame = (
   img: HTMLImageElement | HTMLCanvasElement, palette: RGB[] | null,
@@ -605,10 +639,12 @@ export const normalizeFrame = (
 
   const cell = mkCanvas(CELL_W, CELL_H);
   const ctx = cell.getContext('2d', { willReadFrequently: true })!;
-  ctx.imageSmoothingEnabled = false; // nearest-neighbor
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(cut, bb.l, bb.t, srcW, srcH, PIVOT_X - (dw >> 1), PIVOT_Y - dh, dw, dh);
 
-  const paletteMatch = palette ? quantizeToPalette(cell, palette) : 1;
+  // Score colour conformity; never repaint (see quantizeToPalette).
+  const paletteMatch = palette ? quantizeToPalette(cell, palette, false) : 1;
   return { cell, bodyH: dh, bodyW: dw, paletteMatch, majorBlobs, bleed };
 };
 

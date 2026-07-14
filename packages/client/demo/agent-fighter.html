@@ -1857,11 +1857,15 @@ const drawFighter = (ctx, roster, f, tick, x, y, fallback) => {
     ctx.save();
     ctx.translate(x, y);
     ctx.scale(f.facing, 1);
-    ctx.imageSmoothingEnabled = false;
     if (frame && roster.sheet) {
-        ctx.drawImage(roster.sheet, frame.x, frame.y, frame.w, frame.h, -frame.pivotX, -frame.pivotY, frame.w, frame.h);
+        const s = roster.atlas?.scale ?? 1;
+        ctx.imageSmoothingEnabled = roster.atlas?.smooth ?? false;
+        if (ctx.imageSmoothingEnabled)
+            ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(roster.sheet, frame.x, frame.y, frame.w, frame.h, -frame.pivotX * s, -frame.pivotY * s, frame.w * s, frame.h * s);
     }
     else {
+        ctx.imageSmoothingEnabled = false;
         ctx.fillStyle = fallback;
         ctx.fillRect(-26, -108, 52, 108);
     }
@@ -1888,7 +1892,9 @@ const drawPortrait = (ctx, roster, x, y, w, h) => {
     ctx.beginPath();
     ctx.rect(x, y, w, h);
     ctx.clip();
-    ctx.imageSmoothingEnabled = false;
+    ctx.imageSmoothingEnabled = roster.atlas?.smooth ?? false;
+    if (ctx.imageSmoothingEnabled)
+        ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(img, cropX, cropY, side, side, x, y, w, h);
     ctx.restore();
 };
@@ -2637,7 +2643,12 @@ const startFight = () => {
     shake = 0;
     screen = 'fight';
 };
-const FIGHTER_H = 112; // world px — sprite body height (see studio TARGET_BODY_H)
+/**
+ * World px a fighter's body occupies. Sprites are authored supersampled (2x)
+ * for anime detail and scaled back down at blit time via atlas.json `scale`,
+ * so this stays the WORLD height — keep it equal to the Studio's WORLD_BODY_H.
+ */
+const FIGHTER_H = 112;
 /**
  * Dynamic camera: frame BOTH fighters. Zooms in tight when they're close and
  * grounded (big, readable characters) and pulls back on super jumps / air

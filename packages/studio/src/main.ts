@@ -16,7 +16,8 @@ import type {
   CharacterBundle, GameState, HitboxDef, InputFrame, MoveDef, MoveStep, Rect,
 } from '@af/core';
 import {
-  CELL_W, PIVOT_X, PIVOT_Y, alphaBounds, autoHurtboxes, canvasToPngDataUrl,
+  CELL_W, PALETTE_N, PIVOT_X, PIVOT_Y, SPRITE_SCALE,
+  alphaBounds, autoHurtboxes, canvasToPngDataUrl,
   decodeBase64Image, diffHitboxDraft, enclosedWhitePockets, extractPalette,
   sliceSheet,
   flipCanvasH, maskDiff, meanChroma, mirrorMask16, normalizeFrame, qcScore,
@@ -179,7 +180,12 @@ const packAtlas = async (): Promise<number> => {
   });
   await apiJson(`/api/characters/${stCharId}/sprites/atlas.json`, {
     method: 'PUT',
-    body: JSON.stringify({ cellW: CELL_W, cellH: CELL_W, frames }, null, 2),
+    // `scale` = world px per sprite px. Sprites are authored supersampled for
+    // detail, so the renderer must shrink them back to world size; `smooth`
+    // tells it to filter rather than point-sample (anime art, not pixel art).
+    body: JSON.stringify({
+      cellW: CELL_W, cellH: CELL_W, scale: SPRITE_SCALE, smooth: true, frames,
+    }, null, 2),
   });
   return cells.length;
 };
@@ -1120,11 +1126,19 @@ const renderTestTab = (): HTMLElement => {
 };
 
 // ------------------------------------------------------------------ generate tab
-const SPRITE_STYLE = 'perfectly flat solid pure white background, no shadows, no floor, '
-  + 'no gradient, 2D fighting game sprite, single character only, full body in strict '
-  + 'profile view facing right, nose chest and toes all pointing toward the right edge '
-  + 'of the image, feet at the bottom, sharp pixel art style, crisp outlines, vibrant '
-  + 'colors, centered, no text, no watermark';
+/**
+ * ART DIRECTION — hand-drawn anime, in the tradition of 2D arcade fighters
+ * (KOF / Guilty Gear / Arc System Works), NOT retro pixel art. The old
+ * "sharp pixel art" wording plus palette snapping and nearest-neighbour
+ * downscaling is what produced the chunky 8-bit look; see pipeline.ts.
+ */
+const SPRITE_STYLE = 'high-resolution anime fighting game character art, hand-drawn cel-shaded '
+  + 'illustration, clean bold ink outlines, dynamic shading with crisp highlights, '
+  + 'detailed rendering, 2D arcade fighter style like King of Fighters or Guilty Gear. '
+  + 'Single character only, full body in strict profile view facing right, nose chest and '
+  + 'toes all pointing toward the right edge of the image, feet at the bottom, centered. '
+  + 'Perfectly flat solid pure white background, no shadows, no floor, no gradient, '
+  + 'no text, no watermark. Not pixel art, not 8-bit, not blocky.';
 
 /**
  * HARD LIMIT: the endpoint rejects prompts over 800 chars (422
@@ -1165,8 +1179,9 @@ const buildStripPrompt = (desc: string, poses: string[]): string => {
       + `character wearing the identical outfit and colors, one horizontal row, evenly `
       + `spaced, not touching. Each pose is distinct: `;
   const tail = `. Each pose: same full-body character, profile facing right, feet on one `
-    + `ground line. Flat pure white background, no shadow, no floor, no borders. Pixel art `
-    + `fighting game sprite sheet, crisp outlines, vibrant colors, no text.`;
+    + `ground line. Flat pure white background, no shadow, no floor, no borders. `
+    + `Hand-drawn cel-shaded anime fighting game art, bold ink outlines, vibrant colors, `
+    + `no text. Not pixel art.`;
   const max = promptMax();
   const budget = max - head.length - tail.length;
   let body = poses.map((p, k) => `${k + 1}) ${p}`).join('; ');
@@ -1346,7 +1361,9 @@ const buildSheetPrompt = (poses: string[]): string => {
     + `Each figure is a DIFFERENT pose: ${poses.map((p, k) => `${k + 1}) ${p}`).join('; ')}. `
     + `Every figure: full body, strict side profile facing right, feet on its own ground line. `
     + `Flat pure white background, no shadows, no floor, no grid lines, no borders, no text. `
-    + `Figures evenly spaced and clearly separated — never touching or overlapping.`
+    + `Figures evenly spaced and clearly separated — never touching or overlapping. `
+    + `Hand-drawn cel-shaded anime fighting game art, bold ink outlines, detailed shading, `
+    + `vibrant colors. Not pixel art, not 8-bit.`
   ).slice(0, promptMax());
 };
 
@@ -1749,7 +1766,7 @@ const renderGenerateTab = (): HTMLElement => {
       }, '↔ flip'),
       mkEl('button', {
         onclick: () => {
-          const pal = extractPalette(stRefPreview!.cell, 16);
+          const pal = extractPalette(stRefPreview!.cell, PALETTE_N);
           m.palette = pal;
           m.refBodyW = stRefPreview!.bodyW;
           m.refMask = silhouetteMask16(stRefPreview!.cell);
@@ -1776,7 +1793,7 @@ const renderGenerateTab = (): HTMLElement => {
               ref = spriteCanvas('_reference.png');
             }
             if (!ref) { stStatus = 'no saved reference found'; renderAll(); return; }
-            m.palette = extractPalette(ref, 16);
+            m.palette = extractPalette(ref, PALETTE_N);
             m.refMask = silhouetteMask16(ref);
             m.refChroma = Math.round(meanChroma(ref));
             const bb = alphaBounds(ref);

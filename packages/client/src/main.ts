@@ -116,7 +116,12 @@ const startFight = (): void => {
   screen = 'fight';
 };
 
-const FIGHTER_H = 112; // world px — sprite body height (see studio TARGET_BODY_H)
+/**
+ * World px a fighter's body occupies. Sprites are authored supersampled (2x)
+ * for anime detail and scaled back down at blit time via atlas.json `scale`,
+ * so this stays the WORLD height — keep it equal to the Studio's WORLD_BODY_H.
+ */
+const FIGHTER_H = 112;
 
 /**
  * Dynamic camera: frame BOTH fighters. Zooms in tight when they're close and

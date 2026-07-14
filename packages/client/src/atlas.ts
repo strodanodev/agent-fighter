@@ -15,6 +15,14 @@ export interface AtlasFrame {
 export interface AtlasData {
   cellW: number;
   cellH: number;
+  /**
+   * World px per sprite px. Sprites are authored supersampled (anime art keeps
+   * its line work and shading that way), so they must be shrunk back to world
+   * size at draw time. Absent in legacy 1:1 atlases → 1.
+   */
+  scale?: number;
+  /** Filter when scaling (anime art). Legacy pixel-art atlases point-sample. */
+  smooth?: boolean;
   frames: Record<string, AtlasFrame>;
 }
 
@@ -106,14 +114,17 @@ export const drawFighter = (
   ctx.save();
   ctx.translate(x, y);
   ctx.scale(f.facing, 1);
-  ctx.imageSmoothingEnabled = false;
   if (frame && roster.sheet) {
+    const s = roster.atlas?.scale ?? 1;
+    ctx.imageSmoothingEnabled = roster.atlas?.smooth ?? false;
+    if (ctx.imageSmoothingEnabled) ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(
       roster.sheet,
       frame.x, frame.y, frame.w, frame.h,
-      -frame.pivotX, -frame.pivotY, frame.w, frame.h,
+      -frame.pivotX * s, -frame.pivotY * s, frame.w * s, frame.h * s,
     );
   } else {
+    ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = fallback;
     ctx.fillRect(-26, -108, 52, 108);
   }
@@ -145,7 +156,8 @@ export const drawPortrait = (
   ctx.beginPath();
   ctx.rect(x, y, w, h);
   ctx.clip();
-  ctx.imageSmoothingEnabled = false;
+  ctx.imageSmoothingEnabled = roster.atlas?.smooth ?? false;
+  if (ctx.imageSmoothingEnabled) ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(img, cropX, cropY, side, side, x, y, w, h);
   ctx.restore();
 };
