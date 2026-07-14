@@ -331,6 +331,74 @@ const FR_SC = 2.2;
 const FR_CX = 260;
 const FR_CY = 430;
 let frDrag: { mode: 'move' | 'resize'; startX: number; startY: number; orig: Rect } | null = null;
+let frSpriteDrag: { startY: number } | null = null;
+let frSpriteScale = 1; // live preview scale while dragging the sprite handle
+
+/** Alpha bbox of the current step's sprite, in cell coords (null = none). */
+const frSpriteBBox = (): { l: number; t: number; r: number; b: number } | null => {
+  const stp = curStep();
+  if (!stp?.sprite) return null;
+  const c = spriteCanvas(stp.sprite);
+  if (!c) return null;
+  const d = c.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, c.width, c.height).data;
+  let l = c.width, t = c.height, r = -1, b = -1;
+  for (let y = 0; y < c.height; y++) {
+    for (let x = 0; x < c.width; x++) {
+      if (d[(y * c.width + x) * 4 + 3]! > 40) {
+        if (x < l) l = x;
+        if (x > r) r = x;
+        if (y < t) t = y;
+        if (y > b) b = y;
+      }
+    }
+  }
+  return r < 0 ? null : { l, t, r, b };
+};
+
+/** Bake a uniform scale (around the feet pivot) into the sprite PNG. */
+const bakeSpriteScale = async (name: string, s: number): Promise<void> => {
+  const c = spriteCanvas(name);
+  if (!c || s === 1) return;
+  const out = document.createElement('canvas');
+  out.width = CELL_W;
+  out.height = CELL_W;
+  const ctx = out.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(c, PIVOT_X * (1 - s), PIVOT_Y * (1 - s), CELL_W * s, CELL_W * s);
+  await saveSprite(name, out);
+  stDirty = true; // atlas repacks on save
+};
+
+/** Flip EVERY sprite of the character (default orientation fix), incl. the
+ * reference sheet + its facing mask so future generation stays consistent. */
+const flipAllSprites = async (): Promise<void> => {
+  if (stGenBusy || !stBundle) return;
+  stGenBusy = true;
+  const names = [...new Set(
+    stBundle.moves.flatMap((mv) => mv.steps.map((sp) => sp.sprite)).filter((sp): sp is string => !!sp))];
+  names.push('_reference.png');
+  let done = 0;
+  try {
+    for (const name of names) {
+      stStatus = `flipping ${++done}/${names.length}…`; renderAll();
+      let c = spriteCanvas(name);
+      for (let w = 0; w < 30 && !c; w++) {
+        await new Promise((r) => setTimeout(r, 100));
+        c = spriteCanvas(name);
+      }
+      if (!c) continue;
+      await saveSprite(name, flipCanvasH(c));
+    }
+    const m = meta();
+    if (m.refMask) m.refMask = mirrorMask16(m.refMask);
+    stDirty = true;
+    stStatus = `flipped ${done} sprites — default orientation reversed. SAVE to repack the atlas.`;
+  } catch (e) {
+    stStatus = `flip all failed: ${(e as Error).message}`;
+  }
+  stGenBusy = false;
+  renderAll();
+};
 
 const selRect = (): Rect | null => {
   if (!stSel) return null;
@@ -362,13 +430,31 @@ const frPaint = (cv: HTMLCanvasElement): void => {
   const stp = curStep();
   if (!stp) return;
 
-  // Sprite (or body silhouette).
+  // Sprite (or body silhouette). frSpriteScale previews a pending resize.
   if (stp.sprite) {
     const spr = getSprite(stp.sprite);
     if (spr) {
+      const s = frSpriteScale;
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(spr, FR_CX - PIVOT_X * FR_SC, FR_CY - PIVOT_Y * FR_SC,
-        CELL_W * FR_SC, CELL_W * FR_SC);
+      ctx.drawImage(spr, FR_CX - PIVOT_X * FR_SC * s, FR_CY - PIVOT_Y * FR_SC * s,
+        CELL_W * FR_SC * s, CELL_W * FR_SC * s);
+      // Sprite bounds + scale handle (top-forward corner). Drag = uniform
+      // scale around the feet pivot.
+      const bb = frSpriteBBox();
+      if (bb) {
+        const sx = FR_CX + (bb.l - PIVOT_X) * FR_SC * s;
+        const sy = FR_CY + (bb.t - PIVOT_Y) * FR_SC * s;
+        const sw = (bb.r - bb.l + 1) * FR_SC * s;
+        const sh = (bb.b - bb.t + 1) * FR_SC * s;
+        ctx.setLineDash([3, 5]);
+        ctx.strokeStyle = '#ffd16655';
+        ctx.strokeRect(sx + 0.5, sy + 0.5, sw, sh);
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#ffd166';
+        ctx.fillRect(sx + sw - 5, sy - 5, 11, 11);
+        ctx.strokeStyle = '#000';
+        ctx.strokeRect(sx + sw - 5 + 0.5, sy - 5 + 0.5, 10, 10);
+      }
     }
   } else {
     ctx.fillStyle = '#2c3050';
@@ -425,6 +511,17 @@ const frMouse = (cv: HTMLCanvasElement): void => {
     const p = toChar(e);
     const stp = curStep();
     if (!stp) return;
+    // Sprite scale handle takes priority (top-forward corner of sprite bounds).
+    const bb = frSpriteBBox();
+    if (bb && stp.sprite) {
+      const hx = (bb.r + 1 - PIVOT_X) * frSpriteScale;
+      const hy = (bb.t - PIVOT_Y) * frSpriteScale;
+      if (Math.abs(p.x - hx) < 8 && Math.abs(p.y - hy) < 8) {
+        const r = cv.getBoundingClientRect();
+        frSpriteDrag = { startY: e.clientY - r.top };
+        return;
+      }
+    }
     const sr = selRect();
     // Resize handle?
     if (sr && Math.abs(p.x - (sr.x + sr.w)) < 6 / FR_SC * 3 && Math.abs(p.y - (sr.y + sr.h)) < 6 / FR_SC * 3) {
@@ -442,6 +539,17 @@ const frMouse = (cv: HTMLCanvasElement): void => {
     renderAll();
   };
   cv.onmousemove = (e) => {
+    if (frSpriteDrag) {
+      // Uniform scale around the pivot: ratio of distances above the feet.
+      const rc = cv.getBoundingClientRect();
+      const my = e.clientY - rc.top;
+      const denom = FR_CY - frSpriteDrag.startY;
+      if (denom > 8) {
+        frSpriteScale = Math.max(0.3, Math.min(2.5, (FR_CY - my) / denom));
+        frPaint(cv);
+      }
+      return;
+    }
     if (!frDrag) return;
     const p = toChar(e);
     const r = selRect();
@@ -458,7 +566,22 @@ const frMouse = (cv: HTMLCanvasElement): void => {
     stDirty = true;
     frPaint(cv);
   };
-  cv.onmouseup = () => { if (frDrag) { frDrag = null; renderAll(); } };
+  cv.onmouseup = () => {
+    if (frSpriteDrag) {
+      const stp = curStep();
+      const s = frSpriteScale;
+      frSpriteDrag = null;
+      frSpriteScale = 1;
+      if (stp?.sprite && Math.abs(s - 1) > 0.02) {
+        void bakeSpriteScale(stp.sprite, s).then(() => {
+          stStatus = `sprite scaled ×${s.toFixed(2)} (baked)`;
+          renderAll();
+        });
+      } else renderAll();
+      return;
+    }
+    if (frDrag) { frDrag = null; renderAll(); }
+  };
   cv.onmouseleave = cv.onmouseup;
 };
 
@@ -549,6 +672,15 @@ const renderFramesTab = (): HTMLElement => {
       type: 'checkbox', checked: stOnion,
       onchange: (e: Event) => { stOnion = (e.target as HTMLInputElement).checked; renderAll(); },
     })),
+    mkEl('label', { class: 'field', title: 'uniform scale around the feet pivot, baked into the PNG — or drag the gold corner handle on the canvas' },
+      'sprite scale %',
+      numInput(100, (v) => {
+        if (!stp.sprite || v === 100 || v < 20 || v > 300) return;
+        void bakeSpriteScale(stp.sprite, v / 100).then(() => {
+          stStatus = `sprite scaled ×${(v / 100).toFixed(2)} (baked)`;
+          renderAll();
+        });
+      })),
     mkEl('button', {
       title: 'mirror the sprite horizontally (fixes wrong facing)',
       onclick: () => {
@@ -633,6 +765,15 @@ const renderFramesTab = (): HTMLElement => {
         })),
       mkEl('span', { class: 'hint' },
         mv ? `${mv.type} · ${mv.stance} · total ${mv.steps.reduce((n, s) => n + s.frames, 0)}f` : ''),
+      mkEl('button', {
+        disabled: stGenBusy ? '' : null,
+        title: 'mirror EVERY sprite of this character (incl. reference) — fixes wrong default orientation',
+        onclick: () => {
+          if (confirm(`Flip ALL of ${b.name}'s sprites horizontally? Use when the whole character faces the wrong way.`)) {
+            void flipAllSprites();
+          }
+        },
+      }, stGenBusy ? '…' : '↔ flip ALL sprites'),
     ),
     timeline,
     mkEl('div', { class: 'row' }, cv, mkEl('div', {}, stepProps, hbProps)),
@@ -1288,6 +1429,14 @@ const renderGenerateTab = (): HTMLElement => {
     ),
     stRefPreview ? mkEl('div', { class: 'row' },
       thumb(stRefPreview.cell),
+      mkEl('button', {
+        title: 'mirror the reference BEFORE locking — everything generated after inherits this orientation',
+        onclick: () => {
+          stRefPreview!.cell = flipCanvasH(stRefPreview!.cell);
+          stStatus = 'reference preview flipped';
+          renderAll();
+        },
+      }, '↔ flip'),
       mkEl('button', {
         onclick: () => {
           const pal = extractPalette(stRefPreview!.cell, 16);
