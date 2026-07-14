@@ -15,9 +15,11 @@ import { listCharacters, loadRoster, drawFighter } from './atlas.js';
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  drawHud, drawResults, drawSelect, drawStage, drawTitle, worldTransform,
+  drawHud, drawResults, drawSelect, drawStage, drawTitle,
+  setStageAsset, setUiKit, worldTransform,
 } from './ui.js';
 import type { Cam, HudFx } from './ui.js';
+import { listStages, loadStage, loadUiKit } from './chrome.js';
 
 const TICK_MS = 1000 / TICKS_PER_SEC;
 
@@ -83,6 +85,9 @@ const px = (v: number): number => Math.trunc(v / 256);
 // ---------------------------------------------------------------- boot
 const boot = async (): Promise<void> => {
   try {
+    setUiKit(await loadUiKit());
+    const stageIds = await listStages();
+    if (stageIds.length > 0) setStageAsset(await loadStage(stageIds[0]!));
     const ids = await listCharacters();
     if (ids.length === 0) throw new Error('no characters found in characters/');
     allRosters = await Promise.all(ids.map(loadRoster));

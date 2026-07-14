@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="46" viewBox="0 0 400 46">
+  <!-- Health bar frame, LEFT player orientation (arrow nose points to screen center).
+       The right player's frame is this image mirrored by the renderer.
+       The fill is drawn UNDER this frame, clipped to the tray window polygon:
+         (16,10) (358,10) (381,23) (358,36) (16,36) (11,31) (11,15)
+       Keep that polygon in sync with HUD_GEO.healthWindow in ui.ts. -->
+  <defs>
+    <linearGradient id="steel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a8aec0"/>
+      <stop offset="0.22" stop-color="#767c8e"/>
+      <stop offset="0.55" stop-color="#4a4f5e"/>
+      <stop offset="0.8" stop-color="#333744"/>
+      <stop offset="1" stop-color="#22242e"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f7e0a3"/>
+      <stop offset="0.45" stop-color="#d9a441"/>
+      <stop offset="1" stop-color="#8a5f1e"/>
+    </linearGradient>
+  </defs>
+  <!-- dark silhouette / outline -->
+  <polygon points="5,1 362,1 399,23 362,45 5,45 0,39 0,7" fill="#101116"/>
+  <!-- steel plate -->
+  <polygon points="7,3 360,3 395,23 360,43 7,43 2,37 2,9" fill="url(#steel)"/>
+  <!-- top highlight -->
+  <polygon points="7,3 360,3 371,9 9,9 4,12 2,9" fill="#c8cdda" opacity="0.35"/>
+  <!-- gold trim channel -->
+  <polygon points="10,6 358,6 390,23 358,40 10,40 5,34 5,12" fill="none" stroke="url(#gold)" stroke-width="2.4"/>
+  <!-- tray window: TRANSPARENT — the renderer paints the dark tray + health
+       fill underneath, clipped to this polygon (HUD_GEO.healthWindow) -->
+  <polygon points="16,10 358,10 381,23 358,36 16,36 11,31 11,15" fill="none" stroke="#000000" stroke-opacity="0.55" stroke-width="1.6"/>
+  <!-- rivets -->
+  <circle cx="9" cy="8" r="2.4" fill="#d7dbe6"/><circle cx="9" cy="8" r="1.1" fill="#5b6070"/>
+  <circle cx="9" cy="38" r="2.4" fill="#8b91a1"/><circle cx="9" cy="38" r="1.1" fill="#3c404d"/>
+  <circle cx="354" cy="8" r="2.4" fill="#d7dbe6"/><circle cx="354" cy="8" r="1.1" fill="#5b6070"/>
+  <circle cx="354" cy="38" r="2.4" fill="#8b91a1"/><circle cx="354" cy="38" r="1.1" fill="#3c404d"/>
+  <!-- gold nose cap -->
+  <polygon points="381,17 395,23 381,29 376,23" fill="url(#gold)"/>
+</svg>

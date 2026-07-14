@@ -32,6 +32,79 @@ const NVAPI_KEY = env.NVAPI_KEY || process.env.NVAPI_KEY || '';
 const NV_MODEL = env.NV_MODEL || process.env.NV_MODEL || 'black-forest-labs/flux.2-klein-4b';
 const NV_URL = `https://ai.api.nvidia.com/v1/genai/${NV_MODEL}`;
 
+/**
+ * IMAGE PROVIDER — text-to-image is available on any of these; only the
+ * img2img ones can truly hold a character's identity across frames.
+ *
+ * NVIDIA's hosted flux (default) REFUSES user reference images: its `image`
+ * field only accepts gallery `example_id`s — verified against flux.2-klein
+ * AND flux.1-kontext-dev, with base64, data-URI, and uploaded NVCF asset ids
+ * all rejected. So on `nvidia` we can only do text prompts, and character
+ * consistency is best-effort (strips + palette lock + QC).
+ *
+ * To get REAL reference conditioning (FLUX Kontext: "keep this character,
+ * change the pose"), put one of these in .env and the Studio uses it
+ * automatically for every frame once a reference is locked:
+ *
+ *   IMAGE_PROVIDER=bfl   BFL_API_KEY=...    (api.bfl.ai — FLUX Kontext)
+ *   IMAGE_PROVIDER=fal   FAL_KEY=...        (fal.run — FLUX Pro Kontext)
+ */
+const PROVIDER = (env.IMAGE_PROVIDER || process.env.IMAGE_PROVIDER || 'nvidia').toLowerCase();
+const BFL_API_KEY = env.BFL_API_KEY || process.env.BFL_API_KEY || '';
+const FAL_KEY = env.FAL_KEY || process.env.FAL_KEY || '';
+/** Does the active provider accept a user-supplied reference image? */
+const SUPPORTS_IMG2IMG = (PROVIDER === 'bfl' && !!BFL_API_KEY) || (PROVIDER === 'fal' && !!FAL_KEY);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** BFL: submit → poll → fetch result. `image` = raw base64 (no data: prefix). */
+const generateBfl = async ({ prompt, image, seed, width, height }) => {
+  const model = image ? 'flux-kontext-pro' : 'flux-pro-1.1';
+  const body = image
+    ? { prompt, input_image: image, seed, output_format: 'png' }
+    : { prompt, width, height, seed, output_format: 'png' };
+  const submit = await fetch(`https://api.bfl.ai/v1/${model}`, {
+    method: 'POST',
+    headers: { 'x-key': BFL_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const job = await submit.json();
+  if (!submit.ok) throw new Error(`BFL submit ${submit.status}: ${JSON.stringify(job).slice(0, 200)}`);
+  const pollUrl = job.polling_url ?? `https://api.bfl.ai/v1/get_result?id=${job.id}`;
+  for (let i = 0; i < 60; i++) {
+    await sleep(1000);
+    const res = await (await fetch(pollUrl, { headers: { 'x-key': BFL_API_KEY } })).json();
+    if (res.status === 'Ready') {
+      const url = res.result?.sample;
+      const buf = Buffer.from(await (await fetch(url)).arrayBuffer());
+      return buf.toString('base64');
+    }
+    if (res.status && !['Pending', 'Queued', 'Processing', 'Request Moderated'].includes(res.status)) {
+      throw new Error(`BFL job ${res.status}`);
+    }
+  }
+  throw new Error('BFL timed out');
+};
+
+/** fal.ai: synchronous run endpoint. `image` = raw base64. */
+const generateFal = async ({ prompt, image, seed }) => {
+  const model = image ? 'fal-ai/flux-pro/kontext' : 'fal-ai/flux-pro/v1.1';
+  const body = image
+    ? { prompt, image_url: `data:image/png;base64,${image}`, seed, output_format: 'png' }
+    : { prompt, seed, output_format: 'png' };
+  const r = await fetch(`https://fal.run/${model}`, {
+    method: 'POST',
+    headers: { Authorization: `Key ${FAL_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(`fal ${r.status}: ${JSON.stringify(j).slice(0, 200)}`);
+  const url = j.images?.[0]?.url;
+  if (!url) throw new Error('fal: no image in response');
+  if (url.startsWith('data:')) return url.split(',')[1];
+  return Buffer.from(await (await fetch(url)).arrayBuffer()).toString('base64');
+};
+
 // ---- helpers ---------------------------------------------------------------
 const json = (res, code, body) => {
   const data = JSON.stringify(body);
@@ -71,10 +144,48 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const path = url.pathname;
 
+    // ------------------------------------------------ capabilities
+    if (req.method === 'GET' && path === '/api/capabilities') {
+      return json(res, 200, { provider: PROVIDER, img2img: SUPPORTS_IMG2IMG });
+    }
+
     // ------------------------------------------------ generation proxy
     if (req.method === 'POST' && path === '/api/generate') {
+      const raw = await readBody(req);
+      const req0 = JSON.parse(raw.toString('utf8'));
+
+      // Reference-conditioned path (only providers that accept our image).
+      if (req0.image && SUPPORTS_IMG2IMG) {
+        const image = String(req0.image).replace(/^data:image\/\w+;base64,/, '');
+        try {
+          const b64 = PROVIDER === 'bfl'
+            ? await generateBfl({ ...req0, image })
+            : await generateFal({ ...req0, image });
+          return json(res, 200, { artifacts: [{ base64: b64 }] });
+        } catch (err) {
+          return json(res, 502, { error: String(err?.message ?? err) });
+        }
+      }
+      // A reference was sent but the provider cannot use it — say so loudly
+      // rather than silently generating an unconditioned image.
+      if (req0.image && !SUPPORTS_IMG2IMG) {
+        return json(res, 400, {
+          error: `provider "${PROVIDER}" cannot accept a reference image `
+            + `(NVIDIA's flux endpoints only take gallery example_ids). `
+            + `Set IMAGE_PROVIDER=bfl|fal + key in .env for true reference conditioning.`,
+        });
+      }
+
+      // Text-to-image.
+      if (PROVIDER === 'bfl' || PROVIDER === 'fal') {
+        try {
+          const b64 = PROVIDER === 'bfl' ? await generateBfl(req0) : await generateFal(req0);
+          return json(res, 200, { artifacts: [{ base64: b64 }] });
+        } catch (err) {
+          return json(res, 502, { error: String(err?.message ?? err) });
+        }
+      }
       if (!NVAPI_KEY) return json(res, 500, { error: 'NVAPI_KEY missing from .env' });
-      const body = await readBody(req);
       const upstream = await fetch(NV_URL, {
         method: 'POST',
         headers: {
@@ -82,7 +193,7 @@ const server = createServer(async (req, res) => {
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
-        body,
+        body: raw,
       });
       const text = await upstream.text();
       res.writeHead(upstream.status, { 'Content-Type': 'application/json' });
@@ -162,5 +273,9 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Agent Fighter Studio → http://localhost:${PORT}`);
-  console.log(`model: ${NV_MODEL} · key: ${NVAPI_KEY ? 'loaded from .env' : 'MISSING'}`);
+  console.log(`provider: ${PROVIDER}${PROVIDER === 'nvidia' ? ` (${NV_MODEL})` : ''}`);
+  console.log(SUPPORTS_IMG2IMG
+    ? '✅ reference-image conditioning ENABLED (Kontext img2img)'
+    : '⚠ text-only: this provider cannot use a reference image — character identity '
+      + 'is best-effort. Set IMAGE_PROVIDER=bfl|fal + key in .env to enable it.');
 });

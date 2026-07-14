@@ -2726,7 +2726,7 @@
     }
   ],
   "meta": {
-    "desc": "cyberpunk karate fighter, red and black gi, glowing yellow visor, athletic build",
+    "desc": "cyberpunk karate fighter, red top and black pants gi, glowing yellow visor, athletic build",
     "palette": [
       [
         6,
@@ -3073,5 +3073,5 @@
     ],
     "refChroma": 75
   },
-  "versionHash": "5c858e01e32700a3"
+  "versionHash": "18e2668b29259aec"
 }

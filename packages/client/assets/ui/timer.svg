@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="110" height="110" viewBox="0 0 110 110">
+  <!-- Round timer frame: steel octagon with gold trim. The number is drawn by
+       the renderer, centered in the dark window (octagon inset 14px). -->
+  <defs>
+    <linearGradient id="steel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a8aec0"/>
+      <stop offset="0.22" stop-color="#767c8e"/>
+      <stop offset="0.55" stop-color="#4a4f5e"/>
+      <stop offset="1" stop-color="#22242e"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f7e0a3"/>
+      <stop offset="0.45" stop-color="#d9a441"/>
+      <stop offset="1" stop-color="#8a5f1e"/>
+    </linearGradient>
+  </defs>
+  <!-- outline -->
+  <polygon points="32,0 78,0 110,32 110,78 78,110 32,110 0,78 0,32" fill="#101116"/>
+  <!-- steel body -->
+  <polygon points="34,3 76,3 107,34 107,76 76,107 34,107 3,76 3,34" fill="url(#steel)"/>
+  <!-- gold channel -->
+  <polygon points="36,7 74,7 103,36 103,74 74,103 36,103 7,74 7,36" fill="none" stroke="url(#gold)" stroke-width="2.6"/>
+  <!-- dark window -->
+  <polygon points="40,12 70,12 98,40 98,70 70,98 40,98 12,70 12,40" fill="#0c0e13"/>
+  <polygon points="40,12 70,12 98,40 98,70 70,98 40,98 12,70 12,40" fill="none" stroke="#000" stroke-opacity="0.55" stroke-width="1.6"/>
+  <!-- gold corner studs -->
+  <polygon points="55,2 61,8 55,14 49,8" fill="url(#gold)"/>
+  <polygon points="55,96 61,102 55,108 49,102" fill="url(#gold)"/>
+  <!-- rivets -->
+  <circle cx="10" cy="55" r="2.6" fill="#d7dbe6"/><circle cx="10" cy="55" r="1.2" fill="#5b6070"/>
+  <circle cx="100" cy="55" r="2.6" fill="#d7dbe6"/><circle cx="100" cy="55" r="1.2" fill="#5b6070"/>
+</svg>

@@ -183,10 +183,25 @@ const packAtlas = async (): Promise<number> => {
   return cells.length;
 };
 
+/** Server capability: can the active image provider accept a reference image? */
+let stImg2Img = false;
+
+/** The locked reference sheet as base64 PNG (for reference-conditioned gen). */
+const referenceB64 = (): string | null => {
+  const ref = spriteCanvas('_reference.png');
+  return ref ? canvasToPngDataUrl(ref) : null;
+};
+
 const generateImage = async (
-  prompt: string, seed: number, width = 1024, height = 1024,
+  prompt: string, seed: number, width = 1024, height = 1024, useRef = false,
 ): Promise<HTMLImageElement> => {
-  const body = { prompt, width, height, steps: 4, seed };
+  // With an img2img provider, every frame is conditioned on the reference
+  // sheet — that is the ONLY way to truly hold a character's identity across
+  // images. NVIDIA's flux cannot do this (see server.mjs).
+  const image = useRef && stImg2Img ? referenceB64() : null;
+  const body = image
+    ? { prompt, width, height, steps: 4, seed, image }
+    : { prompt, width, height, steps: 4, seed };
   const r = await apiJson<{ artifacts?: { base64: string }[]; b64_json?: string }>(
     '/api/generate',
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -1100,10 +1115,22 @@ const SPRITE_STYLE = 'perfectly flat solid pure white background, no shadows, no
  */
 const PROMPT_MAX = 800;
 
-/** Build a strip prompt that fits the budget, trimming pose text if needed. */
+/**
+ * Build a strip prompt that fits the budget, trimming pose text if needed.
+ *
+ * FAILED EXPERIMENT (do not retry without img2img): prepending a fixed
+ * "anchor" idle pose to every strip AND using one seed for the whole
+ * character collapsed the model onto a single image — a jab, a sweep and a
+ * DP all came back pixel-identical. Costume consistency is worthless if the
+ * poses die with it. Poses must vary per move (distinct seed + distinct
+ * pose text); identity across moves is carried by the costume text + palette
+ * lock, and can only be *guaranteed* by an img2img endpoint (see server.mjs
+ * IMAGE_PROVIDER).
+ */
 const buildStripPrompt = (desc: string, poses: string[]): string => {
-  const head = `${desc}. Sprite sheet: ${poses.length} poses of ONE character, identical `
-    + `outfit and colors, one horizontal row, evenly spaced, not touching. Poses: `;
+  const head = `${desc}. Sprite sheet: ${poses.length} DIFFERENT action poses of ONE `
+    + `character wearing the identical outfit and colors, one horizontal row, evenly `
+    + `spaced, not touching. Each pose is distinct: `;
   const tail = `. Each pose: same full-body character, profile facing right, feet on one `
     + `ground line. Flat pure white background, no shadow, no floor, no borders. Pixel art `
     + `fighting game sprite sheet, crisp outlines, vibrant colors, no text.`;
@@ -1236,7 +1263,7 @@ const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | n
   const frameHint = mv.steps.length > 1 && !STEP_POSES[mv.id]
     ? `, animation frame ${i + 1} of ${mv.steps.length}` : '';
   const prompt = `${desc}, ${poseForStep(mv, i)}${frameHint}, ${SPRITE_STYLE}`.slice(0, PROMPT_MAX);
-  const img = await generateImage(prompt, seedFor(mv.id, i, salt));
+  const img = await generateImage(prompt, seedFor(mv.id, i, salt), 1024, 1024, true);
   return finishFrame(mv, img);
 };
 
@@ -1251,9 +1278,9 @@ const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | n
  * cut them apart. The whole character also shares a single seed across every
  * strip, which keeps costumes consistent between moves too.
  */
-const STRIP_W = 1536;
+const STRIP_W = 1536; // ~1MP is the endpoint's cap; wider is rejected
 const STRIP_H = 640;
-const STRIP_MAX = 4; // poses per image — beyond this each pose gets too few px
+const STRIP_MAX = 4; // poses per image — beyond this each figure gets too few px
 
 /** Strip telemetry: a silent fallback to per-frame means costume drift. */
 let stStripsUsed = 0;
@@ -1263,15 +1290,20 @@ let stStripError = '';
 /** One seed per character: every strip inherits the same design lottery ticket. */
 const charSeed = (salt: number): number => seedFor('_character', 0, salt);
 
-/** Generate every frame of a move. Strip-first, per-frame only as fallback. */
+/**
+ * Generate every frame of a move as STRIPS: one image per animation, all its
+ * poses side by side, sliced apart. Within an image the model draws one
+ * character in one costume, so a move never changes clothes mid-swing.
+ *
+ * The seed varies PER MOVE (not per character) — a single shared seed makes
+ * the model redraw the same picture for every move, killing pose variety
+ * (see buildStripPrompt's failed-experiment note).
+ */
 const genMoveFrames = async (mv: MoveDef, salt = 0): Promise<(GenResult | null)[]> => {
   const n = mv.steps.length;
   const out: (GenResult | null)[] = new Array(n).fill(null);
-  if (n === 1) {
-    out[0] = await genFrame(mv, 0, salt);
-    return out;
-  }
   const desc = meta().desc || stBundle!.name;
+
   for (let start = 0; start < n; start += STRIP_MAX) {
     const idxs: number[] = [];
     for (let i = start; i < Math.min(start + STRIP_MAX, n); i++) idxs.push(i);
@@ -1282,9 +1314,9 @@ const genMoveFrames = async (mv: MoveDef, salt = 0): Promise<(GenResult | null)[
     const prompt = buildStripPrompt(desc, idxs.map((i) => poseForStep(mv, i)));
     let slices: HTMLCanvasElement[] | null = null;
     try {
-      const img = await generateImage(prompt, charSeed(salt), STRIP_W, STRIP_H);
+      const img = await generateImage(prompt, seedFor(mv.id, start, salt), STRIP_W, STRIP_H, true);
       slices = sliceStrip(img, idxs.length);
-      if (!slices) stStripFallbacks++; // model drew overlapping/merged figures
+      if (!slices) stStripFallbacks++; // figures merged/overlapped — unsliceable
     } catch (e) {
       stStripFallbacks++;
       stStripError = (e as Error).message;
@@ -1293,7 +1325,6 @@ const genMoveFrames = async (mv: MoveDef, salt = 0): Promise<(GenResult | null)[
       stStripsUsed++;
       idxs.forEach((i, k) => { out[i] = finishFrame(mv, slices![k]!); });
     } else {
-      // Strip unusable — per-frame (costume may drift for these frames).
       for (const i of idxs) out[i] = await genFrame(mv, i, salt);
     }
   }
@@ -1407,15 +1438,30 @@ interface AuditRow {
   facingStrong: boolean;
   pockets: number;
   gray: boolean; // desaturated vs a colorful reference
+  dupe: boolean; // pixel-identical to another move's frame (dead animation)
   fixed?: string;
 }
 let stAudit: AuditRow[] | null = null;
 let stAuditBusy = false;
 
+/** Cheap content signature of a sprite (FNV over subsampled RGBA). */
+const contentSig = (c: HTMLCanvasElement): number => {
+  const d = c.getContext('2d', { willReadFrequently: true })!
+    .getImageData(0, 0, c.width, c.height).data;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < d.length; i += 4 * 7) { // stride: fast + still discriminating
+    h = Math.imul(h ^ d[i]!, 0x01000193);
+    h = Math.imul(h ^ d[i + 1]!, 0x01000193);
+    h = Math.imul(h ^ d[i + 3]!, 0x01000193);
+  }
+  return h >>> 0;
+};
+
 const runAudit = async (): Promise<void> => {
   if (stAuditBusy || !stBundle) return;
   stAuditBusy = true;
   stAudit = [];
+  const sigOwner = new Map<number, number>(); // content sig → move index
   const m = meta();
   // Ensure a facing mask exists (older bundles: derive from saved reference).
   // The reference Image loads async — wait for it like any other sprite.
@@ -1454,8 +1500,15 @@ const runAudit = async (): Promise<void> => {
         }
         const pockets = enclosedWhitePockets(cell);
         const gray = (m.refChroma ?? 0) >= 40 && meanChroma(cell) < (m.refChroma ?? 0) * 0.4;
-        if (facingStrong || facingSus || pockets > 0 || gray) {
-          stAudit.push({ moveIdx: mi, step: i, name, facingSus, facingStrong, pockets, gray });
+        // Duplicate detection: identical pixels in two different MOVES means
+        // the model redrew one picture instead of animating (see the failed
+        // anchor experiment). Same-move duplicates are legitimate (held poses).
+        const sig = contentSig(cell);
+        const seenIn = sigOwner.get(sig);
+        const dupe = seenIn !== undefined && seenIn !== mi;
+        if (seenIn === undefined) sigOwner.set(sig, mi);
+        if (facingStrong || facingSus || pockets > 0 || gray || dupe) {
+          stAudit.push({ moveIdx: mi, step: i, name, facingSus, facingStrong, pockets, gray, dupe });
         }
       }
     }
@@ -1505,7 +1558,7 @@ const auditFixAll = async (): Promise<void> => {
   for (const row of stAudit) {
     if (row.fixed) continue;
     if (row.facingStrong) await auditFlip(row);
-    else if (row.pockets > 0 || row.gray) await auditRegen(row);
+    else if (row.pockets > 0 || row.gray || row.dupe) await auditRegen(row);
   }
   stStatus = 'audit auto-fix complete — SAVE to persist sprite refs + atlas';
   renderAll();
@@ -1528,6 +1581,11 @@ const renderGenerateTab = (): HTMLElement => {
 
   const refSection = mkEl('div', { class: 'genblock' },
     mkEl('b', {}, '1 · reference sheet (the consistency contract)'),
+    mkEl('p', { class: stImg2Img ? 'qc pass' : 'qc fail' },
+      stImg2Img
+        ? '✅ reference-image conditioning ON — every frame is generated FROM the reference (true identity lock)'
+        : '⚠ text-only provider: the reference CANNOT be fed to the model (NVIDIA flux rejects user images). '
+          + 'Identity is best-effort via strips + palette lock. For a real fix set IMAGE_PROVIDER=bfl or fal (+ key) in .env.'),
     mkEl('div', { class: 'row' },
       mkEl('label', {}, 'character description ', mkEl('input', {
         value: m.desc ?? '', style: 'width:420px',
@@ -1680,7 +1738,8 @@ const renderGenerateTab = (): HTMLElement => {
           mkEl('td', {},
             [row.facingStrong ? 'FACING' : row.facingSus ? 'facing?' : '',
               row.pockets > 0 ? `bleed×${row.pockets}` : '',
-              row.gray ? 'GRAY' : ''].filter(Boolean).join(' · ')),
+              row.gray ? 'GRAY' : '',
+              row.dupe ? 'DUPE' : ''].filter(Boolean).join(' · ')),
           mkEl('td', {}, row.fixed ?? '—'),
           mkEl('td', {},
             mkEl('button', { disabled: stAuditBusy ? '' : null, onclick: () => void auditFlip(row) }, '↔ flip'),
@@ -1716,6 +1775,8 @@ const renderAll = (): void => {
 // boot
 void (async () => {
   try {
+    const caps = await apiJson<{ provider: string; img2img: boolean }>('/api/capabilities');
+    stImg2Img = caps.img2img;
     stCharList = await apiJson<string[]>('/api/characters');
     if (stCharList.length === 0) throw new Error('no characters found');
     await loadChar(stCharList.includes('analog') ? 'analog' : stCharList[0]!);

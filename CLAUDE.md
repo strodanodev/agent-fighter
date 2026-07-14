@@ -69,10 +69,28 @@ Analog frame data from playtests.
   must come from a discrete list, max 1536. An over-long prompt fails the
   whole request, which is why strip mode silently degraded to per-frame
   before the budget existed.
-- NOTE: flux.2-klein-4b on NVIDIA build does NOT accept user reference
-  images (`image` param only takes their gallery example_ids; NVCF asset
-  upload works but is rejected with "Expected: example_id"). So strips +
-  one seed + palette lock + QC gate are the consistency toolkit.
+- **THE CONSISTENCY CEILING (read before "fixing" sprite drift again).**
+  NVIDIA's hosted flux CANNOT accept a user reference image — proven on
+  BOTH flux.2-klein-4b and flux.1-kontext-dev, with base64, data-URI, and
+  a properly uploaded NVCF asset id. The `image` field only accepts their
+  gallery `example_id`. So on IMAGE_PROVIDER=nvidia, cross-image character
+  identity is fundamentally best-effort: strips hold a costume WITHIN one
+  move; between moves only the text description + palette lock carry it.
+- **REAL FIX = img2img.** `server.mjs` now has a pluggable IMAGE_PROVIDER
+  (`nvidia` | `bfl` | `fal`). Set `IMAGE_PROVIDER=bfl` + `BFL_API_KEY`
+  (api.bfl.ai) or `IMAGE_PROVIDER=fal` + `FAL_KEY` (fal.run) in `.env` and
+  the Studio automatically sends the locked reference sheet with EVERY
+  frame request (FLUX Kontext: "keep this character, change the pose") —
+  true identity lock. `GET /api/capabilities` reports whether img2img is
+  live; the Generate tab shows a banner either way. The bfl/fal paths are
+  implemented but UNTESTED (no key available at the time of writing).
+- **FAILED EXPERIMENT — do not repeat.** Prepending a fixed "anchor" idle
+  pose to every strip AND using one shared seed per character collapsed the
+  model onto a single image: the jab, sweep, DP and walk all came back
+  PIXEL-IDENTICAL (48 distinct images out of 100). Perfect costume
+  consistency, dead animation. Poses need distinct seeds + distinct pose
+  text. The sprite audit now flags `DUPE` (identical content across two
+  different moves) so this class of failure can never ship silently.
 - **System animations (2026-07-15):** every non-attack state has a sprite
   track. Bundles carry `sys.*` moves (type:"system" — idle/walkF/walkB/
   crouch/jump(3-step)/dash/block×3/hitstun/airHitstun/knockdown/getup/ko);

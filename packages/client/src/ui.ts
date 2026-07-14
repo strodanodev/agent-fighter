@@ -2,6 +2,16 @@ import { STAGE, TICKS_PER_SEC, TUNING } from '@af/core';
 import type { GameState } from '@af/core';
 import { drawPortrait } from './atlas.js';
 import type { Roster } from './atlas.js';
+import { HUD_GEO, clipPoly, drawChrome, drawStageImage } from './chrome.js';
+import type { StageAsset, UiKit } from './chrome.js';
+
+// Injected at boot (null = procedural fallbacks everywhere).
+let uiKit: UiKit | null = null;
+let stageAsset: StageAsset | null = null;
+export const setUiKit = (k: UiKit): void => { uiKit = k; };
+export const setStageAsset = (s: StageAsset | null): void => { stageAsset = s; };
+
+const ARCADE_FONT = 'Impact, "Arial Black", "Franklin Gothic Medium", sans-serif';
 
 /**
  * Arcade presentation layer: rooftop stage, framed HUD, title / select /
@@ -74,11 +84,14 @@ const bevel = (
 const text = (
   ctx: CanvasRenderingContext2D, s: string, x: number, y: number,
   size: number, color: string, align: CanvasTextAlign = 'center', shadow = true,
+  font: 'arcade' | 'mono' = 'arcade',
 ): void => {
-  ctx.font = `bold ${size}px "Courier New", monospace`;
+  ctx.font = font === 'arcade'
+    ? `${size}px ${ARCADE_FONT}`
+    : `bold ${size}px "Courier New", monospace`;
   ctx.textAlign = align;
   if (shadow) {
-    ctx.fillStyle = '#00000099';
+    ctx.fillStyle = '#000000aa';
     ctx.fillText(s, x + 2, y + 2);
   }
   ctx.fillStyle = color;
@@ -96,6 +109,15 @@ export const drawStage = (ctx: CanvasRenderingContext2D, cam: Cam): void => {
   const viewH = VH / cam.zoom;
   const L = cam.x, R = cam.x + viewW, T = cam.y, B = cam.y + viewH;
   const floorY = STAGE.floorYPx;
+
+  // Image stage (stages/<id>/background.png) — the procedural rooftop below
+  // is only the fallback for a checkout with no stage assets.
+  if (stageAsset?.image) {
+    drawStageImage(ctx, stageAsset, cam, VW, VH);
+    ctx.fillStyle = 'rgba(16, 10, 28, 0.18)'; // veil: fighters pop
+    ctx.fillRect(L - 10, T - 10, viewW + 20, viewH + 20);
+    return;
+  }
 
   // Sky.
   const sky = ctx.createLinearGradient(0, T, 0, floorY);
@@ -199,139 +221,182 @@ export const drawStage = (ctx: CanvasRenderingContext2D, cam: Cam): void => {
 
 // ---------------------------------------------------------------- HUD
 /**
- * HUD layout (rows, top-down): health bar · nameplate · round pips · meter.
- * Kept as named constants so nothing silently overlaps when tuned.
+ * HUD layout (rows, top-down): health bar · nameplate · pips+meter.
+ * Asset sizes derive from the SVG kit geometry (HUD_GEO), scaled to fit the
+ * 960px frame: portrait(92) · bar(328) · timer(96) · bar · portrait.
  */
 const HUD = {
-  edge: 96, // inner edge of the bars (portraits live outside this)
-  barW: 330,
-  barH: 26,
-  barY: 30,
-  nameY: 64,
-  nameH: 21,
-  pipY: 92,
-  pipS: 12,
-  meterY: 110,
-  meterH: 9,
+  edge: 108, // inner start of the bars (portraits live outside this)
+  barW: 328,
+  barH: 38,
+  barY: 12,
+  nameW: 226,
+  nameH: 25,
+  nameY: 56,
+  pipY: 90,
+  meterY: 88,
+  meterSegW: 102,
+  meterSegH: 15,
 } as const;
 
 const drawHealthBar = (
   ctx: CanvasRenderingContext2D,
   i: 0 | 1, ratio: number, flashRatio: number,
 ): void => {
-  const barW = HUD.barW, barH = HUD.barH;
+  const { barW, barH, barY: y } = HUD;
   const x = i === 0 ? HUD.edge : VW - HUD.edge - barW;
-  const y = HUD.barY;
+  const mirror = i === 1;
 
-  // Frame.
-  bevel(ctx, x - 4, y - 4, barW + 8, barH + 8, '#3a3244', '#6f6480', '#1a1626', 2);
-  bevel(ctx, x - 2, y - 2, barW + 4, barH + 4, PANEL, GOLD, GOLD_DK, 2);
+  const fillBar = (r: number, style: string | CanvasGradient): void => {
+    const g = HUD_GEO.healthframe;
+    ctx.save();
+    clipPoly(ctx, HUD_GEO.healthWindow, g.w, g.h, x, y, barW, barH, mirror);
+    // MvC drain: remaining health anchors at the OUTER edge; damage eats
+    // from the center-facing tip.
+    const w = barW * Math.max(0, Math.min(1, r));
+    ctx.fillStyle = style;
+    ctx.fillRect(i === 0 ? x : x + barW - w, y, w, barH);
+    ctx.restore();
+  };
 
-  // Damage flash (recent damage drains behind the bar).
-  const fw = Math.round(barW * Math.max(0, ratio));
-  const flashW = Math.round(barW * Math.max(0, flashRatio));
-  const barX = (w: number): number => (i === 0 ? x + barW - w : x);
-  ctx.fillStyle = '#ffffff55';
-  ctx.fillRect(barX(flashW), y, flashW, barH);
-
-  // Fill (drains toward the center of the screen, MvC style).
-  const grad = ctx.createLinearGradient(0, y, 0, y + barH);
-  const danger = ratio < 0.25;
-  grad.addColorStop(0, danger ? HP_DANGER : HP_HI);
-  grad.addColorStop(1, danger ? '#8a1f30' : HP_LO);
-  ctx.fillStyle = grad;
-  ctx.fillRect(barX(fw), y, fw, barH);
-  // Gloss.
-  ctx.fillStyle = '#ffffff33';
-  ctx.fillRect(barX(fw), y + 2, fw, 5);
-
-  // Arrow cap on the inner edge (reference art has angled bar tips).
-  ctx.fillStyle = GOLD;
-  const tip = i === 0 ? x + barW : x - 12;
-  ctx.beginPath();
-  if (i === 0) {
-    ctx.moveTo(tip, y - 2);
-    ctx.lineTo(tip + 12, y + barH / 2);
-    ctx.lineTo(tip, y + barH + 2);
-  } else {
-    ctx.moveTo(tip + 12, y - 2);
-    ctx.lineTo(tip, y + barH / 2);
-    ctx.lineTo(tip + 12, y + barH + 2);
+  if (uiKit?.healthframe) {
+    // Paint order under the frame: dark tray → damage flash → health → gloss.
+    fillBar(1, '#0c0e13');
+    fillBar(flashRatio, '#ffffff66');
+    const grad = ctx.createLinearGradient(0, y, 0, y + barH);
+    const danger = ratio < 0.25;
+    grad.addColorStop(0, danger ? '#ff8d9e' : '#b9f66d');
+    grad.addColorStop(0.45, danger ? HP_DANGER : HP_HI);
+    grad.addColorStop(1, danger ? '#7a1b2b' : HP_LO);
+    fillBar(ratio, grad);
+    // Gloss line inside the window.
+    ctx.save();
+    const g = HUD_GEO.healthframe;
+    clipPoly(ctx, HUD_GEO.healthWindow, g.w, g.h, x, y, barW, barH, mirror);
+    ctx.fillStyle = '#ffffff2e';
+    ctx.fillRect(x, y + 3, barW, 6);
+    ctx.restore();
+    drawChrome(ctx, uiKit.healthframe, x, y, barW, barH, mirror);
+    return;
   }
-  ctx.closePath();
-  ctx.fill();
+
+  // Procedural fallback.
+  bevel(ctx, x - 3, y - 3, barW + 6, barH + 6, PANEL, GOLD, GOLD_DK, 2);
+  const fw = Math.round((barW - 4) * Math.max(0, ratio));
+  ctx.fillStyle = '#ffffff55';
+  ctx.fillRect(i === 0 ? x + 2 : x + barW - 2 - Math.round((barW - 4) * flashRatio), y + 2,
+    Math.round((barW - 4) * flashRatio), barH - 4);
+  ctx.fillStyle = ratio < 0.25 ? HP_DANGER : HP_HI;
+  ctx.fillRect(i === 0 ? x + 2 : x + barW - 2 - fw, y + 2, fw, barH - 4);
 };
 
 const drawMeter = (ctx: CanvasRenderingContext2D, i: 0 | 1, meter: number): void => {
   const bars = Math.round(TUNING.meterMax / TUNING.meterBar);
-  const gap = 5;
-  const segW = Math.floor((HUD.barW - (bars - 1) * gap) / bars);
+  const gap = 6;
+  const segW = HUD.meterSegW, segH = HUD.meterSegH;
   const total = bars * segW + (bars - 1) * gap;
   const startX = i === 0 ? HUD.edge : VW - HUD.edge - total;
   const y = HUD.meterY;
+  const mirror = i === 1;
   for (let b = 0; b < bars; b++) {
-    const x = startX + b * (segW + gap);
+    // Segments fill outward from the screen edge, like the health bar.
+    const idx = i === 0 ? b : bars - 1 - b;
+    const x = startX + idx * (segW + gap);
     const seg = Math.max(0, Math.min(TUNING.meterBar, meter - b * TUNING.meterBar));
     const ratio = seg / TUNING.meterBar;
-    bevel(ctx, x, y, segW, HUD.meterH, '#191524', '#4a4260', '#0d0a14', 1);
     const full = ratio >= 1;
-    ctx.fillStyle = full ? METER_FULL : METER_HI;
-    ctx.fillRect(x + 1, y + 1, Math.round((segW - 2) * ratio), HUD.meterH - 2);
+    if (uiKit?.meterseg) {
+      const g = HUD_GEO.meterseg;
+      ctx.save();
+      clipPoly(ctx, HUD_GEO.meterWindow, g.w, g.h, x, y, segW, segH, mirror);
+      ctx.fillStyle = '#0c0e13';
+      ctx.fillRect(x, y, segW, segH);
+      ctx.fillStyle = full ? METER_FULL : METER_HI;
+      const w = segW * ratio;
+      ctx.fillRect(mirror ? x + segW - w : x, y, w, segH);
+      ctx.restore();
+      drawChrome(ctx, uiKit.meterseg, x, y, segW, segH, mirror);
+    } else {
+      bevel(ctx, x, y, segW, segH, '#191524', '#4a4260', '#0d0a14', 1);
+      ctx.fillStyle = full ? METER_FULL : METER_HI;
+      ctx.fillRect(x + 1, y + 1, Math.round((segW - 2) * ratio), segH - 2);
+    }
   }
 };
 
 const drawPortraitFrame = (
   ctx: CanvasRenderingContext2D, i: 0 | 1, roster: Roster, lowHealth: boolean,
 ): void => {
-  const s = 76;
-  const x = i === 0 ? 12 : VW - 12 - s;
-  const y = HUD.barY - 6;
-  bevel(ctx, x - 3, y - 3, s + 6, s + 6, PANEL, GOLD, GOLD_DK, 3);
+  const s = 92;
+  const x = i === 0 ? 8 : VW - 8 - s;
+  const y = 8;
+  const win = HUD_GEO.portraitWindow;
+
   ctx.save();
   if (lowHealth) ctx.filter = 'saturate(0.4) brightness(0.8)';
-  drawPortrait(ctx, roster, x, y, s, s);
+  if (uiKit?.portrait) {
+    drawPortrait(ctx, roster, x + win.x, y + win.y, win.w, win.h);
+  } else {
+    drawPortrait(ctx, roster, x + 4, y + 4, s - 8, s - 8);
+  }
   ctx.restore();
+  if (uiKit?.portrait) drawChrome(ctx, uiKit.portrait, x, y, s, s, i === 1);
+  else bevel(ctx, x, y, s, s, '#00000000', GOLD, GOLD_DK, 3);
+
   // Player tag.
   ctx.fillStyle = P_COLORS[i];
-  ctx.fillRect(x, y + s - 14, 26, 14);
-  text(ctx, `P${i + 1}`, x + 13, y + s - 3, 11, '#fff', 'center', false);
+  const tagX = i === 0 ? x + 4 : x + s - 30;
+  ctx.fillRect(tagX, y + s - 20, 26, 14);
+  text(ctx, `P${i + 1}`, tagX + 13, y + s - 9, 12, '#fff', 'center', false);
 };
 
 const drawNameplate = (ctx: CanvasRenderingContext2D, i: 0 | 1, name: string): void => {
-  const w = 216, h = HUD.nameH;
+  const w = HUD.nameW, h = HUD.nameH;
   const x = i === 0 ? HUD.edge : VW - HUD.edge - w;
   const y = HUD.nameY;
-  bevel(ctx, x, y, w, h, PANEL, GOLD, GOLD_DK, 2);
-  // Angled inner tip toward the center.
-  ctx.fillStyle = GOLD;
-  if (i === 0) ctx.fillRect(x + w - 4, y, 4, h);
-  else ctx.fillRect(x, y, 4, h);
-  text(ctx, name.toUpperCase(), i === 0 ? x + 14 : x + w - 14, y + 15, 13, GOLD_LT,
+  if (uiKit?.nameplate) {
+    drawChrome(ctx, uiKit.nameplate, x, y, w, h, i === 1);
+  } else {
+    bevel(ctx, x, y, w, h, PANEL, GOLD, GOLD_DK, 2);
+  }
+  text(ctx, name.toUpperCase(), i === 0 ? x + 16 : x + w - 16, y + h - 7, 15, '#e8e4da',
     i === 0 ? 'left' : 'right');
 };
 
 const drawRoundPips = (ctx: CanvasRenderingContext2D, i: 0 | 1, wins: number): void => {
   const need = TUNING.roundsToWin;
-  const s = HUD.pipS, gap = 6;
-  const y = HUD.pipY;
+  const g = HUD_GEO.pip;
+  const gap = 7;
+  // Sits just inside the nameplate's outer end.
   for (let r = 0; r < need; r++) {
     const x = i === 0
-      ? HUD.edge + r * (s + gap)
-      : VW - HUD.edge - s - r * (s + gap);
-    bevel(ctx, x, y, s, s, r < wins ? GOLD : '#191524', r < wins ? GOLD_LT : '#4a4260', GOLD_DK, 1);
+      ? HUD.edge + HUD.nameW + 14 + r * (g.w + gap)
+      : VW - HUD.edge - HUD.nameW - 14 - g.w - r * (g.w + gap);
+    const on = r < wins;
+    if (uiKit?.pipOn && uiKit.pipOff) {
+      drawChrome(ctx, on ? uiKit.pipOn : uiKit.pipOff, x, HUD.pipY, g.w, g.h, i === 1);
+    } else {
+      bevel(ctx, x, HUD.pipY, 14, 14, on ? GOLD : '#191524', on ? GOLD_LT : '#4a4260', GOLD_DK, 1);
+    }
   }
 };
 
 const drawTimer = (ctx: CanvasRenderingContext2D, secs: number): void => {
-  const cx = VW / 2, cy = 52, r = 42;
-  // Octagon frame.
+  const s = 96;
+  const cx = VW / 2, y = 6;
+  const urgent = secs <= 10;
+  if (uiKit?.timer) {
+    drawChrome(ctx, uiKit.timer, cx - s / 2, y, s, s);
+    text(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, y + s / 2 + 15, 40,
+      urgent ? HP_DANGER : '#ffffff');
+    return;
+  }
+  const cy = y + s / 2, r = 42;
   const oct = (rr: number): void => {
     ctx.beginPath();
     for (let k = 0; k < 8; k++) {
       const a = (Math.PI / 4) * k + Math.PI / 8;
-      const x = cx + Math.cos(a) * rr;
-      const y = cy + Math.sin(a) * rr;
-      if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      ctx.lineTo(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr);
     }
     ctx.closePath();
   };
@@ -341,7 +406,6 @@ const drawTimer = (ctx: CanvasRenderingContext2D, secs: number): void => {
   oct(r - 4);
   ctx.fillStyle = PANEL;
   ctx.fill();
-  const urgent = secs <= 10;
   text(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, cy + 12, 34,
     urgent ? HP_DANGER : '#ffffff');
 };
@@ -391,8 +455,13 @@ export const drawHud = (
     ctx.restore();
   }
 
-  // Controls hint.
-  text(ctx, 'P1: WASD · TYU/GHJ      P2: ARROWS · IOP/KL;      B: HITBOXES', VW / 2, VH - 10, 11, '#ffffff66');
+  // Controls strip (dark band like the reference).
+  ctx.fillStyle = '#0b0a12dd';
+  ctx.fillRect(0, VH - 24, VW, 24);
+  ctx.fillStyle = '#2e3140';
+  ctx.fillRect(0, VH - 24, VW, 1);
+  text(ctx, 'P1: WASD · TYU / GHJ        P2: ARROWS · IOP / KL;        B: HITBOXES        ESC: MENU',
+    VW / 2, VH - 8, 11, '#c8c4ba', 'center', false, 'mono');
 };
 
 // ---------------------------------------------------------------- title

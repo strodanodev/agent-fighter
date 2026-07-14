@@ -1,0 +1,8 @@
+{
+  "name": "Rooftop",
+  "imageW": 1536,
+  "imageH": 640,
+  "floorY": 520,
+  "skyColor": "#7a6cae",
+  "deckColor": "#8f8c98"
+}

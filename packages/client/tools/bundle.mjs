@@ -31,6 +31,7 @@ const ORDER = [
   'core/src/sim.js',
   'core/src/anim.js',
   'client/src/atlas.js',
+  'client/src/chrome.js',
   'client/src/ui.js',
   'client/src/main.js',
 ];

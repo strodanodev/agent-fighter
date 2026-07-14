@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="260" height="30" viewBox="0 0 260 30">
+  <!-- Nameplate, LEFT player orientation (gold wedge points to screen center).
+       Mirrored by the renderer for the right side. Text drawn by renderer. -->
+  <defs>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f7e0a3"/>
+      <stop offset="0.45" stop-color="#d9a441"/>
+      <stop offset="1" stop-color="#8a5f1e"/>
+    </linearGradient>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2e3140"/>
+      <stop offset="0.5" stop-color="#191b24"/>
+      <stop offset="1" stop-color="#101118"/>
+    </linearGradient>
+  </defs>
+  <!-- outline -->
+  <polygon points="8,0 234,0 259,15 234,30 8,30 0,22 0,8" fill="#101116"/>
+  <!-- plate -->
+  <polygon points="10,2 232,2 255,15 232,28 10,28 2,21 2,9" fill="url(#plate)"/>
+  <!-- steel edge -->
+  <polygon points="10,2 232,2 255,15 232,28 10,28 2,21 2,9" fill="none" stroke="#767c8e" stroke-width="1.4"/>
+  <!-- gold wedge at the center-facing end -->
+  <polygon points="222,2 232,2 255,15 232,28 222,28 240,15" fill="url(#gold)"/>
+  <!-- subtle top sheen -->
+  <polygon points="10,2 232,2 236,5 12,5 4,9 2,9" fill="#ffffff" opacity="0.10"/>
+</svg>

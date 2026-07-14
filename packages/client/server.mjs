@@ -11,15 +11,18 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, '..', '..');
 const CHARACTERS = join(ROOT, 'characters');
+const STAGES = join(ROOT, 'stages');
+const ASSETS = join(here, 'assets');
 const PORT = Number(process.env.PORT || 8475);
 
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json',
-  '.png': 'image/png', '.css': 'text/css',
+  '.png': 'image/png', '.css': 'text/css', '.svg': 'image/svg+xml',
 };
 
 const send = (res, code, type, body) => {
-  res.writeHead(code, { 'Content-Type': type });
+  // Dev server: never cache — SVG/PNG assets change constantly during authoring.
+  res.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store' });
   res.end(body);
 };
 
@@ -50,14 +53,30 @@ createServer((req, res) => {
       : [];
     return send(res, 200, 'application/json', JSON.stringify(list));
   }
+  if (path === '/api/stages') {
+    const list = existsSync(STAGES)
+      ? readdirSync(STAGES, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && existsSync(join(STAGES, d.name, 'stage.json')))
+        .map((d) => d.name)
+      : [];
+    return send(res, 200, 'application/json', JSON.stringify(list));
+  }
+
+  const under = (base, prefix) => {
+    const rel = normalize(path.slice(prefix.length)).replace(/^([.][.][/\\])+/, '');
+    const candidate = join(base, rel);
+    return candidate.startsWith(base) ? candidate : null;
+  };
 
   let file = null;
   if (path === '/' || path === '/index.html') {
     file = join(here, 'demo', 'agent-fighter.html');
   } else if (path.startsWith('/characters/')) {
-    const rel = normalize(path.slice('/characters/'.length)).replace(/^([.][.][/\\])+/, '');
-    const candidate = join(CHARACTERS, rel);
-    if (candidate.startsWith(CHARACTERS)) file = candidate;
+    file = under(CHARACTERS, '/characters/');
+  } else if (path.startsWith('/stages/')) {
+    file = under(STAGES, '/stages/');
+  } else if (path.startsWith('/assets/')) {
+    file = under(ASSETS, '/assets/');
   }
 
   if (file && existsSync(file)) {
