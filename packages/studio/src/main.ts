@@ -16,14 +16,14 @@ import type {
   CharacterBundle, GameState, HitboxDef, InputFrame, MoveDef, MoveStep, Rect,
 } from '@af/core';
 import {
-  CELL_W, PALETTE_N, PIVOT_X, PIVOT_Y, SPRITE_SCALE,
+  CELL_W, DEFAULT_KEY, PALETTE_N, PIVOT_X, PIVOT_Y, SPRITE_SCALE,
   alphaBounds, autoHurtboxes, canvasToPngDataUrl,
   decodeBase64Image, diffHitboxDraft, enclosedWhitePockets, extractPalette,
   sliceSheet,
   flipCanvasH, maskDiff, meanChroma, mirrorMask16, normalizeFrame, qcScore,
   measureFigureH, removeBackground, silhouetteMask16, sliceStrip,
 } from './pipeline.js';
-import type { NormalizedFrame, QCResult, RGB } from './pipeline.js';
+import type { KeySettings, NormalizedFrame, QCResult, RGB } from './pipeline.js';
 
 interface StudioMeta {
   desc?: string;
@@ -265,6 +265,64 @@ let stStageProvider = 'nvidia';
  * Recomputed whenever stSpriteProvider changes. */
 let stImg2Img = false;
 
+// ---- background key (chroma/luma) settings ---------------------------------
+/**
+ * Studio-wide keyer tuning, persisted in localStorage. `mode` picks the
+ * GENERATION background color too: 'white' is the classic default but
+ * collides with white costume parts / eyes / teeth; 'magenta'/'green' are the
+ * film-industry answer — characters essentially never contain saturated
+ * magenta, so the key can be generous with zero risk to white foreground.
+ * Changing the mode only affects NEW generations (the prompt asks for that
+ * backdrop and the keyer is told to expect it).
+ */
+type KeyBgMode = 'white' | 'magenta' | 'green';
+interface StudioKeyCfg {
+  mode: KeyBgMode;
+  strength: number;
+  softness: number;
+  clearPockets: boolean;
+  pocketTightness: number;
+  pocketMinFrac: number;
+}
+const KEY_CFG_DEFAULTS: StudioKeyCfg = {
+  mode: 'white',
+  strength: DEFAULT_KEY.strength,
+  softness: DEFAULT_KEY.softness,
+  clearPockets: DEFAULT_KEY.clearPockets,
+  pocketTightness: DEFAULT_KEY.pocketTightness,
+  pocketMinFrac: DEFAULT_KEY.pocketMinFrac,
+};
+const KEY_CFG_LS = 'af-studio-key-cfg';
+let stKeyCfg: StudioKeyCfg = { ...KEY_CFG_DEFAULTS };
+try {
+  stKeyCfg = { ...KEY_CFG_DEFAULTS, ...JSON.parse(localStorage.getItem(KEY_CFG_LS) ?? '{}') as Partial<StudioKeyCfg> };
+} catch { /* corrupted localStorage — defaults */ }
+const saveKeyCfg = (): void => { localStorage.setItem(KEY_CFG_LS, JSON.stringify(stKeyCfg)); };
+
+const KEY_MODE_RGB: Record<KeyBgMode, RGB | null> = {
+  white: null, // auto: sample the border median (robust to off-white JPEG)
+  magenta: [255, 0, 255],
+  green: [0, 255, 0],
+};
+/** The pipeline-shaped settings object for the CURRENT Studio config. */
+const keySettings = (): KeySettings => ({
+  strength: stKeyCfg.strength,
+  softness: stKeyCfg.softness,
+  clearPockets: stKeyCfg.clearPockets,
+  pocketTightness: stKeyCfg.pocketTightness,
+  pocketMinFrac: stKeyCfg.pocketMinFrac,
+  keyColor: KEY_MODE_RGB[stKeyCfg.mode],
+});
+/** Prompt phrase for the generation background, driven by the key mode. */
+const bgPhrase = (): string =>
+  stKeyCfg.mode === 'white' ? 'pure white'
+    : stKeyCfg.mode === 'magenta' ? 'pure magenta (#FF00FF)' : 'pure green (#00FF00)';
+
+/** Last RAW generated image — the key-preview panel re-keys this live. */
+let stLastRaw: HTMLImageElement | null = null;
+/** Memoized keyed preview (renderAll runs constantly; keying 1MP isn't free). */
+let stKeyPreview: { src: HTMLImageElement; cfg: string; out: HTMLCanvasElement; bleed: number } | null = null;
+
 /** The locked reference sheet as base64 PNG (for reference-conditioned gen). */
 /**
  * The reference sprite as base64. Waits for the PNG to decode — it is loaded
@@ -314,7 +372,9 @@ const generateImage = async (
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const b64 = r.artifacts?.[0]?.base64;
   if (!b64) throw new Error('no image in response');
-  return decodeBase64Image(b64);
+  const img = await decodeBase64Image(b64);
+  stLastRaw = img; // feeds the background-key preview panel (Generate tab)
+  return img;
 };
 
 const saveSprite = async (name: string, cell: HTMLCanvasElement): Promise<void> => {
@@ -1378,12 +1438,12 @@ const renderTestTab = (): HTMLElement => {
  * "sharp pixel art" wording plus palette snapping and nearest-neighbour
  * downscaling is what produced the chunky 8-bit look; see pipeline.ts.
  */
-const SPRITE_STYLE = 'high-resolution anime fighting game character art, hand-drawn cel-shaded '
+const spriteStyle = (): string => 'high-resolution anime fighting game character art, hand-drawn cel-shaded '
   + 'illustration, clean bold ink outlines, dynamic shading with crisp highlights, '
   + 'detailed rendering, 2D arcade fighter style like King of Fighters or Guilty Gear. '
   + 'Single character only, full body in strict profile view facing right, nose chest and '
   + 'toes all pointing toward the right edge of the image, feet at the bottom, centered. '
-  + 'Perfectly flat solid pure white background, no shadows, no floor, no gradient, '
+  + `Perfectly flat solid ${bgPhrase()} background, no shadows, no floor, no gradient, `
   + 'no text, no watermark. Not pixel art, not 8-bit, not blocky.';
 
 /**
@@ -1426,7 +1486,7 @@ const buildStripPrompt = (desc: string, poses: string[]): string => {
       + `character wearing the identical outfit and colors, one horizontal row, evenly `
       + `spaced, not touching. Each pose is distinct: `;
   const tail = `. Each pose: same full-body character, profile facing right, feet on one `
-    + `ground line. Flat pure white background, no shadow, no floor, no borders. `
+    + `ground line. Flat ${bgPhrase()} background, no shadow, no floor, no borders. `
     + `Hand-drawn cel-shaded anime fighting game art, bold ink outlines, vibrant colors, `
     + `no text. Not pixel art.`;
   const max = promptMax();
@@ -1538,7 +1598,7 @@ const finishFrame = (
   mv: MoveDef, src: HTMLImageElement | HTMLCanvasElement, refFigureH?: number,
 ): GenResult | null => {
   const m = meta();
-  const norm = normalizeFrame(src, m.palette ?? null, refFigureH);
+  const norm = normalizeFrame(src, m.palette ?? null, refFigureH, keySettings());
   if (!norm) return null;
   // Facing check: if the MIRRORED reference silhouette matches decisively
   // better, the model drew the character facing left — flip (lossless).
@@ -1638,11 +1698,11 @@ const stylizeUpload = async (): Promise<void> => {
         + `hairstyle, outfit, colours and build — standing in a neutral idle fighting stance, full body.`
       : `The attached image shows ONE character (it may be a photo or off-style art). `
         + `Redraw THAT character as a game sprite — keep the same face, hairstyle, outfit, colours `
-        + `and build — standing in a neutral idle fighting stance, full body.`) + ` ${SPRITE_STYLE}`;
+        + `and build — standing in a neutral idle fighting stance, full body.`) + ` ${spriteStyle()}`;
     const refs = stUpload.map(canvasToPngDataUrl);
     const img = await generateImage(prompt.slice(0, promptMax(stRefProvider)), seedFor('_stylize', 0, stSeed++),
       1024, 1024, false, stRefProvider, refs[0], refs);
-    const norm = normalizeFrame(img, null);
+    const norm = normalizeFrame(img, null, undefined, keySettings());
     if (!norm) throw new Error('normalize failed');
     stRefPreview = norm;
     stUpload = [];
@@ -1657,7 +1717,7 @@ const stylizeUpload = async (): Promise<void> => {
 /** Use a raw upload verbatim: normalize NOW (best for clean-bg sprite art). */
 const useUploadVerbatim = (): void => {
   if (!stUpload.length) return;
-  const norm = normalizeFrame(stUpload[0]!, null);
+  const norm = normalizeFrame(stUpload[0]!, null, undefined, keySettings());
   if (!norm) {
     stStatus = 'could not isolate a subject — this looks like a photo; use "stylize" instead';
     renderAll();
@@ -1706,21 +1766,21 @@ const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | n
   if (stImg2Img) {
     const prompt = buildSheetPrompt([ANCHOR_POSE, pose]);
     const img = await generateImage(prompt, seedFor(mv.id, i, salt), 1024, 1024, true, stSpriteProvider);
-    const slices = sliceSheet(img, 2);
+    const slices = sliceSheet(img, 2, keySettings());
     if (slices) {
-      const anchorH = measureFigureH(slices[0]!);
+      const anchorH = measureFigureH(slices[0]!, keySettings());
       return finishFrame(mv, slices[1]!, anchorH ?? undefined);
     }
     // Anchor couldn't be separated — fall back to a lone pose (own-extent scale).
     const solo = `The attached image is the reference for ONE character. Redraw THAT EXACT `
       + `character — identical outfit, identical colors, identical hair, identical face and `
-      + `build — in a single new pose: ${pose}. Do not redesign the character. ${SPRITE_STYLE}`;
+      + `build — in a single new pose: ${pose}. Do not redesign the character. ${spriteStyle()}`;
     const img2 = await generateImage(solo.slice(0, promptMax()),
       seedFor(mv.id, i, salt + 1), 1024, 1024, true, stSpriteProvider);
     return finishFrame(mv, img2);
   }
 
-  const prompt = `${desc}, ${pose}, ${SPRITE_STYLE}`.slice(0, promptMax());
+  const prompt = `${desc}, ${pose}, ${spriteStyle()}`.slice(0, promptMax());
   const img = await generateImage(prompt, seedFor(mv.id, i, salt), 1024, 1024, true, stSpriteProvider);
   return finishFrame(mv, img);
 };
@@ -1763,7 +1823,7 @@ const buildSheetPrompt = (poses: string[]): string => {
     + `Do not redesign the character. Draw a sprite sheet: ${layout}. `
     + `Each figure is a DIFFERENT pose: ${poses.map((p, k) => `${k + 1}) ${p}`).join('; ')}. `
     + `Every figure: full body, strict side profile facing right, feet on its own ground line. `
-    + `Flat pure white background, no shadows, no floor, no grid lines, no borders, no text. `
+    + `Flat ${bgPhrase()} background, no shadows, no floor, no grid lines, no borders, no text. `
     + `Figures evenly spaced and clearly separated — never touching or overlapping. `
     + `Hand-drawn cel-shaded anime fighting game art, bold ink outlines, detailed shading, `
     + `vibrant colors. Not pixel art, not 8-bit.`
@@ -1815,7 +1875,7 @@ const genMoveFrames = async (mv: MoveDef, salt = 0): Promise<(GenResult | null)[
     let slices: HTMLCanvasElement[] | null = null;
     try {
       const img = await generateImage(prompt, seedFor(mv.id, start, salt), STRIP_W, STRIP_H, true, stSpriteProvider);
-      slices = sliceStrip(img, idxs.length);
+      slices = sliceStrip(img, idxs.length, keySettings());
       if (!slices) stStripFallbacks++; // figures merged/overlapped — unsliceable
     } catch (e) {
       stStripFallbacks++;
@@ -1871,10 +1931,10 @@ const runGeneration = async (which: 'reference' | 'move'): Promise<void> => {
     if (which === 'reference') {
       stStatus = `generating reference via ${stRefProvider}…`; renderAll();
       const img = await generateImage(
-        `${desc}, standing idle fighting stance, character reference, ${SPRITE_STYLE}`
+        `${desc}, standing idle fighting stance, character reference, ${spriteStyle()}`
           .slice(0, promptMax(stRefProvider)),
         seedFor('_ref', 0, stSeed++), 1024, 1024, false, stRefProvider);
-      const norm = normalizeFrame(img, null);
+      const norm = normalizeFrame(img, null, undefined, keySettings());
       if (!norm) throw new Error('normalize failed (no subject found)');
       stRefPreview = norm;
       stStatus = 'reference generated — review and click "use as reference"';
@@ -1968,13 +2028,13 @@ const runGenerateAll = async (): Promise<void> => {
             const img = await generateImage(
               buildSheetPrompt(chunk.map((c) => poseForStep(c.mv, c.i))),
               seedFor('_sheet', s, 0), 1024, 1024, true, stSpriteProvider);
-            slices = sliceSheet(img, chunk.length);
+            slices = sliceSheet(img, chunk.length, keySettings());
             if (slices) {
               stStripsUsed++;
               // ONE character scale for the whole sheet: the median figure
               // height. Inside an image the model draws the character at a
               // single size, so height differences are POSE, not scale.
-              const hs = slices.map(measureFigureH).filter((h): h is number => h !== null)
+              const hs = slices.map((s) => measureFigureH(s, keySettings())).filter((h): h is number => h !== null)
                 .sort((a, b) => a - b);
               if (hs.length > 0) sheetFigureH = hs[hs.length >> 1];
             } else stStripFallbacks++;
@@ -2382,8 +2442,112 @@ const renderGenerateTab = (): HTMLElement => {
     }
   }
 
+  // ---- background key panel -------------------------------------------------
+  // Every generated image passes through removeBackground; these knobs are the
+  // difference between "the white gi survived" and "the keyer ate the eyes".
+  const keySlider = (
+    lab: string, min: number, max: number, step: number,
+    get: () => number, set: (v: number) => void, fmt: (v: number) => string, tip: string,
+  ): HTMLElement =>
+    mkEl('label', { title: tip }, `${lab} `, mkEl('input', {
+      type: 'range', min: String(min), max: String(max), step: String(step),
+      value: String(get()), style: 'width:130px;vertical-align:middle',
+      onchange: (e: Event) => {
+        set(Number((e.target as HTMLInputElement).value));
+        saveKeyCfg();
+        stKeyPreview = null;
+        renderAll();
+      },
+    }), mkEl('span', { class: 'hint' }, ` ${fmt(get())}`));
+
+  /** Contain-fit thumbnail on a checkerboard, so keyed alpha is VISIBLE. */
+  const alphaThumb = (src: HTMLImageElement | HTMLCanvasElement, tw = 224, th = 120): HTMLCanvasElement => {
+    const sw = src instanceof HTMLCanvasElement ? src.width : src.naturalWidth;
+    const sh = src instanceof HTMLCanvasElement ? src.height : src.naturalHeight;
+    const t = mkEl('canvas', { width: tw, height: th, class: 'thumb' });
+    const tc = t.getContext('2d')!;
+    for (let y = 0; y < th; y += 8) {
+      for (let x = 0; x < tw; x += 8) {
+        tc.fillStyle = ((x + y) / 8) % 2 === 0 ? '#3a3d4d' : '#23252f';
+        tc.fillRect(x, y, 8, 8);
+      }
+    }
+    if (sw > 0 && sh > 0) {
+      const s = Math.min(tw / sw, th / sh);
+      const dw = sw * s, dh = sh * s;
+      tc.imageSmoothingEnabled = true;
+      tc.imageSmoothingQuality = 'high';
+      tc.drawImage(src, (tw - dw) / 2, (th - dh) / 2, dw, dh);
+    }
+    return t;
+  };
+
+  const keyedPreview = (): { out: HTMLCanvasElement; bleed: number } | null => {
+    if (!stLastRaw) return null;
+    const cfg = JSON.stringify(stKeyCfg);
+    if (!stKeyPreview || stKeyPreview.src !== stLastRaw || stKeyPreview.cfg !== cfg) {
+      const { canvas, bleed } = removeBackground(stLastRaw, keySettings());
+      stKeyPreview = { src: stLastRaw, cfg, out: canvas, bleed };
+    }
+    return { out: stKeyPreview.out, bleed: stKeyPreview.bleed };
+  };
+
+  const kp = keyedPreview();
+  const keySection = mkEl('div', { class: 'genblock' },
+    mkEl('b', {}, '2 · background key (how sprites get their transparency)'),
+    mkEl('div', { class: 'row' },
+      mkEl('label', {}, 'key background ', sessionSelect(
+        stKeyCfg.mode, ['white', 'magenta', 'green'],
+        (v) => { stKeyCfg.mode = v as KeyBgMode; saveKeyCfg(); stKeyPreview = null; },
+      )),
+      keySlider('strength', 0.4, 1.6, 0.05,
+        () => stKeyCfg.strength, (v) => { stKeyCfg.strength = v; },
+        (v) => `${Math.round(v * 100)}%`,
+        'how far from the background color still counts as background — lower protects near-bg foreground'),
+      keySlider('softness', 0, 1, 0.05,
+        () => stKeyCfg.softness, (v) => { stKeyCfg.softness = v; },
+        (v) => `${Math.round(v * 100)}%`,
+        'edge feather width — 0 is a hard cut (no semi-transparent fringe)'),
+      mkEl('label', { title: 'clear background windows fully enclosed by the figure (between legs, under arms)' },
+        ' pockets ', mkEl('input', {
+          type: 'checkbox', checked: stKeyCfg.clearPockets,
+          onchange: (e: Event) => {
+            stKeyCfg.clearPockets = (e.target as HTMLInputElement).checked;
+            saveKeyCfg(); stKeyPreview = null; renderAll();
+          },
+        })),
+      keySlider('pocket match', 0.15, 1, 0.05,
+        () => stKeyCfg.pocketTightness, (v) => { stKeyCfg.pocketTightness = v; },
+        (v) => `${Math.round(v * 100)}%`,
+        'how exactly an enclosed region must match the background to be cleared — keep LOW so white '
+        + 'eyes/teeth/clothing (shaded, off-key) survive while true background windows (flat, exact) go'),
+      keySlider('pocket min', 0.00005, 0.002, 0.00005,
+        () => stKeyCfg.pocketMinFrac, (v) => { stKeyCfg.pocketMinFrac = v; },
+        (v) => `${(v * 100).toFixed(3)}% px`,
+        'smallest enclosed region that can be cleared — raises the floor above eye/mouth size'),
+      mkEl('button', {
+        title: 'back to the shipped defaults',
+        onclick: () => { stKeyCfg = { ...KEY_CFG_DEFAULTS }; saveKeyCfg(); stKeyPreview = null; renderAll(); },
+      }, 'reset'),
+    ),
+    mkEl('p', { class: 'hint' },
+      stKeyCfg.mode === 'white'
+        ? 'white backgrounds can collide with white costume parts — if a character wears white, switch the '
+          + 'key background to magenta/green (chroma key): new generations use that backdrop and white '
+          + 'foreground can never be keyed out'
+        : `new generations are prompted on a flat ${stKeyCfg.mode} backdrop and keyed against it — white `
+          + 'foreground is safe by construction. Regenerate existing frames to benefit.'),
+    kp ? mkEl('div', { class: 'row' },
+      mkEl('div', {}, alphaThumb(stLastRaw!), mkEl('div', { class: 'hint' }, 'last raw generation')),
+      mkEl('div', {}, alphaThumb(kp.out), mkEl('div', { class: 'hint' },
+        `keyed with current settings · bleed ${(kp.bleed * 100).toFixed(1)}%`)),
+    ) : mkEl('p', { class: 'hint' },
+      'no raw image yet this session — generate a reference or some frames and the last raw '
+      + 'result appears here for live key tuning'),
+  );
+
   const moveSection = mkEl('div', { class: 'genblock' },
-    mkEl('b', {}, '2 · per-move animation frames'),
+    mkEl('b', {}, '3 · per-move animation frames'),
     mkEl('div', { class: 'row' },
       mkEl('label', {}, 'move ', selInput(mv?.id ?? '', b.moves.map((x) => x.id), (id) => {
         stMoveIdx = b.moves.findIndex((x) => x.id === id);
@@ -2428,7 +2592,7 @@ const renderGenerateTab = (): HTMLElement => {
   );
 
   const auditSection = mkEl('div', { class: 'genblock' },
-    mkEl('b', {}, '3 · sprite audit (facing + background bleed on saved frames)'),
+    mkEl('b', {}, '4 · sprite audit (facing + background bleed on saved frames)'),
     mkEl('div', { class: 'row' },
       mkEl('button', { disabled: stAuditBusy ? '' : null, onclick: () => void runAudit() },
         stAuditBusy ? 'auditing…' : 'audit sprites'),
@@ -2488,7 +2652,7 @@ const renderGenerateTab = (): HTMLElement => {
     })() : null,
   );
 
-  return mkEl('div', { class: 'pane' }, refSection, moveSection, auditSection);
+  return mkEl('div', { class: 'pane' }, refSection, keySection, moveSection, auditSection);
 };
 
 // ------------------------------------------------------------------ root
@@ -2701,11 +2865,11 @@ const generateStageLayer = async (idx: number): Promise<void> => {
   try {
     const img = await generateImage(
       layer.keyBg
-        ? `${p}. Isolated on a perfectly flat solid pure white background, no shadows, no gradient — `
+        ? `${p}. Isolated on a perfectly flat solid ${bgPhrase()} background, no shadows, no gradient — `
           + `only the described objects, nothing else. Anime background art, no text.`
         : `${p}, anime background art, no text`,
       (Math.random() * 1e6) | 0, 1536, 640, false, stStageProvider);
-    layer.img = layer.keyBg ? removeBackground(img).canvas : img;
+    layer.img = layer.keyBg ? removeBackground(img, keySettings()).canvas : img;
     stStageDirty = true;
     stStatus = `${layer.label} generated`;
     if (layer.keyBg) autoDetectLayer(idx, idx === 1 ? 240 : 150); // suggest a starting position
@@ -3002,7 +3166,7 @@ const renderStageTab = (): HTMLElement => {
             if (!file) return;
             const img = new Image();
             img.onload = () => {
-              layer.img = layer.keyBg ? removeBackground(img).canvas : img;
+              layer.img = layer.keyBg ? removeBackground(img, keySettings()).canvas : img;
               stStageDirty = true;
               if (layer.keyBg) autoDetectLayer(idx, idx === 1 ? 240 : 150);
               renderAll();
@@ -3103,3 +3267,11 @@ void (async () => {
   }
   renderAll();
 })();
+
+// Dev hooks: exercise the keyer from the console (and automated checks)
+// without going through a paid generation call.
+Object.assign(globalThis, {
+  afRemoveBackground: removeBackground,
+  afKeySettings: keySettings,
+  afSetLastRaw: (img: HTMLImageElement): void => { stLastRaw = img; stKeyPreview = null; renderAll(); },
+});

@@ -80,16 +80,62 @@ const dist2 = (r: number, g: number, b: number, c: RGB): number => {
 const clampByte = (v: number): number => (v < 0 ? 0 : v > 255 ? 255 : Math.round(v));
 
 /**
+ * Keyer tuning — every knob the Studio's "background key" panel exposes.
+ * All values are RELATIVE to the auto-detected tolerance so the same settings
+ * work across providers (flat PNG white vs JPEG-noisy white).
+ */
+export interface KeySettings {
+  /** Multiplier on the auto flood tolerance. <1 keys less (protects near-bg
+   *  foreground), >1 keys more. */
+  strength: number;
+  /** Edge feather width, 0..1. 0 = hard binary cut (no alpha ramp, no
+   *  decontamination), 1 = ramp spans the full tolerance radius. */
+  softness: number;
+  /** Clear enclosed bg-colored pockets (between legs, under arms). */
+  clearPockets: boolean;
+  /** Pocket color match as a fraction of the flood tolerance. Pockets are
+   *  REAL background showing through the figure, so they match the bg almost
+   *  exactly — while eyes/teeth/white cloth are shaded and sit further away.
+   *  This being 1.0 (as tight as the flood is loose) was the bug that keyed
+   *  out white costume parts. */
+  pocketTightness: number;
+  /** Min pocket area as a fraction of the image (adaptive floor: leg gaps are
+   *  thousands of px; eye whites are tens). An absolute 24px floor alone let
+   *  every eye/mouth through the trapdoor. */
+  pocketMinFrac: number;
+  /** Explicit key color (overrides border-median sampling), or null = auto.
+   *  Set when generating on a chroma background (magenta/green). */
+  keyColor: RGB | null;
+}
+
+export const DEFAULT_KEY: KeySettings = {
+  strength: 1,
+  softness: 0.65,
+  clearPockets: true,
+  // Real bg pockets sit within ~10 RGB of the key even through JPEG noise;
+  // 0.35 × the (≥62) flood tol ≈ 22 keeps healthy margin over that while
+  // sparing most shaded whites. A large PERFECTLY-FLAT pure-white garment
+  // panel is locally indistinguishable from background — no local rule can
+  // save it; that residual case is what the magenta/green key mode is for.
+  pocketTightness: 0.35,
+  pocketMinFrac: 0.0004, // 1536×640 strip → ≈393px floor
+  keyColor: null,
+};
+
+/**
  * Background removal: flood-fill transparency from every border pixel whose
  * color is close to the border median, THEN clear enclosed background
  * pockets — bg-colored regions the flood can't reach (between legs, under
- * arms). A pocket is safe to clear precisely because it never touches
- * transparency; character details that reach the silhouette edge do.
+ * arms). Pockets must match the bg far more tightly than the flood (see
+ * KeySettings.pocketTightness): enclosed WHITE FOREGROUND (eyes, teeth, white
+ * clothing) is shaded and off-key, real background pockets are flat and
+ * exact — that color distance is what separates them.
  * Returns the canvas plus a bleed fraction (bg-colored pixels that survived)
  * as a QC signal.
  */
 export const removeBackground = (
   img: HTMLImageElement | HTMLCanvasElement,
+  key: KeySettings = DEFAULT_KEY,
 ): { canvas: HTMLCanvasElement; bleed: number } => {
   const w = img instanceof HTMLCanvasElement ? img.width : img.naturalWidth;
   const h = img instanceof HTMLCanvasElement ? img.height : img.naturalHeight;
@@ -109,14 +155,23 @@ export const removeBackground = (
   for (let y = 0; y < h; y += 4) { sampleAt(0, y); sampleAt(w - 1, y); }
   const med = (a: number[]): number => a.sort((p, q) => p - q)[a.length >> 1]!;
   const spread = (a: number[]): number => a[Math.floor(a.length * 0.9)]! - a[Math.floor(a.length * 0.1)]!;
-  const bg: RGB = [med(rs), med(gs), med(bs)];
-  const tol = Math.min(96, 62 + Math.max(spread(rs), spread(gs), spread(bs)));
+  const bg: RGB = key.keyColor ?? [med(rs), med(gs), med(bs)];
+  const tol = Math.min(96, 62 + Math.max(spread(rs), spread(gs), spread(bs))) * key.strength;
   const TOL2 = tol * tol;
 
   const isBg = (p: number): boolean => {
     const i = p * 4;
     return dist2(d[i]!, d[i + 1]!, d[i + 2]!, bg) < TOL2;
   };
+
+  // Pockets use their own (much tighter) match radius — see KeySettings.
+  const pocketTol = tol * key.pocketTightness;
+  const POCKET_TOL2 = pocketTol * pocketTol;
+  const isPocketBg = (p: number): boolean => {
+    const i = p * 4;
+    return dist2(d[i]!, d[i + 1]!, d[i + 2]!, bg) < POCKET_TOL2;
+  };
+  const pocketMin = Math.max(24, Math.round(w * h * key.pocketMinFrac));
 
   // Pass 1: border flood fill.
   const visited = new Uint8Array(w * h);
@@ -137,32 +192,50 @@ export const removeBackground = (
     tryPush(x + 1, y); tryPush(x - 1, y); tryPush(x, y + 1); tryPush(x, y - 1);
   }
 
-  // Pass 2: enclosed pockets. Components of surviving bg-colored pixels that
-  // never touch transparency are keyed out (min size guards small highlights).
+  // Pass 2: enclosed pockets. Components of surviving TIGHTLY-bg-matching
+  // pixels that never touch transparency are keyed out. Three tests separate
+  // enclosed white FOREGROUND (eyes, teeth, white clothing) from real
+  // background windows (between legs, under arms):
+  //   color  — pocket px must sit within pocketTol of the key (shaded cloth
+  //            drifts off-key);
+  //   size   — adaptive floor (leg gaps are thousands of px, eye whites tens);
+  //   FLATNESS — real background is a solid fill (per-channel stddev ≈ 0-5
+  //            even through JPEG); rendered cloth carries shading gradients.
+  //            A large flat near-white patch is indistinguishable from bg by
+  //            color alone — variance is what tells them apart.
+  const POCKET_FLAT_STDDEV = 7;
   const seen = new Uint8Array(w * h);
   const stack: number[] = [];
   let bleedPx = 0, opaquePx = 0;
   for (let p = 0; p < w * h; p++) if (d[p * 4 + 3]! > 40) opaquePx++;
   for (let start = 0; start < w * h; start++) {
-    if (seen[start] || d[start * 4 + 3]! <= 40 || !isBg(start)) continue;
+    if (seen[start] || d[start * 4 + 3]! <= 40 || !isPocketBg(start)) continue;
     const comp: number[] = [];
     let touchesAlpha = false;
+    let sr = 0, sg = 0, sb = 0, sr2 = 0, sg2 = 0, sb2 = 0;
     stack.push(start);
     seen[start] = 1;
     while (stack.length > 0) {
       const p = stack.pop()!;
       comp.push(p);
+      const i = p * 4;
+      const r = d[i]!, g = d[i + 1]!, b = d[i + 2]!;
+      sr += r; sg += g; sb += b;
+      sr2 += r * r; sg2 += g * g; sb2 += b * b;
       const x = p % w;
       for (const q of [p - 1, p + 1, p - w, p + w]) {
         if (q < 0 || q >= w * h || Math.abs((q % w) - x) > 1) continue;
         if (d[q * 4 + 3]! <= 40) { touchesAlpha = true; continue; }
-        if (!seen[q] && isBg(q)) { seen[q] = 1; stack.push(q); }
+        if (!seen[q] && isPocketBg(q)) { seen[q] = 1; stack.push(q); }
       }
     }
-    if (!touchesAlpha && comp.length >= 24) {
+    const m = comp.length;
+    const variance = ((sr2 - (sr * sr) / m) + (sg2 - (sg * sg) / m) + (sb2 - (sb * sb) / m)) / (3 * m);
+    const flat = Math.sqrt(Math.max(0, variance)) <= POCKET_FLAT_STDDEV;
+    if (!touchesAlpha && m >= pocketMin && flat && key.clearPockets) {
       for (const p of comp) d[p * 4 + 3] = 0;
-    } else if (comp.length >= 24) {
-      bleedPx += comp.length; // survived bg-colored area → QC signal
+    } else if (m >= pocketMin && flat) {
+      bleedPx += m; // survived bg-colored area → QC signal
     }
   }
 
@@ -176,25 +249,32 @@ export const removeBackground = (
   // remaining tint subtracted back out (standard matting decontamination),
   // rather than reprocessing the whole image and risking legitimate
   // near-white foreground content elsewhere.
-  const innerR = Math.max(8, tol * 0.35);
-  const src = new Uint8ClampedArray(d); // read neighbours from the PRE-feather state
-  for (let p = 0; p < w * h; p++) {
-    if (src[p * 4 + 3] === 0) continue; // already transparent
-    const x = p % w, y = (p / w) | 0;
-    let nearBoundary = false;
-    for (const [qx, qy] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]] as const) {
-      if (qx < 0 || qy < 0 || qx >= w || qy >= h) continue;
-      if (src[(qy * w + qx) * 4 + 3] === 0) { nearBoundary = true; break; }
+  if (key.softness > 0) {
+    // Ramp spans softness×tol: dist below innerR → most transparent (0.15
+    // floor), dist at rampEnd → fully opaque. Softness 0 skips the pass
+    // entirely (hard cut — the right choice when white costume edges were
+    // getting ghosted).
+    const rampEnd = tol; // ramp always ends at the flood radius…
+    const innerR = Math.max(2, tol * (1 - key.softness)); // …softness widens it inward
+    const src = new Uint8ClampedArray(d); // read neighbours from the PRE-feather state
+    for (let p = 0; p < w * h; p++) {
+      if (src[p * 4 + 3] === 0) continue; // already transparent
+      const x = p % w, y = (p / w) | 0;
+      let nearBoundary = false;
+      for (const [qx, qy] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]] as const) {
+        if (qx < 0 || qy < 0 || qx >= w || qy >= h) continue;
+        if (src[(qy * w + qx) * 4 + 3] === 0) { nearBoundary = true; break; }
+      }
+      if (!nearBoundary) continue;
+      const i = p * 4;
+      const dist = Math.sqrt(dist2(src[i]!, src[i + 1]!, src[i + 2]!, bg));
+      if (dist >= rampEnd) continue; // clearly foreground colour — leave fully opaque
+      const alphaFrac = Math.max(0.15, Math.min(1, (dist - innerR) / Math.max(1, rampEnd - innerR)));
+      d[i] = clampByte(bg[0] + (src[i]! - bg[0]) / alphaFrac);
+      d[i + 1] = clampByte(bg[1] + (src[i + 1]! - bg[1]) / alphaFrac);
+      d[i + 2] = clampByte(bg[2] + (src[i + 2]! - bg[2]) / alphaFrac);
+      d[i + 3] = Math.round(alphaFrac * 255);
     }
-    if (!nearBoundary) continue;
-    const i = p * 4;
-    const dist = Math.sqrt(dist2(src[i]!, src[i + 1]!, src[i + 2]!, bg));
-    if (dist >= tol) continue; // clearly foreground colour — leave fully opaque
-    const alphaFrac = Math.max(0.15, Math.min(1, (dist - innerR) / Math.max(1, tol - innerR)));
-    d[i] = clampByte(bg[0] + (src[i]! - bg[0]) / alphaFrac);
-    d[i + 1] = clampByte(bg[1] + (src[i + 1]! - bg[1]) / alphaFrac);
-    d[i + 2] = clampByte(bg[2] + (src[i + 2]! - bg[2]) / alphaFrac);
-    d[i + 3] = Math.round(alphaFrac * 255);
   }
 
   ctx.putImageData(im, 0, 0);
@@ -436,8 +516,10 @@ export const alphaBounds = (c: HTMLCanvasElement): { l: number; t: number; r: nu
  * the caller then falls back to per-frame generation rather than saving
  * mis-sliced junk.
  */
-export const sliceSheet = (img: HTMLImageElement, n: number): HTMLCanvasElement[] | null => {
-  const { canvas: cut } = removeBackground(img);
+export const sliceSheet = (
+  img: HTMLImageElement, n: number, key: KeySettings = DEFAULT_KEY,
+): HTMLCanvasElement[] | null => {
+  const { canvas: cut } = removeBackground(img, key);
   const w = cut.width, h = cut.height;
   const d = cut.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, w, h).data;
 
@@ -516,7 +598,9 @@ export const sliceSheet = (img: HTMLImageElement, n: number): HTMLCanvasElement[
   }
   const ordered = rows.flatMap((row) => row.sort((a, b) => a.l - b.l));
 
-  // --- emit each figure padded on white (the keyer downstream expects white).
+  // --- emit each figure padded on the key color (the downstream re-key
+  // samples ITS border, so the pad must look like this image's background).
+  const padColor = key.keyColor ?? [255, 255, 255];
   return ordered.map((b) => {
     const bw = b.r - b.l + 1;
     const bh = b.b - b.t + 1;
@@ -525,15 +609,17 @@ export const sliceSheet = (img: HTMLImageElement, n: number): HTMLCanvasElement[
     const ch = bh + pad * 2;
     const out = mkCanvas(cw, ch);
     const octx = out.getContext('2d', { willReadFrequently: true })!;
-    octx.fillStyle = '#ffffff';
+    octx.fillStyle = `rgb(${padColor[0]},${padColor[1]},${padColor[2]})`;
     octx.fillRect(0, 0, cw, ch);
     octx.drawImage(cut, b.l, b.t, bw, bh, pad, pad, bw, bh);
     return out;
   });
 };
 
-export const sliceStrip = (img: HTMLImageElement, n: number): HTMLCanvasElement[] | null => {
-  const { canvas: cut } = removeBackground(img);
+export const sliceStrip = (
+  img: HTMLImageElement, n: number, key: KeySettings = DEFAULT_KEY,
+): HTMLCanvasElement[] | null => {
+  const { canvas: cut } = removeBackground(img, key);
   const w = cut.width, h = cut.height;
   const d = cut.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, w, h).data;
 
@@ -591,15 +677,16 @@ export const sliceStrip = (img: HTMLImageElement, n: number): HTMLCanvasElement[
   if (runs.length !== n) return null;
 
   // Emit each run as its own canvas (padded so normalize sees a clean subject).
+  const padColor = key.keyColor ?? [255, 255, 255];
   return runs.map((run) => {
     const rw = run.r - run.l + 1;
     const pad = Math.round(rw * 0.15);
     const cw = rw + pad * 2;
     const out = mkCanvas(cw, h);
     const octx = out.getContext('2d', { willReadFrequently: true })!;
-    // White background so the downstream keyer behaves identically to a
-    // freshly generated image.
-    octx.fillStyle = '#ffffff';
+    // Key-colored background so the downstream keyer behaves identically to
+    // a freshly generated image.
+    octx.fillStyle = `rgb(${padColor[0]},${padColor[1]},${padColor[2]})`;
     octx.fillRect(0, 0, cw, h);
     octx.drawImage(cut, run.l, 0, rw, h, pad, 0, rw, h);
     return out;
@@ -676,9 +763,9 @@ export interface NormalizedFrame {
  */
 export const normalizeFrame = (
   img: HTMLImageElement | HTMLCanvasElement, palette: RGB[] | null,
-  refFigureH?: number,
+  refFigureH?: number, key: KeySettings = DEFAULT_KEY,
 ): NormalizedFrame | null => {
-  const { canvas: cut, bleed } = removeBackground(img);
+  const { canvas: cut, bleed } = removeBackground(img, key);
   const majorBlobs = filterComponents(cut);
   const bb = alphaBBox(cut);
   if (!bb) return null;
@@ -716,8 +803,10 @@ export const normalizeFrame = (
  * The batch takes the MEDIAN of these across a sheet's panels to get the
  * character's true drawn size, independent of how far any one pose reaches.
  */
-export const measureFigureH = (img: HTMLImageElement | HTMLCanvasElement): number | null => {
-  const { canvas: cut } = removeBackground(img);
+export const measureFigureH = (
+  img: HTMLImageElement | HTMLCanvasElement, key: KeySettings = DEFAULT_KEY,
+): number | null => {
+  const { canvas: cut } = removeBackground(img, key);
   filterComponents(cut);
   const bb = alphaBBox(cut);
   return bb ? bb.b - bb.t + 1 : null;
