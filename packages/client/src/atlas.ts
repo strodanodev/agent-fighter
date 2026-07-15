@@ -50,6 +50,8 @@ export interface Roster {
   portraitFraming: { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean } | null;
   /** Alpha bounds of the portrait art, so frames crop to the figure, not the cell. */
   portraitBox: { x: number; y: number; w: number; h: number } | null;
+  /** Disabled in Studio (meta.disabled): greyed out and unselectable on the select screen. */
+  disabled: boolean;
 }
 
 /** Tight alpha bounds of an image (computed once at load). */
@@ -109,6 +111,7 @@ export const loadRoster = async (id: string): Promise<Roster> => {
     meta?: {
       selectPortrait?: string;
       selectFraming?: { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean };
+      disabled?: boolean;
     };
   }).meta;
   const portraitFile = meta?.selectPortrait;
@@ -128,6 +131,7 @@ export const loadRoster = async (id: string): Promise<Roster> => {
     // A composed portrait fills its frame (cover-fit); only the sprite fallback
     // needs alpha bounds to crop away the empty cell.
     portraitBox: !dedicated && portrait ? alphaBounds(portrait) : null,
+    disabled: !!meta?.disabled,
   };
 };
 

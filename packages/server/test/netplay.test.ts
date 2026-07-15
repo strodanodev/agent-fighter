@@ -68,6 +68,11 @@ describe('persistence hook (Phase B)', () => {
   it('a finished match is recorded exactly once with the verified outcome', async () => {
     const records: import('../src/persist.js').MatchRecord[] = [];
     const mock: import('../src/persist.js').Persistence = {
+      // Dev identities so agents can queue without AIR tokens; generous
+      // credits so escrow doesn't block the Phase-B recordMatch assertion.
+      dev: true,
+      getAccount: async () => ({ credits: 100, level: 1, xp: 0, wins: 0, losses: 0, dailyGranted: false }),
+      escrowMatch: async () => {},
       recordMatch: async (r) => { records.push(r); return []; },
       leaderboard: async () => [],
     };
@@ -86,7 +91,11 @@ describe('persistence hook (Phase B)', () => {
       assert.equal(rec.winner, a.result.winner);
       assert.deepEqual(rec.names.slice().sort(), ['AgentE', 'AgentF']);
       assert.deepEqual(rec.agents, [true, true]);
-      assert.deepEqual(rec.identities, [null, null]); // no auth tokens sent
+      // Dev persistence mints name-keyed identities so escrow/record can run
+      // without AIR tokens (production supabasePersistence never does this).
+      assert.deepEqual(rec.identities.map((i) => i?.sub ?? null).sort(), ['dev:AgentE', 'dev:AgentF']);
+      assert.equal(rec.mode, 'wager');
+      assert.equal(rec.fee, 10);
       assert.equal(rec.hash >>> 0, a.result.hash >>> 0);
     } finally {
       s2.close();

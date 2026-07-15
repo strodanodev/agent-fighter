@@ -14,6 +14,10 @@ const here = dirname(fileURLToPath(import.meta.url));
 const pkg = join(here, '..');
 const tmp = join(pkg, '.bundle-tmp');
 
+// Regenerate the branded PWA icons (assets/icons/*.png) before bundling so a
+// fresh checkout / Vercel build always ships them.
+execSync(`node ${JSON.stringify(join(here, 'make-icons.mjs'))}`, { cwd: pkg, stdio: 'inherit' });
+
 rmSync(tmp, { recursive: true, force: true });
 execSync(
   `tsc -p tsconfig.json --outDir ${JSON.stringify(tmp)} --declaration false --sourceMap false`,
@@ -40,6 +44,8 @@ const ORDER = [
   'client/src/flags.js',
   'client/src/audio.js',
   'client/src/ui.js',
+  'client/src/pwa.js',
+  'client/src/touch.js',
   'client/src/main.js',
 ];
 
@@ -66,13 +72,26 @@ const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Agent Fighter</title>
+<!-- PWA: installable, full-screen, offline-capable (see pwa.ts + /sw.js). -->
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0a0616">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Agent Fighter">
+<link rel="apple-touch-icon" href="/assets/icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/assets/icons/icon-192.png">
 <style>
   /* AgentDisplay (Anton, SIL OFL) is loaded at runtime from /assets/fonts/ —
      see main.ts loadDisplayFont(). The client already depends on the local
      dev server for characters/stages/UI-kit assets, so this follows the same
      pattern rather than bloating every bundle with a base64 font blob. */
   html,body{margin:0;height:100%;background:#07050d;display:flex;align-items:center;justify-content:center;font-family:"Courier New",monospace;color:#666;overflow:hidden}
+  /* Lock the mobile viewport: no rubber-band scroll / pinch-zoom fighting the
+     on-screen controls (touch.ts). Harmless on desktop. */
+  html,body{position:fixed;inset:0;width:100%;overscroll-behavior:none;touch-action:none}
   canvas{image-rendering:pixelated;box-shadow:0 0 0 3px #14121f,0 10px 60px #000c;
          width:min(96vw, calc(96vh * 16 / 9));height:auto;aspect-ratio:16/9}
 </style>
@@ -90,6 +109,13 @@ mkdirSync(join(pkg, 'demo'), { recursive: true });
 const out = join(pkg, 'demo', 'agent-fighter.html');
 writeFileSync(out, html);
 console.log(`bundled → ${out} (${(html.length / 1024).toFixed(1)} KB)`);
+
+// PWA root files (served at / by the dev server and copied to public/ by the
+// Vercel build): the web-app manifest + the service worker.
+for (const f of ['manifest.webmanifest', 'sw.js']) {
+  copyFileSync(join(pkg, 'pwa', f), join(pkg, 'demo', f));
+  console.log(`pwa → demo/${f}`);
+}
 
 // Vendor the AIR Kit UMD build next to the bundle (auth.ts lazy-loads it as
 // vendor/airkit.umd.js on the first sign-in — offline play never fetches it).

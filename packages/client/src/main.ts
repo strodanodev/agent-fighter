@@ -31,6 +31,8 @@ import { NetSession } from './net.js';
 import {
   auraGlow, drawFx, emitAura, emitBurst, emitRing, fxPulse, updateFx,
 } from './fx.js';
+import { initTouchControls } from './touch.js';
+import { initPwa } from './pwa.js';
 
 const TICK_MS = 1000 / TICKS_PER_SEC;
 
@@ -564,7 +566,10 @@ const frame = (): void => {
       mode, cpuLevel: cpuLevelFor(profile, lever),
       authLabel: authName(), authBusy: auth.status === 'busy',
     });
-    const MODES: Mode[] = ['cpu', '2p', 'online'];
+    // 2-player local is disabled on all platforms (single-controller / mobile
+    // focus). The '2p' Mode value + its handling stay in the codebase, just no
+    // longer offered on the menu.
+    const MODES: Mode[] = ['cpu', 'online'];
     if (pressedThisFrame.has('KeyL')) {
       // AIR sign-in/out toggle — must not fall through to "any key starts".
       void (auth.status === 'in' ? authLogout() : authLogin());
@@ -751,3 +756,10 @@ Object.assign(globalThis, {
     stalled: net.stalled, side: net.side,
   } : null),
 });
+
+// Mobile: auto-detect touch devices and lay the on-screen controls over the
+// canvas; register the PWA + offer install on the first landing. Both are
+// no-ops on desktop / when already installed. Runs after afScreen (above) is
+// exposed so the overlay can sync its visibility to the current game screen.
+initPwa();
+initTouchControls();

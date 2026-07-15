@@ -811,9 +811,9 @@ export const drawTitle = (
   // display()/label() already carry their own outline+glow for contrast.
   const barH = 178, barY = VH - barH;
 
+  // 2-player local is disabled (single-controller / mobile focus) — omitted here.
   const rows: [Mode, string][] = [
     ['cpu', `VS AGENT  ·  LV ${menu.cpuLevel}`],
-    ['2p', '2 PLAYERS'],
     ['online', 'ONLINE  ·  HUMANS & AGENTS'],
   ];
   const menuY0 = barY + 30;

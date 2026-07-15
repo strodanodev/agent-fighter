@@ -35,6 +35,7 @@ interface StudioMeta {
   selectPortrait?: string; // character-select portrait sprite (e.g. _select.png)
   // Portrait framing: zoom/recenter + 90° rotation + horizontal flip.
   selectFraming?: { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean };
+  disabled?: boolean; // greyed out + unselectable on the character-select screen
 }
 
 type TabName = 'character' | 'frames' | 'moves' | 'cancels' | 'test' | 'generate' | 'stage';
@@ -950,7 +951,26 @@ const renderCharacterTab = (): HTMLElement => {
     field('throwTossVelY', () => b.throwTossVelY, (v) => { b.throwTossVelY = v; }),
   );
 
-  return mkEl('div', { class: 'pane' }, portraitSection, grid);
+  const disabled = !!meta().disabled;
+  const disableRow = mkEl('div', {
+    style: 'margin-bottom:12px;padding:8px 12px;border-radius:6px;max-width:1100px;display:flex;'
+      + `align-items:center;gap:12px;background:${disabled ? '#3a1420' : '#141724'};`
+      + `border:1px solid ${disabled ? '#c04a5a' : '#232840'}`,
+  },
+    mkEl('button', {
+      title: 'toggle whether this character can be picked on the character-select screen',
+      onclick: () => {
+        const m = meta();
+        if (m.disabled) delete m.disabled; else m.disabled = true;
+        stDirty = true; renderAll();
+      },
+    }, disabled ? '✓ enable character' : '⛔ disable character'),
+    mkEl('span', { class: 'hint' }, disabled
+      ? 'DISABLED — greyed out and unselectable on the character-select screen (Save to apply).'
+      : 'active — selectable on the character-select screen.'),
+  );
+
+  return mkEl('div', { class: 'pane' }, disableRow, portraitSection, grid);
 };
 
 // ------------------------------------------------------------------ frames tab

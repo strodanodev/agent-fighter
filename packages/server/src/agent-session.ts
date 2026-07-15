@@ -42,6 +42,11 @@ export interface AgentOptions {
    * for its owner, per ADR 0003.
    */
   authToken?: string;
+  /**
+   * Ranked-solo house bot: when set, the queue message carries `soloFor` so
+   * the server pairs this agent with the waiting human (loopback-only).
+   */
+  soloFor?: string;
 }
 
 export interface AgentResult {
@@ -106,7 +111,12 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
 
     ws.on('open', () => {
       sendMsg({ t: 'hello', v: PROTOCOL_VERSION, name: opts.name, agent: true, engine: ENGINE_VERSION, auth: opts.authToken });
-      sendMsg({ t: 'queue', character: opts.character, bundleHash: bundleOf(opts.character).versionHash });
+      sendMsg({
+        t: 'queue',
+        character: opts.character,
+        bundleHash: bundleOf(opts.character).versionHash,
+        ...(opts.soloFor ? { soloFor: opts.soloFor } : {}),
+      });
     });
 
     ws.on('message', (data) => {

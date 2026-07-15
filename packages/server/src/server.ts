@@ -25,8 +25,11 @@ import {
 import type { ClientMsg, SMatch, SResult, ServerMsg } from './protocol.js';
 import { verifyAirToken } from './airjwt.js';
 import type { AirIdentity } from './airjwt.js';
-import { createPersistence, loadDotEnv } from './persist.js';
-import type { Persistence } from './persist.js';
+import {
+  InsufficientCredits, SOLO_FEE, WAGER_FEE, createPersistence, loadDotEnv,
+} from './persist.js';
+import type { Account, MatchMode, Persistence } from './persist.js';
+import { playOneMatch } from './agent-session.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(here, '..', '..', '..');
@@ -43,10 +46,19 @@ interface Client {
   side: 0 | 1;
   /** Verified AIR identity (null = anonymous). Set async after hello. */
   identity: AirIdentity | null;
+  /** Settles when the hello token has been verified (or wasn't sent). */
+  identityReady: Promise<void>;
+  /** Account snapshot from persistence (null = anonymous / persistence off). */
+  account: Account | null;
+  /** True for the server's own in-process house bots. */
+  house: boolean;
+  isLoopback: boolean;
 }
 
 interface Match {
   id: string;
+  mode: MatchMode;
+  fee: number;
   clients: [Client, Client];
   seed: number;
   stage: string;
@@ -132,6 +144,8 @@ export const createMatchServer = (opts: {
   let nextId = 1;
   let nextMatch = 1;
   let matchSeed = (Date.now() % 100_000) | 0; // server-side is allowed wall clock
+  /** Filled once http.listen resolves — house bots dial back to this port. */
+  let boundPort = opts.port && opts.port > 0 ? opts.port : DEFAULT_PORT;
 
   const send = (c: Client, msg: ServerMsg): void => {
     if (c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(msg));
@@ -185,7 +199,7 @@ export const createMatchServer = (opts: {
     // match id, so a crash-retry can't double-award.
     if (persistence) {
       void persistence.recordMatch({
-        matchId: m.id,
+        matchId: m.id, mode: m.mode, fee: m.fee,
         identities: [m.clients[0].identity, m.clients[1].identity],
         names: [m.clients[0].name, m.clients[1].name],
         agents: [m.clients[0].agent, m.clients[1].agent],
@@ -199,6 +213,7 @@ export const createMatchServer = (opts: {
           send(m.clients[a.side], {
             t: 'xp', gained: a.gained, levelsUp: a.levelsUp,
             level: a.level, xp: a.xp, wins: a.wins, losses: a.losses,
+            creditsDelta: a.creditsDelta, credits: a.credits,
           });
         }
       }).catch((e) => console.log(`[match ${m.id}] persist failed: ${String(e)}`));
@@ -229,43 +244,110 @@ export const createMatchServer = (opts: {
     return stateHash(g);
   };
 
-  const tryPair = (): void => {
-    while (queue.length >= 2) {
-      const c0 = queue.shift()!;
-      const c1 = queue.shift()!;
-      if (c0.ws.readyState !== WebSocket.OPEN) { queue.unshift(c1); continue; }
-      if (c1.ws.readyState !== WebSocket.OPEN) { queue.unshift(c0); continue; }
+  const startMatch = (c0: Client, c1: Client, mode: MatchMode, fee: number, id?: string): void => {
+    const m: Match = {
+      id: id ?? `m${nextMatch++}`,
+      mode, fee,
+      clients: [c0, c1],
+      seed: (matchSeed = (matchSeed * 1103515245 + 12345) & 0x7fffffff),
+      stage: stageIds.length > 0 ? stageIds[matchSeed % stageIds.length]! : '',
+      chars: [c0.character, c1.character],
+      inputs: [[], []],
+      hashes: [new Map(), new Map()],
+      overAt: [-1, -1],
+      finished: false,
+      forfeitTimer: null,
+    };
+    c0.match = m; c0.side = 0; c0.state = 'playing';
+    c1.match = m; c1.side = 1; c1.state = 'playing';
 
-      const m: Match = {
-        id: `m${nextMatch++}`,
-        clients: [c0, c1],
-        seed: (matchSeed = (matchSeed * 1103515245 + 12345) & 0x7fffffff),
-        stage: stageIds.length > 0 ? stageIds[matchSeed % stageIds.length]! : '',
-        chars: [c0.character, c1.character],
-        inputs: [[], []],
-        hashes: [new Map(), new Map()],
-        overAt: [-1, -1],
-        finished: false,
-        forfeitTimer: null,
+    for (const c of m.clients) {
+      const setup: SMatch = {
+        t: 'match', matchId: m.id, side: c.side, seed: m.seed, stage: m.stage,
+        delay: INPUT_DELAY,
+        chars: [
+          { id: m.chars[0], hash: bundleOf(m.chars[0]).versionHash },
+          { id: m.chars[1], hash: bundleOf(m.chars[1]).versionHash },
+        ],
+        names: [m.clients[0].name, m.clients[1].name],
+        agents: [m.clients[0].agent, m.clients[1].agent],
+        mode, fee,
       };
-      c0.match = m; c0.side = 0; c0.state = 'playing';
-      c1.match = m; c1.side = 1; c1.state = 'playing';
-
-      for (const c of m.clients) {
-        const setup: SMatch = {
-          t: 'match', matchId: m.id, side: c.side, seed: m.seed, stage: m.stage,
-          delay: INPUT_DELAY,
-          chars: [
-            { id: m.chars[0], hash: bundleOf(m.chars[0]).versionHash },
-            { id: m.chars[1], hash: bundleOf(m.chars[1]).versionHash },
-          ],
-          names: [m.clients[0].name, m.clients[1].name],
-          agents: [m.clients[0].agent, m.clients[1].agent],
-        };
-        send(c, setup);
-      }
-      console.log(`[match ${m.id}] ${c0.name}${c0.agent ? ' (agent)' : ''} vs ${c1.name}${c1.agent ? ' (agent)' : ''} · seed ${m.seed} · stage ${m.stage}`);
+      send(c, setup);
     }
+    console.log(`[match ${m.id}] ${mode}·fee ${fee} · ${c0.name}${c0.agent ? ' (agent)' : ''} vs ${c1.name}${c1.agent ? ' (agent)' : ''} · seed ${m.seed} · stage ${m.stage}`);
+  };
+
+  /**
+   * ESCROW at pair time (M5): both entrance fees are charged atomically
+   * before the match setup goes out. Refunds happen in record_match for
+   * draws/incompletes. When persistence is off (tests), play is free.
+   */
+  let pairing = false;
+  const tryPair = async (): Promise<void> => {
+    if (pairing) return; // escrow awaits — re-entered via the tail call below
+    pairing = true;
+    try {
+      while (queue.length >= 2) {
+        const c0 = queue.shift()!;
+        const c1 = queue.shift()!;
+        if (c0.ws.readyState !== WebSocket.OPEN) { queue.unshift(c1); continue; }
+        if (c1.ws.readyState !== WebSocket.OPEN) { queue.unshift(c0); continue; }
+
+        const fee = persistence ? WAGER_FEE : 0;
+        // Allocate the id BEFORE the escrow await — a concurrent solo match
+        // starting mid-await must not steal it (the escrow rows key on it).
+        const matchId = `m${nextMatch++}`;
+        if (fee > 0) {
+          try {
+            await persistence!.escrowMatch(matchId, [c0.identity!.sub, c1.identity!.sub], fee);
+          } catch (e) {
+            const poor = e instanceof InsufficientCredits ? e.side : 0;
+            const [broke, ok] = poor === 0 ? [c0, c1] : [c1, c0];
+            broke.state = 'lobby';
+            send(broke, { t: 'error', code: 'credits', msg: `wager needs ${fee} credits` });
+            queue.unshift(ok);
+            continue;
+          }
+          // Client vanished between escrow and setup → record as incomplete
+          // immediately so the fees refund (the match id is already charged).
+          if (c0.ws.readyState !== WebSocket.OPEN || c1.ws.readyState !== WebSocket.OPEN) {
+            startMatch(c0, c1, 'wager', fee, matchId);
+            finishMatch(c0.match!, null);
+            continue;
+          }
+        }
+        startMatch(c0, c1, 'wager', fee, matchId);
+      }
+    } finally {
+      pairing = false;
+    }
+    if (queue.length >= 2) void tryPair();
+  };
+
+  /** Pending ranked-solo players, waiting for their spawned house bot. */
+  const soloWaiting = new Map<string, Client>();
+
+  const spawnHouseBot = (player: Client, port: number): void => {
+    const level = player.account?.level ?? 1;
+    const skill = Math.max(3, Math.min(100, Math.round((level * 100) / 40)));
+    const character = characterIds[Math.floor(Math.random() * characterIds.length)]!;
+    soloWaiting.set(player.id, player);
+    void playOneMatch({
+      url: `ws://127.0.0.1:${port}`,
+      name: `HOUSE LV${level}`,
+      character, skill, charactersDir,
+      aiSeed: (Date.now() % 100000) + nextMatch,
+      paceMs: 16, // real-time — it's playing a human
+      soloFor: player.id,
+    }).catch((e) => {
+      console.log(`[solo] house bot failed: ${String(e)}`);
+      soloWaiting.delete(player.id);
+      if (player.state === 'queued') {
+        player.state = 'lobby';
+        send(player, { t: 'error', msg: 'house agent unavailable' });
+      }
+    });
   };
 
   const onMessage = (c: Client, raw: string): void => {
@@ -282,15 +364,28 @@ export const createMatchServer = (opts: {
         if (msg.engine !== ENGINE_VERSION) return send(c, { t: 'error', msg: `engine ${ENGINE_VERSION} required (got ${msg.engine})` });
         c.name = String(msg.name ?? 'anon').slice(0, 24) || 'anon';
         c.agent = !!msg.agent;
-        // Identity resolves async and only gates PROGRESSION, never the
-        // queue — the welcome goes out immediately. JWKS is cached, so this
-        // settles long before any match could possibly finish.
-        if (typeof msg.auth === 'string' && msg.auth) {
-          void verifyAirToken(msg.auth).then((identity) => {
-            c.identity = identity;
-            if (identity) console.log(`[auth] ${c.name} = ${identity.sub}${identity.address ? ` (${identity.address.slice(0, 10)}…)` : ''}`);
-          });
-        }
+        // Identity + account resolve async — the welcome goes out immediately
+        // and queueing AWAITS identityReady (fees need a verified account).
+        const auth = typeof msg.auth === 'string' && msg.auth ? msg.auth : null;
+        c.identityReady = (async () => {
+          if (auth) {
+            c.identity = await verifyAirToken(auth);
+            if (c.identity) console.log(`[auth] ${c.name} = ${c.identity.sub}${c.identity.address ? ` (${c.identity.address.slice(0, 10)}…)` : ''}`);
+          }
+          if (!c.identity && persistence?.dev) {
+            // DEV economy only: name-keyed identity so the whole credit loop
+            // runs without AIR/Supabase. supabasePersistence never does this.
+            c.identity = { sub: `dev:${c.name}` };
+          }
+          if (c.identity && persistence) {
+            try {
+              c.account = await persistence.getAccount(c.identity, c.name, c.agent);
+              send(c, { t: 'account', ...c.account });
+            } catch (e) {
+              console.log(`[account] ${c.name}: ${String(e)}`);
+            }
+          }
+        })();
         return send(c, { t: 'welcome', id: c.id, engine: ENGINE_VERSION });
       }
       case 'queue': {
@@ -304,10 +399,60 @@ export const createMatchServer = (opts: {
           return send(c, { t: 'error', msg: `bundle hash mismatch for ${msg.character}` });
         }
         c.character = msg.character;
-        c.state = 'queued';
-        queue.push(c);
-        send(c, { t: 'queued' });
-        return tryPair();
+
+        // Internal: a spawned house bot joining its player's ranked match.
+        // Loopback-only — otherwise anyone could impersonate the house and
+        // farm ranked XP/credits by throwing matches to an accomplice.
+        if (msg.soloFor) {
+          if (!c.isLoopback) return send(c, { t: 'error', msg: 'house bots are server-local' });
+          const player = soloWaiting.get(msg.soloFor);
+          soloWaiting.delete(msg.soloFor);
+          if (!player || player.ws.readyState !== WebSocket.OPEN || player.state !== 'queued') {
+            return send(c, { t: 'error', msg: 'solo player gone' });
+          }
+          c.house = true;
+          void (async () => {
+            // The house plays for the HOUSE: strip any (dev) identity so
+            // settlement can never credit the bot's side.
+            await c.identityReady;
+            c.identity = null;
+            c.account = null;
+            const fee = persistence ? SOLO_FEE : 0;
+            const matchId = `m${nextMatch++}`;
+            if (fee > 0) {
+              try {
+                await persistence!.escrowMatch(matchId, [player.identity?.sub ?? null, null], fee);
+              } catch {
+                player.state = 'lobby';
+                send(player, { t: 'error', code: 'credits', msg: `ranked match needs ${fee} credit` });
+                send(c, { t: 'error', msg: 'player cannot cover the fee' });
+                return;
+              }
+            }
+            startMatch(player, c, 'solo', fee, matchId);
+            if (player.ws.readyState !== WebSocket.OPEN) finishMatch(player.match!, null); // → refund
+          })();
+          return;
+        }
+
+        const mode: MatchMode = msg.mode === 'solo' ? 'solo' : 'wager';
+        void (async () => {
+          await c.identityReady;
+          if (c.state !== 'lobby' || c.ws.readyState !== WebSocket.OPEN) return;
+          if (persistence && !c.identity) {
+            return send(c, { t: 'error', code: 'auth', msg: 'sign in to play ranked/wager matches' });
+          }
+          // Fast pre-check for a friendly error; escrow re-checks atomically.
+          const fee = mode === 'solo' ? SOLO_FEE : WAGER_FEE;
+          if (persistence && (c.account?.credits ?? 0) < fee) {
+            return send(c, { t: 'error', code: 'credits', msg: `${mode === 'solo' ? 'ranked' : 'wager'} match needs ${fee} credit${fee > 1 ? 's' : ''}` });
+          }
+          c.state = 'queued';
+          send(c, { t: 'queued' });
+          if (mode === 'solo') spawnHouseBot(c, boundPort);
+          else { queue.push(c); void tryPair(); }
+        })();
+        return;
       }
       case 'i': {
         const m = c.match;
@@ -375,10 +520,16 @@ export const createMatchServer = (opts: {
   });
   const wss = new WebSocketServer({ server: http });
 
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
+    const remote = req.socket.remoteAddress ?? '';
+    const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === ':ffff:127.0.0.1';
     const c: Client = {
       ws, id: `c${nextId++}`, name: 'anon', agent: false,
       state: 'lobby', character: '', match: null, side: 0, identity: null,
+      identityReady: Promise.resolve(),
+      account: null,
+      house: false,
+      isLoopback,
     };
     clients.add(c);
     ws.on('message', (data) => onMessage(c, String(data)));
@@ -390,6 +541,7 @@ export const createMatchServer = (opts: {
     http.listen(opts.port ?? DEFAULT_PORT, () => {
       const address = http.address();
       const port = typeof address === 'object' && address ? address.port : DEFAULT_PORT;
+      boundPort = port;
       resolve({
         port,
         close: () => { wss.close(); http.close(); },

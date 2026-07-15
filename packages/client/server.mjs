@@ -21,6 +21,7 @@ const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json',
   '.png': 'image/png', '.webp': 'image/webp', '.css': 'text/css', '.svg': 'image/svg+xml',
   '.woff2': 'font/woff2', '.mp4': 'video/mp4', '.ogg': 'audio/ogg', '.mp3': 'audio/mpeg',
+  '.webmanifest': 'application/manifest+json',
 };
 
 const send = (res, code, type, body) => {
@@ -74,6 +75,10 @@ createServer((req, res) => {
   let file = null;
   if (path === '/' || path === '/index.html') {
     file = join(here, 'demo', 'agent-fighter.html');
+  } else if (path === '/manifest.webmanifest' || path === '/sw.js') {
+    // PWA root files, copied next to the bundle by bundle.mjs. The service
+    // worker must be served from the root so its scope covers the whole app.
+    file = join(here, 'demo', path.slice(1));
   } else if (path.startsWith('/characters/')) {
     file = under(CHARACTERS, '/characters/');
   } else if (path.startsWith('/stages/')) {

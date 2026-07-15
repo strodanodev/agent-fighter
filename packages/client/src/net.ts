@@ -19,7 +19,7 @@ import type { GameState, InputFrame } from '@af/core';
  */
 
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 1;
+const NET_PROTOCOL = 2;
 const MAX_AHEAD = 10;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -33,6 +33,8 @@ export interface NetSetup {
   chars: [{ id: string; hash?: string }, { id: string; hash?: string }];
   names: [string, string];
   agents: [boolean, boolean];
+  mode?: 'wager' | 'solo';
+  fee?: number;
 }
 
 export interface NetResult {
@@ -46,7 +48,17 @@ export interface NetResult {
 
 export type NetStatus = 'connecting' | 'queued' | 'playing' | 'done' | 'error';
 
-/** Post-match account progression, server-authoritative (Phase B). */
+/** Live account snapshot from the server (credits economy). */
+export interface NetAccount {
+  credits: number;
+  level: number;
+  xp: number;
+  wins: number;
+  losses: number;
+  dailyGranted: boolean;
+}
+
+/** Post-match account progression, server-authoritative (Phase B/C). */
 export interface NetXp {
   gained: number;
   levelsUp: number;
@@ -54,6 +66,8 @@ export interface NetXp {
   xp: number;
   wins: number;
   losses: number;
+  creditsDelta: number;
+  credits: number;
 }
 
 export class NetSession {
@@ -61,6 +75,8 @@ export class NetSession {
   error = '';
   setup: NetSetup | null = null;
   result: NetResult | null = null;
+  /** Arrives after hello when persistence is on — drives the credits HUD. */
+  account: NetAccount | null = null;
   /** Arrives after the result, only when logged in — drives the XP banner. */
   xp: NetXp | null = null;
   game: GameState | null = null;
@@ -78,11 +94,18 @@ export class NetSession {
   private overSent = false;
   private nextHashTick = 0; // last CONFIRMED checkpoint reported to the server
 
-  constructor(url: string, name: string, character: string, bundleHash?: string, authToken?: string) {
+  constructor(
+    url: string,
+    name: string,
+    character: string,
+    bundleHash?: string,
+    authToken?: string,
+    mode: 'wager' | 'solo' = 'wager',
+  ) {
     this.ws = new WebSocket(url);
     this.ws.onopen = () => {
       this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION, auth: authToken });
-      this.send({ t: 'queue', character, bundleHash });
+      this.send({ t: 'queue', character, bundleHash, mode });
       this.status = 'queued';
     };
     this.ws.onerror = () => {
@@ -112,6 +135,17 @@ export class NetSession {
         this.status = 'error';
         this.error = String(msg.msg ?? 'server error');
         return;
+      case 'account': {
+        this.account = {
+          credits: Number(msg.credits ?? 0),
+          level: Number(msg.level ?? 1),
+          xp: Number(msg.xp ?? 0),
+          wins: Number(msg.wins ?? 0),
+          losses: Number(msg.losses ?? 0),
+          dailyGranted: Boolean(msg.dailyGranted),
+        };
+        return;
+      }
       case 'match': {
         this.setup = msg as unknown as NetSetup;
         // The caller installs characters/stage, then calls begin().
@@ -135,6 +169,16 @@ export class NetSession {
       }
       case 'xp': {
         this.xp = msg as unknown as NetXp;
+        if (this.account && this.xp) {
+          this.account = {
+            ...this.account,
+            credits: this.xp.credits,
+            level: this.xp.level,
+            xp: this.xp.xp,
+            wins: this.xp.wins,
+            losses: this.xp.losses,
+          };
+        }
         return;
       }
       default:

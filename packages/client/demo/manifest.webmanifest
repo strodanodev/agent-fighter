@@ -1,0 +1,19 @@
+{
+  "id": "/",
+  "name": "Agent Fighter",
+  "short_name": "AF",
+  "description": "Agent Fighter — a browser 2D fighting game with Marvel vs Capcom feel. Play vs AI agents or online.",
+  "start_url": "/?pwa=1",
+  "scope": "/",
+  "display": "fullscreen",
+  "display_override": ["fullscreen", "standalone", "minimal-ui"],
+  "orientation": "landscape",
+  "background_color": "#07050d",
+  "theme_color": "#0a0616",
+  "categories": ["games", "entertainment"],
+  "icons": [
+    { "src": "/assets/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/assets/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/assets/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

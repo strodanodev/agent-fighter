@@ -7,7 +7,7 @@
  * server relays it and re-simulates the ledger to derive the result.
  */
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2; // v2: accounts + the credits economy
 export const DEFAULT_PORT = 8477;
 
 /** Local-input delay (ticks) applied by both sides — symmetric by design. */
@@ -37,7 +37,24 @@ export interface CHello {
    */
   auth?: string;
 }
-export interface CQueue { t: 'queue'; character: string; bundleHash?: string }
+/**
+ * Queue modes (M5 credits):
+ *  · 'wager' — PvP. Entrance WAGER_FEE credits each; winner takes the pot.
+ *  · 'solo'  — ranked vs the HOUSE agent at your level. SOLO_FEE credits;
+ *    win nets +1 credit, a loss burns the fee AND −15 XP.
+ * Both require a verified account with enough credits (server-enforced).
+ */
+export interface CQueue {
+  t: 'queue';
+  character: string;
+  bundleHash?: string;
+  mode?: 'wager' | 'solo'; // default 'wager'
+  /**
+   * Internal: house bot pairing for ranked solo. Only accepted from
+   * loopback connections — the server spawns these, clients never send them.
+   */
+  soloFor?: string;
+}
 export interface CInput { t: 'i'; k: number; v: number }
 export interface CHash { t: 'h'; k: number; x: number }
 export interface COver { t: 'over'; k: number }
@@ -56,6 +73,9 @@ export interface SMatch {
   chars: [{ id: string; hash?: string }, { id: string; hash?: string }];
   names: [string, string];
   agents: [boolean, boolean];
+  mode: 'wager' | 'solo';
+  /** Credits escrowed per side (pot = fee×2 in wager mode). */
+  fee: number;
 }
 export interface SInput { t: 'i'; k: number; v: number }
 export interface SResult {
@@ -67,11 +87,26 @@ export interface SResult {
   hash: number; // server re-sim final stateHash (0 for forfeit)
   deviator?: 0 | 1; // side whose reported hashes diverged from the re-sim
 }
-export interface SError { t: 'error'; msg: string }
+export interface SError { t: 'error'; msg: string; code?: 'credits' | 'auth' }
+/**
+ * Your account snapshot — sent once the hello token verifies (and again on
+ * demand). `dailyGranted` = THIS connection claimed today's login bonus.
+ */
+export interface SAccount {
+  t: 'account';
+  credits: number;
+  level: number;
+  xp: number;
+  wins: number;
+  losses: number;
+  dailyGranted: boolean;
+}
 /**
  * Post-match progression for YOUR account, sent after the result once the
  * server has persisted the verified outcome (authenticated players only).
  * Arrives asynchronously — persistence must never delay the result itself.
+ * `gained` can be negative (ranked solo loss burns XP); `creditsDelta` is
+ * net of the entrance fee (wager win = +fee, loss = −fee).
  */
 export interface SXp {
   t: 'xp';
@@ -81,5 +116,7 @@ export interface SXp {
   xp: number;
   wins: number;
   losses: number;
+  creditsDelta: number;
+  credits: number;
 }
-export type ServerMsg = SWelcome | SQueued | SMatch | SInput | SResult | SError | SXp;
+export type ServerMsg = SWelcome | SQueued | SMatch | SInput | SResult | SError | SAccount | SXp;
