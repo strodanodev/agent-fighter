@@ -1,14 +1,28 @@
-node_modules/
-dist/
-.bundle-tmp/
-*.log
-characters/*/frames-raw/
-packages/client/shots/
-tools/vgmstream/
-tools/ffmpeg/
-sounds/
-.git
-.claude
-.cursor
-.github
-docs
+# Exclude everything by default, then whitelist source files
+**
+
+# Whitelist: source code and config
+!.gitignore
+!.vercelignore
+!package.json
+!package-lock.json
+!tsconfig.base.json
+!vercel.json
+!CLAUDE.md
+!AGENTS.md
+!README.md
+
+# Whitelist: packages (source code only)
+!packages/
+!packages/**/*.ts
+!packages/**/*.tsx
+!packages/**/*.js
+!packages/**/*.json
+!packages/**/*.md
+!packages/core/
+!packages/client/
+!packages/studio/
+!packages/server/
+
+# Allow node_modules to be installed (not included in upload)
+# Allow .vercel and .git (handled by Vercel)
