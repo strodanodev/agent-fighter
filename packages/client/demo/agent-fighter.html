@@ -2160,9 +2160,16 @@ const worldTransform = (ctx, cam) => {
     ctx.scale(cam.zoom, cam.zoom);
     ctx.translate(-cam.x, -cam.y);
 };
-/** A fixed camera for the menu backdrops. */
-const menuCam = (x) => ({
-    x, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5,
+/**
+ * Fixed camera for the menu backdrops (title / character select / stage
+ * select). Always centered on the middle of the stage image so every stage
+ * previews the same way on first load, regardless of where its detail sits.
+ */
+const MENU_ZOOM = 1.5;
+const menuCam = () => ({
+    x: STAGE.widthPx / 2 - (VW / MENU_ZOOM) / 2, // horizontally centered on the image
+    y: STAGE.floorYPx - (VH / MENU_ZOOM) * 0.86,
+    zoom: MENU_ZOOM,
 });
 // ---------------------------------------------------------------- palette
 const GOLD = '#d9a441';
@@ -2534,7 +2541,7 @@ const drawHud = (ctx, g, rosters, fx) => {
 // ---------------------------------------------------------------- title
 const drawTitle = (ctx, rosters, tick) => {
     ctx.save();
-    const cam = menuCam(500);
+    const cam = menuCam();
     worldTransform(ctx, cam);
     drawStage(ctx, cam);
     ctx.restore();
@@ -2589,7 +2596,7 @@ const drawTitle = (ctx, rosters, tick) => {
 // ---------------------------------------------------------------- select
 const drawSelect = (ctx, rosters, cursors, locked, tick) => {
     ctx.save();
-    const cam = menuCam(700);
+    const cam = menuCam();
     worldTransform(ctx, cam);
     drawStage(ctx, cam);
     ctx.restore();
@@ -2654,7 +2661,7 @@ const drawStageSelect = (ctx, stageIds, cursor, tick) => {
     // Backdrop previews the currently-highlighted stage — the caller keeps
     // the global stage asset in sync with `cursor` as it moves.
     ctx.save();
-    const cam = menuCam(700);
+    const cam = menuCam();
     worldTransform(ctx, cam);
     drawStage(ctx, cam);
     ctx.restore();

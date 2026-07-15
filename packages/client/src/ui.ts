@@ -54,9 +54,16 @@ export const worldTransform = (ctx: CanvasRenderingContext2D, cam: Cam): void =>
   ctx.translate(-cam.x, -cam.y);
 };
 
-/** A fixed camera for the menu backdrops. */
-export const menuCam = (x: number): Cam => ({
-  x, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5,
+/**
+ * Fixed camera for the menu backdrops (title / character select / stage
+ * select). Always centered on the middle of the stage image so every stage
+ * previews the same way on first load, regardless of where its detail sits.
+ */
+const MENU_ZOOM = 1.5;
+export const menuCam = (): Cam => ({
+  x: STAGE.widthPx / 2 - (VW / MENU_ZOOM) / 2, // horizontally centered on the image
+  y: STAGE.floorYPx - (VH / MENU_ZOOM) * 0.86,
+  zoom: MENU_ZOOM,
 });
 
 // ---------------------------------------------------------------- palette
@@ -479,7 +486,7 @@ export const drawTitle = (
   ctx: CanvasRenderingContext2D, rosters: Roster[], tick: number,
 ): void => {
   ctx.save();
-  const cam = menuCam(500);
+  const cam = menuCam();
   worldTransform(ctx, cam);
   drawStage(ctx, cam);
   ctx.restore();
@@ -543,7 +550,7 @@ export const drawSelect = (
   tick: number,
 ): void => {
   ctx.save();
-  const cam = menuCam(700);
+  const cam = menuCam();
   worldTransform(ctx, cam);
   drawStage(ctx, cam);
   ctx.restore();
@@ -615,7 +622,7 @@ export const drawStageSelect = (
   // Backdrop previews the currently-highlighted stage — the caller keeps
   // the global stage asset in sync with `cursor` as it moves.
   ctx.save();
-  const cam = menuCam(700);
+  const cam = menuCam();
   worldTransform(ctx, cam);
   drawStage(ctx, cam);
   ctx.restore();
