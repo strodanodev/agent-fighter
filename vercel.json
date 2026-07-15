@@ -1,4 +1,8 @@
 {
   "buildCommand": "npm run build && npm run demo",
-  "outputDirectory": "packages/client/demo"
+  "outputDirectory": "packages/client/demo",
+  "rewrites": [
+    { "source": "/", "destination": "/agent-fighter.html" },
+    { "source": "/m1", "destination": "/agent-fighter-m1.html" }
+  ]
 }
