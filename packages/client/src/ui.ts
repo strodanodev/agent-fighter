@@ -618,33 +618,28 @@ export const drawTitle = (
   ctx: CanvasRenderingContext2D, rosters: Roster[], tick: number, menu: TitleMenuState,
 ): void => {
   drawMenuBackdrop(ctx);
-  // Vignette so the logo reads.
-  const vig = ctx.createLinearGradient(0, 0, 0, VH);
-  vig.addColorStop(0, '#0a0616dd');
-  vig.addColorStop(0.5, '#0a061640');
-  vig.addColorStop(0.78, '#0a0616aa');
-  vig.addColorStop(1, '#0a0616ee');
-  ctx.fillStyle = vig;
-  ctx.fillRect(0, 0, VW, VH);
-
-  // Logo — a slow sine bob keeps it feeling alive without being distracting.
-  // Reserved band: y 14–300 (the menu below starts at 356, leaving clear
-  // separation regardless of how tall the logo image's aspect ratio makes
-  // it). Falls back to the old text wordmark (+ two flanking character
-  // cutouts, which the brand art below already supplies its own cast for)
-  // if the art is missing.
   const cx = VW / 2;
-  const bob = Math.sin(tick / 46) * 3;
-  if (logoImg && logoImg.naturalWidth > 0) {
-    const maxW = 500, maxH = 286;
-    const arImg = logoImg.naturalWidth / logoImg.naturalHeight;
-    let lw = maxW, lh = maxW / arImg;
-    if (lh > maxH) { lh = maxH; lw = maxH * arImg; }
-    ctx.save();
+  const haveLogo = !!logoImg && logoImg.naturalWidth > 0;
+
+  if (haveLogo) {
+    // Maximized: the art's native size (1920×1080) is exactly 16:9, same as
+    // the canvas (960×540) — a full-bleed fill needs no crop or letterbox,
+    // just a direct stretch to the frame. No vignette here on purpose: the
+    // point of maximizing is to actually SEE the key art, not dim it.
     ctx.imageSmoothingEnabled = true;
-    ctx.drawImage(logoImg, cx - lw / 2, 16 + bob + (maxH - lh) / 2, lw, lh);
-    ctx.restore();
+    ctx.drawImage(logoImg!, 0, 0, VW, VH);
   } else {
+    // Fallback (art file missing): the old vignette + flanking portraits +
+    // text wordmark treatment, unchanged.
+    const vig = ctx.createLinearGradient(0, 0, 0, VH);
+    vig.addColorStop(0, '#0a0616dd');
+    vig.addColorStop(0.5, '#0a061640');
+    vig.addColorStop(0.78, '#0a0616aa');
+    vig.addColorStop(1, '#0a0616ee');
+    ctx.fillStyle = vig;
+    ctx.fillRect(0, 0, VW, VH);
+
+    const bob = Math.sin(tick / 46) * 3;
     rosters.slice(0, 2).forEach((r, i) => {
       const img = r.portrait;
       if (!img) return;
@@ -663,30 +658,37 @@ export const drawTitle = (
     });
   }
 
-  // Menu: two modes, one hint line. Fully self-contained (no overlay drawn
-  // on top by the caller) so its layout never collides with the logo above
-  // or the build tag below.
+  // Bottom menu bar: its OWN guaranteed-contrast panel rather than text
+  // placed at coordinates guessed from where the art's elements happen to
+  // land — robust even if the logo file gets swapped for different art
+  // later (the whole point of every asset here being a customizable file).
+  const barH = 178, barY = VH - barH;
+  ctx.fillStyle = '#0a0616cc';
+  ctx.fillRect(0, barY, VW, barH);
+  ctx.fillStyle = '#d9a44155';
+  ctx.fillRect(0, barY, VW, 2);
+
   const rows: [Mode, string][] = [
     ['cpu', `VS CPU  ·  LV ${menu.cpuLevel}`],
     ['2p', '2 PLAYERS'],
   ];
-  const menuY0 = 356;
+  const menuY0 = barY + 40;
   rows.forEach(([m, txt], k) => {
-    const y = menuY0 + k * 38;
+    const y = menuY0 + k * 34;
     const on = menu.mode === m;
     if (on) {
       const pulse = 1 + 0.035 * Math.sin(tick / 10);
-      display(ctx, txt, cx, y, 26, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+      display(ctx, txt, cx, y, 24, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
       // A small bouncing arrow marker to the left, arcade-menu style.
       const bounce = 3 * Math.sin(tick / 9);
-      label(ctx, '▶', cx - 118 + bounce, y, 20, GOLD_LT);
+      label(ctx, '▶', cx - 112 + bounce, y, 18, GOLD_LT);
     } else {
-      label(ctx, txt, cx, y, 19, '#ffffff70');
+      label(ctx, txt, cx, y, 17, '#ffffff70');
     }
   });
-  label(ctx, '↑ / ↓  SELECT       ENTER  START', cx, menuY0 + 74, 13, '#ffffffaa');
+  label(ctx, '↑ / ↓  SELECT       ENTER  START', cx, menuY0 + 62, 13, '#ffffffaa');
 
-  label(ctx, 'MILESTONE 4 · AI + LEVELING BUILD', cx, VH - 14, 10, '#ffffff55');
+  label(ctx, 'MILESTONE 4 · AI + LEVELING BUILD', cx, VH - 12, 10, '#ffffff55');
 };
 
 // ---------------------------------------------------------------- select
