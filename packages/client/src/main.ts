@@ -387,7 +387,7 @@ const renderFight = (g: GameState): void => {
     ctx.fillRect(0, 0, VW, VH);
   }
   drawHud(ctx, g, fighters!, fx,
-    cpuAi ? ['', `CPU LV ${cpuLevelFor(profile, lever)}`] : undefined);
+    cpuAi ? ['', `AGENT LV ${cpuLevelFor(profile, lever)}`] : undefined);
 
   // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
   // sweeps across the whole frame.

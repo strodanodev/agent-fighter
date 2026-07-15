@@ -569,7 +569,7 @@ export const drawHud = (
   g: GameState,
   rosters: [Roster, Roster],
   fx: HudFx,
-  tags?: [string, string], // per-player nameplate suffix (e.g. "CPU LV 12")
+  tags?: [string, string], // per-player nameplate suffix (e.g. "AGENT LV 12")
 ): void => {
   for (const i of [0, 1] as const) {
     const f = g.fighters[i];
@@ -678,7 +678,7 @@ export const drawTitle = (
   const barH = 178, barY = VH - barH;
 
   const rows: [Mode, string][] = [
-    ['cpu', `VS CPU  ·  LV ${menu.cpuLevel}`],
+    ['cpu', `VS AGENT  ·  LV ${menu.cpuLevel}`],
     ['2p', '2 PLAYERS'],
   ];
   const menuY0 = barY + 40;
@@ -701,6 +701,93 @@ export const drawTitle = (
 };
 
 // ---------------------------------------------------------------- select
+// Character stats derived DIRECTLY from the Studio bundle config (never
+// hand-authored) so the select screen always reflects the real character.
+// Each raw metric is normalized across the whole roster into 1..5 filled
+// segments, i.e. the bars read as "how this fighter compares to the cast".
+export interface CharStat { key: string; label: string; segs: number }
+export interface CharStats {
+  bars: CharStat[];
+  health: number; // raw maxHealth (concrete config number)
+  moveCount: number; // attack moves (excludes sys.* animation tracks)
+}
+
+/**
+ * Peak single-hit damage the character can deal (normals, specials, super,
+ * projectile, throw) — the honest "how hard do they hit" number.
+ */
+const peakDamage = (b: Roster['bundle']): number => {
+  let peak = b.throwDamage;
+  for (const mv of b.moves) {
+    for (const st of mv.steps) {
+      for (const hb of st.hitboxes ?? []) if (hb.damage > peak) peak = hb.damage;
+    }
+    if (mv.projectile && mv.projectile.hit.damage > peak) peak = mv.projectile.hit.damage;
+  }
+  return peak;
+};
+
+/** Furthest a hitbox reaches in front of the fighter; projectiles score high. */
+const reach = (b: Roster['bundle']): number => {
+  let r = 0;
+  for (const mv of b.moves) {
+    for (const st of mv.steps) {
+      for (const hb of st.hitboxes ?? []) r = Math.max(r, hb.rect.x + hb.rect.w);
+    }
+    // A projectile is a full-screen zoning tool — its reach dwarfs any normal.
+    if (mv.projectile) r = Math.max(r, 260 + mv.projectile.velX * mv.projectile.lifetime * 0.05);
+  }
+  return Math.max(r, b.throwRange);
+};
+
+/** Toolkit depth: specials, super, and how interconnected the cancel graph is. */
+const technique = (b: Roster['bundle']): number => {
+  const specials = b.moves.filter((m) => m.type === 'special').length;
+  const supers = b.moves.filter((m) => m.type === 'super').length;
+  const cancelLinks = b.cancels.reduce((n, e) => n + e.to.length, 0);
+  return specials * 3 + supers * 4 + cancelLinks;
+};
+
+/** Attack moves only (drop the sys.* animation-only tracks). */
+const attackMoveCount = (b: Roster['bundle']): number =>
+  b.moves.filter((m) => m.type !== 'system').length;
+
+/**
+ * Map a raw metric to 1..5 filled segments against a fixed ABSOLUTE reference
+ * band (not the roster). Absolute is the right call for "reflect the actual
+ * configuration": a 10k-HP fighter reads the same STAMINA no matter who else
+ * is on the roster, and a character's profile only moves when its own Studio
+ * config changes. Bands are chosen so the shipped archetype lands mid-to-high
+ * and a designer's tuning visibly pushes bars up or down.
+ */
+const band = (v: number, lo: number, hi: number): number =>
+  Math.max(1, Math.min(5, Math.round(1 + 4 * ((v - lo) / (hi - lo)))));
+
+// Memoized: metrics never change for a loaded roster; recomputing every frame
+// on the select screen would be wasteful.
+let statsCacheKey: Roster[] | null = null;
+let statsCache: CharStats[] = [];
+
+const computeRosterStats = (rosters: Roster[]): CharStats[] => {
+  if (statsCacheKey === rosters) return statsCache;
+  statsCache = rosters.map((r) => {
+    const b = r.bundle;
+    return {
+      bars: [
+        { key: 'power', label: 'POWER', segs: band(peakDamage(b), 500, 1300) },
+        { key: 'speed', label: 'SPEED', segs: band(b.walkFSpeed + b.dashFSpeed, 8, 20) },
+        { key: 'range', label: 'RANGE', segs: band(reach(b), 90, 340) },
+        { key: 'stamina', label: 'STAMINA', segs: band(b.maxHealth, 7000, 13000) },
+        { key: 'technique', label: 'TECHNIQUE', segs: band(technique(b), 40, 180) },
+      ],
+      health: b.maxHealth,
+      moveCount: attackMoveCount(b),
+    };
+  });
+  statsCacheKey = rosters;
+  return statsCache;
+};
+
 export interface CpuBadgeInfo { cpuLevel: number; lever: number }
 
 const drawCpuBadge = (ctx: CanvasRenderingContext2D, info: CpuBadgeInfo, tick: number): void => {
@@ -712,11 +799,83 @@ const drawCpuBadge = (ctx: CanvasRenderingContext2D, info: CpuBadgeInfo, tick: n
   ctx.shadowBlur = 10;
   bevel(ctx, x, y, w, h, PANEL, GOLD, GOLD_DK, 2);
   ctx.restore();
-  label(ctx, 'CPU DIFFICULTY', x + w / 2, y + 15, 10, '#c8b98a');
+  label(ctx, 'AGENT LEVEL', x + w / 2, y + 15, 10, '#c8b98a');
   const delta = info.lever === 0 ? '' : info.lever > 0 ? ` (+${info.lever})` : ` (${info.lever})`;
   display(ctx, `LV ${info.cpuLevel}`, x + w / 2, y + 42, 22, { scale: 1 });
   if (delta) label(ctx, delta, x + w / 2 + 46, y + 42, 11, '#7ee85a');
   label(ctx, '[  /  ]  ADJUST', x + w / 2, y + h - 4, 9, '#c8c4ba99');
+};
+
+/** One labeled 5-segment stat bar. Filled segments animate a soft sheen. */
+const drawStatBar = (
+  ctx: CanvasRenderingContext2D, x: number, y: number, w: number,
+  stat: CharStat, accent: string, tick: number,
+): void => {
+  label(ctx, stat.label, x, y + 8, 10, '#c8c4ba', 'left', false);
+  const trackX = x + 74;
+  const trackW = w - 74;
+  const n = 5, sgap = 3;
+  const segW = (trackW - (n - 1) * sgap) / n;
+  for (let s = 0; s < n; s++) {
+    const sx = trackX + s * (segW + sgap);
+    const on = s < stat.segs;
+    ctx.fillStyle = '#00000055';
+    ctx.fillRect(sx, y, segW, 9);
+    if (on) {
+      // A gentle travelling highlight so filled bars feel alive.
+      const sheen = 0.75 + 0.25 * Math.sin(tick / 12 - s * 0.6);
+      ctx.globalAlpha = sheen;
+      ctx.fillStyle = accent;
+      ctx.fillRect(sx, y, segW, 9);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#ffffff33';
+      ctx.fillRect(sx, y, segW, 3);
+    }
+  }
+};
+
+/**
+ * A player's fighter card: portrait + name + concrete numbers (HP, moves) +
+ * the derived stat bars. Anchored to a screen corner and accent-colored per
+ * player, so P1 (left) and the opponent (right) read as two facing corners.
+ */
+const drawFighterCard = (
+  ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number,
+  r: Roster, stats: CharStats, accent: string, header: string, locked: boolean, tick: number,
+): void => {
+  ctx.save();
+  ctx.shadowColor = '#000000aa';
+  ctx.shadowBlur = 12;
+  bevel(ctx, x, y, w, h, '#120f1de6', accent, GOLD_DK, 2);
+  ctx.restore();
+  // Accent header strip.
+  ctx.fillStyle = accent;
+  ctx.fillRect(x, y, w, 20);
+  label(ctx, header, x + 8, y + 14, 12, '#0a0a12', 'left', false);
+  label(ctx, locked ? 'LOCKED' : 'CHOOSING…', x + w - 8, y + 14, 10, '#0a0a1299', 'right', false);
+
+  // Portrait on the inner-left of the card.
+  const pad = 12;
+  const pSize = h - 32 - pad;
+  const px2 = x + pad;
+  const py2 = y + 24 + pad;
+  bevel(ctx, px2 - 2, py2 - 2, pSize + 4, pSize + 4, PANEL, GOLD, GOLD_DK, 2);
+  drawPortrait(ctx, r, px2, py2, pSize, pSize);
+  if (locked) marchingOutline(ctx, px2 - 4, py2 - 4, pSize + 8, pSize + 8, tick, accent, 10, 0.7);
+
+  // Name + concrete config numbers.
+  const infoX = px2 + pSize + 14;
+  const infoW = x + w - pad - infoX;
+  display(ctx, r.bundle.name.toUpperCase(), infoX, py2 + 16, 20, { align: 'left' });
+  label(ctx, `${stats.health.toLocaleString()} HP   ·   ${stats.moveCount} MOVES`,
+    infoX, py2 + 34, 11, '#ffd99b', 'left', false);
+
+  // Stat bars.
+  let by = py2 + 52;
+  for (const s of stats.bars) {
+    drawStatBar(ctx, infoX, by, infoW, s, accent, tick);
+    by += 20;
+  }
 };
 
 export const drawSelect = (
@@ -728,67 +887,72 @@ export const drawSelect = (
   cpuInfo?: CpuBadgeInfo,
 ): void => {
   drawMenuBackdrop(ctx);
-  ctx.fillStyle = '#0a0616cc';
+  ctx.fillStyle = '#0a0616d9';
   ctx.fillRect(0, 0, VW, VH);
 
-  display(ctx, 'SELECT YOUR FIGHTER', VW / 2, 60, 32);
+  const stats = computeRosterStats(rosters);
+  display(ctx, 'SELECT YOUR FIGHTER', VW / 2, 46, 26);
   if (cpuInfo) drawCpuBadge(ctx, cpuInfo, tick);
 
-  // Portrait grid.
-  const cell = 132, gap = 18;
-  const cols = Math.min(rosters.length, 5);
+  // Portrait grid — a single row (wraps past 6). Compact so the bottom band
+  // is free for the two fighter cards.
+  const cols = Math.min(rosters.length, 6);
+  const gap = 12;
+  const maxGridW = 720;
+  const cell = Math.min(96, Math.floor((maxGridW - (cols - 1) * gap) / cols));
+  const rows = Math.ceil(rosters.length / cols);
   const gridW = cols * cell + (cols - 1) * gap;
   const gx = (VW - gridW) / 2;
-  const gy = 118;
+  const gy = 74;
   rosters.forEach((r, k) => {
     const x = gx + (k % cols) * (cell + gap);
-    const y = gy + Math.floor(k / cols) * (cell + gap + 26);
-    bevel(ctx, x - 3, y - 3, cell + 6, cell + 6, PANEL, GOLD, GOLD_DK, 3);
+    const y = gy + Math.floor(k / cols) * (cell + gap + 20);
+    bevel(ctx, x - 2, y - 2, cell + 4, cell + 4, PANEL, GOLD, GOLD_DK, 2);
     drawPortrait(ctx, r, x, y, cell, cell);
-    label(ctx, r.bundle.name.toUpperCase(), x + cell / 2, y + cell + 20, 14, '#fff');
+    label(ctx, r.bundle.name.toUpperCase(), x + cell / 2, y + cell + 14, 11, '#fff');
 
     // Selection cursors: smooth pulsing glow instead of a hard blink.
     for (const i of [0, 1] as const) {
       if (cursors[i] !== k) continue;
       const pulse = locked[i] ? 1 : 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(tick / 8));
-      const o = i === 0 ? 0 : 5; // offset so both cursors are visible on the same cell
-      const fx = { x: x - 6 - o, y: y - 6 - o, w: cell + 12 + o * 2, h: cell + 12 + o * 2 };
+      const o = i === 0 ? 0 : 4; // offset so both cursors are visible on the same cell
+      const fx = { x: x - 5 - o, y: y - 5 - o, w: cell + 10 + o * 2, h: cell + 10 + o * 2 };
       ctx.save();
       ctx.globalAlpha = pulse;
       ctx.strokeStyle = P_COLORS[i];
-      ctx.lineWidth = 4;
+      ctx.lineWidth = 3;
       ctx.strokeRect(fx.x, fx.y, fx.w, fx.h);
       ctx.restore();
       // Locked-in: an energized marching-ants outline seals the pick.
-      if (locked[i]) marchingOutline(ctx, fx.x - 3, fx.y - 3, fx.w + 6, fx.h + 6, tick, P_COLORS[i], 12, 0.8);
+      if (locked[i]) marchingOutline(ctx, fx.x - 3, fx.y - 3, fx.w + 6, fx.h + 6, tick, P_COLORS[i], 10, 0.8);
       ctx.fillStyle = P_COLORS[i];
-      const tagX = i === 0 ? x - 6 : x + cell + 6;
-      ctx.fillRect(tagX - (i === 0 ? 0 : 30), y - 26, 30, 18);
-      label(ctx, locked[i] ? `P${i + 1}✓` : `P${i + 1}`, tagX + (i === 0 ? 15 : -15), y - 12, 12, '#fff', 'center', false);
+      const tagX = i === 0 ? x - 5 : x + cell - 25;
+      ctx.fillRect(tagX, y - 20, 30, 15);
+      label(ctx, locked[i] ? `P${i + 1}✓` : `P${i + 1}`, tagX + 15, y - 9, 10, '#fff', 'center', false);
     }
   });
 
-  // Big preview of each player's pick.
-  rosters.forEach((r, k) => {
-    for (const i of [0, 1] as const) {
-      if (cursors[i] !== k || !r.portrait) continue;
-      ctx.save();
-      ctx.globalAlpha = locked[i] ? 1 : 0.75;
-      ctx.translate(i === 0 ? 120 : VW - 120, VH - 40);
-      ctx.scale(i === 0 ? 1.15 : -1.15, 1.15);
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(r.portrait, -96, -176);
-      ctx.restore();
-    }
-  });
+  // Two fighter cards in the bottom band — one per side, showing the fighter
+  // each cursor is hovering, with stats derived from real bundle config.
+  const cardW = 448, cardH = 188;
+  const cardY = Math.max(gy + rows * (cell + gap + 20) + 6, VH - cardH - 30);
+  const p2Header = cpuInfo ? `AGENT · LV ${cpuInfo.cpuLevel}` : 'PLAYER 2';
+  const cardHeaders: [string, string] = ['PLAYER 1', p2Header];
+  for (const i of [0, 1] as const) {
+    const r = rosters[cursors[i]];
+    if (!r) continue;
+    const cx = i === 0 ? 16 : VW - 16 - cardW;
+    drawFighterCard(ctx, cx, cardY, cardW, cardH, r, stats[cursors[i]]!,
+      P_COLORS[i], cardHeaders[i], locked[i], tick);
+  }
 
   const bothLocked = locked[0] && locked[1];
   if (bothLocked) {
     const pulse = 1 + 0.04 * Math.sin(tick / 9);
-    display(ctx, 'PRESS START TO FIGHT', VW / 2, VH - 26, 22, { scale: pulse, glow: 'rgba(255,209,102,0.5)' });
+    display(ctx, 'PRESS START TO FIGHT', VW / 2, VH - 8, 20, { scale: pulse, glow: 'rgba(255,209,102,0.5)' });
   } else {
     label(ctx, 'P1: A/D MOVE · F CONFIRM      P2: ←/→ MOVE · K CONFIRM',
-      VW / 2, VH - 26, 13, '#ffffffaa');
+      VW / 2, VH - 8, 12, '#ffffffaa');
   }
 };
 
