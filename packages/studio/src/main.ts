@@ -2317,6 +2317,15 @@ const renderGenerateTab = (): HTMLElement => {
         Object.entries(stAvailable).filter(([, ok]) => ok).map(([p]) => p),
         (v) => { stRefProvider = v; },
       )),
+      // The generation backdrop, choosable right where the reference is made
+      // (same setting as the background-key panel below — one source of truth).
+      mkEl('label', { title: 'backdrop color the model is asked to draw on, and that the keyer removes. '
+        + 'Use magenta/green (chroma key) for characters with white clothing/details — white backdrops '
+        + 'can collide with white foreground.' },
+      ' bg color ', sessionSelect(
+        stKeyCfg.mode, ['white', 'magenta', 'green'],
+        (v) => { stKeyCfg.mode = v as KeyBgMode; saveKeyCfg(); stKeyPreview = null; },
+      )),
       mkEl('button', { disabled: stGenBusy ? '' : null, onclick: () => void runGeneration('reference') },
         stGenBusy ? '…' : 'generate reference'),
       // Bring your own art: use a real image as the character's contract.
