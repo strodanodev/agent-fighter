@@ -34,6 +34,8 @@ const ORDER = [
   'client/src/atlas.js',
   'client/src/chrome.js',
   'client/src/progress.js',
+  'client/src/fx.js',
+  'client/src/audio.js',
   'client/src/ui.js',
   'client/src/main.js',
 ];

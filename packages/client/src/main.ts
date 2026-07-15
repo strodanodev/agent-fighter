@@ -7,7 +7,7 @@
  * to draw (`spriteForFighter`) and blits it.
  */
 import {
-  Action, Btn, Phase, STAGE, TICKS_PER_SEC,
+  Action, Btn, Phase, STAGE, TICKS_PER_SEC, TUNING,
   aiPoll, createAi, createGameState, debugBoxes, setCharacters, step,
 } from '@af/core';
 import type { AiState, GameState, InputFrame } from '@af/core';
@@ -25,6 +25,10 @@ import {
 import type { Cam, HudFx, Mode, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadLogo, loadStage, loadUiKit } from './chrome.js';
 import type { StageAsset } from './chrome.js';
+import { audio } from './audio.js';
+import {
+  auraGlow, drawFx, emitAura, emitBurst, emitRing, fxPulse, updateFx,
+} from './fx.js';
 
 const TICK_MS = 1000 / TICKS_PER_SEC;
 
@@ -32,6 +36,7 @@ const TICK_MS = 1000 / TICKS_PER_SEC;
 const keys = new Set<string>();
 const pressedThisFrame = new Set<string>();
 addEventListener('keydown', (e) => {
+  audio.unlock(); // first user gesture — browsers block AudioContext until one fires
   if (!keys.has(e.code)) pressedThisFrame.add(e.code);
   keys.add(e.code);
   if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].includes(e.code)) e.preventDefault();
@@ -84,8 +89,11 @@ let game: GameState | null = null;
 let showBoxes = false;
 let seed = 1;
 let loadError = '';
+let hurryPlayed = false; // per-round: has the "Hurry Up!" stinger fired yet
+const HURRY_UP_TICKS = 10 * TICKS_PER_SEC; // MvC fires it at 10s left on the clock
 
 // Cosmetic juice — never simulated.
+const DANGER_RED = '#ff2d4a'; // critical-health aura / warning tint
 interface Spark { x: number; y: number; age: number; big: boolean }
 let sparks: Spark[] = [];
 let shake = 0;
@@ -94,6 +102,8 @@ let hitStopFlash = 0;
 const fx: HudFx = { flash: [1, 1], comboOwner: -1, comboHits: 0, comboAge: 0, announce: '', announceAge: 0 };
 let prevHealth: [number, number] = [0, 0];
 let prevPhase: Phase = Phase.PreRound;
+let prevSuperFlash = 0; // rising-edge detect for the super-activation shockwave
+let prevMeter: [number, number] = [0, 0]; // to spot which fighter spent meter
 
 // ---------------------------------------------------------------- canvas
 const canvas = document.getElementById('game') as HTMLCanvasElement;
@@ -120,6 +130,8 @@ const boot = async (): Promise<void> => {
     allRosters = await Promise.all(ids.map(loadRoster));
     picks = [0, Math.min(1, allRosters.length - 1)];
     screen = 'title';
+    audio.preload();
+    void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1.5 });
   } catch (e) {
     loadError = (e as Error).message;
   }
@@ -147,7 +159,9 @@ const startFight = (): void => {
   fx.announceAge = 0;
   sparks = [];
   shake = 0;
+  hurryPlayed = false;
   screen = 'fight';
+  void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
 
 /**
@@ -213,9 +227,20 @@ const updateJuice = (g: GameState): void => {
     if (f.health < prevHealth[i]) {
       const dmg = prevHealth[i] - f.health;
       const big = dmg > 600;
-      sparks.push({ x: px(f.x) + f.facing * -22, y: px(f.y) - 78, age: 0, big });
+      const hx = px(f.x) + f.facing * -22, hy = px(f.y) - 78;
+      sparks.push({ x: hx, y: hy, age: 0, big });
+      // Ember burst in the ATTACKER's color (the victim is fighter i).
+      emitBurst(hx, hy, P_COLORS[(1 - i) as 0 | 1], big ? 1.8 : 0.9);
       shake = big ? 11 : 6;
       hitStopFlash = big ? 3 : 0;
+    }
+    // Aura motes: a fighter that is CHARGED (≥1 super bar) or on CRITICAL
+    // health smoulders — a steady trickle of embers rising off the body.
+    const meterN = f.meter / TUNING.meterMax;
+    const critical = f.health / fighters![i].ch.b.maxHealth < 0.25;
+    const auraRate = (f.meter >= TUNING.meterBar ? 0.35 + meterN * 0.5 : 0) + (critical ? 0.4 : 0);
+    if (auraRate > 0) {
+      emitAura(px(f.x), px(f.y) - 56, 20, 52, critical ? DANGER_RED : P_COLORS[i], auraRate);
     }
     // Progression stats: what the human (P1) dished out.
     if (i === 1 && f.health < prevHealth[1]) statDmg += prevHealth[1] - f.health;
@@ -242,16 +267,33 @@ const updateJuice = (g: GameState): void => {
   else if (inCombo(v0.action) && v0.comboHits >= 2) bumpCombo(1, v0.comboHits);
   else if (!inCombo(v0.action) && !inCombo(v1.action)) fx.comboOwner = -1;
 
-  // Announcements on phase changes.
+  // Announcements on phase changes — each punctuated by a screen shockwave.
   if (g.phase !== prevPhase) {
-    if (g.phase === Phase.Fighting) { fx.announce = 'FIGHT!'; fx.announceAge = 0; }
-    else if (g.phase === Phase.RoundOver) {
+    if (g.phase === Phase.Fighting) {
+      fx.announce = 'FIGHT!'; fx.announceAge = 0;
+      emitRing(VW / 2, VH / 2 - 40, 240, '#ffd166', { life: 30, width: 5 });
+    } else if (g.phase === Phase.RoundOver) {
       fx.announce = g.roundWinner === 2 ? 'DOUBLE KO' : 'K.O.';
       fx.announceAge = 0;
+      emitRing(VW / 2, VH / 2 - 40, 340, DANGER_RED, { life: 40, width: 7 });
     } else if (g.phase === Phase.PreRound) { fx.announce = `ROUND ${g.roundNum + 1}`; fx.announceAge = 0; }
     prevPhase = g.phase;
   }
   fx.announceAge++;
+
+  // Super activation: on the rising edge of the freeze flash, blow a ring off
+  // the fighter who supered (whichever one is spending meter / attacking).
+  if (g.superFlashLeft > 0 && prevSuperFlash === 0) {
+    // The super's owner is whoever just spent meter this frame.
+    const d0 = prevMeter[0] - g.fighters[0].meter;
+    const d1 = prevMeter[1] - g.fighters[1].meter;
+    const su: 0 | 1 = d0 >= d1 ? 0 : 1;
+    const sx = px(g.fighters[su].x), sy = px(g.fighters[su].y) - 56;
+    emitRing(sx, sy, 160, P_COLORS[su], { life: 28, width: 6, layer: 'world' });
+    emitBurst(sx, sy, P_COLORS[su], 2.2);
+  }
+  prevSuperFlash = g.superFlashLeft;
+  prevMeter = [g.fighters[0].meter, g.fighters[1].meter];
 
   sparks = sparks.filter((s) => ++s.age < 9);
   shake = Math.max(0, shake - 0.7);
@@ -266,6 +308,19 @@ const renderFight = (g: GameState): void => {
   worldTransform(ctx, cam);
 
   drawStage(ctx, cam);
+
+  // Character aura (UNDER the sprite): an energy glow that intensifies when a
+  // fighter is charged (super meter) or in critical health — the "this
+  // fighter is dangerous / desperate" read, tinted to the player color.
+  for (const i of [0, 1] as const) {
+    const f = g.fighters[i];
+    const meterN = f.meter / TUNING.meterMax;
+    const critical = f.health / fighters![i].ch.b.maxHealth < 0.25;
+    const intensity = 0.12 + meterN * 0.4 + (critical ? 0.3 : 0);
+    const breathe = fxPulse(g.tick, 0.12, 0.8, 1); // subtle living pulse
+    auraGlow(ctx, px(f.x), px(f.y) - 52, 70,
+      critical ? DANGER_RED : P_COLORS[i], intensity * breathe);
+  }
 
   // Fighters (draw the one in hitstun last so it reads on top).
   const order: (0 | 1)[] = g.fighters[0].action === Action.Hitstun ? [1, 0] : [0, 1];
@@ -307,6 +362,10 @@ const renderFight = (g: GameState): void => {
   }
   ctx.lineWidth = 1;
 
+  // Particle FX in world space (embers, auras, super rings) — on top of the
+  // fighters so debris reads over the bodies.
+  drawFx(ctx, 'world');
+
   // Debug boxes (world space — they come from the sim in world px).
   if (showBoxes) {
     for (const b of debugBoxes(g)) {
@@ -329,6 +388,10 @@ const renderFight = (g: GameState): void => {
   }
   drawHud(ctx, g, fighters!, fx,
     cpuAi ? ['', `CPU LV ${cpuLevelFor(profile, lever)}`] : undefined);
+
+  // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
+  // sweeps across the whole frame.
+  drawFx(ctx, 'screen');
 };
 
 // ---------------------------------------------------------------- screens
@@ -357,6 +420,7 @@ const tickSelect = (): void => {
     // CPU picks its fighter — visibly, like an arcade opponent reveal.
     picks[1] = (seed * 17 + profile.wins * 5 + uiTick) % n;
     locked[1] = true;
+    void audio.playStinger('here_comes_a_new_challenger');
   }
 
   if (pressedThisFrame.has('Escape')) locked = [false, false];
@@ -380,6 +444,7 @@ const tickStageSelect = (): void => {
 
 const frame = (): void => {
   uiTick++;
+  updateFx(); // advance cosmetic particles/rings every frame (fight AND results)
 
   if (screen === 'loading') {
     ctx.fillStyle = '#0a0616';
@@ -401,6 +466,7 @@ const frame = (): void => {
     } else if (pressedThisFrame.size > 0) {
       screen = 'select';
       locked = [false, false];
+      void audio.playBgm('player_select', { fadeInSec: 0.5 });
     }
   } else if (screen === 'select') {
     tickSelect();
@@ -411,12 +477,19 @@ const frame = (): void => {
     drawStageSelect(ctx, stageIds, stageCursor, uiTick);
   } else if (screen === 'fight' && game) {
     if (pressedThisFrame.has('KeyB')) showBoxes = !showBoxes;
-    if (pressedThisFrame.has('Escape')) { screen = 'select'; locked = [false, false]; }
+    if (pressedThisFrame.has('Escape')) {
+      screen = 'select'; locked = [false, false];
+      void audio.playBgm('player_select', { fadeInSec: 0.5 });
+    }
     const p2: InputFrame = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
     step(game, [pollPad(P0_MAP), p2]);
     updateJuice(game);
     updateCamera(game);
     renderFight(game);
+    if (game.phase === Phase.Fighting && !hurryPlayed && game.timerTicks <= HURRY_UP_TICKS) {
+      hurryPlayed = true;
+      void audio.playStinger('hurry_up', { duck: false }); // layers over the stage loop, like the arcade original
+    }
     if (game.phase === Phase.MatchOver) {
       if (cpuAi && !xpBanner) {
         const award = awardXp(profile, {
@@ -436,13 +509,22 @@ const frame = (): void => {
       fx.comboOwner = -1;
       resultsAge = 0;
       screen = 'results';
+      // CPU beat the human → arcade "Game Over"; anything else (human win,
+      // 2P vs 2P, a draw) gets the victory jingle.
+      const lostToCpu = Boolean(cpuAi) && game.winner === 1;
+      void audio.playStinger(lostToCpu ? 'game_over' : 'win', {
+        onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
+      });
     }
   } else if (screen === 'results' && game) {
     resultsAge++;
     renderFight(game);
     drawResults(ctx, game, fighters!, uiTick, resultsAge, xpBanner);
     if (pressedThisFrame.has('Enter')) startFight();
-    if (pressedThisFrame.has('Escape')) { screen = 'select'; locked = [false, false]; }
+    if (pressedThisFrame.has('Escape')) {
+      screen = 'select'; locked = [false, false];
+      void audio.playBgm('player_select', { fadeInSec: 0.5 });
+    }
   }
 
   pressedThisFrame.clear();

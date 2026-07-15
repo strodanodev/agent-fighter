@@ -6,6 +6,7 @@ import {
   DISPLAY_FONT_STACK, HUD_GEO, clipPoly, drawBgVideoCover, drawChrome, drawStageLayers, opaqueBBox, stageCamLimits,
 } from './chrome.js';
 import type { BgVideo, ImgBBox, StageAsset, StageCamLimits, UiKit } from './chrome.js';
+import { fxPulse, glowBar, marchingOutline, warningPulse } from './fx.js';
 
 // Injected at boot (null = procedural fallbacks everywhere).
 let uiKit: UiKit | null = null;
@@ -386,16 +387,8 @@ const drawHealthBar = (
     ctx.restore();
   };
 
-  // Low-health urgency: a soft pulsing red glow behind the frame.
-  if (danger) {
-    const pulse = 0.35 + 0.35 * (0.5 + 0.5 * Math.sin(tick / 8));
-    ctx.save();
-    ctx.shadowColor = `rgba(233,69,96,${pulse})`;
-    ctx.shadowBlur = 16;
-    ctx.fillStyle = 'rgba(233,69,96,0.01)'; // near-invisible fill just to cast the shadow
-    ctx.fillRect(x - 4, y - 4, barW + 8, barH + 8);
-    ctx.restore();
-  }
+  // Low-health urgency: a pulsing red warning halo hugging the frame.
+  if (danger) warningPulse(ctx, x - 4, y - 4, barW + 8, barH + 8, tick, HP_DANGER);
 
   if (uiKit?.healthframe) {
     // Paint order under the frame: dark tray → damage flash → health → gloss.
@@ -427,7 +420,7 @@ const drawHealthBar = (
   ctx.fillRect(i === 0 ? x + 2 : x + barW - 2 - fw, y + 2, fw, barH - 4);
 };
 
-const drawMeter = (ctx: CanvasRenderingContext2D, i: 0 | 1, meter: number): void => {
+const drawMeter = (ctx: CanvasRenderingContext2D, i: 0 | 1, meter: number, tick: number): void => {
   const bars = Math.round(TUNING.meterMax / TUNING.meterBar);
   const gap = 6;
   const segW = HUD.meterSegW, segH = HUD.meterSegH;
@@ -458,6 +451,12 @@ const drawMeter = (ctx: CanvasRenderingContext2D, i: 0 | 1, meter: number): void
       ctx.fillStyle = full ? METER_FULL : METER_HI;
       ctx.fillRect(x + 1, y + 1, Math.round((segW - 2) * ratio), segH - 2);
     }
+    // A full bar breathes with a warm halo — usable meter is "hot".
+    if (full) glowBar(ctx, x, y, segW, segH, METER_FULL, 8, fxPulse(tick, 0.16, 0.4, 0.85));
+  }
+  // ULTIMATE READY (all bars full): a marching-ants outline sweeps the strip.
+  if (meter >= TUNING.meterMax) {
+    marchingOutline(ctx, startX - 2, y - 2, total + 4, segH + 4, tick, METER_FULL);
   }
 };
 
@@ -580,7 +579,7 @@ export const drawHud = (
     drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
     drawNameplate(ctx, i, rosters[i].bundle.name + (tags?.[i] ? ` · ${tags[i]}` : ''));
     drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
-    drawMeter(ctx, i, f.meter);
+    drawMeter(ctx, i, f.meter, g.tick);
   }
   drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
 
@@ -752,13 +751,16 @@ export const drawSelect = (
     for (const i of [0, 1] as const) {
       if (cursors[i] !== k) continue;
       const pulse = locked[i] ? 1 : 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(tick / 8));
+      const o = i === 0 ? 0 : 5; // offset so both cursors are visible on the same cell
+      const fx = { x: x - 6 - o, y: y - 6 - o, w: cell + 12 + o * 2, h: cell + 12 + o * 2 };
       ctx.save();
       ctx.globalAlpha = pulse;
       ctx.strokeStyle = P_COLORS[i];
       ctx.lineWidth = 4;
-      const o = i === 0 ? 0 : 5; // offset so both cursors are visible on the same cell
-      ctx.strokeRect(x - 6 - o, y - 6 - o, cell + 12 + o * 2, cell + 12 + o * 2);
+      ctx.strokeRect(fx.x, fx.y, fx.w, fx.h);
       ctx.restore();
+      // Locked-in: an energized marching-ants outline seals the pick.
+      if (locked[i]) marchingOutline(ctx, fx.x - 3, fx.y - 3, fx.w + 6, fx.h + 6, tick, P_COLORS[i], 12, 0.8);
       ctx.fillStyle = P_COLORS[i];
       const tagX = i === 0 ? x - 6 : x + cell + 6;
       ctx.fillRect(tagX - (i === 0 ? 0 : 30), y - 26, 30, 18);

@@ -7,3 +7,9 @@ characters/*/frames-raw/
 
 # dev screenshot scratch (automated visual checks)
 packages/client/shots/
+
+# portable audio conversion tool binaries (not source; tools/README.md has re-download links)
+/tools/vgmstream/
+/tools/ffmpeg/
+# raw brstm sources kept out of git (unclear license); converted .ogg in packages/client/assets/audio/ is what ships
+/sounds/

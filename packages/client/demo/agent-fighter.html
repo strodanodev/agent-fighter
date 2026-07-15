@@ -2816,6 +2816,404 @@ const cpuLevelFor = (p, lever) => Math.max(1, Math.min(MAX_LEVEL, p.level + leve
 /** Map a CPU level onto the core AI's 0-100 skill lever. */
 const skillForCpuLevel = (cpuLevel) => Math.max(3, Math.min(100, Math.round((cpuLevel * 100) / MAX_LEVEL)));
 
+// ---- client/src/fx.js ----
+/**
+ * Cosmetic FX layer — particles, glows, animated outlines. Client-only eye
+ * candy; NONE of this touches the sim (spec: "cosmetic effects live
+ * client-side only, keyed off state changes"), so it may use Math.random and
+ * float math freely and is safe under future rollback (it is never simulated,
+ * only re-derived from whatever GameState the frame is showing).
+ *
+ * DEPENDENCY-FREE LEAF. It imports nothing from the client — everything is
+ * passed in as plain numbers/colors — so it can sit before ui.ts/main.ts in
+ * the bundle with no import cycle. Two families live here:
+ *
+ *   1. A pooled PARTICLE SYSTEM (emit* → updateFx → drawFx). Particles are
+ *      drawn additively as cached soft-dot sprites, so hundreds of them bloom
+ *      and stack cheaply without a per-particle gradient allocation.
+ *   2. Stateless IMMEDIATE-MODE helpers (auraGlow / glowBar / warningPulse /
+ *      marchingOutline / fxPulse) the HUD and world renderer call directly to
+ *      wrap bars, frames and characters in glow.
+ *
+ * WHY NOT three.js / WebGL: the renderer is a single 2D canvas and the bundle
+ * is one self-contained file with no CDN. A WebGL layer would mean a second
+ * stacked canvas or a full rewrite for effects 2D already does well. See the
+ * commit that introduced this file.
+ */
+// Hard caps: a runaway emitter can never tank the frame. At the cap, new
+// spawns are dropped (the scene is already saturated, so nobody notices).
+const FX_MAX_PARTICLES = 600;
+const FX_MAX_RINGS = 24;
+const fxPool = [];
+const fxRings = [];
+const fxRnd = (a, b) => a + Math.random() * (b - a);
+/** #rrggbb (or #rgb) → [r,g,b]. Tolerates a leading '#'. */
+const parseHex = (hex) => {
+    let h = hex.replace('#', '');
+    if (h.length === 3)
+        h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    const n = parseInt(h, 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+};
+/**
+ * Cached soft-dot sprite per quantized color. A radial gradient (opaque
+ * center → transparent edge) rendered ONCE per color bucket and reused via
+ * drawImage — the whole reason hundreds of additive particles stay cheap
+ * (building a gradient per particle per frame is the classic canvas trap).
+ * Keyed on the top 4 bits of each channel so the cache can't grow unbounded.
+ */
+const fxDotCache = new Map();
+const softDot = (r, g, b) => {
+    const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+    let dot = fxDotCache.get(key);
+    if (dot)
+        return dot;
+    const S = 64;
+    dot = document.createElement('canvas');
+    dot.width = S;
+    dot.height = S;
+    const c = dot.getContext('2d');
+    const grd = c.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+    grd.addColorStop(0, `rgba(${r},${g},${b},1)`);
+    grd.addColorStop(0.4, `rgba(${r},${g},${b},0.55)`);
+    grd.addColorStop(1, `rgba(${r},${g},${b},0)`);
+    c.fillStyle = grd;
+    c.fillRect(0, 0, S, S);
+    fxDotCache.set(key, dot);
+    return dot;
+};
+const spawn = (o) => {
+    if (fxPool.length >= FX_MAX_PARTICLES)
+        return;
+    fxPool.push({
+        x: o.x, y: o.y, vx: o.vx, vy: o.vy, age: 0, life: o.life,
+        size: o.size, grow: o.grow ?? 0, drag: o.drag ?? 0.92, grav: o.grav ?? 0,
+        r: o.color[0], g: o.color[1], b: o.color[2], layer: o.layer,
+    });
+};
+// ---------------------------------------------------------------- emitters
+/**
+ * Impact burst — a radial spray of embers for a hit. `power` scales count,
+ * speed and size (light jab vs heavy launcher). Gravity pulls them down so
+ * they arc like debris rather than floating.
+ */
+const emitBurst = (x, y, color, power = 1, layer = 'world') => {
+    const [r, g, b] = parseHex(color);
+    const n = Math.round(8 + 10 * power);
+    for (let i = 0; i < n; i++) {
+        const ang = fxRnd(0, Math.PI * 2);
+        const spd = fxRnd(1.5, 5.5) * power;
+        spawn({
+            x, y, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - 1,
+            life: fxRnd(10, 20), size: fxRnd(3, 7) * Math.sqrt(power), grow: -0.15,
+            drag: 0.9, grav: 0.35, color: [r, g, b], layer,
+        });
+    }
+    // A couple of hot white core sparks for punch.
+    for (let i = 0; i < Math.round(3 * power); i++) {
+        const ang = fxRnd(0, Math.PI * 2);
+        spawn({
+            x, y, vx: Math.cos(ang) * fxRnd(2, 6), vy: Math.sin(ang) * fxRnd(2, 6),
+            life: fxRnd(6, 12), size: fxRnd(2, 4), drag: 0.85, color: [255, 255, 255], layer,
+        });
+    }
+};
+/**
+ * Aura motes — a trickle of embers drifting UP off a character (charged
+ * meter, critical health). Call once per frame; `rate` is the expected motes
+ * per frame (fractional rate honored probabilistically so intensity ramps
+ * smoothly rather than snapping between whole numbers).
+ */
+const emitAura = (x, y, halfW, halfH, color, rate = 1) => {
+    const [r, g, b] = parseHex(color);
+    let count = Math.floor(rate);
+    if (Math.random() < rate - count)
+        count++;
+    for (let i = 0; i < count; i++) {
+        spawn({
+            x: x + fxRnd(-halfW, halfW), y: y + fxRnd(-halfH * 0.3, halfH),
+            vx: fxRnd(-0.3, 0.3), vy: fxRnd(-1.8, -0.8),
+            life: fxRnd(18, 34), size: fxRnd(2.5, 5), grow: -0.06, drag: 0.98, grav: -0.02,
+            color: [r, g, b], layer: 'world',
+        });
+    }
+};
+/** Expanding shockwave ring — round announcements, super activation, KO. */
+const emitRing = (x, y, maxR, color, { life = 26, width = 4, layer = 'screen' } = {}) => {
+    if (fxRings.length >= FX_MAX_RINGS)
+        fxRings.shift();
+    fxRings.push({ x, y, age: 0, life, r0: 8, r1: maxR, width, color, layer });
+};
+// ---------------------------------------------------------------- sim step
+/** Advance every particle & ring one frame; cull the dead. Call once/frame. */
+const updateFx = () => {
+    for (let i = fxPool.length - 1; i >= 0; i--) {
+        const p = fxPool[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vx *= p.drag;
+        p.vy = p.vy * p.drag + p.grav;
+        p.size += p.grow;
+        if (++p.age >= p.life || p.size <= 0.2) {
+            fxPool[i] = fxPool[fxPool.length - 1];
+            fxPool.pop();
+        }
+    }
+    for (let i = fxRings.length - 1; i >= 0; i--) {
+        if (++fxRings[i].age >= fxRings[i].life) {
+            fxRings[i] = fxRings[fxRings.length - 1];
+            fxRings.pop();
+        }
+    }
+};
+/** Draw all particles & rings tagged for `layer`. Additive (glowy) blend. */
+const drawFx = (ctx, layer) => {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const p of fxPool) {
+        if (p.layer !== layer)
+            continue;
+        // Ease-out fade over life; small tail so particles don't pop out.
+        const t = p.age / p.life;
+        ctx.globalAlpha = Math.max(0, 1 - t * t);
+        const d = p.size * 2;
+        ctx.drawImage(softDot(p.r, p.g, p.b), p.x - p.size, p.y - p.size, d, d);
+    }
+    ctx.globalAlpha = 1;
+    for (const r of fxRings) {
+        if (r.layer !== layer)
+            continue;
+        const t = r.age / r.life;
+        const rad = r.r0 + (r.r1 - r.r0) * (1 - (1 - t) * (1 - t)); // ease-out expand
+        ctx.globalAlpha = Math.max(0, 1 - t);
+        ctx.strokeStyle = r.color;
+        ctx.lineWidth = r.width * (1 - t * 0.6);
+        ctx.beginPath();
+        ctx.arc(r.x, r.y, rad, 0, Math.PI * 2);
+        ctx.stroke();
+    }
+    ctx.restore();
+};
+/** True when nothing is animating — lets callers skip a layer's draw pass. */
+const fxIdle = () => fxPool.length === 0 && fxRings.length === 0;
+// ------------------------------------------------- immediate-mode glow helpers
+/** Sine oscillator 0..1 (remapped to [lo,hi]) — the workhorse pulse clock. */
+const fxPulse = (tick, speed = 1, lo = 0, hi = 1) => lo + (hi - lo) * (0.5 + 0.5 * Math.sin(tick * speed));
+/**
+ * Soft radial glow centered on a point — a character's aura, a projectile
+ * halo, any "energy" bloom. Additive, so it lightens whatever it sits over
+ * instead of muddying it. `intensity` 0..1 scales opacity.
+ */
+const auraGlow = (ctx, x, y, radius, color, intensity) => {
+    if (intensity <= 0)
+        return;
+    const [r, g, b] = parseHex(color);
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const grd = ctx.createRadialGradient(x, y, 0, x, y, radius);
+    grd.addColorStop(0, `rgba(${r},${g},${b},${0.55 * intensity})`);
+    grd.addColorStop(0.5, `rgba(${r},${g},${b},${0.22 * intensity})`);
+    grd.addColorStop(1, `rgba(${r},${g},${b},0)`);
+    ctx.fillStyle = grd;
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+};
+/**
+ * Blurred halo hugging a rectangle (a health frame, a meter bar) — the "this
+ * element is HOT" treatment. `alpha` lets the caller pulse it.
+ */
+const glowBar = (ctx, x, y, w, h, color, blur = 12, alpha = 1) => {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = blur;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    // Stroke twice: the blur builds up into a real halo without a fill washing
+    // out the element it wraps.
+    ctx.strokeRect(x, y, w, h);
+    ctx.strokeRect(x, y, w, h);
+    ctx.restore();
+};
+/**
+ * Danger throb for a rectangle (low health): a red edge whose glow breathes.
+ * Encapsulates the pulse so every "urgent" element reads identically.
+ */
+const warningPulse = (ctx, x, y, w, h, tick, color = '#e94560') => {
+    glowBar(ctx, x, y, w, h, color, 8 + 10 * fxPulse(tick, 0.22), fxPulse(tick, 0.22, 0.35, 0.9));
+};
+/**
+ * Animated marching-ants outline — the classic "selected / ready" cue. The
+ * dash offset scrolls with `tick`, so the outline appears to travel around
+ * the rect. Used for the active select frame and a fully-charged meter bar.
+ */
+const marchingOutline = (ctx, x, y, w, h, tick, color = '#ffd166', dash = 10, speed = 0.6) => {
+    ctx.save();
+    ctx.setLineDash([dash, dash]);
+    ctx.lineDashOffset = -tick * speed;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 6;
+    ctx.strokeRect(x, y, w, h);
+    ctx.restore();
+};
+
+// ---- client/src/audio.js ----
+/**
+ * Music playback — Web Audio API, no dependency. Source tracks are the MvC:
+ * Clash of Super Heroes BRSTM rips (decoded/re-encoded to ogg offline, see
+ * tools/README.md), one file per arcade-mode screen. There's no dedicated
+ * stage BGM yet, so the 4 "Ending" themes double as the title-screen loop
+ * AND the in-match stage loop (ROTATION), picked round-robin so neither
+ * screen repeats the same track back-to-back.
+ */
+const FILES = {
+    continue: '/assets/audio/bgm/continue.ogg',
+    ending_after_the_battle: '/assets/audio/bgm/ending_after_the_battle.ogg',
+    ending_gambit: '/assets/audio/bgm/ending_gambit.ogg',
+    ending_grief: '/assets/audio/bgm/ending_grief.ogg',
+    ending_megaman1: '/assets/audio/bgm/ending_megaman1.ogg',
+    game_over: '/assets/audio/bgm/game_over.ogg',
+    here_comes_a_new_challenger: '/assets/audio/bgm/here_comes_a_new_challenger.ogg',
+    hurry_up: '/assets/audio/bgm/hurry_up.ogg',
+    player_select: '/assets/audio/bgm/player_select.ogg',
+    ranking: '/assets/audio/bgm/ranking.ogg',
+    vs: '/assets/audio/bgm/vs.ogg',
+    win: '/assets/audio/bgm/win.ogg',
+};
+/** Shared title-screen / stage-BGM pool — the 4 "Ending" themes. */
+const ROTATION = [
+    'ending_after_the_battle', 'ending_gambit', 'ending_grief', 'ending_megaman1',
+];
+const BGM_LEVEL = 0.55;
+const SFX_LEVEL = 0.85;
+const DUCK_LEVEL = 0.12;
+class AudioManager {
+    ctx = null;
+    bgmGain = null;
+    sfxGain = null;
+    buffers = new Map();
+    loading = new Map();
+    bgmSource = null;
+    bgmId = null;
+    rotationIndex = 0;
+    unlocked = false;
+    ctxOf() {
+        if (!this.ctx) {
+            const ctx = new AudioContext();
+            this.bgmGain = ctx.createGain();
+            this.bgmGain.gain.value = BGM_LEVEL;
+            this.bgmGain.connect(ctx.destination);
+            this.sfxGain = ctx.createGain();
+            this.sfxGain.gain.value = SFX_LEVEL;
+            this.sfxGain.connect(ctx.destination);
+            this.ctx = ctx;
+        }
+        return this.ctx;
+    }
+    /** Browsers block audio until a user gesture — call from the first input. */
+    unlock() {
+        if (this.unlocked)
+            return;
+        this.unlocked = true;
+        const ctx = this.ctxOf();
+        if (ctx.state === 'suspended')
+            void ctx.resume();
+    }
+    load(id) {
+        const cached = this.buffers.get(id);
+        if (cached)
+            return Promise.resolve(cached);
+        const pending = this.loading.get(id);
+        if (pending)
+            return pending;
+        const ctx = this.ctxOf();
+        const p = fetch(FILES[id])
+            .then((r) => r.arrayBuffer())
+            .then((raw) => ctx.decodeAudioData(raw))
+            .then((decoded) => {
+            this.buffers.set(id, decoded);
+            this.loading.delete(id);
+            return decoded;
+        });
+        this.loading.set(id, p);
+        return p;
+    }
+    /** Warm the decode cache for every track — total payload is ~5.7MB. */
+    preload() {
+        for (const id of Object.keys(FILES))
+            void this.load(id);
+    }
+    /** Next track in the shared title/stage rotation pool. */
+    nextRotationTrack() {
+        const id = ROTATION[this.rotationIndex % ROTATION.length];
+        this.rotationIndex++;
+        return id;
+    }
+    stopBgm() {
+        if (this.bgmSource) {
+            try {
+                this.bgmSource.stop();
+            }
+            catch { /* already stopped */ }
+            this.bgmSource.disconnect();
+            this.bgmSource = null;
+        }
+        this.bgmId = null;
+    }
+    /** Loop a track as the current BGM. No-op if it's already the active loop. */
+    async playBgm(id, opts = {}) {
+        if (this.bgmId === id)
+            return;
+        const ctx = this.ctxOf();
+        const buffer = await this.load(id);
+        this.stopBgm();
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.loop = true;
+        src.connect(this.bgmGain);
+        const fade = opts.fadeInSec ?? 0;
+        if (fade > 0 && this.bgmGain) {
+            this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
+            this.bgmGain.gain.setValueAtTime(0, ctx.currentTime);
+            this.bgmGain.gain.linearRampToValueAtTime(BGM_LEVEL, ctx.currentTime + fade);
+        }
+        else if (this.bgmGain) {
+            this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
+            this.bgmGain.gain.setValueAtTime(BGM_LEVEL, ctx.currentTime);
+        }
+        src.start();
+        this.bgmSource = src;
+        this.bgmId = id;
+    }
+    /**
+     * One-shot jingle (VS splash, win/lose stinger, challenger reveal, hurry-up
+     * warning). Ducks the BGM bed while it plays and restores after.
+     */
+    async playStinger(id, opts = {}) {
+        const ctx = this.ctxOf();
+        const buffer = await this.load(id);
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(this.sfxGain);
+        const duck = opts.duck ?? true;
+        if (duck && this.bgmGain) {
+            this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
+            this.bgmGain.gain.setTargetAtTime(DUCK_LEVEL, ctx.currentTime, 0.05);
+        }
+        src.onended = () => {
+            if (duck && this.bgmGain)
+                this.bgmGain.gain.setTargetAtTime(BGM_LEVEL, ctx.currentTime, 0.4);
+            opts.onEnded?.();
+        };
+        src.start();
+    }
+}
+const audio = new AudioManager();
+
 // ---- client/src/ui.js ----
 // Injected at boot (null = procedural fallbacks everywhere).
 let uiKit = null;
@@ -3123,16 +3521,9 @@ const drawHealthBar = (ctx, i, ratio, flashRatio, tick) => {
         ctx.fillRect(i === 0 ? x : x + barW - w, y, w, barH);
         ctx.restore();
     };
-    // Low-health urgency: a soft pulsing red glow behind the frame.
-    if (danger) {
-        const pulse = 0.35 + 0.35 * (0.5 + 0.5 * Math.sin(tick / 8));
-        ctx.save();
-        ctx.shadowColor = `rgba(233,69,96,${pulse})`;
-        ctx.shadowBlur = 16;
-        ctx.fillStyle = 'rgba(233,69,96,0.01)'; // near-invisible fill just to cast the shadow
-        ctx.fillRect(x - 4, y - 4, barW + 8, barH + 8);
-        ctx.restore();
-    }
+    // Low-health urgency: a pulsing red warning halo hugging the frame.
+    if (danger)
+        warningPulse(ctx, x - 4, y - 4, barW + 8, barH + 8, tick, HP_DANGER);
     if (uiKit?.healthframe) {
         // Paint order under the frame: dark tray → damage flash → health → gloss.
         fillBar(1, '#0c0e13');
@@ -3160,7 +3551,7 @@ const drawHealthBar = (ctx, i, ratio, flashRatio, tick) => {
     ctx.fillStyle = danger ? HP_DANGER : HP_HI;
     ctx.fillRect(i === 0 ? x + 2 : x + barW - 2 - fw, y + 2, fw, barH - 4);
 };
-const drawMeter = (ctx, i, meter) => {
+const drawMeter = (ctx, i, meter, tick) => {
     const bars = Math.round(TUNING.meterMax / TUNING.meterBar);
     const gap = 6;
     const segW = HUD.meterSegW, segH = HUD.meterSegH;
@@ -3192,6 +3583,13 @@ const drawMeter = (ctx, i, meter) => {
             ctx.fillStyle = full ? METER_FULL : METER_HI;
             ctx.fillRect(x + 1, y + 1, Math.round((segW - 2) * ratio), segH - 2);
         }
+        // A full bar breathes with a warm halo — usable meter is "hot".
+        if (full)
+            glowBar(ctx, x, y, segW, segH, METER_FULL, 8, fxPulse(tick, 0.16, 0.4, 0.85));
+    }
+    // ULTIMATE READY (all bars full): a marching-ants outline sweeps the strip.
+    if (meter >= TUNING.meterMax) {
+        marchingOutline(ctx, startX - 2, y - 2, total + 4, segH + 4, tick, METER_FULL);
     }
 };
 const drawPortraitFrame = (ctx, i, roster, lowHealth) => {
@@ -3292,7 +3690,7 @@ const drawHud = (ctx, g, rosters, fx, tags) => {
         drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
         drawNameplate(ctx, i, rosters[i].bundle.name + (tags?.[i] ? ` · ${tags[i]}` : ''));
         drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
-        drawMeter(ctx, i, f.meter);
+        drawMeter(ctx, i, f.meter, g.tick);
     }
     drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
     // Combo counter: punches in on each new hit (re-triggered via comboAge
@@ -3437,13 +3835,17 @@ const drawSelect = (ctx, rosters, cursors, locked, tick, cpuInfo) => {
             if (cursors[i] !== k)
                 continue;
             const pulse = locked[i] ? 1 : 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(tick / 8));
+            const o = i === 0 ? 0 : 5; // offset so both cursors are visible on the same cell
+            const fx = { x: x - 6 - o, y: y - 6 - o, w: cell + 12 + o * 2, h: cell + 12 + o * 2 };
             ctx.save();
             ctx.globalAlpha = pulse;
             ctx.strokeStyle = P_COLORS[i];
             ctx.lineWidth = 4;
-            const o = i === 0 ? 0 : 5; // offset so both cursors are visible on the same cell
-            ctx.strokeRect(x - 6 - o, y - 6 - o, cell + 12 + o * 2, cell + 12 + o * 2);
+            ctx.strokeRect(fx.x, fx.y, fx.w, fx.h);
             ctx.restore();
+            // Locked-in: an energized marching-ants outline seals the pick.
+            if (locked[i])
+                marchingOutline(ctx, fx.x - 3, fx.y - 3, fx.w + 6, fx.h + 6, tick, P_COLORS[i], 12, 0.8);
             ctx.fillStyle = P_COLORS[i];
             const tagX = i === 0 ? x - 6 : x + cell + 6;
             ctx.fillRect(tagX - (i === 0 ? 0 : 30), y - 26, 30, 18);
@@ -3573,11 +3975,14 @@ xp) => {
 
 
 
+
+
 const TICK_MS = 1000 / TICKS_PER_SEC;
 // ---------------------------------------------------------------- input
 const keys = new Set();
 const pressedThisFrame = new Set();
 addEventListener('keydown', (e) => {
+    audio.unlock(); // first user gesture — browsers block AudioContext until one fires
     if (!keys.has(e.code))
         pressedThisFrame.add(e.code);
     keys.add(e.code);
@@ -3627,6 +4032,10 @@ let game = null;
 let showBoxes = false;
 let seed = 1;
 let loadError = '';
+let hurryPlayed = false; // per-round: has the "Hurry Up!" stinger fired yet
+const HURRY_UP_TICKS = 10 * TICKS_PER_SEC; // MvC fires it at 10s left on the clock
+// Cosmetic juice — never simulated.
+const DANGER_RED = '#ff2d4a'; // critical-health aura / warning tint
 let sparks = [];
 let shake = 0;
 let cam = { x: 0, y: 0, zoom: 1.5 };
@@ -3634,6 +4043,8 @@ let hitStopFlash = 0;
 const fx = { flash: [1, 1], comboOwner: -1, comboHits: 0, comboAge: 0, announce: '', announceAge: 0 };
 let prevHealth = [0, 0];
 let prevPhase = 0 /* Phase.PreRound */;
+let prevSuperFlash = 0; // rising-edge detect for the super-activation shockwave
+let prevMeter = [0, 0]; // to spot which fighter spent meter
 // ---------------------------------------------------------------- canvas
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
@@ -3660,6 +4071,8 @@ const boot = async () => {
         allRosters = await Promise.all(ids.map(loadRoster));
         picks = [0, Math.min(1, allRosters.length - 1)];
         screen = 'title';
+        audio.preload();
+        void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1.5 });
     }
     catch (e) {
         loadError = e.message;
@@ -3687,7 +4100,9 @@ const startFight = () => {
     fx.announceAge = 0;
     sparks = [];
     shake = 0;
+    hurryPlayed = false;
     screen = 'fight';
+    void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
 /**
  * World px a fighter's body occupies. Sprites are authored supersampled (2x)
@@ -3743,9 +4158,20 @@ const updateJuice = (g) => {
         if (f.health < prevHealth[i]) {
             const dmg = prevHealth[i] - f.health;
             const big = dmg > 600;
-            sparks.push({ x: px(f.x) + f.facing * -22, y: px(f.y) - 78, age: 0, big });
+            const hx = px(f.x) + f.facing * -22, hy = px(f.y) - 78;
+            sparks.push({ x: hx, y: hy, age: 0, big });
+            // Ember burst in the ATTACKER's color (the victim is fighter i).
+            emitBurst(hx, hy, P_COLORS[(1 - i)], big ? 1.8 : 0.9);
             shake = big ? 11 : 6;
             hitStopFlash = big ? 3 : 0;
+        }
+        // Aura motes: a fighter that is CHARGED (≥1 super bar) or on CRITICAL
+        // health smoulders — a steady trickle of embers rising off the body.
+        const meterN = f.meter / TUNING.meterMax;
+        const critical = f.health / fighters[i].ch.b.maxHealth < 0.25;
+        const auraRate = (f.meter >= TUNING.meterBar ? 0.35 + meterN * 0.5 : 0) + (critical ? 0.4 : 0);
+        if (auraRate > 0) {
+            emitAura(px(f.x), px(f.y) - 56, 20, 52, critical ? DANGER_RED : P_COLORS[i], auraRate);
         }
         // Progression stats: what the human (P1) dished out.
         if (i === 1 && f.health < prevHealth[1])
@@ -3777,15 +4203,17 @@ const updateJuice = (g) => {
         bumpCombo(1, v0.comboHits);
     else if (!inCombo(v0.action) && !inCombo(v1.action))
         fx.comboOwner = -1;
-    // Announcements on phase changes.
+    // Announcements on phase changes — each punctuated by a screen shockwave.
     if (g.phase !== prevPhase) {
         if (g.phase === 1 /* Phase.Fighting */) {
             fx.announce = 'FIGHT!';
             fx.announceAge = 0;
+            emitRing(VW / 2, VH / 2 - 40, 240, '#ffd166', { life: 30, width: 5 });
         }
         else if (g.phase === 2 /* Phase.RoundOver */) {
             fx.announce = g.roundWinner === 2 ? 'DOUBLE KO' : 'K.O.';
             fx.announceAge = 0;
+            emitRing(VW / 2, VH / 2 - 40, 340, DANGER_RED, { life: 40, width: 7 });
         }
         else if (g.phase === 0 /* Phase.PreRound */) {
             fx.announce = `ROUND ${g.roundNum + 1}`;
@@ -3794,6 +4222,19 @@ const updateJuice = (g) => {
         prevPhase = g.phase;
     }
     fx.announceAge++;
+    // Super activation: on the rising edge of the freeze flash, blow a ring off
+    // the fighter who supered (whichever one is spending meter / attacking).
+    if (g.superFlashLeft > 0 && prevSuperFlash === 0) {
+        // The super's owner is whoever just spent meter this frame.
+        const d0 = prevMeter[0] - g.fighters[0].meter;
+        const d1 = prevMeter[1] - g.fighters[1].meter;
+        const su = d0 >= d1 ? 0 : 1;
+        const sx = px(g.fighters[su].x), sy = px(g.fighters[su].y) - 56;
+        emitRing(sx, sy, 160, P_COLORS[su], { life: 28, width: 6, layer: 'world' });
+        emitBurst(sx, sy, P_COLORS[su], 2.2);
+    }
+    prevSuperFlash = g.superFlashLeft;
+    prevMeter = [g.fighters[0].meter, g.fighters[1].meter];
     sparks = sparks.filter((s) => ++s.age < 9);
     shake = Math.max(0, shake - 0.7);
     if (hitStopFlash > 0)
@@ -3807,6 +4248,17 @@ const renderFight = (g) => {
         ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
     worldTransform(ctx, cam);
     drawStage(ctx, cam);
+    // Character aura (UNDER the sprite): an energy glow that intensifies when a
+    // fighter is charged (super meter) or in critical health — the "this
+    // fighter is dangerous / desperate" read, tinted to the player color.
+    for (const i of [0, 1]) {
+        const f = g.fighters[i];
+        const meterN = f.meter / TUNING.meterMax;
+        const critical = f.health / fighters[i].ch.b.maxHealth < 0.25;
+        const intensity = 0.12 + meterN * 0.4 + (critical ? 0.3 : 0);
+        const breathe = fxPulse(g.tick, 0.12, 0.8, 1); // subtle living pulse
+        auraGlow(ctx, px(f.x), px(f.y) - 52, 70, critical ? DANGER_RED : P_COLORS[i], intensity * breathe);
+    }
     // Fighters (draw the one in hitstun last so it reads on top).
     const order = g.fighters[0].action === 10 /* Action.Hitstun */ ? [1, 0] : [0, 1];
     for (const i of order) {
@@ -3845,6 +4297,9 @@ const renderFight = (g) => {
         ctx.stroke();
     }
     ctx.lineWidth = 1;
+    // Particle FX in world space (embers, auras, super rings) — on top of the
+    // fighters so debris reads over the bodies.
+    drawFx(ctx, 'world');
     // Debug boxes (world space — they come from the sim in world px).
     if (showBoxes) {
         for (const b of debugBoxes(g)) {
@@ -3867,6 +4322,9 @@ const renderFight = (g) => {
         ctx.fillRect(0, 0, VW, VH);
     }
     drawHud(ctx, g, fighters, fx, cpuAi ? ['', `CPU LV ${cpuLevelFor(profile, lever)}`] : undefined);
+    // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
+    // sweeps across the whole frame.
+    drawFx(ctx, 'screen');
 };
 // ---------------------------------------------------------------- screens
 const tickSelect = () => {
@@ -3907,6 +4365,7 @@ const tickSelect = () => {
         // CPU picks its fighter — visibly, like an arcade opponent reveal.
         picks[1] = (seed * 17 + profile.wins * 5 + uiTick) % n;
         locked[1] = true;
+        void audio.playStinger('here_comes_a_new_challenger');
     }
     if (pressedThisFrame.has('Escape'))
         locked = [false, false];
@@ -3936,6 +4395,7 @@ const tickStageSelect = () => {
 };
 const frame = () => {
     uiTick++;
+    updateFx(); // advance cosmetic particles/rings every frame (fight AND results)
     if (screen === 'loading') {
         ctx.fillStyle = '#0a0616';
         ctx.fillRect(0, 0, VW, VH);
@@ -3958,6 +4418,7 @@ const frame = () => {
         else if (pressedThisFrame.size > 0) {
             screen = 'select';
             locked = [false, false];
+            void audio.playBgm('player_select', { fadeInSec: 0.5 });
         }
     }
     else if (screen === 'select') {
@@ -3974,12 +4435,17 @@ const frame = () => {
         if (pressedThisFrame.has('Escape')) {
             screen = 'select';
             locked = [false, false];
+            void audio.playBgm('player_select', { fadeInSec: 0.5 });
         }
         const p2 = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
         step(game, [pollPad(P0_MAP), p2]);
         updateJuice(game);
         updateCamera(game);
         renderFight(game);
+        if (game.phase === 1 /* Phase.Fighting */ && !hurryPlayed && game.timerTicks <= HURRY_UP_TICKS) {
+            hurryPlayed = true;
+            void audio.playStinger('hurry_up', { duck: false }); // layers over the stage loop, like the arcade original
+        }
         if (game.phase === 3 /* Phase.MatchOver */) {
             if (cpuAi && !xpBanner) {
                 const award = awardXp(profile, {
@@ -3999,6 +4465,12 @@ const frame = () => {
             fx.comboOwner = -1;
             resultsAge = 0;
             screen = 'results';
+            // CPU beat the human → arcade "Game Over"; anything else (human win,
+            // 2P vs 2P, a draw) gets the victory jingle.
+            const lostToCpu = Boolean(cpuAi) && game.winner === 1;
+            void audio.playStinger(lostToCpu ? 'game_over' : 'win', {
+                onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
+            });
         }
     }
     else if (screen === 'results' && game) {
@@ -4010,6 +4482,7 @@ const frame = () => {
         if (pressedThisFrame.has('Escape')) {
             screen = 'select';
             locked = [false, false];
+            void audio.playBgm('player_select', { fadeInSec: 0.5 });
         }
     }
     pressedThisFrame.clear();
