@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.bundle-tmp/
+*.log
+characters/*/frames-raw/
+packages/client/shots/
+tools/vgmstream/
+tools/ffmpeg/
+sounds/
+.git
+.claude
+.cursor
+.github
+docs

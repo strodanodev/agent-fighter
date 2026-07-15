@@ -1,0 +1,4 @@
+{
+  "buildCommand": "npm run build && npm run demo",
+  "outputDirectory": "packages/client/demo"
+}
