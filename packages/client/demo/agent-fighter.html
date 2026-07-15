@@ -155,6 +155,12 @@ const STAGE = {
 };
 const TICKS_PER_SEC = 60;
 const ROUND_SECONDS = 99;
+/**
+ * Engine compatibility version, pinned in every online match handshake
+ * (ADR 0003). Bump on ANY sim-behavior change — the golden replay tests
+ * going red is the reminder; bless goldens and bump this in the same commit.
+ */
+const ENGINE_VERSION = 'af-core-1';
 const TUNING = {
     roundsToWin: 2, // best of 3
     preRoundTicks: 60,
@@ -2334,8 +2340,8 @@ const loadRoster = async (id) => {
     // Dedicated character-select portrait, authored in Studio (meta.selectPortrait
     // → _select.png). Only honored when the bundle still references it — "remove"
     // in Studio clears the field but leaves the file, and we must respect that.
-    const portraitFile = bundle
-        .meta?.selectPortrait;
+    const meta = bundle.meta;
+    const portraitFile = meta?.selectPortrait;
     const safePortrait = portraitFile && /^[\w.-]+\.(png|webp|jpe?g)$/.test(portraitFile)
         ? portraitFile : null;
     const [sheet, refPortrait, selectPortrait] = await Promise.all([
@@ -2348,6 +2354,7 @@ const loadRoster = async (id) => {
     return {
         id, bundle, ch: loadCharacter(bundle), atlas, sheet, portrait,
         portraitDedicated: dedicated,
+        portraitFraming: dedicated ? (meta?.selectFraming ?? null) : null,
         // A composed portrait fills its frame (cover-fit); only the sprite fallback
         // needs alpha bounds to crop away the empty cell.
         portraitBox: !dedicated && portrait ? alphaBounds(portrait) : null,
@@ -2435,10 +2442,23 @@ const drawPortrait = (ctx, roster, x, y, w, h) => {
     if (ctx.imageSmoothingEnabled)
         ctx.imageSmoothingQuality = 'high';
     if (roster.portraitDedicated) {
-        // Cover-fit: scale so the frame is fully covered, center the overflow.
-        const scale = Math.max(w / img.naturalWidth, h / img.naturalHeight);
-        const dw = img.naturalWidth * scale, dh = img.naturalHeight * scale;
-        ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+        // Cover-fit scaled by zoom, then rotated (90° steps), flipped, and panned.
+        // Must match the Studio preview math (studio main.ts framedPreview).
+        const fr = roster.portraitFraming;
+        const iw = img.naturalWidth, ih = img.naturalHeight;
+        const zoom = Math.max(1, fr?.zoom ?? 1);
+        const rot = ((((fr?.rotate ?? 0) % 360) + 360) % 360);
+        const swap = rot === 90 || rot === 270;
+        const bw = swap ? ih : iw, bh = swap ? iw : ih;
+        const scale = Math.max(w / bw, h / bh) * zoom;
+        const sw = bw * scale, sh = bh * scale;
+        const panX = Math.max(-1, Math.min(1, fr?.panX ?? 0));
+        const panY = Math.max(-1, Math.min(1, fr?.panY ?? 0));
+        ctx.translate(x + w / 2 + panX * (sw - w) / 2, y + h / 2 + panY * (sh - h) / 2);
+        ctx.rotate(rot * Math.PI / 180);
+        if (fr?.flipH)
+            ctx.scale(-1, 1);
+        ctx.drawImage(img, -iw * scale / 2, -ih * scale / 2, iw * scale, ih * scale);
     }
     else {
         const box = roster.portraitBox;
@@ -2498,6 +2518,8 @@ const loadDisplayFont = async () => {
 };
 /** The home-screen brand logo (assets/logo/) — swap the file to rebrand. */
 const loadLogo = () => loadImg(`/assets/logo/main_title_AF.svg?v=${Date.now()}`);
+/** The compact in-game badge logo (assets/logo/), shown below the fight timer. */
+const loadGameLogo = () => loadImg(`/assets/logo/main_logo_AF.svg?v=${Date.now()}`);
 const opaqueBBox = (img) => {
     const iw = img.naturalWidth, ih = img.naturalHeight;
     const full = { x: 0, y: 0, w: iw, h: ih };
@@ -2873,6 +2895,194 @@ const cpuLevelFor = (p, lever) => Math.max(1, Math.min(MAX_LEVEL, p.level + leve
 /** Map a CPU level onto the core AI's 0-100 skill lever. */
 const skillForCpuLevel = (cpuLevel) => Math.max(3, Math.min(100, Math.round((cpuLevel * 100) / MAX_LEVEL)));
 
+// ---- client/src/net.js ----
+/**
+ * Online netplay session — GGPO-style rollback over the match-server relay
+ * (ADR 0003). Transport-agnostic by design: the same prediction/rollback
+ * machinery runs unchanged when WebRTC P2P replaces the relay for
+ * human↔human latency later.
+ *
+ * Per tick: my input is scheduled `delay` ticks ahead (symmetric on both
+ * sides) and sent; the opponent's input is used if known, otherwise
+ * PREDICTED as their last known input. When the real input arrives and the
+ * prediction was wrong, we restore the snapshot taken before the first
+ * mispredicted tick and re-simulate — a few ticks of a 2-fighter sim,
+ * microseconds. If we get too far ahead of the opponent we stall a frame
+ * (the classic GGPO throttle) rather than drift.
+ */
+// Protocol constants — must match packages/server/src/protocol.ts.
+const NET_PROTOCOL = 1;
+const MAX_AHEAD = 10;
+const HASH_EVERY = 60;
+const SNAP_RING = 128;
+class NetSession {
+    status = 'connecting';
+    error = '';
+    setup = null;
+    result = null;
+    game = null;
+    /** Ticks currently stalled waiting on the opponent (UI: "connection…"). */
+    stalled = 0;
+    ws;
+    myInputs = [];
+    oppInputs = [];
+    usedOpp = [];
+    snaps = new Array(SNAP_RING).fill(null);
+    localTick = 0;
+    oppKnown = 0; // opponent inputs contiguous from 0 up to (exclusive)
+    resimFrom = -1;
+    overSent = false;
+    nextHashTick = 0; // last CONFIRMED checkpoint reported to the server
+    constructor(url, name, character, bundleHash) {
+        this.ws = new WebSocket(url);
+        this.ws.onopen = () => {
+            this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION });
+            this.send({ t: 'queue', character, bundleHash });
+            this.status = 'queued';
+        };
+        this.ws.onerror = () => {
+            if (this.status !== 'done') {
+                this.status = 'error';
+                this.error = 'connection failed';
+            }
+        };
+        this.ws.onclose = () => {
+            if (this.status !== 'done' && this.status !== 'error') {
+                this.status = 'error';
+                this.error = 'connection lost';
+            }
+        };
+        this.ws.onmessage = (ev) => this.onMessage(String(ev.data));
+    }
+    close() {
+        try {
+            this.ws.close();
+        }
+        catch { /* already closed */ }
+    }
+    send(msg) {
+        if (this.ws.readyState === WebSocket.OPEN)
+            this.ws.send(JSON.stringify(msg));
+    }
+    onMessage(raw) {
+        const msg = JSON.parse(raw);
+        switch (msg.t) {
+            case 'error':
+                this.status = 'error';
+                this.error = String(msg.msg ?? 'server error');
+                return;
+            case 'match': {
+                this.setup = msg;
+                // The caller installs characters/stage, then calls begin().
+                return;
+            }
+            case 'i': {
+                const k = msg.k;
+                const v = msg.v;
+                this.oppInputs[k] = v;
+                while (this.oppInputs[this.oppKnown] !== undefined)
+                    this.oppKnown++;
+                // Misprediction? Mark the earliest tick that must be re-simulated.
+                if (k < this.localTick && this.usedOpp[k] !== v) {
+                    this.resimFrom = this.resimFrom < 0 ? k : Math.min(this.resimFrom, k);
+                }
+                return;
+            }
+            case 'result': {
+                this.result = msg;
+                this.status = 'done';
+                return;
+            }
+            default:
+                return;
+        }
+    }
+    /** Call after installing characters for the pinned setup. */
+    begin() {
+        const s = this.setup;
+        this.game = createGameState(s.seed);
+        // First `delay` ticks are neutral by convention — symmetric with the peer.
+        for (let k = 0; k < s.delay; k++) {
+            this.myInputs[k] = 0;
+            this.send({ t: 'i', k, v: 0 });
+        }
+        this.status = 'playing';
+    }
+    /** My side's fighter index (for HUD orientation etc.). */
+    get side() { return this.setup?.side ?? 0; }
+    lastKnownOpp() {
+        return this.oppKnown > 0 ? this.oppInputs[this.oppKnown - 1] : 0;
+    }
+    stepTick(t, mine, opp) {
+        const g = this.game;
+        step(g, this.side === 0 ? [mine, opp] : [opp, mine]);
+    }
+    /**
+     * Advance one tick with the local pad input. Renders can always use
+     * `this.game`; a false return means we stalled waiting on the opponent.
+     */
+    frame(pad) {
+        if (!this.game || this.status !== 'playing')
+            return false;
+        const s = this.setup;
+        // Apply pending rollback before stepping forward.
+        if (this.resimFrom >= 0 && this.resimFrom < this.localTick) {
+            const from = this.resimFrom;
+            restore(this.game, this.snaps[from % SNAP_RING]);
+            for (let t = from; t < this.localTick; t++) {
+                const opp = this.oppInputs[t] ?? this.lastKnownOpp();
+                this.usedOpp[t] = opp;
+                this.snaps[t % SNAP_RING] = snapshot(this.game);
+                this.stepTick(t, this.myInputs[t] ?? 0, opp);
+            }
+        }
+        this.resimFrom = -1;
+        // Desync checkpoints — CONFIRMED ticks only. A hash taken from a
+        // predicted state would falsely flag *us* as the deviator when a later
+        // correction rewrites it (the snapshot ring holds the state BEFORE each
+        // tick, which is exactly the server's "after k steps" re-sim state).
+        //
+        // Two hard-won bounds (both false-flagged real matches when violated):
+        //  · k ≤ localTick-1 — tick k's snapshot only exists once k was STEPPED;
+        //    at k == localTick the ring slot still holds tick k-128's state.
+        //  · k ≥ localTick-100 — older slots have been overwritten by the ring.
+        //    Checkpoints that scrolled out are skipped, never hashed stale.
+        const confirmed = Math.min(this.localTick - 1, this.oppKnown);
+        if (this.nextHashTick < this.localTick - 100) {
+            this.nextHashTick = Math.max(this.nextHashTick, Math.floor((this.localTick - 100) / HASH_EVERY) * HASH_EVERY);
+        }
+        while (this.nextHashTick + HASH_EVERY <= confirmed) {
+            this.nextHashTick += HASH_EVERY;
+            const snapAt = this.snaps[this.nextHashTick % SNAP_RING];
+            if (snapAt)
+                this.send({ t: 'h', k: this.nextHashTick, x: stateHash(snapAt) });
+        }
+        // GGPO throttle: never simulate too far past the opponent's confirmed inputs.
+        if (this.localTick - this.oppKnown > MAX_AHEAD) {
+            this.stalled++;
+            return false;
+        }
+        this.stalled = 0;
+        const t = this.localTick;
+        // Schedule + send my input for t+delay (both sides do this — symmetric).
+        if (this.myInputs[t + s.delay] === undefined) {
+            this.myInputs[t + s.delay] = pad;
+            this.send({ t: 'i', k: t + s.delay, v: pad });
+        }
+        const mine = this.myInputs[t] ?? 0;
+        const opp = this.oppInputs[t] ?? this.lastKnownOpp();
+        this.usedOpp[t] = opp;
+        this.snaps[t % SNAP_RING] = snapshot(this.game);
+        this.stepTick(t, mine, opp);
+        this.localTick++;
+        if (this.game.phase === 3 /* Phase.MatchOver */ && !this.overSent) {
+            this.overSent = true;
+            this.send({ t: 'over', k: this.localTick });
+        }
+        return true;
+    }
+}
+
 // ---- client/src/fx.js ----
 /**
  * Cosmetic FX layer — particles, glows, animated outlines. Client-only eye
@@ -3118,6 +3328,519 @@ const marchingOutline = (ctx, x, y, w, h, tick, color = '#ffd166', dash = 10, sp
     ctx.restore();
 };
 
+// ---- client/src/flags.js ----
+/**
+ * Animated country flags for the character-select corners.
+ *
+ * PLAYER flag  — derived from the DEVICE region (timezone first, then locale).
+ *   This is client-only and needs no permission prompt or network round-trip,
+ *   unlike navigator.geolocation (which yields raw coordinates that would then
+ *   need an external reverse-geocode — off the table for an offline, no-CDN
+ *   bundle and a needless privacy ask on a menu). If no region can be inferred
+ *   the flag falls back to WE ARE ANONYMOUS.
+ * OPPONENT flag — resolved from auth/Supabase user metadata via
+ *   `resolveOpponentCountry()`. No auth layer exists yet, so it returns null
+ *   (→ ANONYMOUS) today; when Supabase lands, point that one function at
+ *   `user.user_metadata.country` (or set it explicitly with
+ *   `setOpponentCountry`). Everything downstream already works.
+ *
+ * Rendering is 100% procedural on the 2D canvas — no image assets, no CDN.
+ * Each flag is drawn once to an offscreen canvas (a declarative FlagSpec
+ * interpreter) and then blitted as a WAVING CLOTH: vertical slices offset by a
+ * travelling sine, with fold shading, a hoist pole, and a one-shot linear
+ * wipe-in when it first appears. DEPENDENCY-FREE LEAF (imports nothing from the
+ * client) so it can sit before ui.ts in the bundle.
+ */
+const FLAG_FONT = "'AgentDisplay', Impact, 'Arial Black', sans-serif";
+// All coordinates below are FRACTIONS of the flag's width/height.
+const FLAGS = {
+    PH: {
+        name: 'PHILIPPINES',
+        h: ['#0038A8', '#CE1126'],
+        overlays: [{ t: 'triangleHoist', c: '#FFFFFF', w: 0.42 }, { t: 'phSun', c: '#FCD116' }],
+    },
+    US: {
+        name: 'UNITED STATES',
+        h: ['#B22234', '#fff', '#B22234', '#fff', '#B22234', '#fff', '#B22234',
+            '#fff', '#B22234', '#fff', '#B22234', '#fff', '#B22234'],
+        overlays: [{ t: 'usCanton' }],
+    },
+    JP: { name: 'JAPAN', bg: '#fff', overlays: [{ t: 'disc', c: '#BC002D', cx: 0.5, cy: 0.5, r: 0.3 }] },
+    CN: {
+        name: 'CHINA', bg: '#DE2910',
+        overlays: [
+            { t: 'star', c: '#FFDE00', cx: 0.16, cy: 0.26, r: 0.14 },
+            { t: 'star', c: '#FFDE00', cx: 0.32, cy: 0.14, r: 0.05 },
+            { t: 'star', c: '#FFDE00', cx: 0.38, cy: 0.26, r: 0.05 },
+            { t: 'star', c: '#FFDE00', cx: 0.38, cy: 0.42, r: 0.05 },
+            { t: 'star', c: '#FFDE00', cx: 0.32, cy: 0.54, r: 0.05 },
+        ],
+    },
+    KR: {
+        name: 'KOREA', bg: '#fff',
+        overlays: [
+            { t: 'disc', c: '#CD2E3A', cx: 0.5, cy: 0.5, r: 0.2 }, // taeguk (top half red — simplified)
+            { t: 'disc', c: '#0047A0', cx: 0.5, cy: 0.58, r: 0.1 },
+            { t: 'disc', c: '#CD2E3A', cx: 0.5, cy: 0.42, r: 0.1 },
+        ],
+    },
+    GB: {
+        name: 'UNITED KINGDOM', bg: '#012169',
+        overlays: [
+            { t: 'saltire', c: '#FFFFFF', thick: 0.18 },
+            { t: 'saltire', c: '#C8102E', thick: 0.08 },
+            { t: 'cross', c: '#FFFFFF', thick: 0.22 },
+            { t: 'cross', c: '#C8102E', thick: 0.12 },
+        ],
+    },
+    IN: {
+        name: 'INDIA', h: ['#FF9933', '#fff', '#138808'],
+        overlays: [{ t: 'chakra', c: '#000080', cx: 0.5, cy: 0.5, r: 0.13 }],
+    },
+    VN: { name: 'VIETNAM', bg: '#DA251D', overlays: [{ t: 'star', c: '#FFFF00', cx: 0.5, cy: 0.5, r: 0.26 }] },
+    FR: { name: 'FRANCE', v: ['#0055A4', '#fff', '#EF4135'] },
+    IT: { name: 'ITALY', v: ['#009246', '#fff', '#CE2B37'] },
+    IE: { name: 'IRELAND', v: ['#169B62', '#fff', '#FF883E'] },
+    BE: { name: 'BELGIUM', v: ['#000000', '#FDDA24', '#EF3340'] },
+    DE: { name: 'GERMANY', h: ['#000000', '#DD0000', '#FFCE00'] },
+    ES: { name: 'SPAIN', h: ['#AA151B', '#F1BF00', '#F1BF00', '#AA151B'] },
+    NL: { name: 'NETHERLANDS', h: ['#AE1C28', '#fff', '#21468B'] },
+    RU: { name: 'RUSSIA', h: ['#fff', '#0039A6', '#D52B1E'] },
+    ID: { name: 'INDONESIA', h: ['#FF0000', '#fff'] },
+    PL: { name: 'POLAND', h: ['#fff', '#DC143C'] },
+    UA: { name: 'UKRAINE', h: ['#0057B7', '#FFD700'] },
+    TH: { name: 'THAILAND', h: ['#A51931', '#F4F5F8', '#2D2A4A', '#2D2A4A', '#F4F5F8', '#A51931'] },
+    SG: {
+        name: 'SINGAPORE', h: ['#EF3340', '#fff'],
+        overlays: [{ t: 'disc', c: '#fff', cx: 0.2, cy: 0.25, r: 0.13 }, { t: 'disc', c: '#EF3340', cx: 0.24, cy: 0.25, r: 0.11 }],
+    },
+    MY: {
+        name: 'MALAYSIA',
+        h: ['#CC0001', '#fff', '#CC0001', '#fff', '#CC0001', '#fff', '#CC0001',
+            '#fff', '#CC0001', '#fff', '#CC0001', '#fff', '#CC0001', '#fff'],
+        overlays: [{ t: 'rect', c: '#010066', x: 0, y: 0, w: 0.5, h: 0.5 }],
+    },
+    BR: {
+        name: 'BRAZIL', bg: '#009C3B',
+        overlays: [{ t: 'disc', c: '#FFDF00', cx: 0.5, cy: 0.5, r: 0.28 }, { t: 'disc', c: '#002776', cx: 0.5, cy: 0.5, r: 0.16 }],
+    },
+    MX: { name: 'MEXICO', v: ['#006847', '#fff', '#CE1126'], overlays: [{ t: 'disc', c: '#8B5A2B', cx: 0.5, cy: 0.5, r: 0.08 }] },
+    CA: { name: 'CANADA', v: ['#FF0000', '#fff', '#FF0000'], overlays: [{ t: 'star', c: '#FF0000', cx: 0.5, cy: 0.5, r: 0.16, points: 6 }] },
+    AU: {
+        name: 'AUSTRALIA', bg: '#00008B',
+        overlays: [
+            { t: 'rect', c: '#012169', x: 0, y: 0, w: 0.4, h: 0.5 },
+            { t: 'cross', c: '#fff', thick: 0.06, cx: 0.2 },
+            { t: 'star', c: '#fff', cx: 0.2, cy: 0.75, r: 0.09, points: 7 },
+            { t: 'star', c: '#fff', cx: 0.72, cy: 0.4, r: 0.06 },
+            { t: 'star', c: '#fff', cx: 0.82, cy: 0.62, r: 0.06 },
+        ],
+    },
+    SE: { name: 'SWEDEN', bg: '#006AA7', overlays: [{ t: 'cross', c: '#FECC00', thick: 0.14, cx: 0.32 }] },
+};
+// The fallback "no location" flag: a dark banner with a theatrical mask, so a
+// player with no resolvable region still reads as a deliberate faction, not a
+// bug. Rendered by a dedicated routine (masks don't fit the stripe interpreter).
+const ANON_KEY = '__ANON__';
+const hexToRgb = (hex) => {
+    let h = hex.replace('#', '');
+    if (h.length === 3)
+        h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    const n = parseInt(h, 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+};
+const drawStarShape = (ctx, cx, cy, r, points, rot, color) => {
+    ctx.beginPath();
+    for (let i = 0; i < points * 2; i++) {
+        const rad = i % 2 === 0 ? r : r * 0.42;
+        const a = rot + (Math.PI * i) / points;
+        const x = cx + Math.cos(a) * rad, y = cy + Math.sin(a) * rad;
+        if (i === 0)
+            ctx.moveTo(x, y);
+        else
+            ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+};
+/** Paint a FlagSpec into a W×H context (fractional coords → pixels). */
+const paintSpec = (ctx, W, H, spec) => {
+    if (spec.bg) {
+        ctx.fillStyle = spec.bg;
+        ctx.fillRect(0, 0, W, H);
+    }
+    if (spec.h) {
+        const bh = H / spec.h.length;
+        spec.h.forEach((c, i) => { ctx.fillStyle = c; ctx.fillRect(0, Math.round(i * bh), W, Math.ceil(bh) + 1); });
+    }
+    if (spec.v) {
+        const bw = W / spec.v.length;
+        spec.v.forEach((c, i) => { ctx.fillStyle = c; ctx.fillRect(Math.round(i * bw), 0, Math.ceil(bw) + 1, H); });
+    }
+    for (const o of spec.overlays ?? []) {
+        switch (o.t) {
+            case 'disc':
+                ctx.fillStyle = o.c;
+                ctx.beginPath();
+                ctx.arc(o.cx * W, o.cy * H, o.r * H, 0, Math.PI * 2);
+                ctx.fill();
+                break;
+            case 'rect':
+                ctx.fillStyle = o.c;
+                ctx.fillRect(o.x * W, o.y * H, o.w * W, o.h * H);
+                break;
+            case 'triangleHoist':
+                ctx.fillStyle = o.c;
+                ctx.beginPath();
+                ctx.moveTo(0, 0);
+                ctx.lineTo(o.w * W, H / 2);
+                ctx.lineTo(0, H);
+                ctx.closePath();
+                ctx.fill();
+                break;
+            case 'star':
+                drawStarShape(ctx, o.cx * W, o.cy * H, o.r * H, o.points ?? 5, o.rot ?? -Math.PI / 2, o.c);
+                break;
+            case 'cross':
+                ctx.fillStyle = o.c;
+                ctx.fillRect(0, H / 2 - (o.thick * H) / 2, W, o.thick * H); // horizontal
+                ctx.fillRect((o.cx ?? 0.5) * W - (o.thick * W) / 2, 0, o.thick * W, H); // vertical
+                break;
+            case 'saltire': {
+                ctx.save();
+                ctx.strokeStyle = o.c;
+                ctx.lineWidth = o.thick * H;
+                ctx.beginPath();
+                ctx.moveTo(0, 0);
+                ctx.lineTo(W, H);
+                ctx.moveTo(W, 0);
+                ctx.lineTo(0, H);
+                ctx.stroke();
+                ctx.restore();
+                break;
+            }
+            case 'chakra': {
+                const x = o.cx * W, y = o.cy * H, r = o.r * H;
+                ctx.strokeStyle = o.c;
+                ctx.lineWidth = Math.max(1, r * 0.12);
+                ctx.beginPath();
+                ctx.arc(x, y, r, 0, Math.PI * 2);
+                ctx.stroke();
+                for (let i = 0; i < 24; i++) {
+                    const a = (Math.PI * 2 * i) / 24;
+                    ctx.beginPath();
+                    ctx.moveTo(x, y);
+                    ctx.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r);
+                    ctx.stroke();
+                }
+                break;
+            }
+            case 'usCanton': {
+                const cw = W * 0.4, chh = H * 0.54;
+                ctx.fillStyle = '#3C3B6E';
+                ctx.fillRect(0, 0, cw, chh);
+                ctx.fillStyle = '#fff';
+                for (let ry = 0; ry < 5; ry++) {
+                    for (let rx = 0; rx < 6; rx++) {
+                        const sx = (cw / 6) * (rx + 0.5) + (ry % 2) * (cw / 12);
+                        if (sx > cw)
+                            continue;
+                        ctx.beginPath();
+                        ctx.arc(sx, (chh / 5) * (ry + 0.5), Math.max(0.6, W * 0.012), 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }
+                break;
+            }
+            case 'phSun': {
+                const cx = W * 0.14, cy = H * 0.5, r = H * 0.12;
+                ctx.fillStyle = o.c;
+                ctx.beginPath();
+                ctx.arc(cx, cy, r, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.strokeStyle = o.c;
+                ctx.lineWidth = Math.max(1, r * 0.18);
+                for (let i = 0; i < 8; i++) {
+                    const a = (Math.PI * 2 * i) / 8;
+                    ctx.beginPath();
+                    ctx.moveTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+                    ctx.lineTo(cx + Math.cos(a) * r * 1.9, cy + Math.sin(a) * r * 1.9);
+                    ctx.stroke();
+                }
+                for (const [sx, sy] of [[0.05, 0.12], [0.05, 0.88], [0.34, 0.5]]) {
+                    drawStarShape(ctx, sx * W, sy * H, H * 0.05, 5, -Math.PI / 2, o.c);
+                }
+                break;
+            }
+        }
+    }
+};
+/** The ANONYMOUS banner (mask + text) — its own routine (not a FlagSpec). */
+const paintAnon = (ctx, W, H) => {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#161226');
+    g.addColorStop(1, '#0a0712');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    // Faint circuit-ish diagonal hatch for texture.
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    for (let x = -H; x < W; x += 14) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x + H, H);
+        ctx.stroke();
+    }
+    // Stylized mask: pale face, hollow eyes, upturned moustache, goatee.
+    const cx = W * 0.5, cy = H * 0.46, fw = W * 0.26, fh = H * 0.5;
+    ctx.fillStyle = '#EDE6D6';
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - fh * 0.5);
+    ctx.quadraticCurveTo(cx + fw * 0.5, cy - fh * 0.3, cx + fw * 0.42, cy + fh * 0.1);
+    ctx.quadraticCurveTo(cx + fw * 0.28, cy + fh * 0.5, cx, cy + fh * 0.55);
+    ctx.quadraticCurveTo(cx - fw * 0.28, cy + fh * 0.5, cx - fw * 0.42, cy + fh * 0.1);
+    ctx.quadraticCurveTo(cx - fw * 0.5, cy - fh * 0.3, cx, cy - fh * 0.5);
+    ctx.fill();
+    // Eyes.
+    ctx.fillStyle = '#1a1526';
+    for (const s of [-1, 1]) {
+        ctx.beginPath();
+        ctx.ellipse(cx + s * fw * 0.2, cy - fh * 0.08, fw * 0.12, fh * 0.09, s * 0.3, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    // Moustache (upturned) + goatee.
+    ctx.strokeStyle = '#1a1526';
+    ctx.lineWidth = Math.max(1.5, W * 0.012);
+    ctx.lineCap = 'round';
+    for (const s of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(cx, cy + fh * 0.14);
+        ctx.quadraticCurveTo(cx + s * fw * 0.28, cy + fh * 0.18, cx + s * fw * 0.34, cy + fh * 0.02);
+        ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + fh * 0.2);
+    ctx.lineTo(cx, cy + fh * 0.4);
+    ctx.stroke();
+    // Smile.
+    ctx.beginPath();
+    ctx.moveTo(cx - fw * 0.16, cy + fh * 0.2);
+    ctx.quadraticCurveTo(cx, cy + fh * 0.32, cx + fw * 0.16, cy + fh * 0.2);
+    ctx.stroke();
+};
+// -------------------------------------------------------- offscreen flag cache
+const FW = 192, FH = 120;
+const flagCanvasCache = new Map();
+const flagCanvas = (key) => {
+    let c = flagCanvasCache.get(key);
+    if (c)
+        return c;
+    c = document.createElement('canvas');
+    c.width = FW;
+    c.height = FH;
+    const cx = c.getContext('2d');
+    if (key === ANON_KEY)
+        paintAnon(cx, FW, FH);
+    else
+        paintSpec(cx, FW, FH, FLAGS[key]);
+    flagCanvasCache.set(key, c);
+    return c;
+};
+// A PORTRAIT version for the hanging medieval banner. Country flags are the
+// landscape design rotated 90° (hoist → top), which is exactly how vertical
+// "Hochformat" flags are hung. The ANONYMOUS mask is painted upright directly
+// (rotating a face would tip it on its side).
+const BW = 120, BH = 260;
+const bannerCanvasCache = new Map();
+const bannerCanvas = (key) => {
+    let c = bannerCanvasCache.get(key);
+    if (c)
+        return c;
+    c = document.createElement('canvas');
+    c.width = BW;
+    c.height = BH;
+    const cx = c.getContext('2d');
+    if (key === ANON_KEY) {
+        paintAnon(cx, BW, BH);
+    }
+    else {
+        const src = flagCanvas(key);
+        cx.save();
+        cx.translate(BW / 2, BH / 2);
+        cx.rotate(Math.PI / 2); // 90° clockwise → hoist edge lands at the top
+        cx.drawImage(src, -BH / 2, -BW / 2, BH, BW);
+        cx.restore();
+    }
+    bannerCanvasCache.set(key, c);
+    return c;
+};
+const flagName = (key) => key && key !== ANON_KEY && FLAGS[key] ? FLAGS[key].name : 'WE ARE ANONYMOUS';
+// ---------------------------------------------------------- country detection
+// A compact timezone → ISO-3166-1 map. The device's timezone tracks physical
+// location better than its UI language, so it's tried first.
+const TZ_COUNTRY = {
+    'Asia/Manila': 'PH', 'Asia/Tokyo': 'JP', 'Asia/Shanghai': 'CN', 'Asia/Hong_Kong': 'CN',
+    'Asia/Seoul': 'KR', 'Asia/Kolkata': 'IN', 'Asia/Calcutta': 'IN', 'Asia/Jakarta': 'ID',
+    'Asia/Bangkok': 'TH', 'Asia/Ho_Chi_Minh': 'VN', 'Asia/Saigon': 'VN', 'Asia/Singapore': 'SG',
+    'Asia/Kuala_Lumpur': 'MY', 'Asia/Dubai': 'AE', 'Asia/Karachi': 'PK',
+    'Europe/London': 'GB', 'Europe/Paris': 'FR', 'Europe/Berlin': 'DE', 'Europe/Madrid': 'ES',
+    'Europe/Rome': 'IT', 'Europe/Amsterdam': 'NL', 'Europe/Brussels': 'BE', 'Europe/Dublin': 'IE',
+    'Europe/Moscow': 'RU', 'Europe/Kyiv': 'UA', 'Europe/Kiev': 'UA', 'Europe/Warsaw': 'PL',
+    'Europe/Stockholm': 'SE', 'Europe/Lisbon': 'PT',
+    'America/New_York': 'US', 'America/Chicago': 'US', 'America/Denver': 'US', 'America/Los_Angeles': 'US',
+    'America/Phoenix': 'US', 'America/Anchorage': 'US', 'Pacific/Honolulu': 'US',
+    'America/Toronto': 'CA', 'America/Vancouver': 'CA', 'America/Mexico_City': 'MX', 'America/Sao_Paulo': 'BR',
+    'Australia/Sydney': 'AU', 'Australia/Melbourne': 'AU', 'Australia/Perth': 'AU', 'Pacific/Auckland': 'NZ',
+};
+/** Best-effort ISO country from the device (timezone, then locale). Null if unknown. */
+const detectDeviceCountry = () => {
+    try {
+        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        if (tz && TZ_COUNTRY[tz])
+            return TZ_COUNTRY[tz];
+    }
+    catch { /* Intl unavailable — fall through */ }
+    // Locale region, e.g. "en-PH" → "PH".
+    const langs = [navigator.language, ...(navigator.languages ?? [])];
+    for (const l of langs) {
+        const m = /[-_]([A-Za-z]{2})$/.exec(l ?? '');
+        if (m)
+            return m[1].toUpperCase();
+    }
+    return null;
+};
+/**
+ * Opponent region from auth/Supabase user metadata. No auth layer exists yet,
+ * so this reads a conventional global that future auth code can populate
+ * (`globalThis.__afOpponent = { country: 'JP' }`) and otherwise returns null
+ * (→ ANONYMOUS). When Supabase lands, resolve `user.user_metadata.country`
+ * here (or call setOpponentCountry after sign-in).
+ */
+const resolveOpponentCountry = () => {
+    const meta = globalThis.__afOpponent;
+    const c = meta?.country;
+    return c && (c === '' ? null : c.toUpperCase()) || null;
+};
+// ------------------------------------------------------------ resolved state
+// side 0 = player (device), side 1 = opponent (auth). null country → ANONYMOUS.
+// `override === undefined` means "auto-resolve"; an explicit set (incl. null)
+// sticks and wins over auto-resolution.
+let playerOverride;
+let opponentOverride;
+let detectedPlayer; // device detection, cached once
+const revealAge = [0, 0]; // frames since each side's current flag appeared
+const shownKey = ['', '']; // last drawn key per side — detects changes → replays wipe
+const keyFor = (side) => {
+    let c;
+    if (side === 0) {
+        if (playerOverride !== undefined)
+            c = playerOverride;
+        else {
+            if (detectedPlayer === undefined)
+                detectedPlayer = detectDeviceCountry();
+            c = detectedPlayer;
+        }
+    }
+    else {
+        c = opponentOverride !== undefined ? opponentOverride : resolveOpponentCountry();
+    }
+    return c && (FLAGS[c] || c === ANON_KEY) ? c : ANON_KEY;
+};
+/** Manual overrides (testing, or wiring real data in). Pass null to force ANONYMOUS. */
+const setPlayerCountry = (c) => { playerOverride = c; };
+const setOpponentCountry = (c) => { opponentOverride = c; };
+// ------------------------------------------------------------------- drawing
+/**
+ * Draw the animated flag for `side` as a MEDIEVAL HANGING BANNER filling the
+ * box (x,y,w,h): a crossbar with finials at the top, the cloth hanging
+ * straight down (portrait, filling the tall corner), rippling side-to-side
+ * with a travelling wave, tapering to a point at the bottom. A one-shot
+ * top→down wipe-in plays when it first appears. `mirror` just flips the sway
+ * direction so the two corners breathe in opposition.
+ */
+const drawFlag = (ctx, side, x, y, w, h, tick, mirror = false) => {
+    const key = keyFor(side);
+    if (key !== shownKey[side]) {
+        shownKey[side] = key;
+        revealAge[side] = 0;
+    }
+    const reveal = Math.min(1, revealAge[side] / 30);
+    revealAge[side]++;
+    const banner = bannerCanvas(key);
+    const name = flagName(key);
+    const cxMid = x + w / 2;
+    // The faction / country name rides across the very top; the crossbar and the
+    // long cloth take everything below it.
+    ctx.save();
+    ctx.font = `700 ${name.length > 13 ? 10 : 13}px ${FLAG_FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.globalAlpha = reveal;
+    ctx.fillStyle = '#000000aa';
+    ctx.fillText(name, cxMid + 1, y + 12);
+    ctx.fillStyle = key === ANON_KEY ? '#c9c4ff' : '#ffe9b0';
+    ctx.fillText(name, cxMid, y + 11);
+    ctx.restore();
+    const clothW = Math.min(w - 8, 104);
+    const clothX0 = cxMid - clothW / 2;
+    const barY = y + 20;
+    const clothTop = barY + 6;
+    const clothH = Math.max(120, y + h - clothTop - 4);
+    // Crossbar with metallic sheen + two finial knobs, plus short hanging cords
+    // down to the banner's top corners.
+    const barX0 = clothX0 - 12, barX1 = clothX0 + clothW + 12;
+    const bg = ctx.createLinearGradient(0, barY, 0, barY + 6);
+    bg.addColorStop(0, '#e8ce80');
+    bg.addColorStop(0.5, '#a97b2e');
+    bg.addColorStop(1, '#6b4c17');
+    ctx.fillStyle = bg;
+    ctx.fillRect(barX0, barY, barX1 - barX0, 6);
+    ctx.fillStyle = '#f0d27a';
+    for (const bx of [barX0, barX1]) {
+        ctx.beginPath();
+        ctx.arc(bx, barY + 3, 4.5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.strokeStyle = '#00000055';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(clothX0 + 2, barY + 5);
+    ctx.lineTo(clothX0 + 2, clothTop);
+    ctx.moveTo(clothX0 + clothW - 2, barY + 5);
+    ctx.lineTo(clothX0 + clothW - 2, clothTop);
+    ctx.stroke();
+    // Hanging cloth: horizontal slices, each swayed by a wave that travels DOWN
+    // (amplitude grows toward the free bottom), shaded to read as folds, and the
+    // last stretch tapered to a central point (the pennant tail).
+    const rows = Math.round(clothH / 3);
+    const rowH = clothH / rows;
+    const swayDir = mirror ? -1 : 1;
+    const taperStart = 0.82;
+    for (let r = 0; r < rows; r++) {
+        const rt = r / (rows - 1); // 0 at crossbar → 1 at the tail tip
+        if (rt > reveal)
+            break; // top→down wipe-in
+        const phase = tick * 0.11 - rt * 3.2;
+        const taperK = rt <= taperStart ? 1 : Math.max(0, (1 - rt) / (1 - taperStart));
+        const drawW = clothW * (rt <= taperStart ? 1 : taperK);
+        const amp = clothW * 0.14 * rt * (rt <= taperStart ? 1 : taperK);
+        const offX = Math.sin(phase) * amp * swayDir;
+        const dstX = clothX0 + (clothW - drawW) / 2 + offX;
+        const dstY = clothTop + r * rowH;
+        ctx.drawImage(banner, 0, rt * (BH - 1), BW, BH / rows + 1, dstX, dstY, drawW, rowH + 1);
+        const shade = Math.sin(phase);
+        ctx.fillStyle = shade < 0 ? `rgba(0,0,0,${-shade * 0.3})` : `rgba(255,255,255,${shade * 0.12})`;
+        ctx.fillRect(dstX, dstY, drawW, rowH + 1);
+    }
+};
+// Console hooks: preview any flag without changing device settings.
+Object.assign(globalThis, {
+    afSetPlayerCountry: (c) => { setPlayerCountry(c); },
+    afSetOpponentCountry: (c) => { setOpponentCountry(c); },
+    afDetectCountry: () => detectDeviceCountry(),
+});
+
 // ---- client/src/audio.js ----
 /**
  * Sound playback — Web Audio API, no dependency.
@@ -3334,6 +4057,8 @@ let uiKit = null;
 let stageAsset = null;
 let logoImg = null;
 let logoBBox = null;
+let gameLogoImg = null;
+let gameLogoBBox = null;
 let bgVideo = null;
 const setUiKit = (k) => { uiKit = k; };
 const setStageAsset = (s) => { stageAsset = s; };
@@ -3344,6 +4069,11 @@ const setStageAsset = (s) => { stageAsset = s; };
 const setLogo = (img) => {
     logoImg = img;
     logoBBox = img ? opaqueBBox(img) : null;
+};
+// Same crop-to-opaque-bbox treatment for the compact in-game badge logo.
+const setGameLogo = (img) => {
+    gameLogoImg = img;
+    gameLogoBBox = img ? opaqueBBox(img) : null;
 };
 const setBgVideo = (v) => { bgVideo = v; };
 /**
@@ -3795,6 +4525,25 @@ const drawTimer = (ctx, secs, tick) => {
     label(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, cy + 12, 34, urgent ? HP_DANGER : '#ffffff');
     ctx.restore();
 };
+/**
+ * Compact brand badge centered below the fight timer. Crops to the art's
+ * opaque bbox (same reasoning as the title logo — the source SVG carries
+ * transparent padding that would otherwise show as an odd gap) and fits it to
+ * a modest watermark width, scaled to 70% per the requested size reduction.
+ * Silently omitted if the asset hasn't loaded (fire-and-forget at boot).
+ */
+const drawGameLogo = (ctx, y) => {
+    if (!gameLogoImg || gameLogoImg.naturalWidth === 0)
+        return;
+    const box = gameLogoBBox ?? { x: 0, y: 0, w: gameLogoImg.naturalWidth, h: gameLogoImg.naturalHeight };
+    const BASE_W = 100; // natural badge width before the requested reduction
+    const w = BASE_W * 0.7;
+    const h = w * (box.h / box.w);
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, VW / 2 - w / 2, y, w, h);
+    ctx.restore();
+};
 const drawHud = (ctx, g, rosters, fx, tags) => {
     for (const i of [0, 1]) {
         const f = g.fighters[i];
@@ -3807,6 +4556,7 @@ const drawHud = (ctx, g, rosters, fx, tags) => {
         drawMeter(ctx, i, f.meter, g.tick);
     }
     drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
+    drawGameLogo(ctx, 106); // just under the timer badge (which bottoms out ~y=102)
     // Combo counter: punches in on each new hit (re-triggered via comboAge
     // reset in main.ts whenever comboHits increases), settles with overshoot.
     if (fx.comboOwner >= 0 && fx.comboHits >= 2) {
@@ -3890,8 +4640,9 @@ const drawTitle = (ctx, rosters, tick, menu) => {
     const rows = [
         ['cpu', `VS AGENT  ·  LV ${menu.cpuLevel}`],
         ['2p', '2 PLAYERS'],
+        ['online', 'ONLINE  ·  HUMANS & AGENTS'],
     ];
-    const menuY0 = barY + 40;
+    const menuY0 = barY + 30;
     rows.forEach(([m, txt], k) => {
         const y = menuY0 + k * 34;
         const on = menu.mode === m;
@@ -3900,13 +4651,13 @@ const drawTitle = (ctx, rosters, tick, menu) => {
             display(ctx, txt, cx, y, 24, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
             // A small bouncing arrow marker to the left, arcade-menu style.
             const bounce = 3 * Math.sin(tick / 9);
-            label(ctx, '▶', cx - 112 + bounce, y, 18, GOLD_LT);
+            label(ctx, '▶', cx - 148 + bounce, y, 18, GOLD_LT);
         }
         else {
             label(ctx, txt, cx, y, 17, '#ffffff70');
         }
     });
-    label(ctx, '↑ / ↓  SELECT       ENTER  START', cx, menuY0 + 62, 13, '#ffffffaa');
+    label(ctx, '↑ / ↓  SELECT       ENTER  START', cx, menuY0 + rows.length * 34 + 6, 13, '#ffffffaa');
     label(ctx, 'MILESTONE 4 · AI + LEVELING BUILD', cx, VH - 12, 10, '#ffffff55');
 };
 /**
@@ -4109,6 +4860,17 @@ const drawSelect = (ctx, rosters, cursors, locked, tick, cpuInfo) => {
     // each cursor is hovering, with stats derived from real bundle config.
     const cardW = 448, cardH = 188;
     const cardY = Math.max(gy + rows * (cell + gap + 20) + 6, VH - cardH - 30);
+    // Animated hanging BANNERS in the empty side-margins beside the grid: the
+    // player's (device region) on the left, the opponent's (auth metadata) on
+    // the right — both fall back to a WE ARE ANONYMOUS banner when unknown. They
+    // hang the full height from the top down to just above the fighter cards.
+    const flagBoxW = gx - 16;
+    if (flagBoxW >= 72) {
+        const flagY = 74;
+        const flagH = cardY - flagY - 6;
+        drawFlag(ctx, 0, 8, flagY, flagBoxW, flagH, tick, false);
+        drawFlag(ctx, 1, gx + gridW + 8, flagY, flagBoxW, flagH, tick, true);
+    }
     const p2Header = cpuInfo ? `AGENT · LV ${cpuInfo.cpuLevel}` : 'PLAYER 2';
     const cardHeaders = ['PLAYER 1', p2Header];
     for (const i of [0, 1]) {
@@ -4229,6 +4991,7 @@ xp) => {
 
 
 
+
 const TICK_MS = 1000 / TICKS_PER_SEC;
 // ---------------------------------------------------------------- input
 const keys = new Set();
@@ -4264,6 +5027,8 @@ const pollPad = (map) => {
 };
 let screen = 'loading';
 let mode = 'cpu';
+let net = null;
+let netInstalled = false;
 let uiTick = 0;
 let allRosters = [];
 let picks = [0, 0];
@@ -4313,6 +5078,7 @@ const boot = async () => {
         // important on mobile, where blocking boot on ~20MB of art would stall
         // first paint for seconds on a slow connection.
         void loadLogo().then(setLogo);
+        void loadGameLogo().then(setGameLogo);
         setBgVideo(loadBgVideo('/assets/video/bg_video_main_af.mp4'));
         stageIds = await listStages();
         stageAssets = await Promise.all(stageIds.map(loadStage));
@@ -4331,6 +5097,60 @@ const boot = async () => {
         loadError = e.message;
     }
 };
+/** Reset per-match juice/announce state (shared by local + online starts). */
+const resetMatchFx = (g) => {
+    cam = { x: STAGE.widthPx / 2 - VW / 2 / 1.5, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5 };
+    updateCamera(g);
+    prevHealth = [g.fighters[0].health, g.fighters[1].health];
+    prevConnected = [0, 0];
+    prevPhase = g.phase;
+    fx.flash = [1, 1];
+    fx.comboOwner = -1;
+    fx.comboHits = 0;
+    fx.comboAge = 0;
+    fx.announce = `ROUND ${g.roundNum + 1}`;
+    fx.announceAge = 0;
+    sparks = [];
+    shake = 0;
+    hurryPlayed = false;
+    resetFighterTrails();
+};
+/** Queue for an online match (ADR 0003): connect, pin bundle hash, wait. */
+const startOnline = () => {
+    const roster = allRosters[picks[0]];
+    // ?ws=ws://host:port overrides the default match server (deploys, dev).
+    const url = new URLSearchParams(location.search).get('ws')
+        ?? `ws://${location.hostname}:8477`;
+    net = new NetSession(url, `PLAYER-${(profile.wins + profile.losses) % 1000}`, roster.id, roster.bundle.versionHash);
+    netInstalled = false;
+    screen = 'online';
+};
+/** Match setup arrived — install the pinned characters/stage and begin. */
+const installOnlineMatch = () => {
+    const s = net.setup;
+    const r0 = allRosters.find((r) => r.id === s.chars[0].id);
+    const r1 = allRosters.find((r) => r.id === s.chars[1].id);
+    if (!r0 || !r1) {
+        net.error = `missing character "${!r0 ? s.chars[0].id : s.chars[1].id}" locally`;
+        net.close();
+        return;
+    }
+    fighters = [r0, r1];
+    setCharacters(r0.ch, r1.ch);
+    const si = stageIds.indexOf(s.stage);
+    if (si >= 0)
+        setStageAsset(stageAssets[si] ?? null);
+    net.begin();
+    game = net.game;
+    cpuAi = null;
+    xpBanner = null;
+    statDmg = 0;
+    statBestCombo = 0;
+    resetMatchFx(game);
+    netInstalled = true;
+    screen = 'fight';
+    void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
+};
 const startFight = () => {
     fighters = [allRosters[picks[0]], allRosters[picks[1]]];
     setCharacters(fighters[0].ch, fighters[1].ch);
@@ -4341,21 +5161,8 @@ const startFight = () => {
     statDmg = 0;
     statBestCombo = 0;
     xpBanner = null;
-    cam = { x: STAGE.widthPx / 2 - VW / 2 / 1.5, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5 };
-    updateCamera(game); // settle before the first frame so round 1 opens framed
-    prevHealth = [game.fighters[0].health, game.fighters[1].health];
-    prevConnected = [0, 0];
-    prevPhase = game.phase;
-    fx.flash = [1, 1];
-    fx.comboOwner = -1;
-    fx.comboHits = 0;
-    fx.comboAge = 0;
-    fx.announce = `ROUND ${game.roundNum + 1}`;
-    fx.announceAge = 0;
-    sparks = [];
-    shake = 0;
-    hurryPlayed = false;
-    resetFighterTrails(); // no stale motion echoes carried into the new match
+    net = null;
+    resetMatchFx(game);
     screen = 'fight';
     void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
@@ -4598,7 +5405,12 @@ const renderFight = (g) => {
         ctx.fillStyle = '#ffffff33';
         ctx.fillRect(0, 0, VW, VH);
     }
-    drawHud(ctx, g, fighters, fx, cpuAi ? ['', `AGENT LV ${cpuLevelFor(profile, lever)}`] : undefined);
+    drawHud(ctx, g, fighters, fx, net?.setup
+        ? [
+            `${net.setup.names[0]}${net.setup.agents[0] ? ' · AGENT' : ''}${net.side === 0 ? ' (YOU)' : ''}`,
+            `${net.setup.names[1]}${net.setup.agents[1] ? ' · AGENT' : ''}${net.side === 1 ? ' (YOU)' : ''}`,
+        ]
+        : cpuAi ? ['', `AGENT LV ${cpuLevelFor(profile, lever)}`] : undefined);
     // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
     // sweeps across the whole frame.
     drawFx(ctx, 'screen');
@@ -4634,6 +5446,12 @@ const tickSelect = () => {
     }
     if (CONFIRM[0].some((k) => pressedThisFrame.has(k)))
         locked[0] = true;
+    if (mode === 'online') {
+        // Online: your pick is the queue ticket — opponent comes from matchmaking.
+        if (locked[0])
+            startOnline();
+        return;
+    }
     if (mode === '2p') {
         if (CONFIRM[1].some((k) => pressedThisFrame.has(k)))
             locked[1] = true;
@@ -4688,9 +5506,12 @@ const frame = () => {
     }
     else if (screen === 'title') {
         drawTitle(ctx, allRosters, uiTick, { mode, cpuLevel: cpuLevelFor(profile, lever) });
-        if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')
-            || pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
-            mode = mode === 'cpu' ? '2p' : 'cpu';
+        const MODES = ['cpu', '2p', 'online'];
+        if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')) {
+            mode = MODES[(MODES.indexOf(mode) + MODES.length - 1) % MODES.length];
+        }
+        else if (pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
+            mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length];
         }
         else if (pressedThisFrame.size > 0) {
             screen = 'select';
@@ -4706,16 +5527,56 @@ const frame = () => {
         tickStageSelect();
         drawStageSelect(ctx, stageIds, stageCursor, uiTick);
     }
+    else if (screen === 'online') {
+        // Matchmaking lobby: connect → queue → match setup → install → fight.
+        ctx.fillStyle = '#0a0616';
+        ctx.fillRect(0, 0, VW, VH);
+        const dots = '.'.repeat(1 + (Math.trunc(uiTick / 20) % 3));
+        const msg = !net ? 'NO CONNECTION'
+            : net.status === 'error' ? `OFFLINE: ${net.error}`
+                : net.setup ? 'OPPONENT FOUND — STARTING'
+                    : net.status === 'queued' ? `SEARCHING FOR OPPONENT${dots}`
+                        : `CONNECTING${dots}`;
+        ctx.font = 'bold 22px "Courier New", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = net?.status === 'error' ? '#e94560' : '#f7e0a3';
+        ctx.fillText(msg, VW / 2, VH / 2 - 10);
+        ctx.font = '13px "Courier New", monospace';
+        ctx.fillStyle = '#ffffff88';
+        ctx.fillText(net?.status === 'error'
+            ? 'is the match server running?  npm run server  ·  ESC: back'
+            : 'humans and agents share this queue  ·  ESC: cancel', VW / 2, VH / 2 + 24);
+        if (net?.setup && !netInstalled)
+            installOnlineMatch();
+        if (pressedThisFrame.has('Escape')) {
+            net?.close();
+            net = null;
+            screen = 'select';
+            locked = [false, false];
+        }
+    }
     else if (screen === 'fight' && game) {
         if (pressedThisFrame.has('KeyB'))
             showBoxes = !showBoxes;
         if (pressedThisFrame.has('Escape')) {
+            net?.close(); // online: leaving is a forfeit (ADR 0003)
+            net = null;
             screen = 'select';
             locked = [false, false];
             void audio.playBgm('player_select', { fadeInSec: 0.5 });
         }
-        const p2 = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
-        step(game, [pollPad(P0_MAP), p2]);
+        if (net) {
+            net.frame(pollPad(P0_MAP)); // rollback session owns stepping
+            if (net.status === 'error' && !net.result) {
+                // Connection died mid-match: back out gracefully.
+                fx.announce = 'CONNECTION LOST';
+                fx.announceAge = 0;
+            }
+        }
+        else {
+            const p2 = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
+            step(game, [pollPad(P0_MAP), p2]);
+        }
         updateJuice(game);
         updateCamera(game);
         renderFight(game);
@@ -4754,9 +5615,34 @@ const frame = () => {
         resultsAge++;
         renderFight(game);
         drawResults(ctx, game, fighters, uiTick, resultsAge, xpBanner);
-        if (pressedThisFrame.has('Enter'))
-            startFight();
+        // Online: the server's verdict is the real result (ADR 0003).
+        if (net) {
+            ctx.font = 'bold 15px "Courier New", monospace';
+            ctx.textAlign = 'center';
+            if (net.result) {
+                const ok = net.result.reason === 'verified';
+                ctx.fillStyle = ok ? '#7ee85a' : '#ffd166';
+                ctx.fillText(ok ? `✓ SERVER-VERIFIED RESULT · ${net.result.rounds[0]}-${net.result.rounds[1]}`
+                    : `RESULT: ${net.result.reason.toUpperCase()}`, VW / 2, VH - 44);
+            }
+            else {
+                ctx.fillStyle = '#ffffff88';
+                ctx.fillText('VERIFYING WITH SERVER…', VW / 2, VH - 44);
+            }
+        }
+        if (pressedThisFrame.has('Enter')) {
+            if (net) {
+                net.close();
+                net = null;
+                screen = 'select';
+                locked = [false, false];
+            }
+            else
+                startFight();
+        }
         if (pressedThisFrame.has('Escape')) {
+            net?.close();
+            net = null;
             screen = 'select';
             locked = [false, false];
             void audio.playBgm('player_select', { fadeInSec: 0.5 });
@@ -4801,6 +5687,10 @@ Object.assign(globalThis, {
         mode = m; return mode; },
     afProfile: () => ({ ...profile, lever }),
     afSetLever: (v) => { lever = Math.max(-10, Math.min(10, v | 0)); saveLever(lever); },
+    afNet: () => (net ? {
+        status: net.status, error: net.error, setup: net.setup, result: net.result,
+        stalled: net.stalled, side: net.side,
+    } : null),
 });
 </script>
 </body>

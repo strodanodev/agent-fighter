@@ -87,6 +87,12 @@ export interface CancelEdge {
 
 export interface CharacterBundle {
   name: string;
+  /**
+   * sha256 content hash (first 16 hex chars), written by the Studio on save
+   * and pinned in every online match handshake (spec §3.1, ADR 0003). The
+   * sim never reads it.
+   */
+  versionHash?: string;
   maxHealth: number;
   walkFSpeed: number; // px/tick
   walkBSpeed: number;
@@ -217,6 +223,13 @@ export const STAGE = {
 
 export const TICKS_PER_SEC = 60;
 export const ROUND_SECONDS = 99;
+
+/**
+ * Engine compatibility version, pinned in every online match handshake
+ * (ADR 0003). Bump on ANY sim-behavior change — the golden replay tests
+ * going red is the reminder; bless goldens and bump this in the same commit.
+ */
+export const ENGINE_VERSION = 'af-core-1';
 
 export const TUNING = {
   roundsToWin: 2, // best of 3

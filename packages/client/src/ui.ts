@@ -7,12 +7,15 @@ import {
 } from './chrome.js';
 import type { BgVideo, ImgBBox, StageAsset, StageCamLimits, UiKit } from './chrome.js';
 import { fxPulse, glowBar, marchingOutline, warningPulse } from './fx.js';
+import { drawFlag } from './flags.js';
 
 // Injected at boot (null = procedural fallbacks everywhere).
 let uiKit: UiKit | null = null;
 let stageAsset: StageAsset | null = null;
 let logoImg: HTMLImageElement | null = null;
 let logoBBox: ImgBBox | null = null;
+let gameLogoImg: HTMLImageElement | null = null;
+let gameLogoBBox: ImgBBox | null = null;
 let bgVideo: BgVideo | null = null;
 export const setUiKit = (k: UiKit): void => { uiKit = k; };
 export const setStageAsset = (s: StageAsset | null): void => { stageAsset = s; };
@@ -23,6 +26,11 @@ export const setStageAsset = (s: StageAsset | null): void => { stageAsset = s; }
 export const setLogo = (img: HTMLImageElement | null): void => {
   logoImg = img;
   logoBBox = img ? opaqueBBox(img) : null;
+};
+// Same crop-to-opaque-bbox treatment for the compact in-game badge logo.
+export const setGameLogo = (img: HTMLImageElement | null): void => {
+  gameLogoImg = img;
+  gameLogoBBox = img ? opaqueBBox(img) : null;
 };
 export const setBgVideo = (v: BgVideo | null): void => { bgVideo = v; };
 
@@ -58,7 +66,7 @@ export const currentStageCamLimits = (): StageCamLimits | null =>
  * or a customizable asset file (assets/ui/*.svg, assets/fonts/).
  */
 
-export type Mode = 'cpu' | '2p';
+export type Mode = 'cpu' | '2p' | 'online';
 
 export const VW = STAGE.viewportW; // 960 — screen px
 export const VH = STAGE.viewportH; // 540
@@ -555,6 +563,25 @@ const drawTimer = (ctx: CanvasRenderingContext2D, secs: number, tick: number): v
   ctx.restore();
 };
 
+/**
+ * Compact brand badge centered below the fight timer. Crops to the art's
+ * opaque bbox (same reasoning as the title logo — the source SVG carries
+ * transparent padding that would otherwise show as an odd gap) and fits it to
+ * a modest watermark width, scaled to 70% per the requested size reduction.
+ * Silently omitted if the asset hasn't loaded (fire-and-forget at boot).
+ */
+const drawGameLogo = (ctx: CanvasRenderingContext2D, y: number): void => {
+  if (!gameLogoImg || gameLogoImg.naturalWidth === 0) return;
+  const box = gameLogoBBox ?? { x: 0, y: 0, w: gameLogoImg.naturalWidth, h: gameLogoImg.naturalHeight };
+  const BASE_W = 100; // natural badge width before the requested reduction
+  const w = BASE_W * 0.7;
+  const h = w * (box.h / box.w);
+  ctx.save();
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, VW / 2 - w / 2, y, w, h);
+  ctx.restore();
+};
+
 export interface HudFx {
   flash: [number, number]; // lagging health ratio per player (damage flash)
   comboOwner: number; // -1 none
@@ -582,6 +609,7 @@ export const drawHud = (
     drawMeter(ctx, i, f.meter, g.tick);
   }
   drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
+  drawGameLogo(ctx, 106); // just under the timer badge (which bottoms out ~y=102)
 
   // Combo counter: punches in on each new hit (re-triggered via comboAge
   // reset in main.ts whenever comboHits increases), settles with overshoot.
@@ -680,8 +708,9 @@ export const drawTitle = (
   const rows: [Mode, string][] = [
     ['cpu', `VS AGENT  ·  LV ${menu.cpuLevel}`],
     ['2p', '2 PLAYERS'],
+    ['online', 'ONLINE  ·  HUMANS & AGENTS'],
   ];
-  const menuY0 = barY + 40;
+  const menuY0 = barY + 30;
   rows.forEach(([m, txt], k) => {
     const y = menuY0 + k * 34;
     const on = menu.mode === m;
@@ -690,12 +719,12 @@ export const drawTitle = (
       display(ctx, txt, cx, y, 24, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
       // A small bouncing arrow marker to the left, arcade-menu style.
       const bounce = 3 * Math.sin(tick / 9);
-      label(ctx, '▶', cx - 112 + bounce, y, 18, GOLD_LT);
+      label(ctx, '▶', cx - 148 + bounce, y, 18, GOLD_LT);
     } else {
       label(ctx, txt, cx, y, 17, '#ffffff70');
     }
   });
-  label(ctx, '↑ / ↓  SELECT       ENTER  START', cx, menuY0 + 62, 13, '#ffffffaa');
+  label(ctx, '↑ / ↓  SELECT       ENTER  START', cx, menuY0 + rows.length * 34 + 6, 13, '#ffffffaa');
 
   label(ctx, 'MILESTONE 4 · AI + LEVELING BUILD', cx, VH - 12, 10, '#ffffff55');
 };
@@ -936,6 +965,18 @@ export const drawSelect = (
   // each cursor is hovering, with stats derived from real bundle config.
   const cardW = 448, cardH = 188;
   const cardY = Math.max(gy + rows * (cell + gap + 20) + 6, VH - cardH - 30);
+
+  // Animated hanging BANNERS in the empty side-margins beside the grid: the
+  // player's (device region) on the left, the opponent's (auth metadata) on
+  // the right — both fall back to a WE ARE ANONYMOUS banner when unknown. They
+  // hang the full height from the top down to just above the fighter cards.
+  const flagBoxW = gx - 16;
+  if (flagBoxW >= 72) {
+    const flagY = 74;
+    const flagH = cardY - flagY - 6;
+    drawFlag(ctx, 0, 8, flagY, flagBoxW, flagH, tick, false);
+    drawFlag(ctx, 1, gx + gridW + 8, flagY, flagBoxW, flagH, tick, true);
+  }
   const p2Header = cpuInfo ? `AGENT · LV ${cpuInfo.cpuLevel}` : 'PLAYER 2';
   const cardHeaders: [string, string] = ['PLAYER 1', p2Header];
   for (const i of [0, 1] as const) {

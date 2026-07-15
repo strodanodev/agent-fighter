@@ -5,7 +5,7 @@ export {
 } from './input.js';
 export type { InputFrame, InputSource } from './input.js';
 export {
-  STAGE, TICKS_PER_SEC, ROUND_SECONDS, TUNING,
+  ENGINE_VERSION, STAGE, TICKS_PER_SEC, ROUND_SECONDS, TUNING,
   BUTTON_BITS, BUTTON_PRIORITY, loadCharacter,
 } from './data.js';
 export type {

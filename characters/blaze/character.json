@@ -3228,7 +3228,15 @@
       0,
       0
     ],
-    "refChroma": 72
+    "refChroma": 72,
+    "selectPortrait": "_select.png",
+    "selectFraming": {
+      "zoom": 1,
+      "panX": -0.24211599298439793,
+      "panY": 0.7992606683165724,
+      "rotate": 0,
+      "flipH": true
+    }
   },
-  "versionHash": "f5bd8229241b583c"
+  "versionHash": "fc84350785685f2d"
 }

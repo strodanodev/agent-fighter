@@ -74,6 +74,10 @@ export const loadDisplayFont = async (): Promise<void> => {
 export const loadLogo = (): Promise<HTMLImageElement | null> =>
   loadImg(`/assets/logo/main_title_AF.svg?v=${Date.now()}`);
 
+/** The compact in-game badge logo (assets/logo/), shown below the fight timer. */
+export const loadGameLogo = (): Promise<HTMLImageElement | null> =>
+  loadImg(`/assets/logo/main_logo_AF.svg?v=${Date.now()}`);
+
 /**
  * Tight bounding box (image pixel space) of an image's non-transparent
  * content. Design-tool SVG exports (e.g. the title logo) often carry large

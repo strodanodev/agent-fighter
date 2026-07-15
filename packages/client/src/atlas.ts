@@ -42,6 +42,12 @@ export interface Roster {
    * which sits in a mostly-empty cell and must be alpha-cropped to the figure.
    */
   portraitDedicated: boolean;
+  /**
+   * Framing transform for a dedicated portrait, authored in Studio
+   * (meta.selectFraming): zoom ≥ 1 and pan ∈ [-1,1] on each axis, applied on top
+   * of the cover-fit. null → plain centered cover-fit. Ignored for the fallback.
+   */
+  portraitFraming: { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean } | null;
   /** Alpha bounds of the portrait art, so frames crop to the figure, not the cell. */
   portraitBox: { x: number; y: number; w: number; h: number } | null;
 }
@@ -99,8 +105,13 @@ export const loadRoster = async (id: string): Promise<Roster> => {
   // Dedicated character-select portrait, authored in Studio (meta.selectPortrait
   // → _select.png). Only honored when the bundle still references it — "remove"
   // in Studio clears the field but leaves the file, and we must respect that.
-  const portraitFile = (bundle as CharacterBundle & { meta?: { selectPortrait?: string } })
-    .meta?.selectPortrait;
+  const meta = (bundle as CharacterBundle & {
+    meta?: {
+      selectPortrait?: string;
+      selectFraming?: { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean };
+    };
+  }).meta;
+  const portraitFile = meta?.selectPortrait;
   const safePortrait = portraitFile && /^[\w.-]+\.(png|webp|jpe?g)$/.test(portraitFile)
     ? portraitFile : null;
   const [sheet, refPortrait, selectPortrait] = await Promise.all([
@@ -113,6 +124,7 @@ export const loadRoster = async (id: string): Promise<Roster> => {
   return {
     id, bundle, ch: loadCharacter(bundle), atlas, sheet, portrait,
     portraitDedicated: dedicated,
+    portraitFraming: dedicated ? (meta?.selectFraming ?? null) : null,
     // A composed portrait fills its frame (cover-fit); only the sprite fallback
     // needs alpha bounds to crop away the empty cell.
     portraitBox: !dedicated && portrait ? alphaBounds(portrait) : null,
@@ -230,10 +242,22 @@ export const drawPortrait = (
   ctx.imageSmoothingEnabled = roster.portraitDedicated ? true : (roster.atlas?.smooth ?? false);
   if (ctx.imageSmoothingEnabled) ctx.imageSmoothingQuality = 'high';
   if (roster.portraitDedicated) {
-    // Cover-fit: scale so the frame is fully covered, center the overflow.
-    const scale = Math.max(w / img.naturalWidth, h / img.naturalHeight);
-    const dw = img.naturalWidth * scale, dh = img.naturalHeight * scale;
-    ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+    // Cover-fit scaled by zoom, then rotated (90° steps), flipped, and panned.
+    // Must match the Studio preview math (studio main.ts framedPreview).
+    const fr = roster.portraitFraming;
+    const iw = img.naturalWidth, ih = img.naturalHeight;
+    const zoom = Math.max(1, fr?.zoom ?? 1);
+    const rot = ((((fr?.rotate ?? 0) % 360) + 360) % 360);
+    const swap = rot === 90 || rot === 270;
+    const bw = swap ? ih : iw, bh = swap ? iw : ih;
+    const scale = Math.max(w / bw, h / bh) * zoom;
+    const sw = bw * scale, sh = bh * scale;
+    const panX = Math.max(-1, Math.min(1, fr?.panX ?? 0));
+    const panY = Math.max(-1, Math.min(1, fr?.panY ?? 0));
+    ctx.translate(x + w / 2 + panX * (sw - w) / 2, y + h / 2 + panY * (sh - h) / 2);
+    ctx.rotate(rot * Math.PI / 180);
+    if (fr?.flipH) ctx.scale(-1, 1);
+    ctx.drawImage(img, -iw * scale / 2, -ih * scale / 2, iw * scale, ih * scale);
   } else {
     const box = roster.portraitBox!;
     const side = Math.max(box.w * 1.15, box.h * 0.55);

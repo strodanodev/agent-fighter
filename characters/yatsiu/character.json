@@ -1,0 +1,3268 @@
+{
+  "name": "yatsiu",
+  "maxHealth": 10000,
+  "walkFSpeed": 4.2,
+  "walkBSpeed": 3.2,
+  "dashFSpeed": 9,
+  "dashFTicks": 14,
+  "dashBSpeed": 7.5,
+  "dashBTicks": 12,
+  "jumpVelY": -14,
+  "superJumpVelY": -19.5,
+  "jumpVelX": 5,
+  "gravity": 0.8,
+  "doubleJump": true,
+  "airDash": true,
+  "airDashSpeed": 8.5,
+  "airDashTicks": 12,
+  "bodyWidth": 52,
+  "standHurtbox": {
+    "x": -26,
+    "y": -108,
+    "w": 52,
+    "h": 108
+  },
+  "crouchHurtbox": {
+    "x": -26,
+    "y": -80,
+    "w": 52,
+    "h": 80
+  },
+  "airHurtbox": {
+    "x": -26,
+    "y": -98,
+    "w": 52,
+    "h": 88
+  },
+  "throwRange": 72,
+  "throwDamage": 1000,
+  "throwTossVelX": 9,
+  "throwTossVelY": -8,
+  "moves": [
+    {
+      "id": "5LP",
+      "type": "normal",
+      "stance": "stand",
+      "button": "LP",
+      "steps": [
+        {
+          "frames": 3,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5LP_s0.png"
+        },
+        {
+          "frames": 3,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -31,
+              "y": -112,
+              "w": 69,
+              "h": 34
+            },
+            {
+              "x": -34,
+              "y": -79,
+              "w": 67,
+              "h": 46
+            },
+            {
+              "x": -37,
+              "y": -34,
+              "w": 71,
+              "h": 34
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 30,
+                "y": -105,
+                "w": 32,
+                "h": 22
+              },
+              "damage": 300,
+              "chip": 0,
+              "hitstun": 14,
+              "blockstun": 10,
+              "hitstopFrames": 5,
+              "pushbackHit": 4.5,
+              "pushbackBlock": 5,
+              "guard": "mid",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "5LP_s1.png"
+        },
+        {
+          "frames": 6,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5LP_s2.png"
+        }
+      ],
+      "meterGainWhiff": 5,
+      "meterGainHit": 40
+    },
+    {
+      "id": "5MP",
+      "type": "normal",
+      "stance": "stand",
+      "button": "MP",
+      "steps": [
+        {
+          "frames": 6,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5MP_s0.png"
+        },
+        {
+          "frames": 4,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -28,
+              "y": -109,
+              "w": 52,
+              "h": 108
+            },
+            {
+              "x": 8,
+              "y": -99,
+              "w": 52,
+              "h": 28
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 8,
+                "y": -99,
+                "w": 52,
+                "h": 28
+              },
+              "damage": 550,
+              "chip": 0,
+              "hitstun": 17,
+              "blockstun": 13,
+              "hitstopFrames": 6,
+              "pushbackHit": 5.5,
+              "pushbackBlock": 6.5,
+              "guard": "mid",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "5MP_s1.png"
+        },
+        {
+          "frames": 10,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -17,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5MP_s2.png"
+        }
+      ],
+      "meterGainWhiff": 8,
+      "meterGainHit": 70
+    },
+    {
+      "id": "5HP",
+      "type": "normal",
+      "stance": "stand",
+      "button": "HP",
+      "steps": [
+        {
+          "frames": 9,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -11,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5HP_s0.png"
+        },
+        {
+          "frames": 4,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            },
+            {
+              "x": 4,
+              "y": -95,
+              "w": 54,
+              "h": 34
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 4,
+                "y": -95,
+                "w": 53,
+                "h": 34
+              },
+              "damage": 800,
+              "chip": 0,
+              "hitstun": 21,
+              "blockstun": 16,
+              "hitstopFrames": 8,
+              "pushbackHit": 6.5,
+              "pushbackBlock": 8,
+              "guard": "mid",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "5HP_s1.png"
+        },
+        {
+          "frames": 16,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -12,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5HP_s2.png"
+        }
+      ],
+      "meterGainWhiff": 12,
+      "meterGainHit": 100
+    },
+    {
+      "id": "5LK",
+      "type": "normal",
+      "stance": "stand",
+      "button": "LK",
+      "steps": [
+        {
+          "frames": 4,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5LK_s0.png"
+        },
+        {
+          "frames": 3,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            },
+            {
+              "x": 12,
+              "y": -107,
+              "w": 46,
+              "h": 24
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 14,
+                "y": -108,
+                "w": 46,
+                "h": 24
+              },
+              "damage": 320,
+              "chip": 0,
+              "hitstun": 14,
+              "blockstun": 10,
+              "hitstopFrames": 5,
+              "pushbackHit": 4.5,
+              "pushbackBlock": 5,
+              "guard": "mid",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "5LK_s1.png"
+        },
+        {
+          "frames": 8,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5LK_s2.png"
+        }
+      ],
+      "meterGainWhiff": 5,
+      "meterGainHit": 40
+    },
+    {
+      "id": "5MK",
+      "type": "normal",
+      "stance": "stand",
+      "button": "MK",
+      "steps": [
+        {
+          "frames": 7,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5MK_s0.png"
+        },
+        {
+          "frames": 4,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            },
+            {
+              "x": 0,
+              "y": -109,
+              "w": 54,
+              "h": 26
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 0,
+                "y": -109,
+                "w": 54,
+                "h": 26
+              },
+              "damage": 570,
+              "chip": 0,
+              "hitstun": 17,
+              "blockstun": 13,
+              "hitstopFrames": 6,
+              "pushbackHit": 5.5,
+              "pushbackBlock": 6.5,
+              "guard": "mid",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "5MK_s1.png"
+        },
+        {
+          "frames": 12,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5MK_s2.png"
+        }
+      ],
+      "meterGainWhiff": 8,
+      "meterGainHit": 70
+    },
+    {
+      "id": "5HK",
+      "type": "normal",
+      "stance": "stand",
+      "button": "HK",
+      "steps": [
+        {
+          "frames": 10,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5HK_s0.png"
+        },
+        {
+          "frames": 5,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -107,
+              "w": 52,
+              "h": 108
+            },
+            {
+              "x": -5,
+              "y": -113,
+              "w": 62,
+              "h": 40
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": -5,
+                "y": -113,
+                "w": 62,
+                "h": 40
+              },
+              "damage": 830,
+              "chip": 0,
+              "hitstun": 22,
+              "blockstun": 17,
+              "hitstopFrames": 8,
+              "pushbackHit": 7,
+              "pushbackBlock": 8.5,
+              "guard": "mid",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "5HK_s1.png"
+        },
+        {
+          "frames": 18,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5HK_s2.png"
+        }
+      ],
+      "meterGainWhiff": 12,
+      "meterGainHit": 100
+    },
+    {
+      "id": "2LP",
+      "type": "normal",
+      "stance": "crouch",
+      "button": "LP",
+      "steps": [
+        {
+          "frames": 3,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            }
+          ],
+          "sprite": "2LP_s0.png"
+        },
+        {
+          "frames": 3,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -29,
+              "y": -81,
+              "w": 52,
+              "h": 80
+            },
+            {
+              "x": 0,
+              "y": -68,
+              "w": 42,
+              "h": 20
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 5,
+                "y": -68,
+                "w": 42,
+                "h": 20
+              },
+              "damage": 280,
+              "chip": 0,
+              "hitstun": 14,
+              "blockstun": 10,
+              "hitstopFrames": 5,
+              "pushbackHit": 4.5,
+              "pushbackBlock": 5,
+              "guard": "mid",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "2LP_s1.png"
+        },
+        {
+          "frames": 6,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            }
+          ],
+          "sprite": "2LP_s2.png"
+        }
+      ],
+      "meterGainWhiff": 5,
+      "meterGainHit": 40
+    },
+    {
+      "id": "2MP",
+      "type": "normal",
+      "stance": "crouch",
+      "button": "MP",
+      "steps": [
+        {
+          "frames": 6,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            }
+          ],
+          "sprite": "2MP_s0.png"
+        },
+        {
+          "frames": 4,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            },
+            {
+              "x": -5,
+              "y": -80,
+              "w": 48,
+              "h": 30
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": -4,
+                "y": -79,
+                "w": 48,
+                "h": 30
+              },
+              "damage": 520,
+              "chip": 0,
+              "hitstun": 17,
+              "blockstun": 13,
+              "hitstopFrames": 6,
+              "pushbackHit": 5.5,
+              "pushbackBlock": 6.5,
+              "guard": "mid",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "2MP_s1.png"
+        },
+        {
+          "frames": 11,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            }
+          ],
+          "sprite": "2MP_s2.png"
+        }
+      ],
+      "meterGainWhiff": 8,
+      "meterGainHit": 70
+    },
+    {
+      "id": "2HP",
+      "type": "normal",
+      "stance": "crouch",
+      "button": "HP",
+      "steps": [
+        {
+          "frames": 10,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            }
+          ],
+          "sprite": "2HP_s0.png"
+        },
+        {
+          "frames": 4,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            },
+            {
+              "x": -7,
+              "y": -118,
+              "w": 44,
+              "h": 70
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": -8,
+                "y": -117,
+                "w": 44,
+                "h": 70
+              },
+              "damage": 750,
+              "chip": 0,
+              "hitstun": 90,
+              "blockstun": 16,
+              "hitstopFrames": 9,
+              "pushbackHit": 2,
+              "pushbackBlock": 8,
+              "guard": "mid",
+              "juggleCost": 1,
+              "launcher": true,
+              "launchVelY": -17,
+              "knockdown": true
+            }
+          ],
+          "sprite": "2HP_s1.png"
+        },
+        {
+          "frames": 20,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            }
+          ],
+          "sprite": "2HP_s2.png"
+        }
+      ],
+      "meterGainWhiff": 12,
+      "meterGainHit": 100
+    },
+    {
+      "id": "2LK",
+      "type": "normal",
+      "stance": "crouch",
+      "button": "LK",
+      "steps": [
+        {
+          "frames": 4,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            }
+          ],
+          "sprite": "2LK_s0.png"
+        },
+        {
+          "frames": 3,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            },
+            {
+              "x": 24,
+              "y": -31,
+              "w": 35,
+              "h": 22
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 12,
+                "y": -33,
+                "w": 45,
+                "h": 22
+              },
+              "damage": 260,
+              "chip": 0,
+              "hitstun": 13,
+              "blockstun": 10,
+              "hitstopFrames": 5,
+              "pushbackHit": 4,
+              "pushbackBlock": 4.5,
+              "guard": "low",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "2LK_s1.png"
+        },
+        {
+          "frames": 7,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            }
+          ],
+          "sprite": "2LK_s2.png"
+        }
+      ],
+      "meterGainWhiff": 5,
+      "meterGainHit": 40
+    },
+    {
+      "id": "2MK",
+      "type": "normal",
+      "stance": "crouch",
+      "button": "MK",
+      "steps": [
+        {
+          "frames": 7,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            }
+          ],
+          "sprite": "2MK_s0.png"
+        },
+        {
+          "frames": 4,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            },
+            {
+              "x": -6,
+              "y": -26,
+              "w": 56,
+              "h": 24
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": -5,
+                "y": -26,
+                "w": 56,
+                "h": 24
+              },
+              "damage": 500,
+              "chip": 0,
+              "hitstun": 16,
+              "blockstun": 13,
+              "hitstopFrames": 6,
+              "pushbackHit": 5.5,
+              "pushbackBlock": 6.5,
+              "guard": "low",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "2MK_s1.png"
+        },
+        {
+          "frames": 13,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            }
+          ],
+          "sprite": "2MK_s2.png"
+        }
+      ],
+      "meterGainWhiff": 8,
+      "meterGainHit": 70
+    },
+    {
+      "id": "2HK",
+      "type": "normal",
+      "stance": "crouch",
+      "button": "HK",
+      "steps": [
+        {
+          "frames": 11,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            }
+          ],
+          "sprite": "2HK_s0.png"
+        },
+        {
+          "frames": 5,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            },
+            {
+              "x": -9,
+              "y": -67,
+              "w": 66,
+              "h": 22
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": -10,
+                "y": -70,
+                "w": 66,
+                "h": 22
+              },
+              "damage": 780,
+              "chip": 0,
+              "hitstun": 30,
+              "blockstun": 17,
+              "hitstopFrames": 8,
+              "pushbackHit": 5,
+              "pushbackBlock": 8,
+              "guard": "low",
+              "juggleCost": 1,
+              "knockdown": true
+            }
+          ],
+          "sprite": "2HK_s1.png"
+        },
+        {
+          "frames": 22,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -80,
+              "w": 52,
+              "h": 80
+            }
+          ],
+          "sprite": "2HK_s2.png"
+        }
+      ],
+      "meterGainWhiff": 12,
+      "meterGainHit": 100
+    },
+    {
+      "id": "j.LP",
+      "type": "normal",
+      "stance": "air",
+      "button": "LP",
+      "steps": [
+        {
+          "frames": 3,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "sprite": "j_LP_s0.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 16,
+                "y": -86,
+                "w": 42,
+                "h": 26
+              },
+              "damage": 300,
+              "chip": 0,
+              "hitstun": 15,
+              "blockstun": 11,
+              "hitstopFrames": 5,
+              "pushbackHit": 4,
+              "pushbackBlock": 4.5,
+              "guard": "overhead",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "j_LP_s1.png"
+        },
+        {
+          "frames": 4,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "sprite": "j_LP_s2.png"
+        }
+      ],
+      "meterGainWhiff": 5,
+      "meterGainHit": 40
+    },
+    {
+      "id": "j.MP",
+      "type": "normal",
+      "stance": "air",
+      "button": "MP",
+      "steps": [
+        {
+          "frames": 5,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "sprite": "j_MP_s0.png"
+        },
+        {
+          "frames": 6,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 2,
+                "y": -84,
+                "w": 50,
+                "h": 30
+              },
+              "damage": 540,
+              "chip": 0,
+              "hitstun": 18,
+              "blockstun": 13,
+              "hitstopFrames": 6,
+              "pushbackHit": 5,
+              "pushbackBlock": 5.5,
+              "guard": "overhead",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "j_MP_s1.png"
+        },
+        {
+          "frames": 6,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "sprite": "j_MP_s2.png"
+        }
+      ],
+      "meterGainWhiff": 8,
+      "meterGainHit": 70
+    },
+    {
+      "id": "j.HP",
+      "type": "normal",
+      "stance": "air",
+      "button": "HP",
+      "steps": [
+        {
+          "frames": 7,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "sprite": "j_HP_s0.png"
+        },
+        {
+          "frames": 6,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": -7,
+                "y": -97,
+                "w": 56,
+                "h": 38
+              },
+              "damage": 820,
+              "chip": 0,
+              "hitstun": 24,
+              "blockstun": 16,
+              "hitstopFrames": 8,
+              "pushbackHit": 6.5,
+              "pushbackBlock": 7,
+              "guard": "overhead",
+              "juggleCost": 2,
+              "knockdown": true
+            }
+          ],
+          "sprite": "j_HP_s1.png"
+        },
+        {
+          "frames": 8,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "sprite": "j_HP_s2.png"
+        }
+      ],
+      "meterGainWhiff": 12,
+      "meterGainHit": 100
+    },
+    {
+      "id": "j.LK",
+      "type": "normal",
+      "stance": "air",
+      "button": "LK",
+      "steps": [
+        {
+          "frames": 4,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "sprite": "j_LK_s0.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 13,
+                "y": -68,
+                "w": 44,
+                "h": 26
+              },
+              "damage": 310,
+              "chip": 0,
+              "hitstun": 15,
+              "blockstun": 11,
+              "hitstopFrames": 5,
+              "pushbackHit": 4,
+              "pushbackBlock": 4.5,
+              "guard": "overhead",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "j_LK_s1.png"
+        },
+        {
+          "frames": 4,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "sprite": "j_LK_s2.png"
+        }
+      ],
+      "meterGainWhiff": 5,
+      "meterGainHit": 40
+    },
+    {
+      "id": "j.MK",
+      "type": "normal",
+      "stance": "air",
+      "button": "MK",
+      "steps": [
+        {
+          "frames": 6,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "sprite": "j_MK_s0.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -42,
+              "y": -92,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 5,
+                "y": -65,
+                "w": 52,
+                "h": 30
+              },
+              "damage": 560,
+              "chip": 0,
+              "hitstun": 18,
+              "blockstun": 13,
+              "hitstopFrames": 6,
+              "pushbackHit": 5,
+              "pushbackBlock": 5.5,
+              "guard": "overhead",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "j_MK_s1.png"
+        },
+        {
+          "frames": 6,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "sprite": "j_MK_s2.png"
+        }
+      ],
+      "meterGainWhiff": 8,
+      "meterGainHit": 70
+    },
+    {
+      "id": "j.HK",
+      "type": "normal",
+      "stance": "air",
+      "button": "HK",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -98,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "sprite": "j_HK_s0.png"
+        },
+        {
+          "frames": 6,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -45,
+              "y": -92,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 0,
+                "y": -85,
+                "w": 60,
+                "h": 42
+              },
+              "damage": 850,
+              "chip": 0,
+              "hitstun": 24,
+              "blockstun": 16,
+              "hitstopFrames": 8,
+              "pushbackHit": 6.5,
+              "pushbackBlock": 7,
+              "guard": "overhead",
+              "juggleCost": 2,
+              "knockdown": true
+            }
+          ],
+          "sprite": "j_HK_s1.png"
+        },
+        {
+          "frames": 8,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -22,
+              "y": -90,
+              "w": 52,
+              "h": 88
+            }
+          ],
+          "sprite": "j_HK_s2.png"
+        }
+      ],
+      "meterGainWhiff": 12,
+      "meterGainHit": 100
+    },
+    {
+      "id": "236P",
+      "type": "special",
+      "stance": "stand",
+      "motion": 236,
+      "buttons": "P",
+      "steps": [
+        {
+          "frames": 12,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "236P_s0.png"
+        },
+        {
+          "frames": 2,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 27,
+                "y": -91,
+                "w": 50,
+                "h": 30
+              },
+              "damage": 500,
+              "chip": 0,
+              "hitstun": 16,
+              "blockstun": 12,
+              "hitstopFrames": 6,
+              "pushbackHit": 5,
+              "pushbackBlock": 6,
+              "guard": "mid",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "236P_s1.png"
+        },
+        {
+          "frames": 18,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "236P_s2.png"
+        }
+      ],
+      "projectile": {
+        "spawnX": 50,
+        "spawnY": -78,
+        "velX": 8,
+        "lifetime": 90,
+        "rect": {
+          "x": -18,
+          "y": -14,
+          "w": 36,
+          "h": 28
+        },
+        "hit": {
+          "rect": {
+            "x": -18,
+            "y": -14,
+            "w": 36,
+            "h": 28
+          },
+          "damage": 700,
+          "chip": 90,
+          "hitstun": 20,
+          "blockstun": 15,
+          "hitstopFrames": 6,
+          "pushbackHit": 6,
+          "pushbackBlock": 7,
+          "guard": "mid",
+          "juggleCost": 2,
+          "airPopVelY": -6
+        }
+      },
+      "meterGainWhiff": 20,
+      "meterGainHit": 120
+    },
+    {
+      "id": "623P",
+      "type": "special",
+      "stance": "stand",
+      "motion": 623,
+      "buttons": "P",
+      "steps": [
+        {
+          "frames": 4,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "623P_s0.png"
+        },
+        {
+          "frames": 10,
+          "phase": "active",
+          "velX": 3.5,
+          "velY": -13,
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 6,
+                "y": -128,
+                "w": 54,
+                "h": 128
+              },
+              "damage": 900,
+              "chip": 110,
+              "hitstun": 40,
+              "blockstun": 18,
+              "hitstopFrames": 9,
+              "pushbackHit": 3,
+              "pushbackBlock": 8,
+              "guard": "mid",
+              "juggleCost": 3,
+              "launcher": true,
+              "launchVelY": -14,
+              "knockdown": true
+            }
+          ],
+          "sprite": "623P_s1.png"
+        },
+        {
+          "frames": 14,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "623P_s2.png"
+        }
+      ],
+      "meterGainWhiff": 20,
+      "meterGainHit": 140
+    },
+    {
+      "id": "214K",
+      "type": "special",
+      "stance": "stand",
+      "motion": 214,
+      "buttons": "K",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "214K_s0.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "velX": 6,
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": -52,
+                "y": -115,
+                "w": 109,
+                "h": 117
+              },
+              "damage": 400,
+              "chip": 50,
+              "hitstun": 18,
+              "blockstun": 13,
+              "hitstopFrames": 6,
+              "pushbackHit": 3,
+              "pushbackBlock": 5,
+              "guard": "mid",
+              "juggleCost": 2,
+              "airPopVelY": -7
+            }
+          ],
+          "sprite": "214K_s1.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "velX": 6,
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": -55,
+                "y": -95,
+                "w": 110,
+                "h": 53
+              },
+              "damage": 420,
+              "chip": 50,
+              "hitstun": 24,
+              "blockstun": 14,
+              "hitstopFrames": 7,
+              "pushbackHit": 6,
+              "pushbackBlock": 7,
+              "guard": "mid",
+              "juggleCost": 2,
+              "knockdown": true,
+              "airPopVelY": -6
+            }
+          ],
+          "sprite": "214K_s2.png"
+        },
+        {
+          "frames": 16,
+          "phase": "recovery",
+          "velX": 0,
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "214K_s3.png"
+        }
+      ],
+      "meterGainWhiff": 20,
+      "meterGainHit": 130
+    },
+    {
+      "id": "236PP",
+      "type": "super",
+      "stance": "stand",
+      "motion": 236,
+      "buttons": "PP",
+      "meterCost": 1000,
+      "steps": [
+        {
+          "frames": 6,
+          "phase": "startup",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "236PP_s0.png"
+        },
+        {
+          "frames": 4,
+          "phase": "active",
+          "velX": 7,
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 14,
+                "y": -104,
+                "w": 62,
+                "h": 74
+              },
+              "damage": 500,
+              "chip": 70,
+              "hitstun": 22,
+              "blockstun": 14,
+              "hitstopFrames": 5,
+              "pushbackHit": 1.5,
+              "pushbackBlock": 4,
+              "guard": "mid",
+              "juggleCost": 0,
+              "airPopVelY": -6
+            }
+          ],
+          "sprite": "236PP_s1.png"
+        },
+        {
+          "frames": 4,
+          "phase": "active",
+          "velX": 7,
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 14,
+                "y": -104,
+                "w": 62,
+                "h": 74
+              },
+              "damage": 500,
+              "chip": 70,
+              "hitstun": 22,
+              "blockstun": 14,
+              "hitstopFrames": 5,
+              "pushbackHit": 1.5,
+              "pushbackBlock": 4,
+              "guard": "mid",
+              "juggleCost": 0,
+              "airPopVelY": -6
+            }
+          ],
+          "sprite": "236PP_s2.png"
+        },
+        {
+          "frames": 4,
+          "phase": "active",
+          "velX": 7,
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 14,
+                "y": -104,
+                "w": 62,
+                "h": 74
+              },
+              "damage": 500,
+              "chip": 70,
+              "hitstun": 22,
+              "blockstun": 14,
+              "hitstopFrames": 5,
+              "pushbackHit": 1.5,
+              "pushbackBlock": 4,
+              "guard": "mid",
+              "juggleCost": 0,
+              "airPopVelY": -6
+            }
+          ],
+          "sprite": "236PP_s3.png"
+        },
+        {
+          "frames": 4,
+          "phase": "active",
+          "velX": 7,
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 14,
+                "y": -104,
+                "w": 62,
+                "h": 74
+              },
+              "damage": 500,
+              "chip": 70,
+              "hitstun": 22,
+              "blockstun": 14,
+              "hitstopFrames": 5,
+              "pushbackHit": 1.5,
+              "pushbackBlock": 4,
+              "guard": "mid",
+              "juggleCost": 0,
+              "airPopVelY": -6
+            }
+          ],
+          "sprite": "236PP_s4.png"
+        },
+        {
+          "frames": 5,
+          "phase": "active",
+          "velX": 4,
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 14,
+                "y": -110,
+                "w": 70,
+                "h": 84
+              },
+              "damage": 1000,
+              "chip": 120,
+              "hitstun": 30,
+              "blockstun": 18,
+              "hitstopFrames": 10,
+              "pushbackHit": 9,
+              "pushbackBlock": 10,
+              "guard": "mid",
+              "juggleCost": 0,
+              "launcher": true,
+              "launchVelY": -12,
+              "knockdown": true
+            }
+          ],
+          "sprite": "236PP_s5.png"
+        },
+        {
+          "frames": 24,
+          "phase": "recovery",
+          "velX": 0,
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "hitboxes": [
+            {
+              "rect": {
+                "x": 8,
+                "y": -98,
+                "w": 50,
+                "h": 30
+              },
+              "damage": 500,
+              "chip": 0,
+              "hitstun": 16,
+              "blockstun": 12,
+              "hitstopFrames": 6,
+              "pushbackHit": 5,
+              "pushbackBlock": 6,
+              "guard": "mid",
+              "juggleCost": 1
+            }
+          ],
+          "sprite": "236PP_s6.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.idle",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_idle_s0.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_idle_s1.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_idle_s2.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_idle_s3.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_idle_s4.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.walkF",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkF_s0.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkF_s1.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkF_s2.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkF_s3.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.walkB",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkB_s0.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkB_s1.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkB_s2.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_walkB_s3.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.crouch",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_crouch_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.jump",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_jump_s0.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_jump_s1.png"
+        },
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_jump_s2.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.dashF",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 6,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_dashF_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.dashB",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 6,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_dashB_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.block",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_block_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.blockCrouch",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_blockCrouch_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.blockAir",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_blockAir_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.hitstun",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_hitstun_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.airHitstun",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_airHitstun_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.knockdown",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_knockdown_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.getup",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_getup_s0.png"
+        },
+        {
+          "frames": 7,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_getup_s1.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    },
+    {
+      "id": "sys.ko",
+      "type": "system",
+      "stance": "stand",
+      "steps": [
+        {
+          "frames": 8,
+          "phase": "active",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "sys_ko_s0.png"
+        }
+      ],
+      "meterGainWhiff": 0,
+      "meterGainHit": 0
+    }
+  ],
+  "cancels": [
+    {
+      "from": "5LP",
+      "to": [
+        "5LP",
+        "5LK",
+        "2LP",
+        "2LK",
+        "5MP",
+        "5MK",
+        "2MP",
+        "2MK",
+        "5HP",
+        "5HK",
+        "2HK",
+        "2HP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "5LK",
+      "to": [
+        "5LP",
+        "5LK",
+        "2LP",
+        "2LK",
+        "5MP",
+        "5MK",
+        "2MP",
+        "2MK",
+        "5HP",
+        "5HK",
+        "2HK",
+        "2HP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "2LP",
+      "to": [
+        "5LP",
+        "5LK",
+        "2LP",
+        "2LK",
+        "5MP",
+        "5MK",
+        "2MP",
+        "2MK",
+        "5HP",
+        "5HK",
+        "2HK",
+        "2HP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "2LK",
+      "to": [
+        "5LP",
+        "5LK",
+        "2LP",
+        "2LK",
+        "5MP",
+        "5MK",
+        "2MP",
+        "2MK",
+        "5HP",
+        "5HK",
+        "2HK",
+        "2HP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "5MP",
+      "to": [
+        "5HP",
+        "5HK",
+        "2HK",
+        "2HP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "5MK",
+      "to": [
+        "5HP",
+        "5HK",
+        "2HK",
+        "2HP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "2MP",
+      "to": [
+        "5HP",
+        "5HK",
+        "2HK",
+        "2HP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "2MK",
+      "to": [
+        "5HP",
+        "5HK",
+        "2HK",
+        "2HP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "5HP",
+      "to": [
+        "2HP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "5HK",
+      "to": [
+        "2HP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "2HK",
+      "to": [
+        "2HP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "5LP",
+      "to": [
+        "236P",
+        "623P",
+        "214K",
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "5LK",
+      "to": [
+        "236P",
+        "623P",
+        "214K",
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "2LP",
+      "to": [
+        "236P",
+        "623P",
+        "214K",
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "2LK",
+      "to": [
+        "236P",
+        "623P",
+        "214K",
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "5MP",
+      "to": [
+        "236P",
+        "623P",
+        "214K",
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "5MK",
+      "to": [
+        "236P",
+        "623P",
+        "214K",
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "2MP",
+      "to": [
+        "236P",
+        "623P",
+        "214K",
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "2MK",
+      "to": [
+        "236P",
+        "623P",
+        "214K",
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "5HP",
+      "to": [
+        "236P",
+        "623P",
+        "214K",
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "5HK",
+      "to": [
+        "236P",
+        "623P",
+        "214K",
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "2HK",
+      "to": [
+        "236P",
+        "623P",
+        "214K",
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "2HP",
+      "to": [
+        "236P",
+        "623P",
+        "214K",
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "236P",
+      "to": [
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "623P",
+      "to": [
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "214K",
+      "to": [
+        "236PP"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "j.LP",
+      "to": [
+        "j.MP",
+        "j.MK",
+        "j.HP",
+        "j.HK"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "j.LK",
+      "to": [
+        "j.MP",
+        "j.MK",
+        "j.HP",
+        "j.HK"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "j.MP",
+      "to": [
+        "j.HP",
+        "j.HK"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    },
+    {
+      "from": "j.MK",
+      "to": [
+        "j.HP",
+        "j.HK"
+      ],
+      "on": [
+        "hit",
+        "block"
+      ]
+    }
+  ],
+  "meta": {
+    "desc": "yat siu, CEO of Animoca Brands",
+    "palette": [
+      [
+        40,
+        28,
+        38
+      ],
+      [
+        48,
+        43,
+        59
+      ],
+      [
+        59,
+        44,
+        51
+      ],
+      [
+        59,
+        56,
+        67
+      ],
+      [
+        62,
+        60,
+        74
+      ],
+      [
+        68,
+        63,
+        69
+      ],
+      [
+        74,
+        58,
+        60
+      ],
+      [
+        85,
+        56,
+        56
+      ],
+      [
+        103,
+        63,
+        61
+      ],
+      [
+        71,
+        69,
+        78
+      ],
+      [
+        77,
+        75,
+        81
+      ],
+      [
+        81,
+        84,
+        98
+      ],
+      [
+        102,
+        84,
+        84
+      ],
+      [
+        131,
+        90,
+        82
+      ],
+      [
+        99,
+        103,
+        112
+      ],
+      [
+        128,
+        113,
+        111
+      ],
+      [
+        167,
+        106,
+        98
+      ],
+      [
+        174,
+        123,
+        106
+      ],
+      [
+        178,
+        127,
+        117
+      ],
+      [
+        195,
+        127,
+        117
+      ],
+      [
+        198,
+        139,
+        121
+      ],
+      [
+        222,
+        155,
+        123
+      ],
+      [
+        106,
+        123,
+        136
+      ],
+      [
+        120,
+        135,
+        142
+      ],
+      [
+        123,
+        142,
+        148
+      ],
+      [
+        150,
+        137,
+        134
+      ],
+      [
+        193,
+        145,
+        130
+      ],
+      [
+        212,
+        154,
+        130
+      ],
+      [
+        224,
+        163,
+        131
+      ],
+      [
+        234,
+        170,
+        132
+      ],
+      [
+        149,
+        157,
+        159
+      ],
+      [
+        167,
+        160,
+        155
+      ],
+      [
+        226,
+        171,
+        141
+      ],
+      [
+        233,
+        179,
+        142
+      ],
+      [
+        185,
+        180,
+        173
+      ],
+      [
+        216,
+        188,
+        165
+      ],
+      [
+        232,
+        190,
+        160
+      ],
+      [
+        173,
+        184,
+        186
+      ],
+      [
+        217,
+        205,
+        193
+      ],
+      [
+        225,
+        220,
+        218
+      ],
+      [
+        239,
+        179,
+        137
+      ],
+      [
+        240,
+        184,
+        141
+      ],
+      [
+        240,
+        184,
+        142
+      ],
+      [
+        239,
+        186,
+        146
+      ],
+      [
+        241,
+        196,
+        159
+      ],
+      [
+        241,
+        218,
+        191
+      ],
+      [
+        242,
+        238,
+        229
+      ],
+      [
+        247,
+        247,
+        245
+      ]
+    ],
+    "refBodyW": 94,
+    "refMask": [
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "refChroma": 33
+  },
+  "versionHash": "3a4271fc68326dd7"
+}

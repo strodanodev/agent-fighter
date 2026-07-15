@@ -18,3 +18,12 @@ Re-download the tools themselves from their official GitHub releases if this
 folder is ever wiped:
 - vgmstream-cli: https://github.com/vgmstream/vgmstream/releases (`*-win64.zip`)
 - ffmpeg: https://github.com/BtbN/FFmpeg-Builds/releases (`*-win64-gpl*.zip`)
+
+## Hit SFX
+
+`packages/client/assets/audio/sfx/*.mp3` are a straight copy (renamed only)
+of `../sounds/SFX HITS/*.mp3` — no conversion needed, mp3 decodes fine via
+`decodeAudioData`. Mapping from pack filename → shipped id, see
+`packages/client/src/audio.ts` (`SFX_FILES`) for the exact list and
+`hitSfxFor()` for how a connecting move's button (LP/MP/HP/LK/MK/HK) picks
+one.

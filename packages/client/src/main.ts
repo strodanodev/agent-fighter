@@ -20,12 +20,13 @@ import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, VH, VW, ZOOM_MAX, ZOOM_MIN,
   currentStageCamLimits, drawHud, drawResults, drawSelect, drawStage,
-  drawStageSelect, drawTitle, setBgVideo, setLogo, setStageAsset, setUiKit, worldTransform,
+  drawStageSelect, drawTitle, setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit, worldTransform,
 } from './ui.js';
 import type { Cam, HudFx, Mode, XpInfo } from './ui.js';
-import { listStages, loadBgVideo, loadDisplayFont, loadLogo, loadStage, loadUiKit } from './chrome.js';
+import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit } from './chrome.js';
 import type { StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
+import { NetSession } from './net.js';
 import {
   auraGlow, drawFx, emitAura, emitBurst, emitRing, fxPulse, updateFx,
 } from './fx.js';
@@ -64,10 +65,12 @@ const pollPad = (map: [string, number][]): InputFrame => {
 };
 
 // ---------------------------------------------------------------- state
-type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'fight' | 'results';
+type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results';
 
 let screen: Screen = 'loading';
 let mode: Mode = 'cpu';
+let net: NetSession | null = null;
+let netInstalled = false;
 let uiTick = 0;
 let allRosters: Roster[] = [];
 let picks: [number, number] = [0, 0];
@@ -122,6 +125,7 @@ const boot = async (): Promise<void> => {
     // important on mobile, where blocking boot on ~20MB of art would stall
     // first paint for seconds on a slow connection.
     void loadLogo().then(setLogo);
+    void loadGameLogo().then(setGameLogo);
     setBgVideo(loadBgVideo('/assets/video/bg_video_main_af.mp4'));
     stageIds = await listStages();
     stageAssets = await Promise.all(stageIds.map(loadStage));
@@ -138,6 +142,62 @@ const boot = async (): Promise<void> => {
   }
 };
 
+/** Reset per-match juice/announce state (shared by local + online starts). */
+const resetMatchFx = (g: GameState): void => {
+  cam = { x: STAGE.widthPx / 2 - VW / 2 / 1.5, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5 };
+  updateCamera(g);
+  prevHealth = [g.fighters[0].health, g.fighters[1].health];
+  prevConnected = [0, 0];
+  prevPhase = g.phase;
+  fx.flash = [1, 1];
+  fx.comboOwner = -1;
+  fx.comboHits = 0;
+  fx.comboAge = 0;
+  fx.announce = `ROUND ${g.roundNum + 1}`;
+  fx.announceAge = 0;
+  sparks = [];
+  shake = 0;
+  hurryPlayed = false;
+  resetFighterTrails();
+};
+
+/** Queue for an online match (ADR 0003): connect, pin bundle hash, wait. */
+const startOnline = (): void => {
+  const roster = allRosters[picks[0]]!;
+  // ?ws=ws://host:port overrides the default match server (deploys, dev).
+  const url = new URLSearchParams(location.search).get('ws')
+    ?? `ws://${location.hostname}:8477`;
+  net = new NetSession(url, `PLAYER-${(profile.wins + profile.losses) % 1000}`, roster.id, roster.bundle.versionHash);
+  netInstalled = false;
+  screen = 'online';
+};
+
+/** Match setup arrived — install the pinned characters/stage and begin. */
+const installOnlineMatch = (): void => {
+  const s = net!.setup!;
+  const r0 = allRosters.find((r) => r.id === s.chars[0].id);
+  const r1 = allRosters.find((r) => r.id === s.chars[1].id);
+  if (!r0 || !r1) {
+    net!.error = `missing character "${!r0 ? s.chars[0].id : s.chars[1].id}" locally`;
+    net!.close();
+    return;
+  }
+  fighters = [r0, r1];
+  setCharacters(r0.ch, r1.ch);
+  const si = stageIds.indexOf(s.stage);
+  if (si >= 0) setStageAsset(stageAssets[si] ?? null);
+  net!.begin();
+  game = net!.game;
+  cpuAi = null;
+  xpBanner = null;
+  statDmg = 0;
+  statBestCombo = 0;
+  resetMatchFx(game!);
+  netInstalled = true;
+  screen = 'fight';
+  void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
+};
+
 const startFight = (): void => {
   fighters = [allRosters[picks[0]]!, allRosters[picks[1]]!];
   setCharacters(fighters[0].ch, fighters[1].ch);
@@ -148,21 +208,8 @@ const startFight = (): void => {
   statDmg = 0;
   statBestCombo = 0;
   xpBanner = null;
-  cam = { x: STAGE.widthPx / 2 - VW / 2 / 1.5, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5 };
-  updateCamera(game); // settle before the first frame so round 1 opens framed
-  prevHealth = [game.fighters[0].health, game.fighters[1].health];
-  prevConnected = [0, 0];
-  prevPhase = game.phase;
-  fx.flash = [1, 1];
-  fx.comboOwner = -1;
-  fx.comboHits = 0;
-  fx.comboAge = 0;
-  fx.announce = `ROUND ${game.roundNum + 1}`;
-  fx.announceAge = 0;
-  sparks = [];
-  shake = 0;
-  hurryPlayed = false;
-  resetFighterTrails(); // no stale motion echoes carried into the new match
+  net = null;
+  resetMatchFx(game);
   screen = 'fight';
   void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
@@ -410,7 +457,12 @@ const renderFight = (g: GameState): void => {
     ctx.fillRect(0, 0, VW, VH);
   }
   drawHud(ctx, g, fighters!, fx,
-    cpuAi ? ['', `AGENT LV ${cpuLevelFor(profile, lever)}`] : undefined);
+    net?.setup
+      ? [
+        `${net.setup.names[0]}${net.setup.agents[0] ? ' · AGENT' : ''}${net.side === 0 ? ' (YOU)' : ''}`,
+        `${net.setup.names[1]}${net.setup.agents[1] ? ' · AGENT' : ''}${net.side === 1 ? ' (YOU)' : ''}`,
+      ]
+      : cpuAi ? ['', `AGENT LV ${cpuLevelFor(profile, lever)}`] : undefined);
 
   // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
   // sweeps across the whole frame.
@@ -437,6 +489,11 @@ const tickSelect = (): void => {
   }
 
   if (CONFIRM[0]!.some((k) => pressedThisFrame.has(k))) locked[0] = true;
+  if (mode === 'online') {
+    // Online: your pick is the queue ticket — opponent comes from matchmaking.
+    if (locked[0]) startOnline();
+    return;
+  }
   if (mode === '2p') {
     if (CONFIRM[1]!.some((k) => pressedThisFrame.has(k))) locked[1] = true;
   } else if (locked[0] && !locked[1]) {
@@ -483,9 +540,11 @@ const frame = (): void => {
     }
   } else if (screen === 'title') {
     drawTitle(ctx, allRosters, uiTick, { mode, cpuLevel: cpuLevelFor(profile, lever) });
-    if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')
-      || pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
-      mode = mode === 'cpu' ? '2p' : 'cpu';
+    const MODES: Mode[] = ['cpu', '2p', 'online'];
+    if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')) {
+      mode = MODES[(MODES.indexOf(mode) + MODES.length - 1) % MODES.length]!;
+    } else if (pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
+      mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length]!;
     } else if (pressedThisFrame.size > 0) {
       screen = 'select';
       locked = [false, false];
@@ -498,14 +557,51 @@ const frame = (): void => {
   } else if (screen === 'stageSelect') {
     tickStageSelect();
     drawStageSelect(ctx, stageIds, stageCursor, uiTick);
+  } else if (screen === 'online') {
+    // Matchmaking lobby: connect → queue → match setup → install → fight.
+    ctx.fillStyle = '#0a0616';
+    ctx.fillRect(0, 0, VW, VH);
+    const dots = '.'.repeat(1 + (Math.trunc(uiTick / 20) % 3));
+    const msg = !net ? 'NO CONNECTION'
+      : net.status === 'error' ? `OFFLINE: ${net.error}`
+      : net.setup ? 'OPPONENT FOUND — STARTING'
+      : net.status === 'queued' ? `SEARCHING FOR OPPONENT${dots}`
+      : `CONNECTING${dots}`;
+    ctx.font = 'bold 22px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = net?.status === 'error' ? '#e94560' : '#f7e0a3';
+    ctx.fillText(msg, VW / 2, VH / 2 - 10);
+    ctx.font = '13px "Courier New", monospace';
+    ctx.fillStyle = '#ffffff88';
+    ctx.fillText(net?.status === 'error'
+      ? 'is the match server running?  npm run server  ·  ESC: back'
+      : 'humans and agents share this queue  ·  ESC: cancel', VW / 2, VH / 2 + 24);
+    if (net?.setup && !netInstalled) installOnlineMatch();
+    if (pressedThisFrame.has('Escape')) {
+      net?.close();
+      net = null;
+      screen = 'select';
+      locked = [false, false];
+    }
   } else if (screen === 'fight' && game) {
     if (pressedThisFrame.has('KeyB')) showBoxes = !showBoxes;
     if (pressedThisFrame.has('Escape')) {
+      net?.close(); // online: leaving is a forfeit (ADR 0003)
+      net = null;
       screen = 'select'; locked = [false, false];
       void audio.playBgm('player_select', { fadeInSec: 0.5 });
     }
-    const p2: InputFrame = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
-    step(game, [pollPad(P0_MAP), p2]);
+    if (net) {
+      net.frame(pollPad(P0_MAP)); // rollback session owns stepping
+      if (net.status === 'error' && !net.result) {
+        // Connection died mid-match: back out gracefully.
+        fx.announce = 'CONNECTION LOST';
+        fx.announceAge = 0;
+      }
+    } else {
+      const p2: InputFrame = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
+      step(game, [pollPad(P0_MAP), p2]);
+    }
     updateJuice(game);
     updateCamera(game);
     renderFight(game);
@@ -543,8 +639,29 @@ const frame = (): void => {
     resultsAge++;
     renderFight(game);
     drawResults(ctx, game, fighters!, uiTick, resultsAge, xpBanner);
-    if (pressedThisFrame.has('Enter')) startFight();
+    // Online: the server's verdict is the real result (ADR 0003).
+    if (net) {
+      ctx.font = 'bold 15px "Courier New", monospace';
+      ctx.textAlign = 'center';
+      if (net.result) {
+        const ok = net.result.reason === 'verified';
+        ctx.fillStyle = ok ? '#7ee85a' : '#ffd166';
+        ctx.fillText(
+          ok ? `✓ SERVER-VERIFIED RESULT · ${net.result.rounds[0]}-${net.result.rounds[1]}`
+            : `RESULT: ${net.result.reason.toUpperCase()}`,
+          VW / 2, VH - 44);
+      } else {
+        ctx.fillStyle = '#ffffff88';
+        ctx.fillText('VERIFYING WITH SERVER…', VW / 2, VH - 44);
+      }
+    }
+    if (pressedThisFrame.has('Enter')) {
+      if (net) { net.close(); net = null; screen = 'select'; locked = [false, false]; }
+      else startFight();
+    }
     if (pressedThisFrame.has('Escape')) {
+      net?.close();
+      net = null;
       screen = 'select'; locked = [false, false];
       void audio.playBgm('player_select', { fadeInSec: 0.5 });
     }
@@ -587,7 +704,11 @@ Object.assign(globalThis, {
   afStep: (n = 1) => { for (let k = 0; k < n; k++) frame(); },
   afPress: (code: string) => { pressedThisFrame.add(code); keys.add(code); },
   afRelease: (code: string) => { keys.delete(code); },
-  afMode: (m?: 'cpu' | '2p') => { if (m) mode = m; return mode; },
+  afMode: (m?: Mode) => { if (m) mode = m; return mode; },
   afProfile: () => ({ ...profile, lever }),
   afSetLever: (v: number) => { lever = Math.max(-10, Math.min(10, v | 0)); saveLever(lever); },
+  afNet: () => (net ? {
+    status: net.status, error: net.error, setup: net.setup, result: net.result,
+    stalled: net.stalled, side: net.side,
+  } : null),
 });

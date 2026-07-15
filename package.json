@@ -8,12 +8,14 @@
   ],
   "scripts": {
     "test": "npm run test -w @af/core",
-    "typecheck": "npm run typecheck -w @af/core && npm run typecheck -w @af/client && npm run typecheck -w @af/studio",
-    "verify": "npm run typecheck && npm run test",
+    "typecheck": "npm run typecheck -w @af/core && npm run typecheck -w @af/client && npm run typecheck -w @af/studio && npm run typecheck -w @af/server",
+    "verify": "npm run typecheck && npm run test && npm run test -w @af/server",
     "golden:bless": "npm run golden:bless -w @af/core",
     "build": "npm run build -w @af/core && npm run build -w @af/client",
     "demo": "npm run demo -w @af/client",
     "play": "npm run play -w @af/client",
+    "server": "npm run start -w @af/server",
+    "agent": "npm run agent -w @af/server",
     "studio": "npm run start -w @af/studio"
   },
   "devDependencies": {
