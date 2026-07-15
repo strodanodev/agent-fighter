@@ -243,14 +243,27 @@ const packAtlas = async (): Promise<number> => {
   return placed.length;
 };
 
-/** Server capability: can the active image provider accept a reference image? */
-let stImg2Img = false;
 /** Which text-to-image providers are configured (have a key in .env). */
 let stAvailable: Record<string, boolean> = { nvidia: false, gemini: false, bfl: false, fal: false };
-/** Stage tab's explicit engine choice — set-dressing art needs no identity
- * lock, so NVIDIA (cheap, fast, no reference support required) is a fine
- * default even when Gemini is the character pipeline's default provider. */
+/** Providers that accept a user reference image (true identity lock). NVIDIA
+ * cannot — its `image` field only takes gallery example_ids, so it's text-only. */
+const IMG2IMG_PROVIDERS = new Set(['gemini', 'bfl', 'fal']);
+const isImg2Img = (p: string): boolean => IMG2IMG_PROVIDERS.has(p) && !!stAvailable[p];
+/**
+ * Per-category generation engines, chosen in the Generate/Stage tabs. Each
+ * defaults to the server's configured IMAGE_PROVIDER on capabilities load and
+ * is overridable independently (e.g. Gemini reference, fal sprite batch,
+ * NVIDIA stage):
+ *  - stRefProvider    : character reference (generate reference + stylize upload)
+ *  - stSpriteProvider : per-move sprite / frame batches
+ *  - stStageProvider  : set-dressing (no identity lock — NVIDIA is fine + cheap)
+ */
+let stRefProvider = 'nvidia';
+let stSpriteProvider = 'nvidia';
 let stStageProvider = 'nvidia';
+/** img2img capability of the SPRITE engine — most call sites are sprite-context.
+ * Recomputed whenever stSpriteProvider changes. */
+let stImg2Img = false;
 
 /** The locked reference sheet as base64 PNG (for reference-conditioned gen). */
 /**
@@ -270,18 +283,20 @@ const referenceB64 = async (): Promise<string | null> => {
 
 const generateImage = async (
   prompt: string, seed: number, width = 1024, height = 1024, useRef = false, provider?: string,
-  imageOverride?: string,
+  imageOverride?: string, imagesOverride?: string[],
 ): Promise<HTMLImageElement> => {
-  // With an img2img provider, every frame is conditioned on the reference
-  // sheet — that is the ONLY way to truly hold a character's identity across
-  // images. NVIDIA's flux cannot do this (see server.mjs) — useRef and an
-  // explicit `provider` override are mutually exclusive by construction
-  // (only the Stage tab passes `provider`, and it never passes useRef).
+  // With an img2img engine, every frame is conditioned on the reference sheet —
+  // the ONLY way to truly hold a character's identity across images. NVIDIA's
+  // flux cannot (see server.mjs), so useRef is a no-op on it. `provider` names
+  // the engine for THIS call (per-category: reference/sprite/stage); useRef +
+  // provider now compose — a sprite batch on `fal` sends the reference AND the
+  // provider. Whether the reference actually rides along is gated on the
+  // engine's img2img capability, so picking NVIDIA silently downgrades to text.
   //
   // `imageOverride` conditions on some OTHER image than the locked reference —
   // used to stylize a user's upload into a reference in the first place.
   let image: string | null = imageOverride ?? null;
-  if (!image && useRef && stImg2Img) {
+  if (!image && useRef && isImg2Img(provider ?? stSpriteProvider)) {
     image = await referenceB64();
     if (!image) {
       throw new Error('reference sprite not available — generate + lock a reference first '
@@ -290,7 +305,8 @@ const generateImage = async (
   }
   const body = {
     prompt, width, height, steps: 4, seed,
-    ...(image ? { image } : {}),
+    ...(imagesOverride && imagesOverride.length ? { images: imagesOverride }
+      : image ? { image } : {}),
     ...(provider ? { provider } : {}),
   };
   const r = await apiJson<{ artifacts?: { base64: string }[]; b64_json?: string }>(
@@ -383,6 +399,16 @@ const selInput = (value: string, options: string[], onCommit: (v: string) => voi
   return s;
 };
 
+/** Like selInput but does NOT mark the bundle dirty — for session-only choices
+ * (e.g. which image engine to generate with) that are not part of the bundle. */
+const sessionSelect = (value: string, options: string[], onCommit: (v: string) => void): HTMLSelectElement => {
+  const s = mkEl('select', {
+    onchange: (e: Event) => { onCommit((e.target as HTMLSelectElement).value); renderAll(); },
+  });
+  for (const o of options) s.append(mkEl('option', { value: o, selected: o === value ? '' : null }, o || '(none)'));
+  return s;
+};
+
 // ------------------------------------------------- modal dialogs
 /**
  * NEVER use window.prompt/confirm here. Embedded browsers (the in-app preview
@@ -462,7 +488,7 @@ const createCharacter = async (id: string, name: string, desc: string): Promise<
   stSel = null;
   stGenResults = new Map();
   stRefPreview = null;
-  stUpload = null;
+  stUpload = [];
   stAudit = null;
   spriteImgs.clear();
   stDirty = true;
@@ -1372,7 +1398,8 @@ const SPRITE_STYLE = 'high-resolution anime fighting game character art, hand-dr
  */
 const PROMPT_MAX_TEXT = 800;
 const PROMPT_MAX_REF = 2000;
-const promptMax = (): number => (stImg2Img ? PROMPT_MAX_REF : PROMPT_MAX_TEXT);
+const promptMax = (provider: string = stSpriteProvider): number =>
+  (isImg2Img(provider) ? PROMPT_MAX_REF : PROMPT_MAX_TEXT);
 
 /**
  * Build a strip prompt that fits the budget, trimming pose text if needed.
@@ -1546,7 +1573,7 @@ const finishFrame = (
  *   - "use verbatim" only makes sense for already-clean sprite art, and does
  *     its normalize at click time.
  */
-let stUpload: HTMLCanvasElement | null = null;
+let stUpload: HTMLCanvasElement[] = [];
 
 const fileToImage = (file: File): Promise<HTMLImageElement> =>
   new Promise((resolve, reject) => {
@@ -1570,14 +1597,22 @@ const imageToCanvas = (img: HTMLImageElement): HTMLCanvasElement => {
   return c;
 };
 
-/** Keep an uploaded image RAW (see stUpload) — no keying, no crop. */
-const loadUploadedReference = async (file: File): Promise<void> => {
+/**
+ * Keep uploaded images RAW (see stUpload) — no keying, no crop. Multiple
+ * photos (front / side / detail) are APPENDED: the stylize step feeds them all
+ * to Gemini so the locked reference is corroborated from several views, which
+ * every generated sprite then inherits. Frame generation is unaffected.
+ */
+const loadUploadedReference = async (files: File[]): Promise<void> => {
   try {
-    stStatus = `reading ${file.name}…`; renderAll();
-    const img = await fileToImage(file);
-    stUpload = imageToCanvas(img);
+    for (const file of files) {
+      stStatus = `reading ${file.name}…`; renderAll();
+      const img = await fileToImage(file);
+      stUpload.push(imageToCanvas(img));
+    }
     stRefPreview = null;
-    stStatus = `uploaded ${file.name} · ${img.naturalWidth}×${img.naturalHeight} — stylize it, or use as-is`;
+    stStatus = `${stUpload.length} photo${stUpload.length === 1 ? '' : 's'} uploaded — stylize`
+      + `${stUpload.length > 1 ? ' (all fed as references)' : ' it, or use as-is'}`;
   } catch (e) {
     stStatus = `upload failed: ${(e as Error).message}`;
   }
@@ -1591,19 +1626,26 @@ const loadUploadedReference = async (file: File): Promise<void> => {
  * before it. This is the right path for a photo or off-style art.
  */
 const stylizeUpload = async (): Promise<void> => {
-  if (!stUpload || stGenBusy) return;
+  if (!stUpload.length || stGenBusy) return;
   stGenBusy = true;
   stStatus = 'stylizing upload into a reference…'; renderAll();
   try {
-    const prompt = `The attached image shows ONE character (it may be a photo or off-style art). `
-      + `Redraw THAT character as a game sprite — keep the same face, hairstyle, outfit, colours `
-      + `and build — standing in a neutral idle fighting stance, full body. ${SPRITE_STYLE}`;
-    const img = await generateImage(prompt.slice(0, promptMax()), seedFor('_stylize', 0, stSeed++),
-      1024, 1024, false, undefined, canvasToPngDataUrl(stUpload));
+    const multi = stUpload.length > 1;
+    const prompt = (multi
+      ? `The attached ${stUpload.length} images all show the SAME ONE character from different `
+        + `views/details (they may be photos or off-style art). Synthesize ONE character `
+        + `consistent with ALL of them and redraw it as a game sprite — keep the same face, `
+        + `hairstyle, outfit, colours and build — standing in a neutral idle fighting stance, full body.`
+      : `The attached image shows ONE character (it may be a photo or off-style art). `
+        + `Redraw THAT character as a game sprite — keep the same face, hairstyle, outfit, colours `
+        + `and build — standing in a neutral idle fighting stance, full body.`) + ` ${SPRITE_STYLE}`;
+    const refs = stUpload.map(canvasToPngDataUrl);
+    const img = await generateImage(prompt.slice(0, promptMax(stRefProvider)), seedFor('_stylize', 0, stSeed++),
+      1024, 1024, false, stRefProvider, refs[0], refs);
     const norm = normalizeFrame(img, null);
     if (!norm) throw new Error('normalize failed');
     stRefPreview = norm;
-    stUpload = null;
+    stUpload = [];
     stStatus = 'stylized — review, then "use as reference"';
   } catch (e) {
     stStatus = `stylize failed: ${(e as Error).message}`;
@@ -1614,15 +1656,15 @@ const stylizeUpload = async (): Promise<void> => {
 
 /** Use a raw upload verbatim: normalize NOW (best for clean-bg sprite art). */
 const useUploadVerbatim = (): void => {
-  if (!stUpload) return;
-  const norm = normalizeFrame(stUpload, null);
+  if (!stUpload.length) return;
+  const norm = normalizeFrame(stUpload[0]!, null);
   if (!norm) {
     stStatus = 'could not isolate a subject — this looks like a photo; use "stylize" instead';
     renderAll();
     return;
   }
   stRefPreview = norm;
-  stUpload = null;
+  stUpload = [];
   stStatus = 'staged — review, then "use as reference"';
   renderAll();
 };
@@ -1663,7 +1705,7 @@ const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | n
    */
   if (stImg2Img) {
     const prompt = buildSheetPrompt([ANCHOR_POSE, pose]);
-    const img = await generateImage(prompt, seedFor(mv.id, i, salt), 1024, 1024, true);
+    const img = await generateImage(prompt, seedFor(mv.id, i, salt), 1024, 1024, true, stSpriteProvider);
     const slices = sliceSheet(img, 2);
     if (slices) {
       const anchorH = measureFigureH(slices[0]!);
@@ -1674,12 +1716,12 @@ const genFrame = async (mv: MoveDef, i: number, salt = 0): Promise<GenResult | n
       + `character — identical outfit, identical colors, identical hair, identical face and `
       + `build — in a single new pose: ${pose}. Do not redesign the character. ${SPRITE_STYLE}`;
     const img2 = await generateImage(solo.slice(0, promptMax()),
-      seedFor(mv.id, i, salt + 1), 1024, 1024, true);
+      seedFor(mv.id, i, salt + 1), 1024, 1024, true, stSpriteProvider);
     return finishFrame(mv, img2);
   }
 
   const prompt = `${desc}, ${pose}, ${SPRITE_STYLE}`.slice(0, promptMax());
-  const img = await generateImage(prompt, seedFor(mv.id, i, salt), 1024, 1024, true);
+  const img = await generateImage(prompt, seedFor(mv.id, i, salt), 1024, 1024, true, stSpriteProvider);
   return finishFrame(mv, img);
 };
 
@@ -1772,7 +1814,7 @@ const genMoveFrames = async (mv: MoveDef, salt = 0): Promise<(GenResult | null)[
     const prompt = buildStripPrompt(desc, idxs.map((i) => poseForStep(mv, i)));
     let slices: HTMLCanvasElement[] | null = null;
     try {
-      const img = await generateImage(prompt, seedFor(mv.id, start, salt), STRIP_W, STRIP_H, true);
+      const img = await generateImage(prompt, seedFor(mv.id, start, salt), STRIP_W, STRIP_H, true, stSpriteProvider);
       slices = sliceStrip(img, idxs.length);
       if (!slices) stStripFallbacks++; // figures merged/overlapped — unsliceable
     } catch (e) {
@@ -1797,6 +1839,29 @@ const acceptFrame = async (mv: MoveDef, i: number, r: GenResult): Promise<void> 
   stDirty = true;
 };
 
+/**
+ * Regenerate ONE frame with a fresh random seed and stage it as a pending
+ * result (does NOT overwrite the saved sprite until "accept"). Shared by the
+ * per-frame "retry" (on a fresh result) and "⟳ regenerate" (on the saved
+ * "in use" thumbnail) buttons, so any frame can be re-rolled in place.
+ */
+const regenSingleFrame = (mv: MoveDef, i: number): void => {
+  if (stGenBusy) return;
+  void (async () => {
+    stGenBusy = true;
+    stStatus = `regenerating ${mv.id}#${i} via ${stSpriteProvider}…`; renderAll();
+    try {
+      const nr = await genFrame(mv, i, (Math.random() * 1e6) | 0);
+      if (nr) {
+        stGenResults.set(i, nr);
+        stStatus = `regenerated ${mv.id}#${i} · QC ${nr.qc.score} — review, then accept to replace`;
+      } else stStatus = `regenerate ${mv.id}#${i}: no subject found`;
+    } catch (e) { stStatus = `regenerate failed: ${(e as Error).message}`; }
+    stGenBusy = false;
+    renderAll();
+  })();
+};
+
 const runGeneration = async (which: 'reference' | 'move'): Promise<void> => {
   if (stGenBusy || !stBundle) return;
   stGenBusy = true;
@@ -1804,10 +1869,11 @@ const runGeneration = async (which: 'reference' | 'move'): Promise<void> => {
   const desc = m.desc || stBundle.name;
   try {
     if (which === 'reference') {
-      stStatus = 'generating reference…'; renderAll();
+      stStatus = `generating reference via ${stRefProvider}…`; renderAll();
       const img = await generateImage(
-        `${desc}, standing idle fighting stance, character reference, ${SPRITE_STYLE}`,
-        seedFor('_ref', 0, stSeed++));
+        `${desc}, standing idle fighting stance, character reference, ${SPRITE_STYLE}`
+          .slice(0, promptMax(stRefProvider)),
+        seedFor('_ref', 0, stSeed++), 1024, 1024, false, stRefProvider);
       const norm = normalizeFrame(img, null);
       if (!norm) throw new Error('normalize failed (no subject found)');
       stRefPreview = norm;
@@ -1833,14 +1899,44 @@ const runGeneration = async (which: 'reference' | 'move'): Promise<void> => {
 };
 
 /**
+ * Pick the higher-QC of two results (either may be null). Retries must keep the
+ * BEST attempt, not the latest — a reroll can come back worse, and every call
+ * was billed, so the best image earned so far should never be clobbered.
+ */
+const betterResult = (a: GenResult | null, b: GenResult | null): GenResult | null =>
+  !a ? b : !b ? a : b.qc.score > a.qc.score ? b : a;
+
+/**
+ * Batch status line. Frames whose best attempt cleared QC are "clean"; frames
+ * that produced a real figure but stayed below QC are SAVED anyway (a paid
+ * generation is never thrown away — the best image beats a blank frame) and
+ * flagged in `review`; only frames where nothing usable came back are hard
+ * `failures`.
+ */
+const batchSummary = (
+  total: number, failures: string[], review: string[], tail: string,
+): string => {
+  if (failures.length === 0 && review.length === 0) {
+    return `batch complete: all ${total} frames accepted · ${tail} — SAVE to persist`;
+  }
+  const clean = total - failures.length - review.length;
+  const bits = [`${clean}/${total} clean`];
+  if (review.length) bits.push(`${review.length} saved below-QC (review: ${review.join(' ')})`);
+  if (failures.length) bits.push(`${failures.length} no image (${failures.join(' ')})`);
+  return `batch done: ${bits.join(' · ')} · ${tail} — SAVE to persist`;
+};
+
+/**
  * Batch: generate every step of every move (spec §5.2 "per-move batch
- * generation"). QC passes auto-accept; failures are listed for per-move
- * regeneration. One retry with a new seed on QC failure.
+ * generation"). QC passes auto-accept; sub-QC frames save their best attempt
+ * and are flagged for review; only frames that yield no figure at all are
+ * listed as failures. Up to two rerolls per frame on QC failure.
  */
 const runGenerateAll = async (): Promise<void> => {
   if (stGenBusy || !stBundle) return;
   stGenBusy = true;
-  const failures: string[] = [];
+  const failures: string[] = []; // nothing usable came back at all
+  const review: string[] = [];   // saved the best attempt, but it's below QC
   stStripsUsed = 0; stStripFallbacks = 0; stStripError = '';
   const want = (mv: MoveDef, i: number): boolean => !stMissingOnly || !mv.steps[i]!.sprite;
   const total = stBundle.moves.reduce(
@@ -1871,7 +1967,7 @@ const runGenerateAll = async (): Promise<void> => {
           try {
             const img = await generateImage(
               buildSheetPrompt(chunk.map((c) => poseForStep(c.mv, c.i))),
-              seedFor('_sheet', s, 0), 1024, 1024, true);
+              seedFor('_sheet', s, 0), 1024, 1024, true, stSpriteProvider);
             slices = sliceSheet(img, chunk.length);
             if (slices) {
               stStripsUsed++;
@@ -1891,23 +1987,29 @@ const runGenerateAll = async (): Promise<void> => {
         for (let k = 0; k < chunk.length; k++) {
           const { mv, i } = chunk[k]!;
           done++;
-          let r = slices ? finishFrame(mv, slices[k]!, sheetFigureH) : null;
-          // Anything the sheet failed on gets its own single-pose call.
-          for (let att = 0; att < 2 && !(r && r.qc.pass); att++) {
+          let best = slices ? finishFrame(mv, slices[k]!, sheetFigureH) : null;
+          // Anything the sheet failed on gets its own single-pose call — keep
+          // the best of every (paid) attempt, not just the last.
+          for (let att = 0; att < 2 && !(best && best.qc.pass); att++) {
             try {
-              r = (await genFrame(mv, i, att === 0 ? 0 : 2 + ((Math.random() * 1e6) | 0))) ?? r;
+              best = betterResult(best,
+                await genFrame(mv, i, att === 0 ? 0 : 2 + ((Math.random() * 1e6) | 0)));
             } catch { /* transient — next attempt */ }
           }
-          if (r && r.qc.pass) await acceptFrame(mv, i, r);
-          else failures.push(`${mv.id}#${i}${r ? ` QC${r.qc.score}` : ' ERR'}`);
+          if (best) {
+            // Never discard a paid generation: save the best image. If it
+            // didn't clear QC it still beats a blank frame — flag for review.
+            await acceptFrame(mv, i, best);
+            if (!best.qc.pass) review.push(`${mv.id}#${i} QC${best.qc.score}`);
+          } else {
+            failures.push(`${mv.id}#${i} ERR`); // no figure at all
+          }
           renderAll();
         }
       }
       const summary = `${stStripsUsed} sheets ok, ${stStripFallbacks} fell back`
         + (stStripError ? ` (${stStripError})` : '');
-      stStatus = failures.length === 0
-        ? `batch complete: all ${total} frames accepted · ${summary} — SAVE to persist`
-        : `batch done, ${total - failures.length}/${total} accepted · ${summary} · needs review: ${failures.join(' ')}`;
+      stStatus = batchSummary(total, failures, review, summary);
     } catch (e) {
       stStatus = `batch aborted: ${(e as Error).message}`;
     }
@@ -1930,26 +2032,28 @@ const runGenerateAll = async (): Promise<void> => {
       } catch { frames = new Array(mv.steps.length).fill(null); }
 
       for (const i of wanted) {
-        let r = frames[i] ?? null;
-        // Per-frame reroll only for the frames the strip failed on.
-        for (let att = 0; att < 2 && !(r && r.qc.pass); att++) {
+        let best = frames[i] ?? null;
+        // Reroll only until we get a QC pass, but KEEP THE BEST attempt —
+        // a reroll can come back worse, and each one was billed.
+        for (let att = 0; att < 2 && !(best && best.qc.pass); att++) {
           try {
-            r = (await genFrame(mv, i, 2 + ((Math.random() * 1e6) | 0))) ?? r;
+            best = betterResult(best, await genFrame(mv, i, 2 + ((Math.random() * 1e6) | 0)));
           } catch { /* transient — next attempt */ }
         }
-        if (r && r.qc.pass) {
-          await acceptFrame(mv, i, r);
+        if (best) {
+          // Never discard a paid generation: save the best image we got. If it
+          // didn't clear QC it still beats a blank frame — flag it for review.
+          await acceptFrame(mv, i, best);
+          if (!best.qc.pass) review.push(`${mv.id}#${i} QC${best.qc.score}`);
         } else {
-          failures.push(`${mv.id}#${i}${r ? ` QC${r.qc.score}` : ' ERR'}`);
+          failures.push(`${mv.id}#${i} ERR`); // no figure at all
         }
         renderAll();
       }
     }
     const strips = `strips ${stStripsUsed} ok / ${stStripFallbacks} fell back to per-frame`
       + (stStripError ? ` (${stStripError})` : '');
-    stStatus = failures.length === 0
-      ? `batch complete: all ${total} frames accepted · ${strips} — SAVE to persist`
-      : `batch done, ${total - failures.length}/${total} accepted · ${strips} · needs review: ${failures.join(' ')}`;
+    stStatus = batchSummary(total, failures, review, strips);
   } catch (e) {
     stStatus = `batch aborted: ${(e as Error).message}`;
   }
@@ -2136,35 +2240,40 @@ const renderGenerateTab = (): HTMLElement => {
 
   const refSection = mkEl('div', { class: 'genblock' },
     mkEl('b', {}, '1 · reference sheet (the consistency contract)'),
-    mkEl('p', { class: stImg2Img ? 'qc pass' : 'qc fail' },
-      stImg2Img
-        ? `✅ reference-image conditioning ON — every frame is generated FROM the reference (true identity lock), `
-          + `batched ${SHEET_MAX}-up per API call`
-        : '⚠ text-only provider: the reference CANNOT be fed to the model (NVIDIA flux rejects user images). '
-          + 'Identity is best-effort via strips + palette lock. For a real fix set IMAGE_PROVIDER=gemini|bfl|fal (+ key) in .env.'),
+    mkEl('p', { class: isImg2Img(stRefProvider) ? 'qc pass' : 'qc fail' },
+      isImg2Img(stRefProvider)
+        ? `✅ ${stRefProvider} accepts a reference image — you can stylize an uploaded photo, and sprites `
+          + `generated from the locked reference get true identity lock`
+        : `⚠ ${stRefProvider} is text-only (cannot accept a reference image). "Generate reference" works, `
+          + `but stylizing an uploaded photo needs an img2img engine (gemini / bfl / fal).`),
     mkEl('div', { class: 'row' },
       mkEl('label', {}, 'character description ', mkEl('input', {
         value: m.desc ?? '', style: 'width:420px',
         placeholder: 'e.g. cyberpunk karate robot, red chassis, yellow visor',
         onchange: (e: Event) => { m.desc = (e.target as HTMLInputElement).value; stDirty = true; },
       })),
+      mkEl('label', {}, ' engine ', sessionSelect(
+        stRefProvider,
+        Object.entries(stAvailable).filter(([, ok]) => ok).map(([p]) => p),
+        (v) => { stRefProvider = v; },
+      )),
       mkEl('button', { disabled: stGenBusy ? '' : null, onclick: () => void runGeneration('reference') },
         stGenBusy ? '…' : 'generate reference'),
       // Bring your own art: use a real image as the character's contract.
-      mkEl('label', { class: 'upload', title: 'use your own artwork as the reference (or as the basis to stylize one)' },
-        stGenBusy ? '…' : '⬆ upload image',
+      mkEl('label', { class: 'upload', title: 'use your own artwork as the reference — add several photos (front / side / detail) to emphasize features' },
+        stGenBusy ? '…' : '⬆ upload image(s)',
         mkEl('input', {
-          type: 'file', accept: 'image/*', style: 'display:none',
+          type: 'file', accept: 'image/*', multiple: '', style: 'display:none',
           onchange: (e: Event) => {
-            const file = (e.target as HTMLInputElement).files?.[0];
-            if (file) void loadUploadedReference(file);
+            const files = Array.from((e.target as HTMLInputElement).files ?? []);
+            if (files.length) void loadUploadedReference(files);
             (e.target as HTMLInputElement).value = '';
           },
         })),
     ),
     // The locked reference, shown by default — it IS the character contract,
     // so it should never be invisible just because you haven't regenerated it.
-    !stRefPreview && stUpload === null ? mkEl('div', { class: 'row' },
+    !stRefPreview && stUpload.length === 0 ? mkEl('div', { class: 'row' },
       savedThumb('_reference.png') ?? mkEl('div', { class: 'thumb empty' }, 'no reference'),
       mkEl('p', { class: 'hint' }, m.palette
         ? `locked reference in use · every frame is generated from this image`
@@ -2173,24 +2282,26 @@ const renderGenerateTab = (): HTMLElement => {
     // An uploaded image (shown RAW). Recommended path: stylize — the model
     // redraws the character as a game sprite, handling the background itself.
     // "use as-is" only suits already-clean sprite art.
-    stUpload ? mkEl('div', { class: 'row' },
-      thumb(stUpload),
+    stUpload.length ? mkEl('div', { class: 'row' },
+      ...stUpload.map((c) => thumb(c)),
       mkEl('div', {},
         mkEl('p', { class: 'hint' },
-          'uploaded image (raw). For a photo or any real background, use ✨ stylize — it keeps the '
-          + 'face/outfit and redraws on a clean sprite background. "use as-is" is for art that is '
-          + 'already a clean sprite on white.'),
+          `${stUpload.length} uploaded image${stUpload.length === 1 ? '' : 's'} (raw). For a photo or any `
+          + 'real background, use ✨ stylize — it keeps the face/outfit and redraws on a clean sprite '
+          + 'background. Add more photos (front / side / detail) to emphasize features; "use as-is" '
+          + '(first image only) is for art that is already a clean sprite on white.'),
         mkEl('button', {
-          disabled: stGenBusy || !stImg2Img ? '' : null,
-          title: stImg2Img ? 'redraw the uploaded character as a game sprite (recommended for photos)'
-            : 'needs an img2img provider (IMAGE_PROVIDER=gemini)',
+          disabled: stGenBusy || !isImg2Img(stRefProvider) ? '' : null,
+          title: isImg2Img(stRefProvider)
+            ? `redraw the uploaded character as a game sprite via ${stRefProvider} (recommended for photos)`
+            : `the reference engine "${stRefProvider}" is text-only — switch it to gemini / bfl / fal to stylize`,
           onclick: () => { void stylizeUpload(); },
         }, stGenBusy ? '…' : '✨ stylize into reference'),
         mkEl('button', {
           title: 'use the uploaded image directly (best for a clean sprite on a white background)',
           onclick: () => useUploadVerbatim(),
         }, 'use as-is'),
-        mkEl('button', { onclick: () => { stUpload = null; renderAll(); } }, 'discard'),
+        mkEl('button', { onclick: () => { stUpload = []; renderAll(); } }, 'discard'),
       ),
     ) : null,
     stRefPreview ? mkEl('div', { class: 'row' },
@@ -2253,20 +2364,20 @@ const renderGenerateTab = (): HTMLElement => {
           }, r.accepted ? 'accepted ✓' : 'accept'),
           mkEl('button', {
             disabled: stGenBusy ? '' : null,
-            onclick: () => {
-              void (async () => {
-                stGenBusy = true;
-                stStatus = `retrying ${mv.id}#${i}…`; renderAll();
-                try {
-                  const nr = await genFrame(mv, i, (Math.random() * 999) | 0);
-                  if (nr) stGenResults.set(i, nr);
-                } catch (e) { stStatus = `retry failed: ${(e as Error).message}`; }
-                stGenBusy = false;
-                renderAll();
-              })();
-            },
+            title: `re-roll this frame with a new seed via ${stSpriteProvider}`,
+            onclick: () => regenSingleFrame(mv, i),
           }, 'retry'),
-        ) : null,
+        // No fresh result: let the saved "in use" (or empty) frame be
+        // regenerated directly, without a full-move generate first.
+        ) : mkEl('div', {},
+          mkEl('button', {
+            disabled: stGenBusy ? '' : null,
+            title: saved
+              ? `regenerate just this frame with a new seed via ${stSpriteProvider} (review + accept to replace)`
+              : `generate this single frame via ${stSpriteProvider}`,
+            onclick: () => regenSingleFrame(mv, i),
+          }, stGenBusy ? '…' : (saved ? '⟳ regenerate' : 'generate')),
+        ),
       ));
     }
   }
@@ -2278,6 +2389,11 @@ const renderGenerateTab = (): HTMLElement => {
         stMoveIdx = b.moves.findIndex((x) => x.id === id);
         stGenResults = new Map();
       })),
+      mkEl('label', {}, ' engine ', sessionSelect(
+        stSpriteProvider,
+        Object.entries(stAvailable).filter(([, ok]) => ok).map(([p]) => p),
+        (v) => { stSpriteProvider = v; stImg2Img = isImg2Img(v); },
+      )),
       mv ? mkEl('label', {}, ' pose description ', mkEl('input', {
         value: m.moveDesc?.[mv.id] ?? '', style: 'width:340px',
         placeholder: SHOTO_POSES[mv.id] ?? 'e.g. throwing a heavy straight right punch',
@@ -2795,7 +2911,7 @@ const renderStageTab = (): HTMLElement => {
           id: 'stageprompt', style: 'width:460px',
           placeholder: 'e.g. anime city rooftop at dusk, purple sunset sky, empty concrete floor at the bottom',
         }),
-        mkEl('label', {}, ' engine ', selInput(
+        mkEl('label', {}, ' engine ', sessionSelect(
           stStageProvider,
           Object.entries(stAvailable).filter(([, ok]) => ok).map(([p]) => p),
           (v) => { stStageProvider = v; },
@@ -2969,11 +3085,15 @@ const renderAll = (): void => {
 void (async () => {
   try {
     const caps = await apiJson<{ provider: string; img2img: boolean; available: Record<string, boolean> }>('/api/capabilities');
-    stImg2Img = caps.img2img;
     stAvailable = caps.available;
-    // Default the Stage engine to whatever's actually configured: prefer
-    // NVIDIA (cheaper, no identity needed for backgrounds) if its key is
-    // set, else fall back to the character pipeline's provider.
+    // Character reference + sprite engines default to the server's configured
+    // IMAGE_PROVIDER (the one with a proven key); each is overridable per
+    // category in the Generate tab.
+    stRefProvider = caps.provider;
+    stSpriteProvider = caps.provider;
+    stImg2Img = isImg2Img(stSpriteProvider);
+    // Stage set-dressing needs no identity lock — prefer cheap NVIDIA if keyed,
+    // else the configured provider.
     stStageProvider = stAvailable.nvidia ? 'nvidia' : caps.provider;
     stCharList = await apiJson<string[]>('/api/characters');
     if (stCharList.length === 0) throw new Error('no characters found');
