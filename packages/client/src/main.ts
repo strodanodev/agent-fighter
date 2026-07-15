@@ -15,11 +15,12 @@ import { listCharacters, loadRoster, drawFighter } from './atlas.js';
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  drawHud, drawResults, drawSelect, drawStage, drawTitle,
+  drawHud, drawResults, drawSelect, drawStage, drawStageSelect, drawTitle,
   setStageAsset, setUiKit, worldTransform,
 } from './ui.js';
 import type { Cam, HudFx } from './ui.js';
 import { listStages, loadStage, loadUiKit } from './chrome.js';
+import type { StageAsset } from './chrome.js';
 
 const TICK_MS = 1000 / TICKS_PER_SEC;
 
@@ -54,13 +55,16 @@ const pollPad = (map: [string, number][]): InputFrame => {
 };
 
 // ---------------------------------------------------------------- state
-type Screen = 'loading' | 'title' | 'select' | 'fight' | 'results';
+type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'fight' | 'results';
 
 let screen: Screen = 'loading';
 let uiTick = 0;
 let allRosters: Roster[] = [];
 let picks: [number, number] = [0, 0];
 let locked: [boolean, boolean] = [false, false];
+let stageIds: string[] = [];
+let stageAssets: (StageAsset | null)[] = [];
+let stageCursor = 0;
 let fighters: [Roster, Roster] | null = null;
 let game: GameState | null = null;
 let showBoxes = false;
@@ -86,8 +90,9 @@ const px = (v: number): number => Math.trunc(v / 256);
 const boot = async (): Promise<void> => {
   try {
     setUiKit(await loadUiKit());
-    const stageIds = await listStages();
-    if (stageIds.length > 0) setStageAsset(await loadStage(stageIds[0]!));
+    stageIds = await listStages();
+    stageAssets = await Promise.all(stageIds.map(loadStage));
+    if (stageAssets.length > 0) setStageAsset(stageAssets[0]!);
     const ids = await listCharacters();
     if (ids.length === 0) throw new Error('no characters found in characters/');
     allRosters = await Promise.all(ids.map(loadRoster));
@@ -285,8 +290,21 @@ const tickSelect = (): void => {
   }
   if (pressedThisFrame.has('Escape')) locked = [false, false];
   if (locked[0] && locked[1] && (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space'))) {
-    startFight();
+    if (stageIds.length > 0) screen = 'stageSelect';
+    else startFight(); // no stages installed — fall back to the procedural stage
   }
+};
+
+const tickStageSelect = (): void => {
+  const n = stageIds.length;
+  const move = (d: number): void => {
+    stageCursor = (stageCursor + d + n) % n;
+    setStageAsset(stageAssets[stageCursor] ?? null);
+  };
+  if (pressedThisFrame.has('KeyA') || pressedThisFrame.has('ArrowLeft')) move(-1);
+  if (pressedThisFrame.has('KeyD') || pressedThisFrame.has('ArrowRight')) move(1);
+  if (pressedThisFrame.has('Escape')) { screen = 'select'; locked = [false, false]; }
+  if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space')) startFight();
 };
 
 const frame = (): void => {
@@ -310,6 +328,9 @@ const frame = (): void => {
   } else if (screen === 'select') {
     tickSelect();
     drawSelect(ctx, allRosters, picks, locked, uiTick);
+  } else if (screen === 'stageSelect') {
+    tickStageSelect();
+    drawStageSelect(ctx, stageIds, stageCursor, uiTick);
   } else if (screen === 'fight' && game) {
     if (pressedThisFrame.has('KeyB')) showBoxes = !showBoxes;
     if (pressedThisFrame.has('Escape')) { screen = 'select'; locked = [false, false]; }

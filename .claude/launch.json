@@ -1,0 +1,21 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "client",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["server.mjs"],
+      "cwd": "packages/client",
+      "env": { "PORT": "8575" },
+      "port": 8575
+    },
+    {
+      "name": "studio",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["server.mjs"],
+      "cwd": "packages/studio",
+      "env": { "PORT": "8574" },
+      "port": 8574
+    }
+  ]
+}

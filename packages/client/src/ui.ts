@@ -596,6 +596,50 @@ export const drawSelect = (
   }
 };
 
+// ---------------------------------------------------------------- stage select
+export const drawStageSelect = (
+  ctx: CanvasRenderingContext2D,
+  stageIds: string[],
+  cursor: number,
+  tick: number,
+): void => {
+  // Backdrop previews the currently-highlighted stage — the caller keeps
+  // the global stage asset in sync with `cursor` as it moves.
+  ctx.save();
+  const cam = menuCam(700);
+  worldTransform(ctx, cam);
+  drawStage(ctx, cam);
+  ctx.restore();
+  ctx.fillStyle = '#0a0616cc';
+  ctx.fillRect(0, 0, VW, VH);
+
+  text(ctx, 'SELECT STAGE', VW / 2, 62, 30, GOLD_LT);
+
+  const cell = 172, cellH = 108, gap = 22;
+  const cols = stageIds.length;
+  const gridW = cols * cell + (cols - 1) * gap;
+  const gx = (VW - gridW) / 2;
+  const gy = 150;
+  stageIds.forEach((id, k) => {
+    const x = gx + k * (cell + gap);
+    const y = gy;
+    const on = k === cursor;
+    bevel(ctx, x - 3, y - 3, cell + 6, cellH + 6, PANEL, on ? GOLD : GOLD_DK, GOLD_DK, on ? 3 : 2);
+    ctx.fillStyle = PANEL_LT;
+    ctx.fillRect(x, y, cell, cellH);
+    text(ctx, id.toUpperCase(), x + cell / 2, y + cellH / 2 + 6, 16, on ? '#fff' : '#ffffffaa');
+
+    if (on && tick % 30 < 20) {
+      ctx.strokeStyle = GOLD_LT;
+      ctx.lineWidth = 4;
+      ctx.strokeRect(x - 8, y - 8, cell + 16, cellH + 16);
+      ctx.lineWidth = 1;
+    }
+  });
+
+  text(ctx, '◄/► CHOOSE STAGE      ENTER: FIGHT      ESC: BACK', VW / 2, VH - 30, 13, '#ffffffaa');
+};
+
 // ---------------------------------------------------------------- results
 export const drawResults = (
   ctx: CanvasRenderingContext2D,
