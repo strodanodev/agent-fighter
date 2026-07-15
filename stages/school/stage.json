@@ -2,16 +2,29 @@
   "name": "school",
   "imageW": 1536,
   "imageH": 640,
-  "floorY": 520,
-  "skyColor": "#2b1b4d",
-  "deckColor": "#3a3644",
+  "floorY": 586,
+  "skyColor": "#0b0024",
+  "deckColor": "#121212",
   "layers": [
+    {
+      "file": "layer-bg.png",
+      "depth": 0.15,
+      "stretch": true
+    },
+    {
+      "file": "layer-mid.png",
+      "depth": 0.45,
+      "stretch": false,
+      "scale": 1.0109031593406592,
+      "offsetX": -53,
+      "offsetY": -491
+    },
     {
       "file": "layer-fg.png",
       "depth": 0.75,
       "stretch": false,
-      "scale": 0.22,
-      "offsetX": 0,
+      "scale": 0.580587714716806,
+      "offsetX": 347,
       "offsetY": -150
     }
   ]

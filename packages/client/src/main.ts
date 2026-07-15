@@ -8,9 +8,13 @@
  */
 import {
   Action, Btn, Phase, STAGE, TICKS_PER_SEC,
-  createGameState, debugBoxes, setCharacters, step,
+  aiPoll, createAi, createGameState, debugBoxes, setCharacters, step,
 } from '@af/core';
-import type { GameState, InputFrame } from '@af/core';
+import type { AiState, GameState, InputFrame } from '@af/core';
+import {
+  awardXp, cpuLevelFor, loadLever, loadProfile, saveLever, skillForCpuLevel, xpForNext,
+} from './progress.js';
+import type { Profile } from './progress.js';
 import { listCharacters, loadRoster, drawFighter } from './atlas.js';
 import type { Roster } from './atlas.js';
 import {
@@ -56,12 +60,22 @@ const pollPad = (map: [string, number][]): InputFrame => {
 
 // ---------------------------------------------------------------- state
 type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'fight' | 'results';
+type Mode = 'cpu' | '2p';
 
 let screen: Screen = 'loading';
+let mode: Mode = 'cpu';
 let uiTick = 0;
 let allRosters: Roster[] = [];
 let picks: [number, number] = [0, 0];
 let locked: [boolean, boolean] = [false, false];
+
+// Progression + the CPU difficulty lever.
+const profile: Profile = loadProfile();
+let lever = loadLever();
+let cpuAi: AiState | null = null;
+let statDmg = 0; // damage the human dealt this match
+let statBestCombo = 0;
+let xpBanner: { gained: number; levelsUp: number } | null = null;
 let stageIds: string[] = [];
 let stageAssets: (StageAsset | null)[] = [];
 let stageCursor = 0;
@@ -107,6 +121,12 @@ const startFight = (): void => {
   fighters = [allRosters[picks[0]]!, allRosters[picks[1]]!];
   setCharacters(fighters[0].ch, fighters[1].ch);
   game = createGameState(seed++);
+  cpuAi = mode === 'cpu'
+    ? createAi(1, skillForCpuLevel(cpuLevelFor(profile, lever)), seed * 31 + 7)
+    : null;
+  statDmg = 0;
+  statBestCombo = 0;
+  xpBanner = null;
   cam = { x: STAGE.widthPx / 2 - VW / 2 / 1.5, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5 };
   updateCamera(game); // settle before the first frame so round 1 opens framed
   prevHealth = [game.fighters[0].health, game.fighters[1].health];
@@ -188,12 +208,15 @@ const updateJuice = (g: GameState): void => {
       shake = big ? 11 : 6;
       hitStopFlash = big ? 3 : 0;
     }
+    // Progression stats: what the human (P1) dished out.
+    if (i === 1 && f.health < prevHealth[1]) statDmg += prevHealth[1] - f.health;
     prevHealth[i] = f.health;
     // Health bar lag (white flash draining behind the real bar).
     const max = fighters![i].ch.b.maxHealth;
     const target = Math.max(0, f.health) / max;
     fx.flash[i] = fx.flash[i] > target ? Math.max(target, fx.flash[i] - 0.006) : target;
   }
+  statBestCombo = Math.max(statBestCombo, g.fighters[1].comboHits);
 
   // Combo counter tracks whoever is being hit.
   const v0 = g.fighters[0], v1 = g.fighters[1];
@@ -287,7 +310,8 @@ const renderFight = (g: GameState): void => {
     ctx.fillStyle = '#ffffff33';
     ctx.fillRect(0, 0, VW, VH);
   }
-  drawHud(ctx, g, fighters!, fx);
+  drawHud(ctx, g, fighters!, fx,
+    cpuAi ? ['', `CPU LV ${cpuLevelFor(profile, lever)}`] : undefined);
 };
 
 // ---------------------------------------------------------------- screens
@@ -299,11 +323,25 @@ const tickSelect = (): void => {
   };
   if (pressedThisFrame.has('KeyA')) move(0, -1);
   if (pressedThisFrame.has('KeyD')) move(0, 1);
-  if (pressedThisFrame.has('ArrowLeft')) move(1, -1);
-  if (pressedThisFrame.has('ArrowRight')) move(1, 1);
-  for (const i of [0, 1] as const) {
-    if (CONFIRM[i]!.some((k) => pressedThisFrame.has(k))) locked[i] = true;
+
+  // The CPU difficulty lever: [ and ] on the select screen (CPU mode).
+  if (mode === 'cpu') {
+    if (pressedThisFrame.has('BracketLeft')) { lever = Math.max(-10, lever - 1); saveLever(lever); }
+    if (pressedThisFrame.has('BracketRight')) { lever = Math.min(10, lever + 1); saveLever(lever); }
+  } else {
+    if (pressedThisFrame.has('ArrowLeft')) move(1, -1);
+    if (pressedThisFrame.has('ArrowRight')) move(1, 1);
   }
+
+  if (CONFIRM[0]!.some((k) => pressedThisFrame.has(k))) locked[0] = true;
+  if (mode === '2p') {
+    if (CONFIRM[1]!.some((k) => pressedThisFrame.has(k))) locked[1] = true;
+  } else if (locked[0] && !locked[1]) {
+    // CPU picks its fighter — visibly, like an arcade opponent reveal.
+    picks[1] = (seed * 17 + profile.wins * 5 + uiTick) % n;
+    locked[1] = true;
+  }
+
   if (pressedThisFrame.has('Escape')) locked = [false, false];
   if (locked[0] && locked[1] && (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space'))) {
     if (stageIds.length > 0) screen = 'stageSelect';
@@ -323,6 +361,60 @@ const tickStageSelect = (): void => {
   if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space')) startFight();
 };
 
+// ---------------------------------------------------------------- overlays
+const ARCADE = 'Impact, "Arial Black", sans-serif';
+
+const overlayText = (
+  s: string, x: number, y: number, size: number, color: string,
+  align: CanvasTextAlign = 'center',
+): void => {
+  ctx.font = `${size}px ${ARCADE}`;
+  ctx.textAlign = align;
+  ctx.fillStyle = '#000000aa';
+  ctx.fillText(s, x + 2, y + 2);
+  ctx.fillStyle = color;
+  ctx.fillText(s, x, y);
+};
+
+const drawModePicker = (): void => {
+  const y0 = VH - 168;
+  const rows: [Mode, string][] = [['cpu', `VS CPU  ·  LV ${cpuLevelFor(profile, lever)}`], ['2p', '2 PLAYERS']];
+  rows.forEach(([m, label], k) => {
+    const y = y0 + k * 30;
+    const on = mode === m;
+    overlayText(`${on ? '▶ ' : ''}${label}`, VW / 2, y, on ? 22 : 18, on ? '#f7e0a3' : '#ffffff77');
+  });
+  overlayText('W/S: MODE', VW / 2, y0 + 62, 12, '#ffffff55');
+};
+
+const drawCpuLever = (): void => {
+  const cl = cpuLevelFor(profile, lever);
+  overlayText(`YOU: LV ${profile.level}    CPU: LV ${cl}  ${lever === 0 ? '' : lever > 0 ? `(+${lever})` : `(${lever})`}`,
+    VW / 2, 96, 20, '#f7e0a3');
+  overlayText('[ / ] ADJUST CPU LEVEL', VW / 2, 118, 12, '#ffffff88');
+};
+
+const drawXpBanner = (): void => {
+  if (!xpBanner) return;
+  const y = VH / 2 + 128;
+  overlayText(`+${xpBanner.gained} XP`, VW / 2, y, 26, '#7ee85a');
+  // XP progress bar toward next level.
+  const need = xpForNext(profile.level);
+  const w = 300, h = 10;
+  const x = VW / 2 - w / 2;
+  ctx.fillStyle = '#101116';
+  ctx.fillRect(x - 2, y + 12 - 2, w + 4, h + 4);
+  ctx.fillStyle = '#23242e';
+  ctx.fillRect(x, y + 12, w, h);
+  ctx.fillStyle = '#6fd3ff';
+  ctx.fillRect(x, y + 12, Math.round((w * Math.min(profile.xp, need)) / need), h);
+  overlayText(`LV ${profile.level}  ·  ${profile.xp}/${need} XP  ·  ${profile.wins}W ${profile.losses}L`,
+    VW / 2, y + 40, 13, '#ffffffcc');
+  if (xpBanner.levelsUp > 0 && uiTick % 40 < 28) {
+    overlayText(`LEVEL UP!  LV ${profile.level}`, VW / 2, VH / 2 - 100, 32, '#ffd166');
+  }
+};
+
 const frame = (): void => {
   uiTick++;
 
@@ -340,24 +432,43 @@ const frame = (): void => {
     }
   } else if (screen === 'title') {
     drawTitle(ctx, allRosters, uiTick);
-    if (pressedThisFrame.size > 0) { screen = 'select'; locked = [false, false]; }
+    drawModePicker();
+    if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')
+      || pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
+      mode = mode === 'cpu' ? '2p' : 'cpu';
+    } else if (pressedThisFrame.size > 0) {
+      screen = 'select';
+      locked = [false, false];
+    }
   } else if (screen === 'select') {
     tickSelect();
     drawSelect(ctx, allRosters, picks, locked, uiTick);
+    if (mode === 'cpu') drawCpuLever();
   } else if (screen === 'stageSelect') {
     tickStageSelect();
     drawStageSelect(ctx, stageIds, stageCursor, uiTick);
   } else if (screen === 'fight' && game) {
     if (pressedThisFrame.has('KeyB')) showBoxes = !showBoxes;
     if (pressedThisFrame.has('Escape')) { screen = 'select'; locked = [false, false]; }
-    step(game, [pollPad(P0_MAP), pollPad(P1_MAP)]);
+    const p2: InputFrame = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
+    step(game, [pollPad(P0_MAP), p2]);
     updateJuice(game);
     updateCamera(game);
     renderFight(game);
-    if (game.phase === Phase.MatchOver) screen = 'results';
+    if (game.phase === Phase.MatchOver) {
+      if (cpuAi && !xpBanner) {
+        xpBanner = awardXp(profile, {
+          won: game.winner === 0,
+          damageDealt: statDmg,
+          bestCombo: statBestCombo,
+        });
+      }
+      screen = 'results';
+    }
   } else if (screen === 'results' && game) {
     renderFight(game);
     drawResults(ctx, game, fighters!, uiTick);
+    if (cpuAi) drawXpBanner();
     if (pressedThisFrame.has('Enter')) startFight();
     if (pressedThisFrame.has('Escape')) { screen = 'select'; locked = [false, false]; }
   }
@@ -399,4 +510,7 @@ Object.assign(globalThis, {
   afStep: (n = 1) => { for (let k = 0; k < n; k++) frame(); },
   afPress: (code: string) => { pressedThisFrame.add(code); keys.add(code); },
   afRelease: (code: string) => { keys.delete(code); },
+  afMode: (m?: 'cpu' | '2p') => { if (m) mode = m; return mode; },
+  afProfile: () => ({ ...profile, lever }),
+  afSetLever: (v: number) => { lever = Math.max(-10, Math.min(10, v | 0)); saveLever(lever); },
 });

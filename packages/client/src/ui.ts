@@ -440,6 +440,7 @@ export const drawHud = (
   g: GameState,
   rosters: [Roster, Roster],
   fx: HudFx,
+  tags?: [string, string], // per-player nameplate suffix (e.g. "CPU LV 12")
 ): void => {
   for (const i of [0, 1] as const) {
     const f = g.fighters[i];
@@ -447,7 +448,7 @@ export const drawHud = (
     const ratio = Math.max(0, f.health) / max;
     drawHealthBar(ctx, i, ratio, fx.flash[i]);
     drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
-    drawNameplate(ctx, i, rosters[i].bundle.name);
+    drawNameplate(ctx, i, rosters[i].bundle.name + (tags?.[i] ? ` · ${tags[i]}` : ''));
     drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
     drawMeter(ctx, i, f.meter);
   }

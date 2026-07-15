@@ -6,8 +6,9 @@
       "runtimeExecutable": "node",
       "runtimeArgs": ["server.mjs"],
       "cwd": "packages/client",
-      "env": { "PORT": "8575" },
-      "port": 8575
+      "env": { "PORT": "8576" },
+      "port": 8576,
+      "autoPort": false
     },
     {
       "name": "studio",
@@ -15,7 +16,8 @@
       "runtimeArgs": ["server.mjs"],
       "cwd": "packages/studio",
       "env": { "PORT": "8574" },
-      "port": 8574
+      "port": 8574,
+      "autoPort": false
     }
   ]
 }

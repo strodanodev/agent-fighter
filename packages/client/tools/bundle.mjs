@@ -30,8 +30,10 @@ const ORDER = [
   'core/src/state.js',
   'core/src/sim.js',
   'core/src/anim.js',
+  'core/src/ai.js',
   'client/src/atlas.js',
   'client/src/chrome.js',
+  'client/src/progress.js',
   'client/src/ui.js',
   'client/src/main.js',
 ];

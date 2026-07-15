@@ -125,9 +125,13 @@ const generateNvidia = async ({ prompt, seed, width = 1024, height = 1024 }) => 
  * character, change the pose" works directly — no asset upload dance.
  * `image` = raw base64 PNG. Returns base64 PNG.
  */
-const generateGemini = async ({ prompt, image, seed }) => {
+const generateGemini = async ({ prompt, image, images, seed }) => {
   const parts = [{ text: prompt }];
-  if (image) parts.push({ inline_data: { mime_type: 'image/png', data: image } });
+  // Multi-reference: the stylize step can corroborate ONE character across
+  // several photos (front / side / detail). `images` (array) is that path;
+  // single `image` is the untouched frame-generation path.
+  const refs = Array.isArray(images) && images.length ? images : (image ? [image] : []);
+  for (const ref of refs) parts.push({ inline_data: { mime_type: 'image/png', data: ref } });
   const r = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
     {
@@ -163,19 +167,58 @@ const generateGemini = async ({ prompt, image, seed }) => {
   return data;
 };
 
-/** fal.ai: synchronous run endpoint. `image` = raw base64. */
-const generateFal = async ({ prompt, image, seed }) => {
-  const model = image ? 'fal-ai/flux-pro/kontext' : 'fal-ai/flux-pro/v1.1';
-  const body = image
-    ? { prompt, image_url: `data:image/png;base64,${image}`, seed, output_format: 'png' }
-    : { prompt, seed, output_format: 'png' };
+/**
+ * fal.ai reference-conditioning model. nano-banana (Google's Gemini-image
+ * family, hosted on fal) via its /edit endpoint takes image_urls as an ARRAY —
+ * so multi-photo references (front/side/detail) work here, unlike flux Kontext
+ * which only accepts a single image_url. Same identity-lock quality as the
+ * direct Gemini path but billed through fal. Override to fall back to the old
+ * single-image path with FAL_IMG2IMG_MODEL=fal-ai/flux-pro/kontext.
+ */
+const FAL_IMG2IMG_MODEL = env.FAL_IMG2IMG_MODEL || process.env.FAL_IMG2IMG_MODEL || 'fal-ai/nano-banana/edit';
+/** fal text-to-image (no reference) — unchanged default. */
+const FAL_TXT2IMG_MODEL = env.FAL_TXT2IMG_MODEL || process.env.FAL_TXT2IMG_MODEL || 'fal-ai/flux-pro/v1.1';
+
+/** Map pixel dims to the closest aspect_ratio nano-banana accepts (it has no
+ * width/height params). Wide sheets (1536×640) → 21:9 so poses pack in a row. */
+const falAspect = (w, h) => {
+  if (!w || !h) return '1:1';
+  const r = w / h;
+  if (r >= 2) return '21:9';
+  if (r >= 1.3) return '16:9';
+  if (r <= 0.5) return '9:16';
+  if (r <= 0.77) return '3:4';
+  return '1:1';
+};
+
+/**
+ * fal.ai synchronous run endpoint. `image` = one raw base64 reference
+ * (frame-gen); `images` = base64 array (multi-photo stylize). Any reference →
+ * the /edit (img2img) model; none → the text-to-image model.
+ */
+const generateFal = async ({ prompt, image, images, seed, width, height }) => {
+  const refs = (Array.isArray(images) && images.length ? images : (image ? [image] : []))
+    .map((b) => (String(b).startsWith('data:') ? String(b) : `data:image/png;base64,${b}`));
+  const model = refs.length ? FAL_IMG2IMG_MODEL : FAL_TXT2IMG_MODEL;
+  const isNano = model.includes('nano-banana');
+  let body;
+  if (refs.length && isNano) {
+    body = { prompt, image_urls: refs, num_images: 1, output_format: 'png', aspect_ratio: falAspect(width, height) };
+  } else if (refs.length) {
+    // flux Kontext fallback — single image_url only.
+    body = { prompt, image_url: refs[0], seed, output_format: 'png' };
+  } else if (isNano) {
+    body = { prompt, num_images: 1, output_format: 'png', aspect_ratio: falAspect(width, height) };
+  } else {
+    body = { prompt, seed, output_format: 'png' };
+  }
   const r = await fetch(`https://fal.run/${model}`, {
     method: 'POST',
     headers: { Authorization: `Key ${FAL_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
   const j = await r.json();
-  if (!r.ok) throw new Error(`fal ${r.status}: ${JSON.stringify(j).slice(0, 200)}`);
+  if (!r.ok) throw new Error(`fal ${r.status} (${model}): ${JSON.stringify(j).slice(0, 200)}`);
   const url = j.images?.[0]?.url;
   if (!url) throw new Error('fal: no image in response');
   if (url.startsWith('data:')) return url.split(',')[1];
@@ -249,7 +292,13 @@ const server = createServer(async (req, res) => {
         || (p === 'fal' && !!FAL_KEY) || (p === 'gemini' && !!GEMINI_API_KEY);
 
       // Reference-conditioned path (only providers that accept our image).
-      if (req0.image) {
+      // `image` = single reference (frame-gen). `images` = multi-reference
+      // array (stylize step). Gemini and fal (nano-banana/edit) both consume
+      // the whole array; bfl (single image_url) takes the first.
+      const stripPrefix = (s) => String(s).replace(/^data:image\/\w+;base64,/, '');
+      const imagesIn = Array.isArray(req0.images) && req0.images.length
+        ? req0.images.map(stripPrefix) : null;
+      if (req0.image || imagesIn) {
         if (!canImg2Img(provider)) {
           return json(res, 400, {
             error: `provider "${provider}" cannot accept a reference image `
@@ -258,11 +307,12 @@ const server = createServer(async (req, res) => {
               + `Use gemini, bfl, or fal (+ key) in .env for true reference conditioning.`,
           });
         }
-        const image = String(req0.image).replace(/^data:image\/\w+;base64,/, '');
+        const image = req0.image ? stripPrefix(req0.image) : imagesIn?.[0];
+        const images = (provider === 'gemini' || provider === 'fal') ? (imagesIn ?? undefined) : undefined;
         try {
           const b64 = provider === 'bfl' ? await generateBfl({ ...req0, image })
-            : provider === 'gemini' ? await generateGemini({ ...req0, image })
-            : await generateFal({ ...req0, image });
+            : provider === 'gemini' ? await generateGemini({ ...req0, image, images })
+            : await generateFal({ ...req0, image, images });
           return json(res, 200, { artifacts: [{ base64: b64 }] });
         } catch (err) {
           return json(res, 502, { error: String(err?.message ?? err) });

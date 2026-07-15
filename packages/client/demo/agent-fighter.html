@@ -1788,6 +1788,493 @@ const spriteForFighter = (f, ch, tick) => {
     }
 };
 
+// ---- core/src/ai.js ----
+// ---------------------------------------------------------------- helpers
+const rnd = (ai, n) => {
+    ai.rng = nextRand(ai.rng);
+    return ai.rng % n;
+};
+/** True with probability p/255. */
+const chance = (ai, p) => rnd(ai, 255) < p;
+/** Linear interpolation on the skill lever: value at skill 0 → value at 100. */
+const lerp = (ai, at0, at100) => at0 + Math.trunc(((at100 - at0) * ai.skill) / 100);
+const pxDist = (a, b) => Math.abs(fpToPx(a.x - b.x));
+const aiGrounded = (f) => f.y >= fp(460);
+const actionable = (f) => f.action === 0 /* Action.Idle */ || f.action === 1 /* Action.WalkF */
+    || f.action === 2 /* Action.WalkB */ || f.action === 3 /* Action.Crouch */;
+// ---------------------------------------------------------------- create
+const createAi = (side, skill, seed) => {
+    const ai = {
+        side,
+        skill: Math.max(0, Math.min(100, skill)),
+        rng: (seed | 0) ^ 0x51ed1e5,
+        p: { aggression: 0, jumpiness: 0, zoner: 0, throwHappy: 0, pushblocker: 0, patience: 0 },
+        intent: 0 /* Intent.Observe */,
+        intentUntil: 0,
+        queue: [],
+        qTicks: 0,
+        oppAction: -1,
+        oppActionAt: 0,
+        reacted: 1,
+        moveDir: 0,
+        moveTicks: 0,
+        guardHigh: 0,
+        eatJump: 0, eatLow: 0, eatOverhead: 0, eatThrow: 0, eatProj: 0,
+        lastHealth: -1,
+        airAttackDone: 0,
+        bookGround: [], bookLauncher: -1, bookAir: [],
+        idxFireball: -1, idxDp: -1, idxSweep: -1, idxLow: -1, idxSuper: -1,
+        bookBuilt: 0,
+    };
+    // Personality: sampled once — this "person" for this match.
+    ai.p.aggression = 90 + rnd(ai, 130);
+    ai.p.jumpiness = 40 + rnd(ai, 150);
+    ai.p.zoner = 40 + rnd(ai, 170);
+    ai.p.throwHappy = 30 + rnd(ai, 120);
+    ai.p.pushblocker = 60 + rnd(ai, 160);
+    ai.p.patience = 60 + rnd(ai, 140);
+    return ai;
+};
+/** Combo routes come from the character's own data — cancel graph included. */
+const buildBook = (ai, ch) => {
+    const id = (s) => ch.moveIdxById[s] ?? -1;
+    ai.bookGround = ['5LP', '5MP', '5HP'].map(id).filter((i) => i >= 0);
+    ai.bookLauncher = id('2HP');
+    ai.bookAir = ['j.LP', 'j.MP', 'j.HP'].map(id).filter((i) => i >= 0);
+    ai.idxFireball = id('236P');
+    ai.idxDp = id('623P');
+    ai.idxSweep = id('2HK');
+    ai.idxLow = id('2LK');
+    ai.idxSuper = ch.superIdx;
+    ai.bookBuilt = 1;
+};
+const BUTTON_OF = {
+    LP: 16 /* Btn.LP */, MP: 32 /* Btn.MP */, HP: 64 /* Btn.HP */, LK: 128 /* Btn.LK */, MK: 256 /* Btn.MK */, HK: 512 /* Btn.HK */,
+};
+const buttonOfMove = (ch, idx) => {
+    const b = ch.b.moves[idx]?.button;
+    return b ? BUTTON_OF[b] : 16 /* Btn.LP */;
+};
+// ---------------------------------------------------------------- queueing
+const q = (ai, step) => { ai.queue.push(step); };
+const qTapButton = (ai, buttons, down = 0) => {
+    q(ai, { buttons, down, ticks: 2 });
+    q(ai, { down, ticks: 1 });
+};
+/** Queue a QCF motion + punch — sloppy at low skill (sometimes fails, human). */
+const qFireball = (ai, buttons) => {
+    const sloppy = !chance(ai, lerp(ai, 140, 250)); // execution success odds
+    q(ai, { down: 1, ticks: 3 });
+    q(ai, { down: 1, fwd: 1, ticks: 2 });
+    if (sloppy) {
+        // Rushed the motion: skip the forward — parser may drop it. Human whiff.
+        q(ai, { buttons, ticks: 2 });
+    }
+    else {
+        q(ai, { fwd: 1, ticks: 2 });
+        q(ai, { fwd: 1, buttons, ticks: 2 });
+    }
+    q(ai, { ticks: 2 });
+};
+/** DP: f, d, df + P. */
+const qDp = (ai, buttons) => {
+    q(ai, { fwd: 1, ticks: 2 });
+    q(ai, { down: 1, ticks: 2 });
+    q(ai, { down: 1, fwd: 1, buttons, ticks: 3 });
+    q(ai, { ticks: 2 });
+};
+const qDash = (ai, dir) => {
+    const d = dir === 'fwd' ? { fwd: 1 } : { back: 1 };
+    q(ai, { ...d, ticks: 2 });
+    q(ai, { ticks: 2 });
+    q(ai, { ...d, ticks: 3 });
+};
+// ---------------------------------------------------------------- emission
+/** Translate a facing-relative step into an InputFrame for this tick. */
+const emit = (me, step, moveDir, crouch) => {
+    let f = 0;
+    const fwdBit = me.facing === 1 ? 2 /* Btn.Right */ : 1 /* Btn.Left */;
+    const backBit = me.facing === 1 ? 1 /* Btn.Left */ : 2 /* Btn.Right */;
+    if (step) {
+        if (step.fwd)
+            f |= fwdBit;
+        if (step.back)
+            f |= backBit;
+        if (step.up)
+            f |= 4 /* Btn.Up */;
+        if (step.down)
+            f |= 8 /* Btn.Down */;
+        if (step.buttons)
+            f |= step.buttons;
+        return f;
+    }
+    if (moveDir === 1)
+        f |= fwdBit;
+    else if (moveDir === -1)
+        f |= backBit;
+    if (crouch)
+        f |= 8 /* Btn.Down */;
+    return f;
+};
+// ---------------------------------------------------------------- the brain
+const aiPoll = (ai, g) => {
+    const me = g.fighters[ai.side];
+    const op = g.fighters[1 - ai.side];
+    const ch = characters[ai.side];
+    if (!ai.bookBuilt)
+        buildBook(ai, ch);
+    if (ai.lastHealth < 0)
+        ai.lastHealth = me.health;
+    if (g.phase !== 1 /* Phase.Fighting */) {
+        ai.queue = [];
+        ai.qTicks = 0;
+        ai.intent = 0 /* Intent.Observe */;
+        ai.lastHealth = me.health;
+        return 0;
+    }
+    const dist = pxDist(me, op);
+    const reaction = lerp(ai, 22, 7) + rnd(ai, lerp(ai, 8, 3)); // frames + jitter
+    const seen = (sinceTick) => g.tick - sinceTick >= reaction;
+    // ---- perception bookkeeping
+    if (op.action !== ai.oppAction) {
+        ai.oppAction = op.action;
+        ai.oppActionAt = g.tick;
+        ai.reacted = 0;
+    }
+    // ---- adaptation: classify how I just got hit
+    if (me.health < ai.lastHealth) {
+        if (!aiGrounded(op))
+            ai.eatJump = Math.min(9, ai.eatJump + 1);
+        else if (op.action === 17 /* Action.Grab */ || me.action === 18 /* Action.Thrown */)
+            ai.eatThrow = Math.min(9, ai.eatThrow + 1);
+        else if (op.action === 3 /* Action.Crouch */ || op.action === 9 /* Action.Attack */) {
+            // crude read: low pokes come from crouch-stance moves
+            const opCh = characters[(1 - ai.side)];
+            const mv = op.moveIdx >= 0 ? opCh.b.moves[op.moveIdx] : null;
+            if (mv?.stance === 'crouch')
+                ai.eatLow = Math.min(9, ai.eatLow + 1);
+        }
+        ai.lastHealth = me.health;
+    }
+    else if (me.health > ai.lastHealth) {
+        ai.lastHealth = me.health;
+    }
+    // ---- committed execution: drain the queue first (humans finish inputs)
+    if (ai.queue.length > 0) {
+        const step = ai.queue[0];
+        const frame = emit(me, step, 0, false);
+        if (++ai.qTicks >= step.ticks) {
+            ai.queue.shift();
+            ai.qTicks = 0;
+        }
+        return frame;
+    }
+    // ---- non-actionable states: reactions that don't need the intent system
+    switch (me.action) {
+        case 18 /* Action.Thrown */: {
+            // Throw tech after human delay; success scales with skill.
+            if (g.tick - ai.oppActionAt >= Math.max(3, reaction - 4)
+                && chance(ai, lerp(ai, 40, 215))) {
+                qTapButton(ai, 64 /* Btn.HP */);
+            }
+            return emit(me, null, 0, false);
+        }
+        case 12 /* Action.BlockStand */:
+        case 13 /* Action.BlockCrouch */: {
+            // Pushblock habit (advancing guard) — more at higher skill.
+            if (chance(ai, Math.trunc((ai.p.pushblocker * lerp(ai, 20, 110)) / 255))) {
+                qTapButton(ai, 16 /* Btn.LP */ | 32 /* Btn.MP */, me.action === 13 /* Action.BlockCrouch */ ? 1 : 0);
+            }
+            return emit(me, null, -1, me.action === 13 /* Action.BlockCrouch */);
+        }
+        case 10 /* Action.Hitstun */:
+        case 11 /* Action.AirHitstun */:
+            ai.intent = 7 /* Intent.Defend */; // when I come out, expect pressure
+            ai.intentUntil = g.tick + 30;
+            return 0;
+        case 15 /* Action.Knockdown */:
+        case 16 /* Action.Getup */:
+            // Wake up guarding (down-back) — the most human default there is.
+            return emit(me, null, -1, true);
+        case 5 /* Action.Air */: {
+            // Jump-in: time the air button by proximity, once per airtime.
+            if (!ai.airAttackDone && ai.bookAir.length > 0) {
+                const closing = dist < lerp(ai, 150, 190) && me.velY > fp(-6);
+                if (closing) {
+                    ai.airAttackDone = 1;
+                    const pick = ai.bookAir[rnd(ai, ai.bookAir.length)];
+                    qTapButton(ai, buttonOfMove(ch, pick));
+                }
+            }
+            // drift toward the opponent while airborne
+            return emit(me, null, 1, false);
+        }
+        case 9 /* Action.Attack */: {
+            // Hit-confirm: continue the combo book. Blocked → usually stop (safe).
+            if (me.attackConnected === 1) {
+                const next = comboNext(ai, ch, me);
+                if (next)
+                    return emit(me, null, 0, false); // queued; emitted next tick
+            }
+            else if (me.attackConnected === 2 && chance(ai, lerp(ai, 90, 30))) {
+                // Low skill mashes one more into block sometimes — very human.
+                const gi = ai.bookGround.indexOf(me.moveIdx);
+                if (gi >= 0 && gi + 1 < ai.bookGround.length) {
+                    qTapButton(ai, buttonOfMove(ch, ai.bookGround[gi + 1]));
+                }
+            }
+            return emit(me, null, 0, false);
+        }
+        default:
+            break;
+    }
+    if (aiGrounded(me))
+        ai.airAttackDone = 0;
+    if (!actionable(me))
+        return emit(me, null, 0, false);
+    // ---- reactive triggers (only after the reaction delay — humans are late)
+    if (!ai.reacted && seen(ai.oppActionAt)) {
+        // Opponent jumped at me → anti-air.
+        const oppAirborne = ai.oppAction === 5 /* Action.Air */ || ai.oppAction === 8 /* Action.AirDash */;
+        if (oppAirborne && !aiGrounded(op) && dist < 240) {
+            const aaOdds = Math.min(240, lerp(ai, 30, 190) + ai.eatJump * 12);
+            if (chance(ai, aaOdds)) {
+                ai.reacted = 1;
+                if (ai.idxDp >= 0 && chance(ai, 170))
+                    qDp(ai, 64 /* Btn.HP */);
+                else if (ai.bookLauncher >= 0)
+                    qTapButton(ai, 64 /* Btn.HP */, 1); // 2HP
+                return emit(me, null, 0, false);
+            }
+        }
+        // Opponent started an attack in my face → guard.
+        if (ai.oppAction === 9 /* Action.Attack */ && dist < 200) {
+            ai.reacted = 1;
+            if (chance(ai, lerp(ai, 120, 235))) {
+                ai.intent = 7 /* Intent.Defend */;
+                ai.intentUntil = g.tick + 26 + rnd(ai, 30);
+            }
+        }
+        // Opponent is getting up next to me → okizeme.
+        if ((ai.oppAction === 15 /* Action.Knockdown */) && dist < 320 && chance(ai, ai.p.aggression)) {
+            ai.reacted = 1;
+            ai.intent = 8 /* Intent.Oki */;
+            ai.intentUntil = g.tick + 70;
+        }
+    }
+    // Projectile incoming → jump it or brace (personality decides).
+    for (const pr of g.projectiles) {
+        if (!pr.active || pr.owner === ai.side)
+            continue;
+        const towardMe = (pr.velX > 0) === (me.x > pr.x);
+        const pdist = Math.abs(fpToPx(pr.x - me.x));
+        if (towardMe && pdist < lerp(ai, 120, 260) && pdist > 40) {
+            if (chance(ai, Math.min(220, ai.p.jumpiness + ai.eatProj * 20))) {
+                q(ai, { up: 1, fwd: 1, ticks: 3 });
+                ai.eatProj = Math.max(0, ai.eatProj - 1);
+            }
+            else {
+                ai.intent = 7 /* Intent.Defend */;
+                ai.intentUntil = g.tick + 24;
+                if (me.health > 0 && chance(ai, 30))
+                    ai.eatProj = Math.min(9, ai.eatProj + 1);
+            }
+            break;
+        }
+    }
+    // Whiff punish: opponent stuck in recovery within reach.
+    if (op.action === 9 /* Action.Attack */ && op.attackConnected === 0
+        && seen(ai.oppActionAt) && dist < 170 && chance(ai, lerp(ai, 40, 200))) {
+        ai.intent = 6 /* Intent.Punish */;
+        ai.intentUntil = g.tick + 40;
+    }
+    // ---- intent lifecycle
+    if (g.tick >= ai.intentUntil)
+        pickIntent(ai, g, me, op, dist);
+    return actIntent(ai, g, me, op, ch, dist);
+};
+// ---------------------------------------------------------------- intents
+const pickIntent = (ai, g, me, op, dist) => {
+    // Utility-ish weighted pick, shaped by distance band + personality + memory.
+    const w = [];
+    const losing = me.health < op.health - 1500;
+    if (dist < 110) {
+        w.push([3 /* Intent.Pressure */, ai.p.aggression + (losing ? 40 : 0)]);
+        w.push([0 /* Intent.Observe */, 60]);
+        w.push([2 /* Intent.Retreat */, 70 - Math.trunc(ai.p.aggression / 4)]);
+        w.push([7 /* Intent.Defend */, 50 + ai.eatThrow * 10]);
+    }
+    else if (dist < 260) {
+        w.push([1 /* Intent.Approach */, ai.p.aggression]);
+        w.push([0 /* Intent.Observe */, ai.p.patience]);
+        w.push([5 /* Intent.JumpIn */, Math.trunc(ai.p.jumpiness / 2)]);
+        w.push([2 /* Intent.Retreat */, 45]);
+        if (ai.idxFireball >= 0)
+            w.push([4 /* Intent.Zone */, Math.trunc(ai.p.zoner / 3)]);
+    }
+    else {
+        w.push([1 /* Intent.Approach */, ai.p.aggression]);
+        if (ai.idxFireball >= 0)
+            w.push([4 /* Intent.Zone */, ai.p.zoner + (losing ? -30 : 20)]);
+        w.push([5 /* Intent.JumpIn */, ai.p.jumpiness]);
+        w.push([0 /* Intent.Observe */, Math.trunc(ai.p.patience / 2)]);
+    }
+    let total = 0;
+    for (const [, wt] of w)
+        total += Math.max(1, wt);
+    let roll = rnd(ai, total);
+    let picked = w[0][0];
+    for (const [intent, wt] of w) {
+        roll -= Math.max(1, wt);
+        if (roll < 0) {
+            picked = intent;
+            break;
+        }
+    }
+    ai.intent = picked;
+    // Humans hold a plan for a beat — duration scales with patience.
+    ai.intentUntil = g.tick + 14 + rnd(ai, 30 + Math.trunc(ai.p.patience / 4));
+    ai.moveTicks = 0;
+};
+const actIntent = (ai, g, me, op, ch, dist) => {
+    switch (ai.intent) {
+        case 0 /* Intent.Observe */: {
+            // Shimmy: small walk holds back and forth, occasional crouch flicker.
+            if (--ai.moveTicks <= 0) {
+                ai.moveDir = [1, 0, -1, 0][rnd(ai, 4)];
+                ai.moveTicks = 8 + rnd(ai, 18);
+            }
+            return emit(me, null, ai.moveDir, chance(ai, 6));
+        }
+        case 1 /* Intent.Approach */: {
+            if (chance(ai, lerp(ai, 2, 14)))
+                qDash(ai, 'fwd'); // dashes at higher skill
+            if (dist < 100) { // arrived → strike or throw
+                ai.intent = 3 /* Intent.Pressure */;
+                ai.intentUntil = g.tick + 40;
+            }
+            return emit(me, null, 1, false);
+        }
+        case 2 /* Intent.Retreat */:
+            return emit(me, null, -1, chance(ai, 30));
+        case 4 /* Intent.Zone */: {
+            if (ai.queue.length === 0 && dist > 180)
+                qFireball(ai, 16 /* Btn.LP */);
+            ai.intent = 0 /* Intent.Observe */;
+            ai.intentUntil = g.tick + 20 + rnd(ai, 26);
+            return emit(me, null, 0, false);
+        }
+        case 5 /* Intent.JumpIn */: {
+            q(ai, { up: 1, fwd: 1, ticks: 4 });
+            ai.intent = 1 /* Intent.Approach */;
+            ai.intentUntil = g.tick + 50;
+            return emit(me, null, 1, false);
+        }
+        case 6 /* Intent.Punish */:
+        case 3 /* Intent.Pressure */: {
+            if (dist > 140) { // not in range yet — close in
+                return emit(me, null, 1, false);
+            }
+            openString(ai, ch, dist);
+            ai.intent = 0 /* Intent.Observe */;
+            ai.intentUntil = g.tick + 16 + rnd(ai, 20);
+            return emit(me, null, 0, false);
+        }
+        case 7 /* Intent.Defend */: {
+            // Hold guard. Default crouch-block; stand vs remembered overheads/jumpers.
+            const standGuard = ai.eatOverhead >= 2 || (!aiGrounded(op) && chance(ai, 200));
+            return emit(me, null, -1, !standGuard);
+        }
+        case 8 /* Intent.Oki */: {
+            if (dist > 90)
+                return emit(me, null, 1, false);
+            if (op.action !== 15 /* Action.Knockdown */ && op.action !== 16 /* Action.Getup */) {
+                ai.intent = 3 /* Intent.Pressure */;
+                ai.intentUntil = g.tick + 30;
+                return emit(me, null, 0, false);
+            }
+            // Time a meaty as they rise: low / throw mixup.
+            if (op.action === 16 /* Action.Getup */ && ch.b.moves && ai.queue.length === 0) {
+                if (chance(ai, ai.p.throwHappy))
+                    q(ai, { fwd: 1, buttons: 64 /* Btn.HP */, ticks: 2 });
+                else if (ai.idxLow >= 0)
+                    qTapButton(ai, 128 /* Btn.LK */, 1);
+            }
+            return emit(me, null, 0, chance(ai, 128));
+        }
+        default:
+            return emit(me, null, 0, false);
+    }
+};
+/** Pick a string opener at close range: jab chain / low / sweep / throw. */
+const openString = (ai, ch, dist) => {
+    const roll = rnd(ai, 255);
+    if (dist < 70 && roll < ai.p.throwHappy) {
+        q(ai, { fwd: 1, buttons: 64 /* Btn.HP */, ticks: 2 }); // throw attempt
+        return;
+    }
+    if (roll < 100 && ai.idxLow >= 0) {
+        qTapButton(ai, 128 /* Btn.LK */, 1); // 2LK — low opener
+        return;
+    }
+    if (roll < 140 && ai.idxSweep >= 0 && chance(ai, 90)) {
+        qTapButton(ai, 512 /* Btn.HK */, 1); // sweep
+        return;
+    }
+    qTapButton(ai, 16 /* Btn.LP */); // jab — chain continues via hit-confirm
+};
+/**
+ * Continue the combo book after a confirmed hit. Skill gates route depth:
+ * low skill stops at chains, high skill goes launcher → air combo → enders.
+ * Every link can be flubbed (dropped/late) — that's the human hand.
+ */
+const comboNext = (ai, ch, me) => {
+    // Flubbed link: hesitate — the buffer may still save it, sometimes not.
+    const flub = !chance(ai, lerp(ai, 150, 246));
+    const delay = flub ? 3 + rnd(ai, 5) : 0;
+    const gi = ai.bookGround.indexOf(me.moveIdx);
+    if (gi >= 0) {
+        if (gi + 1 < ai.bookGround.length) {
+            if (delay)
+                q(ai, { ticks: delay });
+            qTapButton(ai, buttonOfMove(ch, ai.bookGround[gi + 1]));
+            return true;
+        }
+        // End of ground chain: launcher / special / super, by skill.
+        if (ai.idxSuper >= 0 && me.meter >= (ch.b.moves[ai.idxSuper].meterCost ?? 9999)
+            && ai.skill >= 65 && chance(ai, 120)) {
+            qFireball(ai, 16 /* Btn.LP */ | 32 /* Btn.MP */); // 236 + two punches = super
+            return true;
+        }
+        if (ai.bookLauncher >= 0 && ai.skill >= 40 && chance(ai, lerp(ai, 60, 210))) {
+            if (delay)
+                q(ai, { ticks: delay });
+            qTapButton(ai, 64 /* Btn.HP */, 1); // 2HP launcher
+            return true;
+        }
+        if (ai.idxFireball >= 0 && chance(ai, ai.p.zoner)) {
+            qFireball(ai, 16 /* Btn.LP */);
+            return true;
+        }
+        return false;
+    }
+    // Launcher connected → super jump after it (engine's launch jump-cancel).
+    if (me.moveIdx === ai.bookLauncher && ai.skill >= 45) {
+        q(ai, { up: 1, fwd: 1, ticks: 6 });
+        // Rising air chain, timed like fingers, each link flubbable.
+        let t = 4 + rnd(ai, 3);
+        for (const idx of ai.bookAir) {
+            if (!chance(ai, lerp(ai, 130, 240)))
+                break; // dropped the string here
+            q(ai, { ticks: t });
+            qTapButton(ai, buttonOfMove(ch, idx));
+            t = 4 + rnd(ai, 4);
+        }
+        return true;
+    }
+    return false;
+};
+
 // ---- client/src/atlas.js ----
 /** Tight alpha bounds of an image (computed once at load). */
 const alphaBounds = (img) => {
@@ -2128,6 +2615,75 @@ const drawStageLayers = (ctx, stage, cam, vw, vh) => {
         }
     }
 };
+
+// ---- client/src/progress.js ----
+/**
+ * Player progression: XP → level, persisted in localStorage (server profiles
+ * arrive with M5/Privy — this is deliberately client-local until then).
+ *
+ * The CPU's strength follows the player's level, adjusted by a LEVER the
+ * player controls (±). One mapping, one knob:
+ *
+ *   cpuLevel = clamp(playerLevel + lever, 1, MAX_LEVEL)
+ *   aiSkill  = cpuLevel · 100 / MAX_LEVEL          (the core AI's 0-100 lever)
+ */
+const MAX_LEVEL = 40;
+const KEY = 'af-profile';
+const LEVER_KEY = 'af-cpu-lever';
+const loadProfile = () => {
+    try {
+        const raw = localStorage.getItem(KEY);
+        if (raw) {
+            const p = JSON.parse(raw);
+            if (typeof p.xp === 'number' && typeof p.level === 'number') {
+                return { xp: p.xp, level: Math.max(1, p.level), wins: p.wins | 0, losses: p.losses | 0 };
+            }
+        }
+    }
+    catch { /* fresh profile */ }
+    return { xp: 0, level: 1, wins: 0, losses: 0 };
+};
+const saveProfile = (p) => {
+    try {
+        localStorage.setItem(KEY, JSON.stringify(p));
+    }
+    catch { /* private mode */ }
+};
+/** XP needed to go from `level` to `level+1` — gentle early, steep later. */
+const xpForNext = (level) => 80 + level * 45;
+/** Award XP for a finished match. Returns levels gained (for the banner). */
+const awardXp = (p, s) => {
+    const gained = (s.won ? 60 : 20)
+        + Math.min(60, Math.trunc(s.damageDealt / 250))
+        + Math.min(40, s.bestCombo * 4);
+    p.xp += gained;
+    if (s.won)
+        p.wins++;
+    else
+        p.losses++;
+    let levelsUp = 0;
+    while (p.level < MAX_LEVEL && p.xp >= xpForNext(p.level)) {
+        p.xp -= xpForNext(p.level);
+        p.level++;
+        levelsUp++;
+    }
+    saveProfile(p);
+    return { gained, levelsUp };
+};
+// ---- the lever -------------------------------------------------------------
+const loadLever = () => {
+    const v = Number(localStorage.getItem(LEVER_KEY) ?? '0');
+    return Number.isFinite(v) ? Math.max(-10, Math.min(10, v)) : 0;
+};
+const saveLever = (v) => {
+    try {
+        localStorage.setItem(LEVER_KEY, String(v));
+    }
+    catch { /* ok */ }
+};
+const cpuLevelFor = (p, lever) => Math.max(1, Math.min(MAX_LEVEL, p.level + lever));
+/** Map a CPU level onto the core AI's 0-100 skill lever. */
+const skillForCpuLevel = (cpuLevel) => Math.max(3, Math.min(100, Math.round((cpuLevel * 100) / MAX_LEVEL)));
 
 // ---- client/src/ui.js ----
 // Injected at boot (null = procedural fallbacks everywhere).
@@ -2502,14 +3058,14 @@ const drawTimer = (ctx, secs) => {
     ctx.fill();
     text(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, cy + 12, 34, urgent ? HP_DANGER : '#ffffff');
 };
-const drawHud = (ctx, g, rosters, fx) => {
+const drawHud = (ctx, g, rosters, fx, tags) => {
     for (const i of [0, 1]) {
         const f = g.fighters[i];
         const max = rosters[i].ch.b.maxHealth;
         const ratio = Math.max(0, f.health) / max;
         drawHealthBar(ctx, i, ratio, fx.flash[i]);
         drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
-        drawNameplate(ctx, i, rosters[i].bundle.name);
+        drawNameplate(ctx, i, rosters[i].bundle.name + (tags?.[i] ? ` · ${tags[i]}` : ''));
         drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
         drawMeter(ctx, i, f.meter);
     }
@@ -2717,6 +3273,7 @@ const drawResults = (ctx, g, rosters, tick) => {
 
 
 
+
 const TICK_MS = 1000 / TICKS_PER_SEC;
 // ---------------------------------------------------------------- input
 const keys = new Set();
@@ -2750,10 +3307,18 @@ const pollPad = (map) => {
     return f;
 };
 let screen = 'loading';
+let mode = 'cpu';
 let uiTick = 0;
 let allRosters = [];
 let picks = [0, 0];
 let locked = [false, false];
+// Progression + the CPU difficulty lever.
+const profile = loadProfile();
+let lever = loadLever();
+let cpuAi = null;
+let statDmg = 0; // damage the human dealt this match
+let statBestCombo = 0;
+let xpBanner = null;
 let stageIds = [];
 let stageAssets = [];
 let stageCursor = 0;
@@ -2796,6 +3361,12 @@ const startFight = () => {
     fighters = [allRosters[picks[0]], allRosters[picks[1]]];
     setCharacters(fighters[0].ch, fighters[1].ch);
     game = createGameState(seed++);
+    cpuAi = mode === 'cpu'
+        ? createAi(1, skillForCpuLevel(cpuLevelFor(profile, lever)), seed * 31 + 7)
+        : null;
+    statDmg = 0;
+    statBestCombo = 0;
+    xpBanner = null;
     cam = { x: STAGE.widthPx / 2 - VW / 2 / 1.5, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5 };
     updateCamera(game); // settle before the first frame so round 1 opens framed
     prevHealth = [game.fighters[0].health, game.fighters[1].health];
@@ -2867,12 +3438,16 @@ const updateJuice = (g) => {
             shake = big ? 11 : 6;
             hitStopFlash = big ? 3 : 0;
         }
+        // Progression stats: what the human (P1) dished out.
+        if (i === 1 && f.health < prevHealth[1])
+            statDmg += prevHealth[1] - f.health;
         prevHealth[i] = f.health;
         // Health bar lag (white flash draining behind the real bar).
         const max = fighters[i].ch.b.maxHealth;
         const target = Math.max(0, f.health) / max;
         fx.flash[i] = fx.flash[i] > target ? Math.max(target, fx.flash[i] - 0.006) : target;
     }
+    statBestCombo = Math.max(statBestCombo, g.fighters[1].comboHits);
     // Combo counter tracks whoever is being hit.
     const v0 = g.fighters[0], v1 = g.fighters[1];
     const inCombo = (a) => a === 10 /* Action.Hitstun */ || a === 11 /* Action.AirHitstun */;
@@ -2975,7 +3550,7 @@ const renderFight = (g) => {
         ctx.fillStyle = '#ffffff33';
         ctx.fillRect(0, 0, VW, VH);
     }
-    drawHud(ctx, g, fighters, fx);
+    drawHud(ctx, g, fighters, fx, cpuAi ? ['', `CPU LV ${cpuLevelFor(profile, lever)}`] : undefined);
 };
 // ---------------------------------------------------------------- screens
 const tickSelect = () => {
@@ -2989,13 +3564,33 @@ const tickSelect = () => {
         move(0, -1);
     if (pressedThisFrame.has('KeyD'))
         move(0, 1);
-    if (pressedThisFrame.has('ArrowLeft'))
-        move(1, -1);
-    if (pressedThisFrame.has('ArrowRight'))
-        move(1, 1);
-    for (const i of [0, 1]) {
-        if (CONFIRM[i].some((k) => pressedThisFrame.has(k)))
-            locked[i] = true;
+    // The CPU difficulty lever: [ and ] on the select screen (CPU mode).
+    if (mode === 'cpu') {
+        if (pressedThisFrame.has('BracketLeft')) {
+            lever = Math.max(-10, lever - 1);
+            saveLever(lever);
+        }
+        if (pressedThisFrame.has('BracketRight')) {
+            lever = Math.min(10, lever + 1);
+            saveLever(lever);
+        }
+    }
+    else {
+        if (pressedThisFrame.has('ArrowLeft'))
+            move(1, -1);
+        if (pressedThisFrame.has('ArrowRight'))
+            move(1, 1);
+    }
+    if (CONFIRM[0].some((k) => pressedThisFrame.has(k)))
+        locked[0] = true;
+    if (mode === '2p') {
+        if (CONFIRM[1].some((k) => pressedThisFrame.has(k)))
+            locked[1] = true;
+    }
+    else if (locked[0] && !locked[1]) {
+        // CPU picks its fighter — visibly, like an arcade opponent reveal.
+        picks[1] = (seed * 17 + profile.wins * 5 + uiTick) % n;
+        locked[1] = true;
     }
     if (pressedThisFrame.has('Escape'))
         locked = [false, false];
@@ -3023,6 +3618,51 @@ const tickStageSelect = () => {
     if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space'))
         startFight();
 };
+// ---------------------------------------------------------------- overlays
+const ARCADE = 'Impact, "Arial Black", sans-serif';
+const overlayText = (s, x, y, size, color, align = 'center') => {
+    ctx.font = `${size}px ${ARCADE}`;
+    ctx.textAlign = align;
+    ctx.fillStyle = '#000000aa';
+    ctx.fillText(s, x + 2, y + 2);
+    ctx.fillStyle = color;
+    ctx.fillText(s, x, y);
+};
+const drawModePicker = () => {
+    const y0 = VH - 168;
+    const rows = [['cpu', `VS CPU  ·  LV ${cpuLevelFor(profile, lever)}`], ['2p', '2 PLAYERS']];
+    rows.forEach(([m, label], k) => {
+        const y = y0 + k * 30;
+        const on = mode === m;
+        overlayText(`${on ? '▶ ' : ''}${label}`, VW / 2, y, on ? 22 : 18, on ? '#f7e0a3' : '#ffffff77');
+    });
+    overlayText('W/S: MODE', VW / 2, y0 + 62, 12, '#ffffff55');
+};
+const drawCpuLever = () => {
+    const cl = cpuLevelFor(profile, lever);
+    overlayText(`YOU: LV ${profile.level}    CPU: LV ${cl}  ${lever === 0 ? '' : lever > 0 ? `(+${lever})` : `(${lever})`}`, VW / 2, 96, 20, '#f7e0a3');
+    overlayText('[ / ] ADJUST CPU LEVEL', VW / 2, 118, 12, '#ffffff88');
+};
+const drawXpBanner = () => {
+    if (!xpBanner)
+        return;
+    const y = VH / 2 + 128;
+    overlayText(`+${xpBanner.gained} XP`, VW / 2, y, 26, '#7ee85a');
+    // XP progress bar toward next level.
+    const need = xpForNext(profile.level);
+    const w = 300, h = 10;
+    const x = VW / 2 - w / 2;
+    ctx.fillStyle = '#101116';
+    ctx.fillRect(x - 2, y + 12 - 2, w + 4, h + 4);
+    ctx.fillStyle = '#23242e';
+    ctx.fillRect(x, y + 12, w, h);
+    ctx.fillStyle = '#6fd3ff';
+    ctx.fillRect(x, y + 12, Math.round((w * Math.min(profile.xp, need)) / need), h);
+    overlayText(`LV ${profile.level}  ·  ${profile.xp}/${need} XP  ·  ${profile.wins}W ${profile.losses}L`, VW / 2, y + 40, 13, '#ffffffcc');
+    if (xpBanner.levelsUp > 0 && uiTick % 40 < 28) {
+        overlayText(`LEVEL UP!  LV ${profile.level}`, VW / 2, VH / 2 - 100, 32, '#ffd166');
+    }
+};
 const frame = () => {
     uiTick++;
     if (screen === 'loading') {
@@ -3040,7 +3680,12 @@ const frame = () => {
     }
     else if (screen === 'title') {
         drawTitle(ctx, allRosters, uiTick);
-        if (pressedThisFrame.size > 0) {
+        drawModePicker();
+        if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')
+            || pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
+            mode = mode === 'cpu' ? '2p' : 'cpu';
+        }
+        else if (pressedThisFrame.size > 0) {
             screen = 'select';
             locked = [false, false];
         }
@@ -3048,6 +3693,8 @@ const frame = () => {
     else if (screen === 'select') {
         tickSelect();
         drawSelect(ctx, allRosters, picks, locked, uiTick);
+        if (mode === 'cpu')
+            drawCpuLever();
     }
     else if (screen === 'stageSelect') {
         tickStageSelect();
@@ -3060,16 +3707,27 @@ const frame = () => {
             screen = 'select';
             locked = [false, false];
         }
-        step(game, [pollPad(P0_MAP), pollPad(P1_MAP)]);
+        const p2 = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
+        step(game, [pollPad(P0_MAP), p2]);
         updateJuice(game);
         updateCamera(game);
         renderFight(game);
-        if (game.phase === 3 /* Phase.MatchOver */)
+        if (game.phase === 3 /* Phase.MatchOver */) {
+            if (cpuAi && !xpBanner) {
+                xpBanner = awardXp(profile, {
+                    won: game.winner === 0,
+                    damageDealt: statDmg,
+                    bestCombo: statBestCombo,
+                });
+            }
             screen = 'results';
+        }
     }
     else if (screen === 'results' && game) {
         renderFight(game);
         drawResults(ctx, game, fighters, uiTick);
+        if (cpuAi)
+            drawXpBanner();
         if (pressedThisFrame.has('Enter'))
             startFight();
         if (pressedThisFrame.has('Escape')) {
@@ -3112,6 +3770,10 @@ Object.assign(globalThis, {
         frame(); },
     afPress: (code) => { pressedThisFrame.add(code); keys.add(code); },
     afRelease: (code) => { keys.delete(code); },
+    afMode: (m) => { if (m)
+        mode = m; return mode; },
+    afProfile: () => ({ ...profile, lever }),
+    afSetLever: (v) => { lever = Math.max(-10, Math.min(10, v | 0)); saveLever(lever); },
 });
 </script>
 </body>

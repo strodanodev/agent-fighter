@@ -15,9 +15,17 @@
       "file": "layer-mid.png",
       "depth": 0.45,
       "stretch": false,
-      "scale": 0.7233072916666666,
-      "offsetX": -212,
-      "offsetY": -240
+      "scale": 0.2476152855805243,
+      "offsetX": 787,
+      "offsetY": -144
+    },
+    {
+      "file": "layer-fg.png",
+      "depth": 0.75,
+      "stretch": false,
+      "scale": 0.3171247357293869,
+      "offsetX": 134,
+      "offsetY": 6
     }
   ]
 }

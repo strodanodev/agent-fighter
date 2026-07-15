@@ -1,0 +1,31 @@
+{
+  "name": "bgc",
+  "imageW": 2816,
+  "imageH": 1536,
+  "floorY": 1476,
+  "skyColor": "#2b1b4d",
+  "deckColor": "#3a3644",
+  "layers": [
+    {
+      "file": "layer-bg.png",
+      "depth": 0.15,
+      "stretch": true
+    },
+    {
+      "file": "layer-mid.png",
+      "depth": 0.45,
+      "stretch": false,
+      "scale": 1.001882040727903,
+      "offsetX": -711,
+      "offsetY": -534
+    },
+    {
+      "file": "layer-fg.png",
+      "depth": 0.75,
+      "stretch": false,
+      "scale": 0.49288225117785633,
+      "offsetX": 443,
+      "offsetY": -517
+    }
+  ]
+}
