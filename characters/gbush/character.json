@@ -1,5 +1,5 @@
 {
-  "name": "Vector",
+  "name": "gbush",
   "maxHealth": 10000,
   "walkFSpeed": 4.2,
   "walkBSpeed": 3.2,
@@ -55,8 +55,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "5LP_s0.png"
+          ]
         },
         {
           "frames": 3,
@@ -116,8 +115,7 @@
               "guard": "mid",
               "juggleCost": 1
             }
-          ],
-          "sprite": "5LP_s1.png"
+          ]
         },
         {
           "frames": 6,
@@ -129,8 +127,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "5LP_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 5,
@@ -152,16 +149,15 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "5MP_s0.png"
+          ]
         },
         {
           "frames": 4,
           "phase": "active",
           "hurtboxes": [
             {
-              "x": -26,
-              "y": -108,
+              "x": -28,
+              "y": -109,
               "w": 52,
               "h": 108
             },
@@ -190,8 +186,7 @@
               "guard": "mid",
               "juggleCost": 1
             }
-          ],
-          "sprite": "5MP_s1.png"
+          ]
         },
         {
           "frames": 10,
@@ -203,8 +198,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "5MP_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 8,
@@ -226,8 +220,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "5HP_s0.png"
+          ]
         },
         {
           "frames": 4,
@@ -264,8 +257,7 @@
               "guard": "mid",
               "juggleCost": 1
             }
-          ],
-          "sprite": "5HP_s1.png"
+          ]
         },
         {
           "frames": 16,
@@ -277,8 +269,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "5HP_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 12,
@@ -300,8 +291,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "5LK_s0.png"
+          ]
         },
         {
           "frames": 3,
@@ -338,8 +328,7 @@
               "guard": "mid",
               "juggleCost": 1
             }
-          ],
-          "sprite": "5LK_s1.png"
+          ]
         },
         {
           "frames": 8,
@@ -351,8 +340,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "5LK_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 5,
@@ -374,8 +362,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "5MK_s0.png"
+          ]
         },
         {
           "frames": 4,
@@ -412,8 +399,7 @@
               "guard": "mid",
               "juggleCost": 1
             }
-          ],
-          "sprite": "5MK_s1.png"
+          ]
         },
         {
           "frames": 12,
@@ -425,8 +411,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "5MK_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 8,
@@ -448,8 +433,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "5HK_s0.png"
+          ]
         },
         {
           "frames": 5,
@@ -486,8 +470,7 @@
               "guard": "mid",
               "juggleCost": 1
             }
-          ],
-          "sprite": "5HK_s1.png"
+          ]
         },
         {
           "frames": 18,
@@ -499,8 +482,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "5HK_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 12,
@@ -522,8 +504,7 @@
               "w": 52,
               "h": 80
             }
-          ],
-          "sprite": "2LP_s0.png"
+          ]
         },
         {
           "frames": 3,
@@ -560,8 +541,7 @@
               "guard": "mid",
               "juggleCost": 1
             }
-          ],
-          "sprite": "2LP_s1.png"
+          ]
         },
         {
           "frames": 6,
@@ -573,8 +553,7 @@
               "w": 52,
               "h": 80
             }
-          ],
-          "sprite": "2LP_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 5,
@@ -596,8 +575,7 @@
               "w": 52,
               "h": 80
             }
-          ],
-          "sprite": "2MP_s0.png"
+          ]
         },
         {
           "frames": 4,
@@ -634,8 +612,7 @@
               "guard": "mid",
               "juggleCost": 1
             }
-          ],
-          "sprite": "2MP_s1.png"
+          ]
         },
         {
           "frames": 11,
@@ -647,8 +624,7 @@
               "w": 52,
               "h": 80
             }
-          ],
-          "sprite": "2MP_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 8,
@@ -670,8 +646,7 @@
               "w": 52,
               "h": 80
             }
-          ],
-          "sprite": "2HP_s0.png"
+          ]
         },
         {
           "frames": 4,
@@ -711,8 +686,7 @@
               "launchVelY": -17,
               "knockdown": true
             }
-          ],
-          "sprite": "2HP_s1.png"
+          ]
         },
         {
           "frames": 20,
@@ -724,8 +698,7 @@
               "w": 52,
               "h": 80
             }
-          ],
-          "sprite": "2HP_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 12,
@@ -747,8 +720,7 @@
               "w": 52,
               "h": 80
             }
-          ],
-          "sprite": "2LK_s0.png"
+          ]
         },
         {
           "frames": 3,
@@ -785,8 +757,7 @@
               "guard": "low",
               "juggleCost": 1
             }
-          ],
-          "sprite": "2LK_s1.png"
+          ]
         },
         {
           "frames": 7,
@@ -798,8 +769,7 @@
               "w": 52,
               "h": 80
             }
-          ],
-          "sprite": "2LK_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 5,
@@ -821,8 +791,7 @@
               "w": 52,
               "h": 80
             }
-          ],
-          "sprite": "2MK_s0.png"
+          ]
         },
         {
           "frames": 4,
@@ -859,8 +828,7 @@
               "guard": "low",
               "juggleCost": 1
             }
-          ],
-          "sprite": "2MK_s1.png"
+          ]
         },
         {
           "frames": 13,
@@ -872,8 +840,7 @@
               "w": 52,
               "h": 80
             }
-          ],
-          "sprite": "2MK_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 8,
@@ -895,8 +862,7 @@
               "w": 52,
               "h": 80
             }
-          ],
-          "sprite": "2HK_s0.png"
+          ]
         },
         {
           "frames": 5,
@@ -934,8 +900,7 @@
               "juggleCost": 1,
               "knockdown": true
             }
-          ],
-          "sprite": "2HK_s1.png"
+          ]
         },
         {
           "frames": 22,
@@ -947,8 +912,7 @@
               "w": 52,
               "h": 80
             }
-          ],
-          "sprite": "2HK_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 12,
@@ -970,8 +934,7 @@
               "w": 52,
               "h": 88
             }
-          ],
-          "sprite": "j_LP_s0.png"
+          ]
         },
         {
           "frames": 8,
@@ -1002,8 +965,7 @@
               "guard": "overhead",
               "juggleCost": 1
             }
-          ],
-          "sprite": "j_LP_s1.png"
+          ]
         },
         {
           "frames": 4,
@@ -1015,8 +977,7 @@
               "w": 52,
               "h": 88
             }
-          ],
-          "sprite": "j_LP_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 5,
@@ -1038,8 +999,7 @@
               "w": 52,
               "h": 88
             }
-          ],
-          "sprite": "j_MP_s0.png"
+          ]
         },
         {
           "frames": 6,
@@ -1070,8 +1030,7 @@
               "guard": "overhead",
               "juggleCost": 1
             }
-          ],
-          "sprite": "j_MP_s1.png"
+          ]
         },
         {
           "frames": 6,
@@ -1083,8 +1042,7 @@
               "w": 52,
               "h": 88
             }
-          ],
-          "sprite": "j_MP_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 8,
@@ -1106,8 +1064,7 @@
               "w": 52,
               "h": 88
             }
-          ],
-          "sprite": "j_HP_s0.png"
+          ]
         },
         {
           "frames": 6,
@@ -1139,8 +1096,7 @@
               "juggleCost": 2,
               "knockdown": true
             }
-          ],
-          "sprite": "j_HP_s1.png"
+          ]
         },
         {
           "frames": 8,
@@ -1152,8 +1108,7 @@
               "w": 52,
               "h": 88
             }
-          ],
-          "sprite": "j_HP_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 12,
@@ -1175,8 +1130,7 @@
               "w": 52,
               "h": 88
             }
-          ],
-          "sprite": "j_LK_s0.png"
+          ]
         },
         {
           "frames": 8,
@@ -1207,8 +1161,7 @@
               "guard": "overhead",
               "juggleCost": 1
             }
-          ],
-          "sprite": "j_LK_s1.png"
+          ]
         },
         {
           "frames": 4,
@@ -1220,8 +1173,7 @@
               "w": 52,
               "h": 88
             }
-          ],
-          "sprite": "j_LK_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 5,
@@ -1243,8 +1195,7 @@
               "w": 52,
               "h": 88
             }
-          ],
-          "sprite": "j_MK_s0.png"
+          ]
         },
         {
           "frames": 7,
@@ -1275,8 +1226,7 @@
               "guard": "overhead",
               "juggleCost": 1
             }
-          ],
-          "sprite": "j_MK_s1.png"
+          ]
         },
         {
           "frames": 6,
@@ -1288,8 +1238,7 @@
               "w": 52,
               "h": 88
             }
-          ],
-          "sprite": "j_MK_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 8,
@@ -1311,8 +1260,7 @@
               "w": 52,
               "h": 88
             }
-          ],
-          "sprite": "j_HK_s0.png"
+          ]
         },
         {
           "frames": 6,
@@ -1344,8 +1292,7 @@
               "juggleCost": 2,
               "knockdown": true
             }
-          ],
-          "sprite": "j_HK_s1.png"
+          ]
         },
         {
           "frames": 8,
@@ -1357,8 +1304,7 @@
               "w": 52,
               "h": 88
             }
-          ],
-          "sprite": "j_HK_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 12,
@@ -1381,8 +1327,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "236P_s0.png"
+          ]
         },
         {
           "frames": 2,
@@ -1394,8 +1339,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "236P_s1.png"
+          ]
         },
         {
           "frames": 18,
@@ -1407,8 +1351,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "236P_s2.png"
+          ]
         }
       ],
       "projectile": {
@@ -1461,8 +1404,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "623P_s0.png"
+          ]
         },
         {
           "frames": 10,
@@ -1498,8 +1440,7 @@
               "launchVelY": -14,
               "knockdown": true
             }
-          ],
-          "sprite": "623P_s1.png"
+          ]
         },
         {
           "frames": 14,
@@ -1511,8 +1452,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "623P_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 20,
@@ -1535,8 +1475,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "214K_s0.png"
+          ]
         },
         {
           "frames": 8,
@@ -1569,8 +1508,7 @@
               "juggleCost": 2,
               "airPopVelY": -7
             }
-          ],
-          "sprite": "214K_s1.png"
+          ]
         },
         {
           "frames": 8,
@@ -1604,8 +1542,7 @@
               "knockdown": true,
               "airPopVelY": -6
             }
-          ],
-          "sprite": "214K_s2.png"
+          ]
         },
         {
           "frames": 16,
@@ -1618,8 +1555,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "214K_s3.png"
+          ]
         }
       ],
       "meterGainWhiff": 20,
@@ -1643,8 +1579,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "236PP_s0.png"
+          ]
         },
         {
           "frames": 4,
@@ -1677,8 +1612,7 @@
               "juggleCost": 0,
               "airPopVelY": -6
             }
-          ],
-          "sprite": "236PP_s1.png"
+          ]
         },
         {
           "frames": 4,
@@ -1711,8 +1645,7 @@
               "juggleCost": 0,
               "airPopVelY": -6
             }
-          ],
-          "sprite": "236PP_s2.png"
+          ]
         },
         {
           "frames": 4,
@@ -1745,8 +1678,7 @@
               "juggleCost": 0,
               "airPopVelY": -6
             }
-          ],
-          "sprite": "236PP_s3.png"
+          ]
         },
         {
           "frames": 4,
@@ -1779,8 +1711,7 @@
               "juggleCost": 0,
               "airPopVelY": -6
             }
-          ],
-          "sprite": "236PP_s4.png"
+          ]
         },
         {
           "frames": 5,
@@ -1815,8 +1746,7 @@
               "launchVelY": -12,
               "knockdown": true
             }
-          ],
-          "sprite": "236PP_s5.png"
+          ]
         },
         {
           "frames": 24,
@@ -1829,8 +1759,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "236PP_s6.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -1851,8 +1780,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_idle_s0.png"
+          ]
         },
         {
           "frames": 8,
@@ -1864,8 +1792,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_idle_s1.png"
+          ]
         },
         {
           "frames": 8,
@@ -1877,8 +1804,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_idle_s2.png"
+          ]
         },
         {
           "frames": 8,
@@ -1890,8 +1816,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_idle_s3.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -1912,8 +1837,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_walkF_s0.png"
+          ]
         },
         {
           "frames": 7,
@@ -1925,8 +1849,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_walkF_s1.png"
+          ]
         },
         {
           "frames": 7,
@@ -1938,8 +1861,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_walkF_s2.png"
+          ]
         },
         {
           "frames": 7,
@@ -1951,8 +1873,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_walkF_s3.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -1973,8 +1894,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_walkB_s0.png"
+          ]
         },
         {
           "frames": 7,
@@ -1986,8 +1906,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_walkB_s1.png"
+          ]
         },
         {
           "frames": 7,
@@ -1999,8 +1918,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_walkB_s2.png"
+          ]
         },
         {
           "frames": 7,
@@ -2012,8 +1930,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_walkB_s3.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2034,8 +1951,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_crouch_s0.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2056,8 +1972,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_jump_s0.png"
+          ]
         },
         {
           "frames": 8,
@@ -2069,8 +1984,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_jump_s1.png"
+          ]
         },
         {
           "frames": 8,
@@ -2082,8 +1996,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_jump_s2.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2104,8 +2017,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_dashF_s0.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2126,8 +2038,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_dashB_s0.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2148,8 +2059,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_block_s0.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2170,8 +2080,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_blockCrouch_s0.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2192,8 +2101,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_blockAir_s0.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2214,8 +2122,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_hitstun_s0.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2236,8 +2143,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_airHitstun_s0.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2258,8 +2164,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_knockdown_s0.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2280,8 +2185,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_getup_s0.png"
+          ]
         },
         {
           "frames": 7,
@@ -2293,8 +2197,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_getup_s1.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2315,8 +2218,7 @@
               "w": 52,
               "h": 108
             }
-          ],
-          "sprite": "sys_ko_s0.png"
+          ]
         }
       ],
       "meterGainWhiff": 0,
@@ -2726,512 +2628,7 @@
     }
   ],
   "meta": {
-    "desc": "an anime cyber-ninja woman: short silver hair, glowing cyan visor over her eyes, sleek neon-green and black techwear bodysuit with glowing cyan circuit lines, black armored gloves and boots, slender athletic build",
-    "palette": [
-      [
-        20,
-        22,
-        28
-      ],
-      [
-        30,
-        33,
-        38
-      ],
-      [
-        35,
-        43,
-        45
-      ],
-      [
-        29,
-        68,
-        68
-      ],
-      [
-        22,
-        105,
-        98
-      ],
-      [
-        15,
-        156,
-        145
-      ],
-      [
-        14,
-        214,
-        197
-      ],
-      [
-        44,
-        47,
-        55
-      ],
-      [
-        50,
-        55,
-        62
-      ],
-      [
-        54,
-        59,
-        65
-      ],
-      [
-        47,
-        80,
-        29
-      ],
-      [
-        61,
-        76,
-        52
-      ],
-      [
-        78,
-        83,
-        55
-      ],
-      [
-        74,
-        128,
-        25
-      ],
-      [
-        108,
-        181,
-        36
-      ],
-      [
-        141,
-        218,
-        46
-      ],
-      [
-        57,
-        63,
-        72
-      ],
-      [
-        63,
-        71,
-        79
-      ],
-      [
-        66,
-        77,
-        84
-      ],
-      [
-        70,
-        82,
-        90
-      ],
-      [
-        62,
-        97,
-        103
-      ],
-      [
-        45,
-        118,
-        112
-      ],
-      [
-        55,
-        167,
-        156
-      ],
-      [
-        54,
-        206,
-        193
-      ],
-      [
-        83,
-        90,
-        98
-      ],
-      [
-        95,
-        104,
-        113
-      ],
-      [
-        111,
-        112,
-        119
-      ],
-      [
-        118,
-        129,
-        137
-      ],
-      [
-        124,
-        134,
-        149
-      ],
-      [
-        132,
-        140,
-        153
-      ],
-      [
-        129,
-        145,
-        156
-      ],
-      [
-        120,
-        162,
-        168
-      ],
-      [
-        96,
-        193,
-        177
-      ],
-      [
-        105,
-        227,
-        221
-      ],
-      [
-        159,
-        141,
-        133
-      ],
-      [
-        142,
-        148,
-        158
-      ],
-      [
-        212,
-        163,
-        141
-      ],
-      [
-        169,
-        239,
-        69
-      ],
-      [
-        170,
-        236,
-        71
-      ],
-      [
-        221,
-        169,
-        145
-      ],
-      [
-        219,
-        172,
-        148
-      ],
-      [
-        164,
-        162,
-        155
-      ],
-      [
-        221,
-        177,
-        155
-      ],
-      [
-        149,
-        155,
-        165
-      ],
-      [
-        177,
-        170,
-        164
-      ],
-      [
-        232,
-        186,
-        162
-      ],
-      [
-        161,
-        169,
-        179
-      ],
-      [
-        235,
-        197,
-        176
-      ]
-    ],
-    "refBodyW": 52,
-    "moveDesc": {
-      "5LP": "throwing a quick left jab punch"
-    },
-    "refMask": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      1,
-      0,
-      0,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      0,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      0,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1,
-      0,
-      0
-    ],
-    "refChroma": 21
+    "desc": "metaverse overlord, commander of legions"
   },
-  "versionHash": "b8f2e5fbdcd66fae"
+  "versionHash": "b45b123e1654bd4c"
 }

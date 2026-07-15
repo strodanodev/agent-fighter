@@ -1536,7 +1536,17 @@ const finishFrame = (
 
 /** Generate + normalize + QC ONE frame as its own image (fallback path). */
 // ---- uploaded artwork (bring your own character) ---------------------------
-let stUpload: NormalizedFrame | null = null;
+/**
+ * The RAW uploaded image (no background removal, no cropping). Uploads are
+ * kept verbatim because the two things they feed want opposite treatment:
+ *   - "stylize" sends the FULL image to Gemini, which needs the face, the
+ *     background context and every detail to redraw the character — pre-keying
+ *     a photo destroys exactly that (the reported bug: features cut, subject
+ *     eaten by an over-eager flood fill tuned for flat-white AI sprites).
+ *   - "use verbatim" only makes sense for already-clean sprite art, and does
+ *     its normalize at click time.
+ */
+let stUpload: HTMLCanvasElement | null = null;
 
 const fileToImage = (file: File): Promise<HTMLImageElement> =>
   new Promise((resolve, reject) => {
@@ -1551,17 +1561,23 @@ const fileToImage = (file: File): Promise<HTMLImageElement> =>
     fr.readAsDataURL(file);
   });
 
-/** Run an uploaded image through the same normalize pass as generated art. */
+/** Draw an image onto its own canvas so we hold pixels, not a decode-once <img>. */
+const imageToCanvas = (img: HTMLImageElement): HTMLCanvasElement => {
+  const c = document.createElement('canvas');
+  c.width = img.naturalWidth;
+  c.height = img.naturalHeight;
+  c.getContext('2d')!.drawImage(img, 0, 0);
+  return c;
+};
+
+/** Keep an uploaded image RAW (see stUpload) — no keying, no crop. */
 const loadUploadedReference = async (file: File): Promise<void> => {
   try {
     stStatus = `reading ${file.name}…`; renderAll();
     const img = await fileToImage(file);
-    // No palette yet: normalize on its own colours (this image DEFINES them).
-    const norm = normalizeFrame(img, null);
-    if (!norm) throw new Error('no subject found (is the background flat?)');
-    stUpload = norm;
+    stUpload = imageToCanvas(img);
     stRefPreview = null;
-    stStatus = `uploaded ${file.name} · ${norm.bodyW}×${norm.bodyH}`;
+    stStatus = `uploaded ${file.name} · ${img.naturalWidth}×${img.naturalHeight} — stylize it, or use as-is`;
   } catch (e) {
     stStatus = `upload failed: ${(e as Error).message}`;
   }
@@ -1569,20 +1585,21 @@ const loadUploadedReference = async (file: File): Promise<void> => {
 };
 
 /**
- * Redraw an uploaded image in the game's art style, conditioned on the upload
- * itself — so a photo, a sketch or off-style art becomes a usable reference
- * without losing the character.
+ * Redraw the RAW uploaded image in the game's art style. Gemini gets the whole
+ * photo (face + all) and returns the character on a flat-white sprite bg, which
+ * is what normalizeFrame is built for — so keying happens AFTER the redraw, not
+ * before it. This is the right path for a photo or off-style art.
  */
 const stylizeUpload = async (): Promise<void> => {
   if (!stUpload || stGenBusy) return;
   stGenBusy = true;
   stStatus = 'stylizing upload into a reference…'; renderAll();
   try {
-    const prompt = `The attached image shows ONE character. Redraw THAT character — same outfit, `
-      + `same colours, same hair, same build — standing in a neutral idle fighting stance. `
-      + `${SPRITE_STYLE}`;
+    const prompt = `The attached image shows ONE character (it may be a photo or off-style art). `
+      + `Redraw THAT character as a game sprite — keep the same face, hairstyle, outfit, colours `
+      + `and build — standing in a neutral idle fighting stance, full body. ${SPRITE_STYLE}`;
     const img = await generateImage(prompt.slice(0, promptMax()), seedFor('_stylize', 0, stSeed++),
-      1024, 1024, false, undefined, canvasToPngDataUrl(stUpload.cell));
+      1024, 1024, false, undefined, canvasToPngDataUrl(stUpload));
     const norm = normalizeFrame(img, null);
     if (!norm) throw new Error('normalize failed');
     stRefPreview = norm;
@@ -1592,6 +1609,21 @@ const stylizeUpload = async (): Promise<void> => {
     stStatus = `stylize failed: ${(e as Error).message}`;
   }
   stGenBusy = false;
+  renderAll();
+};
+
+/** Use a raw upload verbatim: normalize NOW (best for clean-bg sprite art). */
+const useUploadVerbatim = (): void => {
+  if (!stUpload) return;
+  const norm = normalizeFrame(stUpload, null);
+  if (!norm) {
+    stStatus = 'could not isolate a subject — this looks like a photo; use "stylize" instead';
+    renderAll();
+    return;
+  }
+  stRefPreview = norm;
+  stUpload = null;
+  stStatus = 'staged — review, then "use as reference"';
   renderAll();
 };
 
@@ -2138,21 +2170,26 @@ const renderGenerateTab = (): HTMLElement => {
         ? `locked reference in use · every frame is generated from this image`
         : 'no reference locked yet — generate or upload one, then "use as reference"'),
     ) : null,
-    // An uploaded image: use it verbatim, or have the model redraw it in the
-    // game's art style first (keeping the character).
+    // An uploaded image (shown RAW). Recommended path: stylize — the model
+    // redraws the character as a game sprite, handling the background itself.
+    // "use as-is" only suits already-clean sprite art.
     stUpload ? mkEl('div', { class: 'row' },
-      thumb(stUpload.cell),
+      thumb(stUpload),
       mkEl('div', {},
-        mkEl('p', { class: 'hint' }, 'uploaded image (normalized). Use it as-is, or stylize it into the game\'s look first.'),
-        mkEl('button', {
-          onclick: () => { stRefPreview = stUpload; stUpload = null; stStatus = 'upload staged — click "use as reference" to lock it'; renderAll(); },
-        }, 'use this image'),
+        mkEl('p', { class: 'hint' },
+          'uploaded image (raw). For a photo or any real background, use ✨ stylize — it keeps the '
+          + 'face/outfit and redraws on a clean sprite background. "use as-is" is for art that is '
+          + 'already a clean sprite on white.'),
         mkEl('button', {
           disabled: stGenBusy || !stImg2Img ? '' : null,
-          title: stImg2Img ? 'redraw the uploaded character in the game art style'
+          title: stImg2Img ? 'redraw the uploaded character as a game sprite (recommended for photos)'
             : 'needs an img2img provider (IMAGE_PROVIDER=gemini)',
           onclick: () => { void stylizeUpload(); },
         }, stGenBusy ? '…' : '✨ stylize into reference'),
+        mkEl('button', {
+          title: 'use the uploaded image directly (best for a clean sprite on a white background)',
+          onclick: () => useUploadVerbatim(),
+        }, 'use as-is'),
         mkEl('button', { onclick: () => { stUpload = null; renderAll(); } }, 'discard'),
       ),
     ) : null,
