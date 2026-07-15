@@ -232,6 +232,96 @@ const display = (
 const DANGER_OPTS: DisplayOpts = { from: '#ffe3e6', mid: '#ff6b81', to: '#8f1626', outline: '#2a0810' };
 const COOL_OPTS: DisplayOpts = { from: '#eaf6ff', mid: '#7fd0ff', to: '#1a5f8f', outline: '#0a1a2a' };
 
+/**
+ * Center announcement (ROUND n / FIGHT! / K.O. / DOUBLE KO) — the marquee
+ * moment of each round. Drawn as the FRONT-MOST HUD element (called dead last
+ * in drawHud, after the brand badge) so nothing occludes it.
+ *
+ * The look: a cinematic dark letterbox band for contrast over busy stages,
+ * radiating speed lines on entry, a heavy slam-in with overshoot (plus a
+ * short shake on K.O.), a diagonal gleam that sweeps across as it settles, and
+ * a per-type palette (gold for ROUND/FIGHT, red for K.O.). `age` is ticks
+ * since the text last changed (fx.announceAge), driving the whole timeline.
+ */
+const drawAnnounce = (ctx: CanvasRenderingContext2D, s: string, age: number): void => {
+  // Rise in ~5 ticks, hold, fade out by ~112; nothing draws once faded.
+  const alpha = clamp01(Math.min(age / 5, (112 - age) / 20));
+  if (alpha <= 0) return;
+
+  const danger = s === 'K.O.' || s === 'DOUBLE KO';
+  const isFight = s === 'FIGHT!';
+  const size = danger ? 112 : isFight ? 98 : 80;
+  const cx = VW / 2, cy = 258;
+
+  // Slam: overshoot down from a large scale to 1, then a faint breathe.
+  const inT = clamp01(age / 9);
+  const scale = (1.95 - 0.95 * easeOutBack(inT)) * (1 + 0.02 * Math.sin(age / 9));
+  const shake = danger && age < 16 ? Math.sin(age * 2.3) * (1 - age / 16) * 7 : 0;
+
+  ctx.font = `${size}px ${DISPLAY_FONT_STACK}`;
+  const tw = ctx.measureText(s).width * scale + size * 0.5;
+
+  // 1) Letterbox band — a soft dark strip behind the text so it reads over any
+  // stage. Full width; vertical gradient fades top/bottom.
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  const bandH = size * 1.5;
+  const band = ctx.createLinearGradient(0, cy - bandH * 0.72, 0, cy + bandH * 0.28);
+  band.addColorStop(0, 'rgba(6,4,12,0)');
+  band.addColorStop(0.5, 'rgba(6,4,12,0.72)');
+  band.addColorStop(1, 'rgba(6,4,12,0)');
+  ctx.fillStyle = band;
+  ctx.fillRect(0, cy - bandH * 0.72, VW, bandH);
+  ctx.restore();
+
+  // 2) Speed lines — brief horizontal streaks radiating from the center on
+  // entry, additive, selling the impact.
+  if (age < 16) {
+    const sl = (1 - age / 16) * alpha;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = danger ? `rgba(255,120,140,${0.4 * sl})` : `rgba(255,225,150,${0.4 * sl})`;
+    for (let k = -2; k <= 2; k++) {
+      if (k === 0) continue;
+      const ly = cy - size * 0.32 + k * size * 0.24;
+      const len = (100 + age * 26) * (1.1 - Math.abs(k) * 0.18);
+      ctx.lineWidth = size * 0.03;
+      ctx.beginPath(); ctx.moveTo(cx - len, ly); ctx.lineTo(cx - size * 0.9, ly);
+      ctx.moveTo(cx + len, ly); ctx.lineTo(cx + size * 0.9, ly); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // 3) The text itself (SF-style display treatment, per-type palette + glow).
+  display(ctx, s, cx + shake, cy, size, {
+    scale, alpha,
+    ...(danger ? DANGER_OPTS : {}),
+    glow: danger ? 'rgba(255,60,90,0.85)' : 'rgba(255,214,120,0.8)',
+    glowBlur: size * 0.4,
+  });
+
+  // 4) Gleam — a diagonal highlight sweeping across the text as it settles.
+  const gT = (age - 6) / 22;
+  if (gT > 0 && gT < 1) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(cx - tw / 2 - 12, cy - size * 1.05, tw + 24, size * 1.3);
+    ctx.clip();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.translate(cx - tw / 2 - 20 + gT * (tw + 60), cy - size * 0.4);
+    ctx.rotate(-0.26);
+    const gw = size * 0.55;
+    const gl = ctx.createLinearGradient(-gw / 2, 0, gw / 2, 0);
+    const gi = Math.sin(gT * Math.PI) * 0.6 * alpha;
+    gl.addColorStop(0, 'rgba(255,255,255,0)');
+    gl.addColorStop(0.5, `rgba(255,255,255,${gi})`);
+    gl.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = gl;
+    ctx.fillRect(-gw / 2, -size * 1.3, gw, size * 2.6);
+    ctx.restore();
+  }
+};
+
 // ---------------------------------------------------------------- stage
 /**
  * Rooftop at sunset: parallax skyline, chain-link fence, tiled deck.
@@ -564,21 +654,40 @@ const drawTimer = (ctx: CanvasRenderingContext2D, secs: number, tick: number): v
 };
 
 /**
- * Compact brand badge centered below the fight timer. Crops to the art's
- * opaque bbox (same reasoning as the title logo — the source SVG carries
- * transparent padding that would otherwise show as an odd gap) and fits it to
- * a modest watermark width, scaled to 70% per the requested size reduction.
- * Silently omitted if the asset hasn't loaded (fire-and-forget at boot).
+ * Brand badge over the fight timer — drawn LAST in drawHud (see the call
+ * site) so it sits on the top layer, free to overlap the timer/health/meter
+ * chrome beneath it. Crops to the art's opaque bbox (same reasoning as the
+ * title logo — the source SVG carries transparent padding that would
+ * otherwise show as an odd gap), sized to 175% of the original 100px base
+ * (70% reduction × 2.5 enlargement, per the two size requests), and carries a
+ * breathing scale pulse + a pulsing white/light-blue glow that follows the
+ * art's own silhouette (shadowBlur tracks alpha, unlike a rectangular halo).
+ * `topY` anchors the TOP edge (not center) — set to the timer's vertical
+ * midpoint so the badge only overlaps the timer's lower half and hangs down
+ * past it, rather than burying the whole badge. Silently omitted if the
+ * asset hasn't loaded (fire-and-forget at boot).
  */
-const drawGameLogo = (ctx: CanvasRenderingContext2D, y: number): void => {
+const drawGameLogo = (ctx: CanvasRenderingContext2D, cx: number, topY: number, tick: number): void => {
   if (!gameLogoImg || gameLogoImg.naturalWidth === 0) return;
   const box = gameLogoBBox ?? { x: 0, y: 0, w: gameLogoImg.naturalWidth, h: gameLogoImg.naturalHeight };
-  const BASE_W = 100; // natural badge width before the requested reduction
-  const w = BASE_W * 0.7;
+  const BASE_W = 100; // natural badge width before the size adjustments below
+  const w = BASE_W * 0.7 * 2.5;
   const h = w * (box.h / box.w);
+  const breathe = fxPulse(tick, 0.045, 0.96, 1.06); // slow "alive" scale
+
   ctx.save();
+  ctx.translate(cx, topY);
+  ctx.scale(breathe, breathe);
   ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, VW / 2 - w / 2, y, w, h);
+  // Pulses between near-white and light blue rather than a fixed hue.
+  const glowMix = fxPulse(tick, 0.07); // 0..1
+  const gr = Math.round(210 + 40 * glowMix), gg = Math.round(235 + 15 * glowMix), gb = 255;
+  ctx.shadowColor = `rgba(${gr},${gg},${gb},${0.55 + 0.35 * fxPulse(tick, 0.09)})`;
+  ctx.shadowBlur = 14 + 10 * fxPulse(tick, 0.09);
+  // Two passes: the shadow builds a real halo around the artwork's own
+  // silhouette without a second draw looking like a ghost/double-image.
+  ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, -w / 2, 0, w, h);
+  ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, -w / 2, 0, w, h);
   ctx.restore();
 };
 
@@ -609,7 +718,6 @@ export const drawHud = (
     drawMeter(ctx, i, f.meter, g.tick);
   }
   drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
-  drawGameLogo(ctx, 106); // just under the timer badge (which bottoms out ~y=102)
 
   // Combo counter: punches in on each new hit (re-triggered via comboAge
   // reset in main.ts whenever comboHits increases), settles with overshoot.
@@ -622,18 +730,6 @@ export const drawHud = (
     label(ctx, 'HITS', i === 0 ? x + 62 : x - 62, 200, 20, '#fff', align);
   }
 
-  // Center announcements (ROUND 1 / FIGHT! / KO): pop in with overshoot, hold, fade.
-  if (fx.announce) {
-    const inT = clamp01(fx.announceAge / 10);
-    const scale = 0.5 + 0.5 * easeOutBack(inT);
-    const alpha = clamp01(1.6 - fx.announceAge / 60);
-    const danger = fx.announce === 'K.O.' || fx.announce === 'DOUBLE KO';
-    display(ctx, fx.announce, VW / 2, VH / 2 - 40, 64, {
-      scale, alpha, ...(danger ? DANGER_OPTS : {}),
-      glow: danger ? 'rgba(233,69,96,0.7)' : 'rgba(255,209,102,0.6)',
-    });
-  }
-
   // Controls strip (dark band like the reference).
   ctx.fillStyle = '#0b0a12dd';
   ctx.fillRect(0, VH - 24, VW, 24);
@@ -641,12 +737,22 @@ export const drawHud = (
   ctx.fillRect(0, VH - 24, VW, 1);
   label(ctx, 'P1: WASD · TYU / GHJ        P2: ARROWS · IOP / KL;        B: HITBOXES        ESC: MENU',
     VW / 2, VH - 8, 11, '#c8c4ba');
+
+  // Brand badge over the timer's lower rim (top layer of the persistent HUD).
+  drawGameLogo(ctx, VW / 2, 70, g.tick);
+
+  // Center announcement (ROUND n / FIGHT! / K.O.) — drawn ABSOLUTELY LAST so it
+  // is the front-most element, over the brand badge and everything else.
+  if (fx.announce) drawAnnounce(ctx, fx.announce, fx.announceAge);
 };
 
 // ---------------------------------------------------------------- title
 export interface TitleMenuState {
   mode: Mode;
   cpuLevel: number;
+  /** AIR account chip: display handle when logged in, null when out. */
+  authLabel?: string | null;
+  authBusy?: boolean;
 }
 
 export const drawTitle = (
@@ -725,6 +831,13 @@ export const drawTitle = (
     }
   });
   label(ctx, '↑ / ↓  SELECT       ENTER  START', cx, menuY0 + rows.length * 34 + 6, 13, '#ffffffaa');
+
+  // AIR account chip (top-right): identity when signed in, the key hint when
+  // out. Signing in is optional — it unlocks persistent XP + the leaderboard.
+  const chip = menu.authBusy ? 'SIGNING IN…'
+    : menu.authLabel ? `◆ ${menu.authLabel}   ·   L: SIGN OUT`
+    : 'L: SIGN IN  ·  SAVE XP & RANK';
+  label(ctx, chip, VW - 16, 22, 12, menu.authLabel ? '#8fe8a0' : '#ffffff88', 'right');
 
   label(ctx, 'MILESTONE 4 · AI + LEVELING BUILD', cx, VH - 12, 10, '#ffffff55');
 };
@@ -835,30 +948,78 @@ const drawCpuBadge = (ctx: CanvasRenderingContext2D, info: CpuBadgeInfo, tick: n
   label(ctx, '[  /  ]  ADJUST', x + w / 2, y + h - 4, 9, '#c8c4ba99');
 };
 
-/** One labeled 5-segment stat bar. Filled segments animate a soft sheen. */
+/** Rounded-rectangle path (no fill/stroke — caller decides). */
+const rrect = (
+  ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number,
+): void => {
+  const rr = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+};
+
+/** Lighten (d>0) / darken (d<0) a #rrggbb hex by a flat per-channel delta. */
+const tintHex = (hex: string, d: number): string => {
+  const n = parseInt(hex.slice(1), 16);
+  const c = (v: number): number => Math.max(0, Math.min(255, v + d));
+  return `rgb(${c((n >> 16) & 255)},${c((n >> 8) & 255)},${c(n & 255)})`;
+};
+
+/**
+ * One labeled 5-segment stat bar. Filled segments are glossy accent pills with
+ * a soft glow; a bright energy pulse travels across the filled run (the
+ * "charging" fill animation); empty slots are dark with a faint accent stroke.
+ */
 const drawStatBar = (
   ctx: CanvasRenderingContext2D, x: number, y: number, w: number,
   stat: CharStat, accent: string, tick: number,
 ): void => {
-  label(ctx, stat.label, x, y + 8, 10, '#c8c4ba', 'left', false);
-  const trackX = x + 74;
-  const trackW = w - 74;
-  const n = 5, sgap = 3;
+  label(ctx, stat.label, x, y + 9, 10, '#d3cfe0', 'left', false);
+  const trackX = x + 80, trackW = w - 80;
+  const n = 5, sgap = 3, bh = 11, rad = 3;
   const segW = (trackW - (n - 1) * sgap) / n;
+  const lightC = tintHex(accent, 75), darkC = tintHex(accent, -55);
   for (let s = 0; s < n; s++) {
     const sx = trackX + s * (segW + sgap);
-    const on = s < stat.segs;
-    ctx.fillStyle = '#00000055';
-    ctx.fillRect(sx, y, segW, 9);
-    if (on) {
-      // A gentle travelling highlight so filled bars feel alive.
-      const sheen = 0.75 + 0.25 * Math.sin(tick / 12 - s * 0.6);
-      ctx.globalAlpha = sheen;
-      ctx.fillStyle = accent;
-      ctx.fillRect(sx, y, segW, 9);
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = '#ffffff33';
-      ctx.fillRect(sx, y, segW, 3);
+    rrect(ctx, sx, y, segW, bh, rad);
+    if (s < stat.segs) {
+      const grad = ctx.createLinearGradient(0, y, 0, y + bh);
+      grad.addColorStop(0, lightC);
+      grad.addColorStop(0.5, accent);
+      grad.addColorStop(1, darkC);
+      ctx.save();
+      ctx.shadowColor = accent;
+      ctx.shadowBlur = 6;
+      ctx.fillStyle = grad;
+      ctx.fill();
+      ctx.restore();
+      // Top gloss line.
+      ctx.fillStyle = 'rgba(255,255,255,0.4)';
+      rrect(ctx, sx + 1.5, y + 1.5, segW - 3, 2.5, 1);
+      ctx.fill();
+      // Travelling energy pulse — a bright wave sweeping left→right through the
+      // filled run, each segment lit as the wave reaches it.
+      const wave = Math.sin(tick / 9 - s * 0.85);
+      if (wave > 0.05) {
+        ctx.save();
+        rrect(ctx, sx, y, segW, bh, rad);
+        ctx.clip();
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = wave * 0.55;
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(sx, y, segW, bh);
+        ctx.restore();
+      }
+    } else {
+      ctx.fillStyle = '#00000066';
+      ctx.fill();
+      ctx.strokeStyle = accent + '33';
+      ctx.lineWidth = 1;
+      ctx.stroke();
     }
   }
 };
@@ -872,34 +1033,117 @@ const drawFighterCard = (
   ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number,
   r: Roster, stats: CharStats, accent: string, header: string, locked: boolean, tick: number,
 ): void => {
-  ctx.save();
-  ctx.shadowColor = '#000000aa';
-  ctx.shadowBlur = 12;
-  bevel(ctx, x, y, w, h, '#120f1de6', accent, GOLD_DK, 2);
-  ctx.restore();
-  // Accent header strip.
-  ctx.fillStyle = accent;
-  ctx.fillRect(x, y, w, 20);
-  label(ctx, header, x + 8, y + 14, 12, '#0a0a12', 'left', false);
-  label(ctx, locked ? 'LOCKED' : 'CHOOSING…', x + w - 8, y + 14, 10, '#0a0a1299', 'right', false);
+  const rad = 12;
+  const pulse = fxPulse(tick, 0.08); // 0..1 breathing for the accent glow
 
-  // Portrait on the inner-left of the card.
+  // 1) Panel: rounded, vertical gradient fill, cast on a soft accent glow that
+  // intensifies when the pick is locked in.
+  ctx.save();
+  ctx.shadowColor = accent + (locked ? 'ee' : '88');
+  ctx.shadowBlur = (locked ? 20 : 11) + 7 * pulse;
+  const gpanel = ctx.createLinearGradient(0, y, 0, y + h);
+  gpanel.addColorStop(0, '#1b1728f4');
+  gpanel.addColorStop(1, '#0c0a15f4');
+  rrect(ctx, x, y, w, h, rad);
+  ctx.fillStyle = gpanel;
+  ctx.fill();
+  ctx.restore();
+
+  // 2) Glowing accent outline (the "stroke" ask) — double stroke: a wide soft
+  // halo underneath, a crisp bright line on top.
+  ctx.save();
+  rrect(ctx, x + 1.5, y + 1.5, w - 3, h - 3, rad - 1);
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 2;
+  ctx.shadowColor = accent;
+  ctx.shadowBlur = 7 + 6 * pulse;
+  ctx.stroke();
+  ctx.restore();
+  ctx.save();
+  rrect(ctx, x + 1.5, y + 1.5, w - 3, h - 3, rad - 1);
+  ctx.strokeStyle = tintHex(accent, 90);
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+
+  // 3) Header strip: horizontal accent gradient with a bright lower edge,
+  // clipped to the card's rounded top.
+  ctx.save();
+  rrect(ctx, x, y, w, h, rad);
+  ctx.clip();
+  const ghead = ctx.createLinearGradient(x, 0, x + w, 0);
+  ghead.addColorStop(0, tintHex(accent, -6));
+  ghead.addColorStop(1, tintHex(accent, -52));
+  ctx.fillStyle = ghead;
+  ctx.fillRect(x, y, w, 22);
+  ctx.fillStyle = tintHex(accent, 80);
+  ctx.fillRect(x, y + 21, w, 1.5);
+  // A faint top inner highlight across the whole panel.
+  const gtop = ctx.createLinearGradient(0, y + 22, 0, y + 52);
+  gtop.addColorStop(0, 'rgba(255,255,255,0.08)');
+  gtop.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = gtop;
+  ctx.fillRect(x, y + 22, w, 30);
+  ctx.restore();
+  // White text with a dark drop-shadow reads across the whole accent gradient
+  // (black was unreadable on the strip's dark end).
+  label(ctx, header, x + 10, y + 15, 12, '#ffffff', 'left', true);
+  // Status: a small pulsing dot + word.
+  const statusTxt = locked ? 'LOCKED' : 'CHOOSING…';
+  if (!locked) {
+    ctx.globalAlpha = 0.5 + 0.5 * fxPulse(tick, 0.12);
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(x + w - 78, y + 11, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  label(ctx, statusTxt, x + w - 10, y + 15, 10, locked ? '#ffffff' : '#ffffffcc', 'right', true);
+
+  // 4) Portrait on the inner-left: a glowing accent ring, a rounded framed
+  // window, a slow diagonal shine, and the locked marching-ants outline.
   const pad = 12;
   const pSize = h - 32 - pad;
   const px2 = x + pad;
   const py2 = y + 24 + pad;
-  bevel(ctx, px2 - 2, py2 - 2, pSize + 4, pSize + 4, PANEL, GOLD, GOLD_DK, 2);
+  ctx.save();
+  ctx.shadowColor = accent;
+  ctx.shadowBlur = 9 + 5 * pulse;
+  rrect(ctx, px2 - 3, py2 - 3, pSize + 6, pSize + 6, 7);
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.restore();
+  ctx.save();
+  rrect(ctx, px2, py2, pSize, pSize, 5);
+  ctx.clip();
+  ctx.fillStyle = '#0c0a14';
+  ctx.fillRect(px2, py2, pSize, pSize);
   drawPortrait(ctx, r, px2, py2, pSize, pSize);
+  // Diagonal shine sweeping across the portrait every few seconds.
+  const shT = (tick % 240) / 240;
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.translate(px2 - pSize + shT * (pSize * 2.4), py2);
+  ctx.rotate(-0.35);
+  const sg = ctx.createLinearGradient(-14, 0, 14, 0);
+  sg.addColorStop(0, 'rgba(255,255,255,0)');
+  sg.addColorStop(0.5, 'rgba(255,255,255,0.14)');
+  sg.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = sg;
+  ctx.fillRect(-14, -pSize * 0.5, 28, pSize * 2);
+  ctx.restore();
   if (locked) marchingOutline(ctx, px2 - 4, py2 - 4, pSize + 8, pSize + 8, tick, accent, 10, 0.7);
 
-  // Name + concrete config numbers.
+  // 5) Name (with a matching glow) + concrete config numbers.
   const infoX = px2 + pSize + 14;
   const infoW = x + w - pad - infoX;
-  display(ctx, r.bundle.name.toUpperCase(), infoX, py2 + 16, 20, { align: 'left' });
+  display(ctx, r.bundle.name.toUpperCase(), infoX, py2 + 16, 20, {
+    align: 'left', glow: accent + 'aa', glowBlur: 12,
+  });
   label(ctx, `${stats.health.toLocaleString()} HP   ·   ${stats.moveCount} MOVES`,
     infoX, py2 + 34, 11, '#ffd99b', 'left', false);
 
-  // Stat bars.
+  // 6) Stat bars.
   let by = py2 + 52;
   for (const s of stats.bars) {
     drawStatBar(ctx, infoX, by, infoW, s, accent, tick);
@@ -938,9 +1182,18 @@ export const drawSelect = (
     const y = gy + Math.floor(k / cols) * (cell + gap + 20);
     bevel(ctx, x - 2, y - 2, cell + 4, cell + 4, PANEL, GOLD, GOLD_DK, 2);
     drawPortrait(ctx, r, x, y, cell, cell);
-    label(ctx, r.bundle.name.toUpperCase(), x + cell / 2, y + cell + 14, 11, '#fff');
+    if (r.disabled) {
+      // Grey veil + tag: the fighter is present but unselectable.
+      ctx.save();
+      ctx.fillStyle = '#0a0a12cc';
+      ctx.fillRect(x, y, cell, cell);
+      ctx.restore();
+      label(ctx, 'DISABLED', x + cell / 2, y + cell / 2 + 3, 10, '#c04a5a', 'center', false);
+    }
+    label(ctx, r.bundle.name.toUpperCase(), x + cell / 2, y + cell + 14, 11, r.disabled ? '#5a5f70' : '#fff');
 
     // Selection cursors: smooth pulsing glow instead of a hard blink.
+    // (Disabled fighters are skipped by the cursor, so none render here.)
     for (const i of [0, 1] as const) {
       if (cursors[i] !== k) continue;
       const pulse = locked[i] ? 1 : 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(tick / 8));

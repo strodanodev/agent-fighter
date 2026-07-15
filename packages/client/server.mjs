@@ -80,6 +80,9 @@ createServer((req, res) => {
     file = under(STAGES, '/stages/');
   } else if (path.startsWith('/assets/')) {
     file = under(ASSETS, '/assets/');
+  } else if (path.startsWith('/vendor/')) {
+    // AIR Kit UMD (and future vendored scripts) — copied by bundle.mjs.
+    file = under(join(here, 'demo', 'vendor'), '/vendor/');
   }
 
   if (file && existsSync(file)) {

@@ -26,6 +26,7 @@ import type { Cam, HudFx, Mode, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit } from './chrome.js';
 import type { StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
+import { auth, authLogin, authLogout, authName, authRehydrate, authToken } from './auth.js';
 import { NetSession } from './net.js';
 import {
   auraGlow, drawFx, emitAura, emitBurst, emitRing, fxPulse, updateFx,
@@ -137,6 +138,9 @@ const boot = async (): Promise<void> => {
     screen = 'title';
     audio.preload();
     void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1.5 });
+    // Restore a previous AIR session silently (30-day sessions) — never blocks
+    // boot, and offline play works identically if it fails or is skipped.
+    void authRehydrate();
   } catch (e) {
     loadError = (e as Error).message;
   }
@@ -167,9 +171,15 @@ const startOnline = (): void => {
   // ?ws=ws://host:port overrides the default match server (deploys, dev).
   const url = new URLSearchParams(location.search).get('ws')
     ?? `ws://${location.hostname}:8477`;
-  net = new NetSession(url, `PLAYER-${(profile.wins + profile.losses) % 1000}`, roster.id, roster.bundle.versionHash);
   netInstalled = false;
   screen = 'online';
+  // Signed in → play under the AIR identity (fresh token; the server verifies
+  // it against the JWKS and persists XP/W-L). Anonymous stays fully playable.
+  const name = authName() ?? `PLAYER-${(profile.wins + profile.losses) % 1000}`;
+  void authToken().then((token) => {
+    if (screen !== 'online' || net) return; // player backed out while fetching
+    net = new NetSession(url, name, roster.id, roster.bundle.versionHash, token);
+  });
 };
 
 /** Match setup arrived — install the pinned characters/stage and begin. */
@@ -472,9 +482,16 @@ const renderFight = (g: GameState): void => {
 // ---------------------------------------------------------------- screens
 const tickSelect = (): void => {
   const n = allRosters.length;
+  const enabled = (i: number): boolean => !allRosters[i]?.disabled;
+  const anyEnabled = allRosters.some((_r, i) => enabled(i));
   const move = (i: 0 | 1, d: number): void => {
-    if (locked[i]) return;
-    picks[i] = (picks[i] + d + n) % n;
+    if (locked[i] || !anyEnabled) return;
+    // Step over disabled fighters so the cursor lands only on selectable ones.
+    let p = picks[i];
+    for (let s = 0; s < n; s++) {
+      p = (p + d + n) % n;
+      if (enabled(p)) { picks[i] = p; return; }
+    }
   };
   if (pressedThisFrame.has('KeyA')) move(0, -1);
   if (pressedThisFrame.has('KeyD')) move(0, 1);
@@ -488,17 +505,21 @@ const tickSelect = (): void => {
     if (pressedThisFrame.has('ArrowRight')) move(1, 1);
   }
 
-  if (CONFIRM[0]!.some((k) => pressedThisFrame.has(k))) locked[0] = true;
+  // A disabled fighter under the cursor cannot be confirmed.
+  if (enabled(picks[0]) && CONFIRM[0]!.some((k) => pressedThisFrame.has(k))) locked[0] = true;
   if (mode === 'online') {
     // Online: your pick is the queue ticket — opponent comes from matchmaking.
     if (locked[0]) startOnline();
     return;
   }
   if (mode === '2p') {
-    if (CONFIRM[1]!.some((k) => pressedThisFrame.has(k))) locked[1] = true;
+    if (enabled(picks[1]) && CONFIRM[1]!.some((k) => pressedThisFrame.has(k))) locked[1] = true;
   } else if (locked[0] && !locked[1]) {
-    // CPU picks its fighter — visibly, like an arcade opponent reveal.
-    picks[1] = (seed * 17 + profile.wins * 5 + uiTick) % n;
+    // CPU picks its fighter — visibly, like an arcade opponent reveal — but
+    // never a disabled one.
+    let p = (seed * 17 + profile.wins * 5 + uiTick) % n;
+    for (let s = 0; s < n && !enabled(p); s++) p = (p + 1) % n;
+    picks[1] = p;
     locked[1] = true;
     void audio.playStinger('here_comes_a_new_challenger');
   }
@@ -539,15 +560,24 @@ const frame = (): void => {
       ctx.fillText('run `npm run play` from the repo root so characters/ is served', VW / 2, VH / 2 + 28);
     }
   } else if (screen === 'title') {
-    drawTitle(ctx, allRosters, uiTick, { mode, cpuLevel: cpuLevelFor(profile, lever) });
+    drawTitle(ctx, allRosters, uiTick, {
+      mode, cpuLevel: cpuLevelFor(profile, lever),
+      authLabel: authName(), authBusy: auth.status === 'busy',
+    });
     const MODES: Mode[] = ['cpu', '2p', 'online'];
-    if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')) {
+    if (pressedThisFrame.has('KeyL')) {
+      // AIR sign-in/out toggle — must not fall through to "any key starts".
+      void (auth.status === 'in' ? authLogout() : authLogin());
+    } else if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')) {
       mode = MODES[(MODES.indexOf(mode) + MODES.length - 1) % MODES.length]!;
     } else if (pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
       mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length]!;
     } else if (pressedThisFrame.size > 0) {
       screen = 'select';
       locked = [false, false];
+      // Start both cursors on the first selectable (non-disabled) fighter.
+      const fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+      picks = [fe, fe];
       void audio.playBgm('player_select', { fadeInSec: 0.5 });
     }
   } else if (screen === 'select') {
@@ -562,7 +592,7 @@ const frame = (): void => {
     ctx.fillStyle = '#0a0616';
     ctx.fillRect(0, 0, VW, VH);
     const dots = '.'.repeat(1 + (Math.trunc(uiTick / 20) % 3));
-    const msg = !net ? 'NO CONNECTION'
+    const msg = !net ? `CONNECTING${dots}` // token fetch in flight
       : net.status === 'error' ? `OFFLINE: ${net.error}`
       : net.setup ? 'OPPONENT FOUND — STARTING'
       : net.status === 'queued' ? `SEARCHING FOR OPPONENT${dots}`
@@ -637,6 +667,15 @@ const frame = (): void => {
     }
   } else if (screen === 'results' && game) {
     resultsAge++;
+    // Online progression is SERVER-AWARDED (Phase B): the xp message lands
+    // after the verified result, only for signed-in players.
+    if (net?.xp && !xpBanner) {
+      xpBanner = {
+        gained: net.xp.gained, levelsUp: net.xp.levelsUp,
+        level: net.xp.level, xp: net.xp.xp, xpNeed: xpForNext(net.xp.level),
+        wins: net.xp.wins, losses: net.xp.losses,
+      };
+    }
     renderFight(game);
     drawResults(ctx, game, fighters!, uiTick, resultsAge, xpBanner);
     // Online: the server's verdict is the real result (ADR 0003).

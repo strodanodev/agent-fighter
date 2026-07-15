@@ -23,6 +23,10 @@ import {
   DEFAULT_PORT, FORFEIT_GRACE_MS, INPUT_DELAY, PROTOCOL_VERSION,
 } from './protocol.js';
 import type { ClientMsg, SMatch, SResult, ServerMsg } from './protocol.js';
+import { verifyAirToken } from './airjwt.js';
+import type { AirIdentity } from './airjwt.js';
+import { createPersistence, loadDotEnv } from './persist.js';
+import type { Persistence } from './persist.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(here, '..', '..', '..');
@@ -37,6 +41,8 @@ interface Client {
   character: string;
   match: Match | null;
   side: 0 | 1;
+  /** Verified AIR identity (null = anonymous). Set async after hello. */
+  identity: AirIdentity | null;
 }
 
 interface Match {
@@ -96,10 +102,17 @@ const verifyLedger = (
 };
 
 // ---------------------------------------------------------------- server
-export const createMatchServer = (opts: { port?: number; root?: string } = {}): Promise<MatchServer> => {
+export const createMatchServer = (opts: {
+  port?: number;
+  root?: string;
+  /** Test hook: overrides the Supabase-backed persistence (null = off). */
+  persistence?: Persistence | null;
+} = {}): Promise<MatchServer> => {
   const root = opts.root ?? REPO_ROOT;
   const charactersDir = join(root, 'characters');
   const stagesDir = join(root, 'stages');
+  loadDotEnv(root); // SUPABASE_URL / SUPABASE_SERVICE_KEY / AIR_JWKS_URL
+  const persistence = opts.persistence !== undefined ? opts.persistence : createPersistence();
 
   const bundleOf = (id: string): CharacterBundle => {
     const file = join(charactersDir, id, 'character.json');
@@ -167,6 +180,29 @@ export const createMatchServer = (opts: { port?: number; root?: string } = {}): 
       c.match = null;
     }
     console.log(`[match ${m.id}] ${result.reason}: winner=${result.winner} ticks=${result.endTick}`);
+    // Persist + award XP AFTER the result is out — progression is async and
+    // must never delay or gate the verdict. record_match is idempotent by
+    // match id, so a crash-retry can't double-award.
+    if (persistence) {
+      void persistence.recordMatch({
+        matchId: m.id,
+        identities: [m.clients[0].identity, m.clients[1].identity],
+        names: [m.clients[0].name, m.clients[1].name],
+        agents: [m.clients[0].agent, m.clients[1].agent],
+        chars: m.chars,
+        winner: result.winner, reason: result.reason,
+        rounds: result.rounds, endTick: result.endTick, hash: result.hash,
+        deviator: result.deviator,
+        engine: ENGINE_VERSION,
+      }).then((awards) => {
+        for (const a of awards) {
+          send(m.clients[a.side], {
+            t: 'xp', gained: a.gained, levelsUp: a.levelsUp,
+            level: a.level, xp: a.xp, wins: a.wins, losses: a.losses,
+          });
+        }
+      }).catch((e) => console.log(`[match ${m.id}] persist failed: ${String(e)}`));
+    }
     if (process.env.AF_DEBUG_LEDGER) {
       // Forensics: dump the canonical ledger for offline diffing (sync — the
       // fs import at module top; async here raced process lifetime).
@@ -246,6 +282,15 @@ export const createMatchServer = (opts: { port?: number; root?: string } = {}): 
         if (msg.engine !== ENGINE_VERSION) return send(c, { t: 'error', msg: `engine ${ENGINE_VERSION} required (got ${msg.engine})` });
         c.name = String(msg.name ?? 'anon').slice(0, 24) || 'anon';
         c.agent = !!msg.agent;
+        // Identity resolves async and only gates PROGRESSION, never the
+        // queue — the welcome goes out immediately. JWKS is cached, so this
+        // settles long before any match could possibly finish.
+        if (typeof msg.auth === 'string' && msg.auth) {
+          void verifyAirToken(msg.auth).then((identity) => {
+            c.identity = identity;
+            if (identity) console.log(`[auth] ${c.name} = ${identity.sub}${identity.address ? ` (${identity.address.slice(0, 10)}…)` : ''}`);
+          });
+        }
         return send(c, { t: 'welcome', id: c.id, engine: ENGINE_VERSION });
       }
       case 'queue': {
@@ -304,12 +349,28 @@ export const createMatchServer = (opts: { port?: number; root?: string } = {}): 
     }
   };
 
-  const http = createHttpServer((_, res) => {
+  const http = createHttpServer((req, res) => {
+    const path = new URL(req.url ?? '/', 'http://x').pathname;
+    if (path === '/leaderboard') {
+      if (!persistence) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'persistence not configured' }));
+      }
+      void persistence.leaderboard(20).then((rows) => {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify(rows));
+      }).catch((e) => {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: String(e) }));
+      });
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       game: 'agent-fighter', engine: ENGINE_VERSION, protocol: PROTOCOL_VERSION,
       characters: characterIds, stages: stageIds,
       online: clients.size, queued: queue.length,
+      persistence: !!persistence,
     }));
   });
   const wss = new WebSocketServer({ server: http });
@@ -317,7 +378,7 @@ export const createMatchServer = (opts: { port?: number; root?: string } = {}): 
   wss.on('connection', (ws) => {
     const c: Client = {
       ws, id: `c${nextId++}`, name: 'anon', agent: false,
-      state: 'lobby', character: '', match: null, side: 0,
+      state: 'lobby', character: '', match: null, side: 0, identity: null,
     };
     clients.add(c);
     ws.on('message', (data) => onMessage(c, String(data)));

@@ -46,11 +46,23 @@ export interface NetResult {
 
 export type NetStatus = 'connecting' | 'queued' | 'playing' | 'done' | 'error';
 
+/** Post-match account progression, server-authoritative (Phase B). */
+export interface NetXp {
+  gained: number;
+  levelsUp: number;
+  level: number;
+  xp: number;
+  wins: number;
+  losses: number;
+}
+
 export class NetSession {
   status: NetStatus = 'connecting';
   error = '';
   setup: NetSetup | null = null;
   result: NetResult | null = null;
+  /** Arrives after the result, only when logged in — drives the XP banner. */
+  xp: NetXp | null = null;
   game: GameState | null = null;
   /** Ticks currently stalled waiting on the opponent (UI: "connection…"). */
   stalled = 0;
@@ -66,10 +78,10 @@ export class NetSession {
   private overSent = false;
   private nextHashTick = 0; // last CONFIRMED checkpoint reported to the server
 
-  constructor(url: string, name: string, character: string, bundleHash?: string) {
+  constructor(url: string, name: string, character: string, bundleHash?: string, authToken?: string) {
     this.ws = new WebSocket(url);
     this.ws.onopen = () => {
-      this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION });
+      this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION, auth: authToken });
       this.send({ t: 'queue', character, bundleHash });
       this.status = 'queued';
     };
@@ -119,6 +131,10 @@ export class NetSession {
       case 'result': {
         this.result = msg as unknown as NetResult;
         this.status = 'done';
+        return;
+      }
+      case 'xp': {
+        this.xp = msg as unknown as NetXp;
         return;
       }
       default:

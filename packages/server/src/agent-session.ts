@@ -36,6 +36,12 @@ export interface AgentOptions {
    * faster-than-realtime matches; the protocol doesn't care about wall time.
    */
   paceMs?: number;
+  /**
+   * AIR session token of the agent's OWNING account (optional). Gives the
+   * agent persistent XP/W-L under that identity — a declared agent playing
+   * for its owner, per ADR 0003.
+   */
+  authToken?: string;
 }
 
 export interface AgentResult {
@@ -99,7 +105,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
     };
 
     ws.on('open', () => {
-      sendMsg({ t: 'hello', v: PROTOCOL_VERSION, name: opts.name, agent: true, engine: ENGINE_VERSION });
+      sendMsg({ t: 'hello', v: PROTOCOL_VERSION, name: opts.name, agent: true, engine: ENGINE_VERSION, auth: opts.authToken });
       sendMsg({ t: 'queue', character: opts.character, bundleHash: bundleOf(opts.character).versionHash });
     });
 

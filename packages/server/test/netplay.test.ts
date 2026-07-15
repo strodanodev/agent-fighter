@@ -23,7 +23,9 @@ after(() => server?.close());
 
 describe('online match: two agents through the real server', () => {
   it('plays a full verified match; server hash == both local hashes', async () => {
-    server = await createMatchServer({ port: 0 });
+    // persistence: null — tests must NEVER write to a real Supabase project,
+    // even when the developer's .env carries live keys.
+    server = await createMatchServer({ port: 0, persistence: null });
     const url = `ws://localhost:${server.port}`;
 
     const [a, b] = await Promise.all([
@@ -59,5 +61,35 @@ describe('online match: two agents through the real server', () => {
     assert.equal(a.result.reason, 'verified');
     assert.equal(a.localHash, a.result.hash >>> 0);
     assert.equal(b.localHash, b.result.hash >>> 0);
+  });
+});
+
+describe('persistence hook (Phase B)', () => {
+  it('a finished match is recorded exactly once with the verified outcome', async () => {
+    const records: import('../src/persist.js').MatchRecord[] = [];
+    const mock: import('../src/persist.js').Persistence = {
+      recordMatch: async (r) => { records.push(r); return []; },
+      leaderboard: async () => [],
+    };
+    const s2 = await createMatchServer({ port: 0, persistence: mock });
+    try {
+      const url = `ws://localhost:${s2.port}`;
+      const [a] = await Promise.all([
+        playOneMatch({ url, name: 'AgentE', character: 'analog', skill: 60, charactersDir, aiSeed: 555, paceMs: 1 }),
+        playOneMatch({ url, name: 'AgentF', character: 'vector', skill: 60, charactersDir, aiSeed: 666, paceMs: 1 }),
+      ]);
+      // recordMatch fires right after the result goes out — same tick.
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(records.length, 1, 'one match → one record');
+      const rec = records[0]!;
+      assert.equal(rec.reason, 'verified');
+      assert.equal(rec.winner, a.result.winner);
+      assert.deepEqual(rec.names.slice().sort(), ['AgentE', 'AgentF']);
+      assert.deepEqual(rec.agents, [true, true]);
+      assert.deepEqual(rec.identities, [null, null]); // no auth tokens sent
+      assert.equal(rec.hash >>> 0, a.result.hash >>> 0);
+    } finally {
+      s2.close();
+    }
   });
 });

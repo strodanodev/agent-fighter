@@ -10,6 +10,7 @@
     "play": "node tools/bundle.mjs && node server.mjs"
   },
   "dependencies": {
-    "@af/core": "*"
+    "@af/core": "*",
+    "@mocanetwork/airkit": "^1.10.0"
   }
 }

@@ -29,6 +29,13 @@ export interface CHello {
   name: string;
   agent?: boolean;
   engine: string; // ENGINE_VERSION — pinned
+  /**
+   * AIR Kit session JWT (optional). The server verifies it against the AIR
+   * JWKS and, if valid, ties this connection to the account (`sub`) for
+   * persistent XP/W-L. Anonymous play stays allowed — identity only gates
+   * PROGRESSION, never the queue. Agents pass their owner's token here.
+   */
+  auth?: string;
 }
 export interface CQueue { t: 'queue'; character: string; bundleHash?: string }
 export interface CInput { t: 'i'; k: number; v: number }
@@ -61,4 +68,18 @@ export interface SResult {
   deviator?: 0 | 1; // side whose reported hashes diverged from the re-sim
 }
 export interface SError { t: 'error'; msg: string }
-export type ServerMsg = SWelcome | SQueued | SMatch | SInput | SResult | SError;
+/**
+ * Post-match progression for YOUR account, sent after the result once the
+ * server has persisted the verified outcome (authenticated players only).
+ * Arrives asynchronously — persistence must never delay the result itself.
+ */
+export interface SXp {
+  t: 'xp';
+  gained: number;
+  levelsUp: number;
+  level: number;
+  xp: number;
+  wins: number;
+  losses: number;
+}
+export type ServerMsg = SWelcome | SQueued | SMatch | SInput | SResult | SError | SXp;

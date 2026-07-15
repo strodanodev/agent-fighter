@@ -6,7 +6,7 @@
  * convention; a name collision fails loudly below).
  */
 import { execSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -34,6 +34,7 @@ const ORDER = [
   'client/src/atlas.js',
   'client/src/chrome.js',
   'client/src/progress.js',
+  'client/src/auth.js',
   'client/src/net.js',
   'client/src/fx.js',
   'client/src/flags.js',
@@ -89,3 +90,17 @@ mkdirSync(join(pkg, 'demo'), { recursive: true });
 const out = join(pkg, 'demo', 'agent-fighter.html');
 writeFileSync(out, html);
 console.log(`bundled → ${out} (${(html.length / 1024).toFixed(1)} KB)`);
+
+// Vendor the AIR Kit UMD build next to the bundle (auth.ts lazy-loads it as
+// vendor/airkit.umd.js on the first sign-in — offline play never fetches it).
+// Copied at bundle time, so Vercel's buildCommand produces it too; the copy
+// itself is gitignored.
+const airkitSrc = join(pkg, '..', '..', 'node_modules', '@mocanetwork', 'airkit', 'dist', 'airkit.umd.js');
+const vendorDir = join(pkg, 'demo', 'vendor');
+try {
+  mkdirSync(vendorDir, { recursive: true });
+  copyFileSync(airkitSrc, join(vendorDir, 'airkit.umd.js'));
+  console.log('vendored → demo/vendor/airkit.umd.js');
+} catch {
+  console.log('WARNING: @mocanetwork/airkit not installed — online sign-in disabled in this bundle');
+}

@@ -111,3 +111,42 @@ complaint more simply than input policing).
 - **C:** Elo + leaderboards (in-game + public), economy writes, ledger
   signatures, statistical input review. WebRTC P2P upgrade when latency
   data demands it.
+
+## Phase B implementation record (2026-07-16)
+
+Shipped: AIR Kit auth + Supabase persistence, exactly per the plan above.
+
+- **Client login** (`packages/client/src/auth.ts`): AIR Kit UMD is
+  vendored at bundle time (`demo/vendor/airkit.umd.js`, gitignored) and
+  script-injected lazily on first sign-in — offline play never loads it.
+  Partner id `cdbfc9c4-62db-4947-b0de-c28932887132` (sandbox = Moca
+  testnet; a PUBLIC identifier, safe to commit). `L` on the title screen
+  signs in/out; sessions rehydrate silently for ~30 days. Signed-in
+  players queue under their AIR handle and send the session JWT in
+  `hello.auth`.
+- **Server verification** (`packages/server/src/airjwt.ts`): zero-dep
+  ES256/RS256 JWT verify against AIR's JWKS
+  (`https://static.air3.com/.well-known/jwks.json`, cached 10 min, one
+  eager refetch on unknown kid). `alg:none`/HMAC downgrades rejected.
+  Identity is `sub` (AIR UUID) + smart-account address. Soft-fail: a bad
+  token plays anonymous — identity gates progression, never the queue.
+- **Persistence** (`packages/server/src/persist.ts` +
+  `supabase/migrations/0001_online_profiles.sql`): one PostgREST RPC per
+  finished match. ALL award logic lives in the `record_match` Postgres
+  function — atomic, idempotent by match id (the `matches` PK insert is
+  the guard), SECURITY DEFINER, callable only by the service role. RLS
+  is public-READ on `profiles`/`matches`; there is no client write path
+  at all. XP mirrors progress.ts (win 60/loss 20/draw 30,
+  `xp_for_next = 80 + level·45`, cap 40); a flagged deviator forfeits
+  its award, its opponent still gets one. `leaderboard` view is ready
+  for Phase C. The server pushes an `xp` message after the result; the
+  client shows it as the banner. Match server HTTP now serves
+  `/leaderboard`.
+- **Agents**: `AF_TOKEN=<owner AIR JWT>` gives an agent persistent XP/
+  W-L under its owner's account (declared agent playing for its owner).
+  AIR's native `registerAgentKey` is noted for a future dedicated
+  agent-key flow.
+- **Config**: `.env` (see `.env.example`) — `SUPABASE_URL` +
+  `SUPABASE_SERVICE_KEY` enable persistence; unset = clean no-op.
+  Tests pin `persistence: null` so they can never write to a real
+  project.
