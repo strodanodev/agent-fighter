@@ -3336,7 +3336,7 @@ const drawTitle = (ctx, rosters, tick, menu) => {
         // maximizing is to actually SEE the key art, not dim it.
         const box = logoBBox ?? { x: 0, y: 0, w: logoImg.naturalWidth, h: logoImg.naturalHeight };
         ctx.imageSmoothingEnabled = true;
-        const scale = Math.max(VW / box.w, VH / box.h);
+        const scale = Math.max(VW / box.w, VH / box.h) * 0.9;
         const dw = box.w * scale, dh = box.h * scale;
         ctx.drawImage(logoImg, box.x, box.y, box.w, box.h, (VW - dw) / 2, (VH - dh) / 2, dw, dh);
     }
