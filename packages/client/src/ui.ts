@@ -3,15 +3,34 @@ import type { GameState } from '@af/core';
 import { drawPortrait } from './atlas.js';
 import type { Roster } from './atlas.js';
 import {
-  DISPLAY_FONT_STACK, HUD_GEO, clipPoly, drawChrome, drawStageLayers, stageCamLimits,
+  DISPLAY_FONT_STACK, HUD_GEO, clipPoly, drawBgVideoCover, drawChrome, drawStageLayers, stageCamLimits,
 } from './chrome.js';
-import type { StageAsset, StageCamLimits, UiKit } from './chrome.js';
+import type { BgVideo, StageAsset, StageCamLimits, UiKit } from './chrome.js';
 
 // Injected at boot (null = procedural fallbacks everywhere).
 let uiKit: UiKit | null = null;
 let stageAsset: StageAsset | null = null;
+let logoImg: HTMLImageElement | null = null;
+let bgVideo: BgVideo | null = null;
 export const setUiKit = (k: UiKit): void => { uiKit = k; };
 export const setStageAsset = (s: StageAsset | null): void => { stageAsset = s; };
+export const setLogo = (img: HTMLImageElement | null): void => { logoImg = img; };
+export const setBgVideo = (v: BgVideo | null): void => { bgVideo = v; };
+
+/**
+ * Menu backdrop: the looping ambient video when it's playing, falling back
+ * to the static stage art (menuCam + drawStage) otherwise — used by both the
+ * title and character-select screens. Screen-space (not world-transformed);
+ * the video is an ambient backdrop, not a stage element.
+ */
+const drawMenuBackdrop = (ctx: CanvasRenderingContext2D): void => {
+  if (bgVideo && drawBgVideoCover(ctx, bgVideo, 0, 0, VW, VH)) return;
+  ctx.save();
+  const cam = menuCam();
+  worldTransform(ctx, cam);
+  drawStage(ctx, cam);
+  ctx.restore();
+};
 
 /**
  * Camera limits for the active stage, or null when there's no art (procedural
@@ -598,11 +617,7 @@ export interface TitleMenuState {
 export const drawTitle = (
   ctx: CanvasRenderingContext2D, rosters: Roster[], tick: number, menu: TitleMenuState,
 ): void => {
-  ctx.save();
-  const cam = menuCam();
-  worldTransform(ctx, cam);
-  drawStage(ctx, cam);
-  ctx.restore();
+  drawMenuBackdrop(ctx);
   // Vignette so the logo reads.
   const vig = ctx.createLinearGradient(0, 0, 0, VH);
   vig.addColorStop(0, '#0a0616dd');
@@ -612,27 +627,41 @@ export const drawTitle = (
   ctx.fillStyle = vig;
   ctx.fillRect(0, 0, VW, VH);
 
-  // Two fighters flanking the logo, squaring off.
-  rosters.slice(0, 2).forEach((r, i) => {
-    const img = r.portrait;
-    if (!img) return;
-    ctx.save();
-    ctx.translate(i === 0 ? 210 : VW - 210, VH - 40);
-    ctx.scale(i === 0 ? 1.9 : -1.9, 1.9);
-    ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(img, -96, -176);
-    ctx.restore();
-  });
-
   // Logo — a slow sine bob keeps it feeling alive without being distracting.
+  // Reserved band: y 14–300 (the menu below starts at 356, leaving clear
+  // separation regardless of how tall the logo image's aspect ratio makes
+  // it). Falls back to the old text wordmark (+ two flanking character
+  // cutouts, which the brand art below already supplies its own cast for)
+  // if the art is missing.
   const cx = VW / 2;
   const bob = Math.sin(tick / 46) * 3;
-  display(ctx, 'AGENT', cx, 150 + bob, 84, {
-    glow: 'rgba(143,184,255,0.55)', from: '#ffffff', mid: '#cfe3ff', to: '#4d7fd4', outline: '#0d1b3a',
-  });
-  display(ctx, 'FIGHTER', cx, 235 + bob, 84, {
-    glow: 'rgba(143,184,255,0.55)', from: '#ffffff', mid: '#cfe3ff', to: '#4d7fd4', outline: '#0d1b3a',
-  });
+  if (logoImg && logoImg.naturalWidth > 0) {
+    const maxW = 500, maxH = 286;
+    const arImg = logoImg.naturalWidth / logoImg.naturalHeight;
+    let lw = maxW, lh = maxW / arImg;
+    if (lh > maxH) { lh = maxH; lw = maxH * arImg; }
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(logoImg, cx - lw / 2, 16 + bob + (maxH - lh) / 2, lw, lh);
+    ctx.restore();
+  } else {
+    rosters.slice(0, 2).forEach((r, i) => {
+      const img = r.portrait;
+      if (!img) return;
+      ctx.save();
+      ctx.translate(i === 0 ? 210 : VW - 210, VH - 40);
+      ctx.scale(i === 0 ? 1.9 : -1.9, 1.9);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(img, -96, -176);
+      ctx.restore();
+    });
+    display(ctx, 'AGENT', cx, 150 + bob, 84, {
+      glow: 'rgba(143,184,255,0.55)', from: '#ffffff', mid: '#cfe3ff', to: '#4d7fd4', outline: '#0d1b3a',
+    });
+    display(ctx, 'FIGHTER', cx, 235 + bob, 84, {
+      glow: 'rgba(143,184,255,0.55)', from: '#ffffff', mid: '#cfe3ff', to: '#4d7fd4', outline: '#0d1b3a',
+    });
+  }
 
   // Menu: two modes, one hint line. Fully self-contained (no overlay drawn
   // on top by the caller) so its layout never collides with the logo above
@@ -687,11 +716,7 @@ export const drawSelect = (
   tick: number,
   cpuInfo?: CpuBadgeInfo,
 ): void => {
-  ctx.save();
-  const cam = menuCam();
-  worldTransform(ctx, cam);
-  drawStage(ctx, cam);
-  ctx.restore();
+  drawMenuBackdrop(ctx);
   ctx.fillStyle = '#0a0616cc';
   ctx.fillRect(0, 0, VW, VH);
 

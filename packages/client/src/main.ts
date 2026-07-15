@@ -20,10 +20,10 @@ import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, VH, VW, ZOOM_MAX, ZOOM_MIN,
   currentStageCamLimits, drawHud, drawResults, drawSelect, drawStage,
-  drawStageSelect, drawTitle, setStageAsset, setUiKit, worldTransform,
+  drawStageSelect, drawTitle, setBgVideo, setLogo, setStageAsset, setUiKit, worldTransform,
 } from './ui.js';
 import type { Cam, HudFx, Mode, XpInfo } from './ui.js';
-import { listStages, loadDisplayFont, loadStage, loadUiKit } from './chrome.js';
+import { listStages, loadBgVideo, loadDisplayFont, loadLogo, loadStage, loadUiKit } from './chrome.js';
 import type { StageAsset } from './chrome.js';
 
 const TICK_MS = 1000 / TICKS_PER_SEC;
@@ -105,6 +105,13 @@ const boot = async (): Promise<void> => {
   try {
     await loadDisplayFont(); // awaited so the title screen never flashes the Impact fallback
     setUiKit(await loadUiKit());
+    // Logo (11MB SVG) and background video (~10MB) are NOT awaited: both have
+    // graceful fallbacks (text wordmark, static stage art), so the title
+    // screen should be interactive immediately and swap in as they arrive —
+    // important on mobile, where blocking boot on ~20MB of art would stall
+    // first paint for seconds on a slow connection.
+    void loadLogo().then(setLogo);
+    setBgVideo(loadBgVideo('/assets/video/bg_video_main_af.mp4'));
     stageIds = await listStages();
     stageAssets = await Promise.all(stageIds.map(loadStage));
     if (stageAssets.length > 0) setStageAsset(stageAssets[0]!);

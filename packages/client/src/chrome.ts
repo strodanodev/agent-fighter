@@ -70,6 +70,89 @@ export const loadDisplayFont = async (): Promise<void> => {
   }
 };
 
+/** The home-screen brand logo (assets/logo/) — swap the file to rebrand. */
+export const loadLogo = (): Promise<HTMLImageElement | null> =>
+  loadImg(`/assets/logo/main_title_AF.svg?v=${Date.now()}`);
+
+// ---------------------------------------------------------------- background video
+/**
+ * Looping ambient background video for the title and character-select
+ * screens (assets/video/). Played through a hidden <video> element and
+ * blitted into the canvas frame-by-frame — the game is single-canvas by
+ * design (spec: "renderer is a pure function of GameState", no DOM overlays)
+ * so this is a texture source, not a layered DOM element.
+ */
+export interface BgVideo {
+  el: HTMLVideoElement;
+  ready: boolean; // has decoded at least one frame — safe to drawImage()
+}
+
+/**
+ * Mobile autoplay is strict and inconsistently enforced: both iOS Safari and
+ * Android Chrome require `muted` (set as BOTH the JS property, authoritative
+ * for elements built in JS, and the HTML attribute, belt-and-suspenders for
+ * older WebViews that only inspect markup) plus `playsinline` (and the
+ * legacy `webkit-playsinline` for old iOS) to avoid the native fullscreen
+ * player hijacking playback. The element is kept in the DOM — NOT
+ * `display:none`, which pauses decoding in some engines — just visually
+ * discarded via off-screen position + zero opacity.
+ */
+export const loadBgVideo = (src: string): BgVideo => {
+  const el = document.createElement('video');
+  el.muted = true;
+  el.defaultMuted = true;
+  el.loop = true;
+  el.autoplay = true;
+  el.playsInline = true;
+  el.preload = 'auto';
+  el.setAttribute('muted', '');
+  el.setAttribute('playsinline', '');
+  el.setAttribute('webkit-playsinline', '');
+  el.disablePictureInPicture = true;
+  el.setAttribute('disableRemotePlayback', '');
+  el.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none';
+  el.src = src;
+
+  const state: BgVideo = { el, ready: false };
+  el.addEventListener('loadeddata', () => { state.ready = true; }, { once: true });
+
+  document.body.appendChild(el);
+  const tryPlay = (): void => { el.play().catch(() => { /* retried below */ }); };
+  tryPlay();
+  // Some mobile browsers only honor autoplay after ANY user gesture on the
+  // page, even for muted video. Retry once, silently, on the first one.
+  const retryOnGesture = (): void => {
+    tryPlay();
+    window.removeEventListener('pointerdown', retryOnGesture);
+    window.removeEventListener('keydown', retryOnGesture);
+    window.removeEventListener('touchstart', retryOnGesture);
+  };
+  window.addEventListener('pointerdown', retryOnGesture, { once: true });
+  window.addEventListener('keydown', retryOnGesture, { once: true });
+  window.addEventListener('touchstart', retryOnGesture, { once: true });
+
+  return state;
+};
+
+/**
+ * Blit the video's current frame into a screen-space rect, "cover" scaled
+ * (fills the rect, cropping overflow) — an ambient backdrop, not a stage
+ * element, so it deliberately ignores the world camera. Returns false
+ * (drawing nothing) until a frame is actually available, so callers can fall
+ * back to their existing static background rather than flash a blank rect.
+ */
+export const drawBgVideoCover = (
+  ctx: CanvasRenderingContext2D, video: BgVideo, x: number, y: number, w: number, h: number,
+): boolean => {
+  if (!video.ready || video.el.readyState < 2) return false;
+  const vw = video.el.videoWidth, vh = video.el.videoHeight;
+  if (!vw || !vh) return false;
+  const scale = Math.max(w / vw, h / vh);
+  const dw = vw * scale, dh = vh * scale;
+  ctx.drawImage(video.el, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  return true;
+};
+
 export const loadUiKit = async (): Promise<UiKit> => {
   // Cache-buster: UI art changes during authoring, and browsers serve stale
   // heuristically-cached images even past a server no-store (dev-only cost).

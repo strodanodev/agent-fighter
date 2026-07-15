@@ -4,7 +4,9 @@
  * server (spec §7.2) is a separate package, later.
  */
 import { createServer } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import {
+  createReadStream, existsSync, mkdirSync, readdirSync, statSync, writeFileSync,
+} from 'node:fs';
 import { dirname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,7 +20,7 @@ const PORT = Number(process.env.PORT || 8475);
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json',
   '.png': 'image/png', '.webp': 'image/webp', '.css': 'text/css', '.svg': 'image/svg+xml',
-  '.woff2': 'font/woff2',
+  '.woff2': 'font/woff2', '.mp4': 'video/mp4',
 };
 
 const send = (res, code, type, body) => {
@@ -82,7 +84,35 @@ createServer((req, res) => {
 
   if (file && existsSync(file)) {
     const ext = file.slice(file.lastIndexOf('.'));
-    return send(res, 200, MIME[ext] ?? 'application/octet-stream', readFileSync(file));
+    const type = MIME[ext] ?? 'application/octet-stream';
+    const stat = statSync(file);
+
+    // HTTP Range support: iOS Safari in particular often refuses to play
+    // (or hangs on) <video> without 206 partial-content responses — it
+    // probes with a Range request before committing to autoplay. Harmless
+    // for every other asset type too (just adds Accept-Ranges).
+    const range = req.headers.range;
+    if (range) {
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      const start = m?.[1] ? parseInt(m[1], 10) : 0;
+      const end = m?.[2] ? parseInt(m[2], 10) : stat.size - 1;
+      if (start >= stat.size || end >= stat.size || start > end) {
+        res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
+        return res.end();
+      }
+      res.writeHead(206, {
+        'Content-Type': type,
+        'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': end - start + 1,
+        'Cache-Control': 'no-store',
+      });
+      return createReadStream(file, { start, end }).pipe(res);
+    }
+    res.writeHead(200, {
+      'Content-Type': type, 'Accept-Ranges': 'bytes', 'Content-Length': stat.size, 'Cache-Control': 'no-store',
+    });
+    return createReadStream(file).pipe(res);
   }
   send(res, 404, 'application/json', JSON.stringify({ error: 'not found' }));
 }).listen(PORT, () => {
