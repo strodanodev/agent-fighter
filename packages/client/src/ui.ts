@@ -3,18 +3,26 @@ import type { GameState } from '@af/core';
 import { drawPortrait } from './atlas.js';
 import type { Roster } from './atlas.js';
 import {
-  DISPLAY_FONT_STACK, HUD_GEO, clipPoly, drawBgVideoCover, drawChrome, drawStageLayers, stageCamLimits,
+  DISPLAY_FONT_STACK, HUD_GEO, clipPoly, drawBgVideoCover, drawChrome, drawStageLayers, opaqueBBox, stageCamLimits,
 } from './chrome.js';
-import type { BgVideo, StageAsset, StageCamLimits, UiKit } from './chrome.js';
+import type { BgVideo, ImgBBox, StageAsset, StageCamLimits, UiKit } from './chrome.js';
 
 // Injected at boot (null = procedural fallbacks everywhere).
 let uiKit: UiKit | null = null;
 let stageAsset: StageAsset | null = null;
 let logoImg: HTMLImageElement | null = null;
+let logoBBox: ImgBBox | null = null;
 let bgVideo: BgVideo | null = null;
 export const setUiKit = (k: UiKit): void => { uiKit = k; };
 export const setStageAsset = (s: StageAsset | null): void => { stageAsset = s; };
-export const setLogo = (img: HTMLImageElement | null): void => { logoImg = img; };
+// The logo art is a design-tool SVG export with large transparent padding
+// around the wordmark (verified: raw viewBox 1363.5×720.75, actual glyph
+// content roughly the middle-right third) — cropping to its opaque bbox once
+// here is what lets drawTitle cover-fit just the artwork, not the void.
+export const setLogo = (img: HTMLImageElement | null): void => {
+  logoImg = img;
+  logoBBox = img ? opaqueBBox(img) : null;
+};
 export const setBgVideo = (v: BgVideo | null): void => { bgVideo = v; };
 
 /**
@@ -622,12 +630,17 @@ export const drawTitle = (
   const haveLogo = !!logoImg && logoImg.naturalWidth > 0;
 
   if (haveLogo) {
-    // Maximized: the art's native size (1920×1080) is exactly 16:9, same as
-    // the canvas (960×540) — a full-bleed fill needs no crop or letterbox,
-    // just a direct stretch to the frame. No vignette here on purpose: the
-    // point of maximizing is to actually SEE the key art, not dim it.
+    // Maximized: cover-fit the art's OPAQUE content (not its full source
+    // rect) into the frame, cropping overflow like drawBgVideoCover — the
+    // source SVG carries transparent padding around the wordmark that, if
+    // stretched in full, reads as a black border/background once composited
+    // over the dark menu backdrop. No vignette here on purpose: the point of
+    // maximizing is to actually SEE the key art, not dim it.
+    const box = logoBBox ?? { x: 0, y: 0, w: logoImg!.naturalWidth, h: logoImg!.naturalHeight };
     ctx.imageSmoothingEnabled = true;
-    ctx.drawImage(logoImg!, 0, 0, VW, VH);
+    const scale = Math.max(VW / box.w, VH / box.h);
+    const dw = box.w * scale, dh = box.h * scale;
+    ctx.drawImage(logoImg!, box.x, box.y, box.w, box.h, (VW - dw) / 2, (VH - dh) / 2, dw, dh);
   } else {
     // Fallback (art file missing): the old vignette + flanking portraits +
     // text wordmark treatment, unchanged.

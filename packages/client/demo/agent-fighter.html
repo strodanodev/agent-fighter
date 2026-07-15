@@ -2441,6 +2441,47 @@ const loadDisplayFont = async () => {
 };
 /** The home-screen brand logo (assets/logo/) — swap the file to rebrand. */
 const loadLogo = () => loadImg(`/assets/logo/main_title_AF.svg?v=${Date.now()}`);
+const opaqueBBox = (img) => {
+    const iw = img.naturalWidth, ih = img.naturalHeight;
+    const full = { x: 0, y: 0, w: iw, h: ih };
+    if (!iw || !ih)
+        return full;
+    const cvs = document.createElement('canvas');
+    cvs.width = iw;
+    cvs.height = ih;
+    const cctx = cvs.getContext('2d', { willReadFrequently: true });
+    if (!cctx)
+        return full;
+    cctx.drawImage(img, 0, 0);
+    let data;
+    try {
+        data = cctx.getImageData(0, 0, iw, ih);
+    }
+    catch {
+        return full; // tainted canvas (cross-origin source) — fall back to full image
+    }
+    const px = data.data;
+    const ALPHA_THRESHOLD = 12;
+    let minX = iw, minY = ih, maxX = -1, maxY = -1;
+    for (let y = 0; y < ih; y++) {
+        const row = y * iw;
+        for (let x = 0; x < iw; x++) {
+            if ((px[(row + x) * 4 + 3] ?? 0) > ALPHA_THRESHOLD) {
+                if (x < minX)
+                    minX = x;
+                if (x > maxX)
+                    maxX = x;
+                if (y < minY)
+                    minY = y;
+                if (y > maxY)
+                    maxY = y;
+            }
+        }
+    }
+    if (maxX < minX || maxY < minY)
+        return full;
+    return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+};
 /**
  * Mobile autoplay is strict and inconsistently enforced: both iOS Safari and
  * Android Chrome require `muted` (set as BOTH the JS property, authoritative
@@ -2780,10 +2821,18 @@ const skillForCpuLevel = (cpuLevel) => Math.max(3, Math.min(100, Math.round((cpu
 let uiKit = null;
 let stageAsset = null;
 let logoImg = null;
+let logoBBox = null;
 let bgVideo = null;
 const setUiKit = (k) => { uiKit = k; };
 const setStageAsset = (s) => { stageAsset = s; };
-const setLogo = (img) => { logoImg = img; };
+// The logo art is a design-tool SVG export with large transparent padding
+// around the wordmark (verified: raw viewBox 1363.5×720.75, actual glyph
+// content roughly the middle-right third) — cropping to its opaque bbox once
+// here is what lets drawTitle cover-fit just the artwork, not the void.
+const setLogo = (img) => {
+    logoImg = img;
+    logoBBox = img ? opaqueBBox(img) : null;
+};
 const setBgVideo = (v) => { bgVideo = v; };
 /**
  * Menu backdrop: the looping ambient video when it's playing, falling back
@@ -3279,12 +3328,17 @@ const drawTitle = (ctx, rosters, tick, menu) => {
     const cx = VW / 2;
     const haveLogo = !!logoImg && logoImg.naturalWidth > 0;
     if (haveLogo) {
-        // Maximized: the art's native size (1920×1080) is exactly 16:9, same as
-        // the canvas (960×540) — a full-bleed fill needs no crop or letterbox,
-        // just a direct stretch to the frame. No vignette here on purpose: the
-        // point of maximizing is to actually SEE the key art, not dim it.
+        // Maximized: cover-fit the art's OPAQUE content (not its full source
+        // rect) into the frame, cropping overflow like drawBgVideoCover — the
+        // source SVG carries transparent padding around the wordmark that, if
+        // stretched in full, reads as a black border/background once composited
+        // over the dark menu backdrop. No vignette here on purpose: the point of
+        // maximizing is to actually SEE the key art, not dim it.
+        const box = logoBBox ?? { x: 0, y: 0, w: logoImg.naturalWidth, h: logoImg.naturalHeight };
         ctx.imageSmoothingEnabled = true;
-        ctx.drawImage(logoImg, 0, 0, VW, VH);
+        const scale = Math.max(VW / box.w, VH / box.h);
+        const dw = box.w * scale, dh = box.h * scale;
+        ctx.drawImage(logoImg, box.x, box.y, box.w, box.h, (VW - dw) / 2, (VH - dh) / 2, dw, dh);
     }
     else {
         // Fallback (art file missing): the old vignette + flanking portraits +

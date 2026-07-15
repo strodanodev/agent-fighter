@@ -74,6 +74,49 @@ export const loadDisplayFont = async (): Promise<void> => {
 export const loadLogo = (): Promise<HTMLImageElement | null> =>
   loadImg(`/assets/logo/main_title_AF.svg?v=${Date.now()}`);
 
+/**
+ * Tight bounding box (image pixel space) of an image's non-transparent
+ * content. Design-tool SVG exports (e.g. the title logo) often carry large
+ * fully-transparent padding around the actual artwork — drawing the full
+ * source rect stretches that padding into what reads as a black border once
+ * it's composited over the dark menu backdrop. Scanned once per image load
+ * and cached by the caller (see ui.ts `setLogo`).
+ */
+export interface ImgBBox { x: number; y: number; w: number; h: number; }
+
+export const opaqueBBox = (img: HTMLImageElement): ImgBBox => {
+  const iw = img.naturalWidth, ih = img.naturalHeight;
+  const full = { x: 0, y: 0, w: iw, h: ih };
+  if (!iw || !ih) return full;
+  const cvs = document.createElement('canvas');
+  cvs.width = iw; cvs.height = ih;
+  const cctx = cvs.getContext('2d', { willReadFrequently: true });
+  if (!cctx) return full;
+  cctx.drawImage(img, 0, 0);
+  let data: ImageData;
+  try {
+    data = cctx.getImageData(0, 0, iw, ih);
+  } catch {
+    return full; // tainted canvas (cross-origin source) — fall back to full image
+  }
+  const px = data.data;
+  const ALPHA_THRESHOLD = 12;
+  let minX = iw, minY = ih, maxX = -1, maxY = -1;
+  for (let y = 0; y < ih; y++) {
+    const row = y * iw;
+    for (let x = 0; x < iw; x++) {
+      if ((px[(row + x) * 4 + 3] ?? 0) > ALPHA_THRESHOLD) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < minX || maxY < minY) return full;
+  return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+};
+
 // ---------------------------------------------------------------- background video
 /**
  * Looping ambient background video for the title and character-select
