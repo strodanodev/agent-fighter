@@ -638,7 +638,7 @@ export const drawTitle = (
     // maximizing is to actually SEE the key art, not dim it.
     const box = logoBBox ?? { x: 0, y: 0, w: logoImg!.naturalWidth, h: logoImg!.naturalHeight };
     ctx.imageSmoothingEnabled = true;
-    const scale = Math.max(VW / box.w, VH / box.h);
+    const scale = Math.max(VW / box.w, VH / box.h) * 0.8;
     const dw = box.w * scale, dh = box.h * scale;
     ctx.drawImage(logoImg!, box.x, box.y, box.w, box.h, (VW - dw) / 2, (VH - dh) / 2, dw, dh);
   } else {
@@ -671,15 +671,12 @@ export const drawTitle = (
     });
   }
 
-  // Bottom menu bar: its OWN guaranteed-contrast panel rather than text
-  // placed at coordinates guessed from where the art's elements happen to
-  // land — robust even if the logo file gets swapped for different art
-  // later (the whole point of every asset here being a customizable file).
+  // Bottom menu: laid out at a fixed offset from the bottom edge rather than
+  // guessed from where the art's elements happen to land — robust even if
+  // the logo file gets swapped for different art later. No opaque panel
+  // behind it (by design): the key art / video backdrop shows through, and
+  // display()/label() already carry their own outline+glow for contrast.
   const barH = 178, barY = VH - barH;
-  ctx.fillStyle = '#0a0616cc';
-  ctx.fillRect(0, barY, VW, barH);
-  ctx.fillStyle = '#d9a44155';
-  ctx.fillRect(0, barY, VW, 2);
 
   const rows: [Mode, string][] = [
     ['cpu', `VS CPU  ·  LV ${menu.cpuLevel}`],
