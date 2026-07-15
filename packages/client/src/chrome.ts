@@ -45,6 +45,31 @@ const loadImg = (src: string): Promise<HTMLImageElement | null> =>
     img.src = src;
   });
 
+/**
+ * The display font (Anton, SIL OFL — assets/fonts/) used for logos,
+ * announcements, and HUD text (build-spec: "street fighter style" chunky
+ * condensed titling). Loaded via the Font Loading API — canvas text silently
+ * falls back to the next stack entry (Impact) until this resolves, and
+ * `loadDisplayFont()` is awaited once at boot so there's no visible swap.
+ */
+export const DISPLAY_FAMILY = 'AgentDisplay';
+export const DISPLAY_FONT_STACK =
+  `'${DISPLAY_FAMILY}', Impact, 'Arial Black', 'Franklin Gothic Medium', sans-serif`;
+
+export const loadDisplayFont = async (): Promise<void> => {
+  try {
+    const face = new FontFace(DISPLAY_FAMILY, 'url(/assets/fonts/Anton-Regular.woff2)');
+    await face.load();
+    // FontFaceSet.add() is real and spec'd (required to register a
+    // JS-constructed FontFace for use), but this TS release's DOM lib omits
+    // it from the FontFaceSet type — hence the cast.
+    (document.fonts as unknown as { add: (f: FontFace) => void }).add(face);
+  } catch {
+    // Offline checkout / font missing — Impact fallback in DISPLAY_FONT_STACK
+    // covers it, so this is silent by design.
+  }
+};
+
 export const loadUiKit = async (): Promise<UiKit> => {
   // Cache-buster: UI art changes during authoring, and browsers serve stale
   // heuristically-cached images even past a server no-store (dev-only cost).

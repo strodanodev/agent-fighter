@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <title>Agent Fighter</title>
 <style>
+  /* AgentDisplay (Anton, SIL OFL) is loaded at runtime from /assets/fonts/ —
+     see main.ts loadDisplayFont(). The client already depends on the local
+     dev server for characters/stages/UI-kit assets, so this follows the same
+     pattern rather than bloating every bundle with a base64 font blob. */
   html,body{margin:0;height:100%;background:#07050d;display:flex;align-items:center;justify-content:center;font-family:"Courier New",monospace;color:#666;overflow:hidden}
   canvas{image-rendering:pixelated;box-shadow:0 0 0 3px #d9a441,0 0 0 6px #14121f,0 10px 60px #000c;
          width:min(96vw, calc(96vh * 16 / 9));height:auto;aspect-ratio:16/9}
@@ -2412,6 +2416,29 @@ const loadImg = (src) => new Promise((resolve) => {
     img.onerror = () => resolve(null);
     img.src = src;
 });
+/**
+ * The display font (Anton, SIL OFL — assets/fonts/) used for logos,
+ * announcements, and HUD text (build-spec: "street fighter style" chunky
+ * condensed titling). Loaded via the Font Loading API — canvas text silently
+ * falls back to the next stack entry (Impact) until this resolves, and
+ * `loadDisplayFont()` is awaited once at boot so there's no visible swap.
+ */
+const DISPLAY_FAMILY = 'AgentDisplay';
+const DISPLAY_FONT_STACK = `'${DISPLAY_FAMILY}', Impact, 'Arial Black', 'Franklin Gothic Medium', sans-serif`;
+const loadDisplayFont = async () => {
+    try {
+        const face = new FontFace(DISPLAY_FAMILY, 'url(/assets/fonts/Anton-Regular.woff2)');
+        await face.load();
+        // FontFaceSet.add() is real and spec'd (required to register a
+        // JS-constructed FontFace for use), but this TS release's DOM lib omits
+        // it from the FontFaceSet type — hence the cast.
+        document.fonts.add(face);
+    }
+    catch {
+        // Offline checkout / font missing — Impact fallback in DISPLAY_FONT_STACK
+        // covers it, so this is silent by design.
+    }
+};
 const loadUiKit = async () => {
     // Cache-buster: UI art changes during authoring, and browsers serve stale
     // heuristically-cached images even past a server no-store (dev-only cost).
@@ -2698,13 +2725,6 @@ const setStageAsset = (s) => { stageAsset = s; };
 const currentStageCamLimits = () => stageAsset && (stageAsset.image || stageAsset.layers.length > 0)
     ? stageCamLimits(stageAsset, VW, VH)
     : null;
-const ARCADE_FONT = 'Impact, "Arial Black", "Franklin Gothic Medium", sans-serif';
-/**
- * Arcade presentation layer: rooftop stage, framed HUD, title / select /
- * results screens. Pure drawing — zero game logic, zero sim reads beyond the
- * exported GameState fields. Everything is procedural (no art assets): the
- * only images in the game are the character sprites.
- */
 const VW = STAGE.viewportW; // 960 — screen px
 const VH = STAGE.viewportH; // 540
 const ZOOM_MIN = 0.85;
@@ -2739,6 +2759,15 @@ const HP_DANGER = '#e94560';
 const METER_HI = '#6fd3ff';
 const METER_FULL = '#ffd166';
 const P_COLORS = ['#e94560', '#4ea8de'];
+// ---------------------------------------------------------------- easing
+/** Ease-out cubic — snappy start, soft landing. Used for pop-ins. */
+const easeOutCubic = (t) => 1 - (1 - t) ** 3;
+/** Ease-out back — slight overshoot, the "arrives with a little bounce" feel. */
+const easeOutBack = (t) => {
+    const c1 = 1.70158, c3 = c1 + 1;
+    return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2;
+};
+const clamp01 = (v) => Math.max(0, Math.min(1, v));
 // ---------------------------------------------------------------- helpers
 /** Beveled plate: the workhorse of the arcade frame look. */
 const bevel = (ctx, x, y, w, h, fill, light = GOLD_LT, dark = GOLD_DK, t = 2) => {
@@ -2751,11 +2780,16 @@ const bevel = (ctx, x, y, w, h, fill, light = GOLD_LT, dark = GOLD_DK, t = 2) =>
     ctx.fillRect(x, y + h - t, w, t); // bottom
     ctx.fillRect(x + w - t, y, t, h); // right
 };
-const text = (ctx, s, x, y, size, color, align = 'center', shadow = true, font = 'arcade') => {
-    ctx.font = font === 'arcade'
-        ? `${size}px ${ARCADE_FONT}`
-        : `bold ${size}px "Courier New", monospace`;
+/**
+ * Clean condensed-bold label text — nameplates, hints, HUD numbers. Same
+ * type family as the display treatment (Anton) for a cohesive "one game, one
+ * font" arcade look, but flat (no skew/outline) so small/fast-changing text
+ * stays crisp and legible.
+ */
+const label = (ctx, s, x, y, size, color, align = 'center', shadow = true) => {
+    ctx.font = `${size}px ${DISPLAY_FONT_STACK}`;
     ctx.textAlign = align;
+    ctx.textBaseline = 'alphabetic';
     if (shadow) {
         ctx.fillStyle = '#000000aa';
         ctx.fillText(s, x + 2, y + 2);
@@ -2763,6 +2797,48 @@ const text = (ctx, s, x, y, size, color, align = 'center', shadow = true, font =
     ctx.fillStyle = color;
     ctx.fillText(s, x, y);
 };
+/** @deprecated alias kept for readability at call sites migrated gradually. */
+const text = label;
+/**
+ * SF-style display type: italic-sheared Anton, heavy dark outline, warm
+ * vertical gradient fill, thin bright rim for pop. Used for anything that
+ * should feel like arcade-cabinet marquee text — logo, round announcements,
+ * results title, combo counter, level-up banner.
+ */
+const display = (ctx, s, x, y, size, opts = {}) => {
+    const { align = 'center', skew = 0.16, from = '#fff8e6', mid = '#ffd166', to = '#c9781a', outline = '#33101a', rim = 'rgba(255,255,255,0.55)', glow, glowBlur = 18, scale = 1, alpha = 1, } = opts;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(x, y);
+    if (scale !== 1)
+        ctx.scale(scale, scale);
+    ctx.transform(1, 0, -skew, 1, 0, 0);
+    ctx.font = `${size}px ${DISPLAY_FONT_STACK}`;
+    ctx.textAlign = align;
+    ctx.textBaseline = 'alphabetic';
+    ctx.lineJoin = 'round';
+    ctx.miterLimit = 2;
+    if (glow) {
+        ctx.shadowColor = glow;
+        ctx.shadowBlur = glowBlur;
+    }
+    ctx.strokeStyle = outline;
+    ctx.lineWidth = Math.max(2, size * 0.16);
+    ctx.strokeText(s, 0, 0);
+    ctx.shadowBlur = 0; // glow only wants the outline pass, not a double-blur on fill
+    const g = ctx.createLinearGradient(0, -size * 0.78, 0, size * 0.12);
+    g.addColorStop(0, from);
+    g.addColorStop(0.5, mid);
+    g.addColorStop(1, to);
+    ctx.fillStyle = g;
+    ctx.fillText(s, 0, 0);
+    ctx.strokeStyle = rim;
+    ctx.lineWidth = Math.max(1, size * 0.035);
+    ctx.strokeText(s, 0, 0);
+    ctx.restore();
+};
+const DANGER_OPTS = { from: '#ffe3e6', mid: '#ff6b81', to: '#8f1626', outline: '#2a0810' };
+const COOL_OPTS = { from: '#eaf6ff', mid: '#7fd0ff', to: '#1a5f8f', outline: '#0a1a2a' };
 // ---------------------------------------------------------------- stage
 /**
  * Rooftop at sunset: parallax skyline, chain-link fence, tiled deck.
@@ -2900,10 +2976,11 @@ const HUD = {
     meterSegW: 102,
     meterSegH: 15,
 };
-const drawHealthBar = (ctx, i, ratio, flashRatio) => {
+const drawHealthBar = (ctx, i, ratio, flashRatio, tick) => {
     const { barW, barH, barY: y } = HUD;
     const x = i === 0 ? HUD.edge : VW - HUD.edge - barW;
     const mirror = i === 1;
+    const danger = ratio < 0.25 && ratio > 0;
     const fillBar = (r, style) => {
         const g = HUD_GEO.healthframe;
         ctx.save();
@@ -2915,12 +2992,21 @@ const drawHealthBar = (ctx, i, ratio, flashRatio) => {
         ctx.fillRect(i === 0 ? x : x + barW - w, y, w, barH);
         ctx.restore();
     };
+    // Low-health urgency: a soft pulsing red glow behind the frame.
+    if (danger) {
+        const pulse = 0.35 + 0.35 * (0.5 + 0.5 * Math.sin(tick / 8));
+        ctx.save();
+        ctx.shadowColor = `rgba(233,69,96,${pulse})`;
+        ctx.shadowBlur = 16;
+        ctx.fillStyle = 'rgba(233,69,96,0.01)'; // near-invisible fill just to cast the shadow
+        ctx.fillRect(x - 4, y - 4, barW + 8, barH + 8);
+        ctx.restore();
+    }
     if (uiKit?.healthframe) {
         // Paint order under the frame: dark tray → damage flash → health → gloss.
         fillBar(1, '#0c0e13');
         fillBar(flashRatio, '#ffffff66');
         const grad = ctx.createLinearGradient(0, y, 0, y + barH);
-        const danger = ratio < 0.25;
         grad.addColorStop(0, danger ? '#ff8d9e' : '#b9f66d');
         grad.addColorStop(0.45, danger ? HP_DANGER : HP_HI);
         grad.addColorStop(1, danger ? '#7a1b2b' : HP_LO);
@@ -2940,7 +3026,7 @@ const drawHealthBar = (ctx, i, ratio, flashRatio) => {
     const fw = Math.round((barW - 4) * Math.max(0, ratio));
     ctx.fillStyle = '#ffffff55';
     ctx.fillRect(i === 0 ? x + 2 : x + barW - 2 - Math.round((barW - 4) * flashRatio), y + 2, Math.round((barW - 4) * flashRatio), barH - 4);
-    ctx.fillStyle = ratio < 0.25 ? HP_DANGER : HP_HI;
+    ctx.fillStyle = danger ? HP_DANGER : HP_HI;
     ctx.fillRect(i === 0 ? x + 2 : x + barW - 2 - fw, y + 2, fw, barH - 4);
 };
 const drawMeter = (ctx, i, meter) => {
@@ -3000,7 +3086,7 @@ const drawPortraitFrame = (ctx, i, roster, lowHealth) => {
     ctx.fillStyle = P_COLORS[i];
     const tagX = i === 0 ? x + 4 : x + s - 30;
     ctx.fillRect(tagX, y + s - 20, 26, 14);
-    text(ctx, `P${i + 1}`, tagX + 13, y + s - 9, 12, '#fff', 'center', false);
+    label(ctx, `P${i + 1}`, tagX + 13, y + s - 9, 12, '#fff', 'center', false);
 };
 const drawNameplate = (ctx, i, name) => {
     const w = HUD.nameW, h = HUD.nameH;
@@ -3012,7 +3098,7 @@ const drawNameplate = (ctx, i, name) => {
     else {
         bevel(ctx, x, y, w, h, PANEL, GOLD, GOLD_DK, 2);
     }
-    text(ctx, name.toUpperCase(), i === 0 ? x + 16 : x + w - 16, y + h - 7, 15, '#e8e4da', i === 0 ? 'left' : 'right');
+    label(ctx, name.toUpperCase(), i === 0 ? x + 16 : x + w - 16, y + h - 7, 15, '#e8e4da', i === 0 ? 'left' : 'right');
 };
 const drawRoundPips = (ctx, i, wins) => {
     const need = TUNING.roundsToWin;
@@ -3032,13 +3118,20 @@ const drawRoundPips = (ctx, i, wins) => {
         }
     }
 };
-const drawTimer = (ctx, secs) => {
+const drawTimer = (ctx, secs, tick) => {
     const s = 96;
     const cx = VW / 2, y = 6;
-    const urgent = secs <= 10;
+    const urgent = secs <= 10 && secs > 0;
+    // Urgent pulse: a small scale breathing so the last ten seconds read as tense.
+    const pulse = urgent ? 1 + 0.06 * Math.sin(tick / 6) : 1;
+    ctx.save();
+    ctx.translate(cx, y + s / 2);
+    ctx.scale(pulse, pulse);
+    ctx.translate(-cx, -(y + s / 2));
     if (uiKit?.timer) {
         drawChrome(ctx, uiKit.timer, cx - s / 2, y, s, s);
-        text(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, y + s / 2 + 15, 40, urgent ? HP_DANGER : '#ffffff');
+        label(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, y + s / 2 + 15, 40, urgent ? HP_DANGER : '#ffffff');
+        ctx.restore();
         return;
     }
     const cy = y + s / 2, r = 42;
@@ -3056,46 +3149,50 @@ const drawTimer = (ctx, secs) => {
     oct(r - 4);
     ctx.fillStyle = PANEL;
     ctx.fill();
-    text(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, cy + 12, 34, urgent ? HP_DANGER : '#ffffff');
+    label(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, cy + 12, 34, urgent ? HP_DANGER : '#ffffff');
+    ctx.restore();
 };
 const drawHud = (ctx, g, rosters, fx, tags) => {
     for (const i of [0, 1]) {
         const f = g.fighters[i];
         const max = rosters[i].ch.b.maxHealth;
         const ratio = Math.max(0, f.health) / max;
-        drawHealthBar(ctx, i, ratio, fx.flash[i]);
+        drawHealthBar(ctx, i, ratio, fx.flash[i], g.tick);
         drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
         drawNameplate(ctx, i, rosters[i].bundle.name + (tags?.[i] ? ` · ${tags[i]}` : ''));
         drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
         drawMeter(ctx, i, f.meter);
     }
-    drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC));
-    // Combo counter.
+    drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
+    // Combo counter: punches in on each new hit (re-triggered via comboAge
+    // reset in main.ts whenever comboHits increases), settles with overshoot.
     if (fx.comboOwner >= 0 && fx.comboHits >= 2) {
         const i = fx.comboOwner;
         const x = i === 0 ? 110 : VW - 110;
         const align = i === 0 ? 'left' : 'right';
-        text(ctx, `${fx.comboHits}`, x, 200, 46, GOLD_LT, align);
-        text(ctx, 'HITS', i === 0 ? x + 62 : x - 62, 200, 20, '#fff', align);
+        const pop = 0.7 + 0.3 * easeOutBack(clamp01(fx.comboAge / 8));
+        display(ctx, `${fx.comboHits}`, x, 200, 46, { align, scale: pop, ...(fx.comboHits >= 6 ? DANGER_OPTS : {}) });
+        label(ctx, 'HITS', i === 0 ? x + 62 : x - 62, 200, 20, '#fff', align);
     }
-    // Center announcements (ROUND 1 / FIGHT! / KO).
+    // Center announcements (ROUND 1 / FIGHT! / KO): pop in with overshoot, hold, fade.
     if (fx.announce) {
-        const t = Math.min(1, fx.announceAge / 8);
-        const size = 64 * (0.6 + 0.4 * t);
-        ctx.save();
-        ctx.globalAlpha = Math.max(0, Math.min(1, 1.6 - fx.announceAge / 60));
-        text(ctx, fx.announce, VW / 2, VH / 2 - 40, size, GOLD_LT);
-        ctx.restore();
+        const inT = clamp01(fx.announceAge / 10);
+        const scale = 0.5 + 0.5 * easeOutBack(inT);
+        const alpha = clamp01(1.6 - fx.announceAge / 60);
+        const danger = fx.announce === 'K.O.' || fx.announce === 'DOUBLE KO';
+        display(ctx, fx.announce, VW / 2, VH / 2 - 40, 64, {
+            scale, alpha, ...(danger ? DANGER_OPTS : {}),
+            glow: danger ? 'rgba(233,69,96,0.7)' : 'rgba(255,209,102,0.6)',
+        });
     }
     // Controls strip (dark band like the reference).
     ctx.fillStyle = '#0b0a12dd';
     ctx.fillRect(0, VH - 24, VW, 24);
     ctx.fillStyle = '#2e3140';
     ctx.fillRect(0, VH - 24, VW, 1);
-    text(ctx, 'P1: WASD · TYU / GHJ        P2: ARROWS · IOP / KL;        B: HITBOXES        ESC: MENU', VW / 2, VH - 8, 11, '#c8c4ba', 'center', false, 'mono');
+    label(ctx, 'P1: WASD · TYU / GHJ        P2: ARROWS · IOP / KL;        B: HITBOXES        ESC: MENU', VW / 2, VH - 8, 11, '#c8c4ba');
 };
-// ---------------------------------------------------------------- title
-const drawTitle = (ctx, rosters, tick) => {
+const drawTitle = (ctx, rosters, tick, menu) => {
     ctx.save();
     const cam = menuCam();
     worldTransform(ctx, cam);
@@ -3104,8 +3201,9 @@ const drawTitle = (ctx, rosters, tick) => {
     // Vignette so the logo reads.
     const vig = ctx.createLinearGradient(0, 0, 0, VH);
     vig.addColorStop(0, '#0a0616dd');
-    vig.addColorStop(0.55, '#0a061633');
-    vig.addColorStop(1, '#0a0616cc');
+    vig.addColorStop(0.5, '#0a061640');
+    vig.addColorStop(0.78, '#0a0616aa');
+    vig.addColorStop(1, '#0a0616ee');
     ctx.fillStyle = vig;
     ctx.fillRect(0, 0, VW, VH);
     // Two fighters flanking the logo, squaring off.
@@ -3120,37 +3218,57 @@ const drawTitle = (ctx, rosters, tick) => {
         ctx.drawImage(img, -96, -176);
         ctx.restore();
     });
-    // Logo.
+    // Logo — a slow sine bob keeps it feeling alive without being distracting.
     const cx = VW / 2;
-    ctx.save();
-    ctx.textAlign = 'center';
-    const logo = (s, y, size) => {
-        ctx.font = `bold ${size}px "Courier New", monospace`;
-        ctx.lineJoin = 'round';
-        ctx.strokeStyle = '#0d1b3a';
-        ctx.lineWidth = 12;
-        ctx.strokeText(s, cx, y);
-        ctx.strokeStyle = '#8fb8ff';
-        ctx.lineWidth = 5;
-        ctx.strokeText(s, cx, y);
-        const g = ctx.createLinearGradient(0, y - size, 0, y + 8);
-        g.addColorStop(0, '#ffffff');
-        g.addColorStop(0.45, '#cfe3ff');
-        g.addColorStop(0.5, '#4d7fd4');
-        g.addColorStop(1, '#e8f1ff');
-        ctx.fillStyle = g;
-        ctx.fillText(s, cx, y);
-    };
-    logo('AGENT', 150, 82);
-    logo('FIGHTER', 235, 82);
-    ctx.restore();
-    if (tick % 60 < 40) {
-        text(ctx, 'PRESS ANY KEY TO BEGIN', cx, VH - 90, 20, GOLD_LT);
-    }
-    text(ctx, 'MILESTONE 2 · STUDIO BUILD', cx, VH - 40, 12, '#ffffff77');
+    const bob = Math.sin(tick / 46) * 3;
+    display(ctx, 'AGENT', cx, 150 + bob, 84, {
+        glow: 'rgba(143,184,255,0.55)', from: '#ffffff', mid: '#cfe3ff', to: '#4d7fd4', outline: '#0d1b3a',
+    });
+    display(ctx, 'FIGHTER', cx, 235 + bob, 84, {
+        glow: 'rgba(143,184,255,0.55)', from: '#ffffff', mid: '#cfe3ff', to: '#4d7fd4', outline: '#0d1b3a',
+    });
+    // Menu: two modes, one hint line. Fully self-contained (no overlay drawn
+    // on top by the caller) so its layout never collides with the logo above
+    // or the build tag below.
+    const rows = [
+        ['cpu', `VS CPU  ·  LV ${menu.cpuLevel}`],
+        ['2p', '2 PLAYERS'],
+    ];
+    const menuY0 = 356;
+    rows.forEach(([m, txt], k) => {
+        const y = menuY0 + k * 38;
+        const on = menu.mode === m;
+        if (on) {
+            const pulse = 1 + 0.035 * Math.sin(tick / 10);
+            display(ctx, txt, cx, y, 26, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+            // A small bouncing arrow marker to the left, arcade-menu style.
+            const bounce = 3 * Math.sin(tick / 9);
+            label(ctx, '▶', cx - 118 + bounce, y, 20, GOLD_LT);
+        }
+        else {
+            label(ctx, txt, cx, y, 19, '#ffffff70');
+        }
+    });
+    label(ctx, '↑ / ↓  SELECT       ENTER  START', cx, menuY0 + 74, 13, '#ffffffaa');
+    label(ctx, 'MILESTONE 4 · AI + LEVELING BUILD', cx, VH - 14, 10, '#ffffff55');
 };
-// ---------------------------------------------------------------- select
-const drawSelect = (ctx, rosters, cursors, locked, tick) => {
+const drawCpuBadge = (ctx, info, tick) => {
+    const w = 168, h = 60;
+    const x = VW - 16 - w, y = 12;
+    const glow = 0.5 + 0.5 * Math.sin(tick / 14);
+    ctx.save();
+    ctx.shadowColor = `rgba(217,164,65,${0.25 + 0.2 * glow})`;
+    ctx.shadowBlur = 10;
+    bevel(ctx, x, y, w, h, PANEL, GOLD, GOLD_DK, 2);
+    ctx.restore();
+    label(ctx, 'CPU DIFFICULTY', x + w / 2, y + 15, 10, '#c8b98a');
+    const delta = info.lever === 0 ? '' : info.lever > 0 ? ` (+${info.lever})` : ` (${info.lever})`;
+    display(ctx, `LV ${info.cpuLevel}`, x + w / 2, y + 42, 22, { scale: 1 });
+    if (delta)
+        label(ctx, delta, x + w / 2 + 46, y + 42, 11, '#7ee85a');
+    label(ctx, '[  /  ]  ADJUST', x + w / 2, y + h - 4, 9, '#c8c4ba99');
+};
+const drawSelect = (ctx, rosters, cursors, locked, tick, cpuInfo) => {
     ctx.save();
     const cam = menuCam();
     worldTransform(ctx, cam);
@@ -3158,35 +3276,37 @@ const drawSelect = (ctx, rosters, cursors, locked, tick) => {
     ctx.restore();
     ctx.fillStyle = '#0a0616cc';
     ctx.fillRect(0, 0, VW, VH);
-    text(ctx, 'SELECT YOUR FIGHTER', VW / 2, 62, 30, GOLD_LT);
+    display(ctx, 'SELECT YOUR FIGHTER', VW / 2, 60, 32);
+    if (cpuInfo)
+        drawCpuBadge(ctx, cpuInfo, tick);
     // Portrait grid.
     const cell = 132, gap = 18;
     const cols = Math.min(rosters.length, 5);
     const gridW = cols * cell + (cols - 1) * gap;
     const gx = (VW - gridW) / 2;
-    const gy = 110;
+    const gy = 118;
     rosters.forEach((r, k) => {
         const x = gx + (k % cols) * (cell + gap);
         const y = gy + Math.floor(k / cols) * (cell + gap + 26);
         bevel(ctx, x - 3, y - 3, cell + 6, cell + 6, PANEL, GOLD, GOLD_DK, 3);
         drawPortrait(ctx, r, x, y, cell, cell);
-        text(ctx, r.bundle.name.toUpperCase(), x + cell / 2, y + cell + 20, 14, '#fff');
-        // Selection cursors.
+        label(ctx, r.bundle.name.toUpperCase(), x + cell / 2, y + cell + 20, 14, '#fff');
+        // Selection cursors: smooth pulsing glow instead of a hard blink.
         for (const i of [0, 1]) {
             if (cursors[i] !== k)
                 continue;
-            const blink = locked[i] || tick % 30 < 20;
-            if (!blink)
-                continue;
+            const pulse = locked[i] ? 1 : 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(tick / 8));
+            ctx.save();
+            ctx.globalAlpha = pulse;
             ctx.strokeStyle = P_COLORS[i];
             ctx.lineWidth = 4;
             const o = i === 0 ? 0 : 5; // offset so both cursors are visible on the same cell
             ctx.strokeRect(x - 6 - o, y - 6 - o, cell + 12 + o * 2, cell + 12 + o * 2);
-            ctx.lineWidth = 1;
+            ctx.restore();
             ctx.fillStyle = P_COLORS[i];
             const tagX = i === 0 ? x - 6 : x + cell + 6;
             ctx.fillRect(tagX - (i === 0 ? 0 : 30), y - 26, 30, 18);
-            text(ctx, locked[i] ? `P${i + 1}✓` : `P${i + 1}`, tagX + (i === 0 ? 15 : -15), y - 12, 12, '#fff', 'center', false);
+            label(ctx, locked[i] ? `P${i + 1}✓` : `P${i + 1}`, tagX + (i === 0 ? 15 : -15), y - 12, 12, '#fff', 'center', false);
         }
     });
     // Big preview of each player's pick.
@@ -3205,11 +3325,11 @@ const drawSelect = (ctx, rosters, cursors, locked, tick) => {
     });
     const bothLocked = locked[0] && locked[1];
     if (bothLocked) {
-        if (tick % 60 < 42)
-            text(ctx, 'PRESS START TO FIGHT', VW / 2, VH - 30, 20, GOLD_LT);
+        const pulse = 1 + 0.04 * Math.sin(tick / 9);
+        display(ctx, 'PRESS START TO FIGHT', VW / 2, VH - 26, 22, { scale: pulse, glow: 'rgba(255,209,102,0.5)' });
     }
     else {
-        text(ctx, 'P1: A/D MOVE · F CONFIRM      P2: ←/→ MOVE · K CONFIRM', VW / 2, VH - 30, 13, '#ffffffaa');
+        label(ctx, 'P1: A/D MOVE · F CONFIRM      P2: ←/→ MOVE · K CONFIRM', VW / 2, VH - 26, 13, '#ffffffaa');
     }
 };
 // ---------------------------------------------------------------- stage select
@@ -3223,7 +3343,7 @@ const drawStageSelect = (ctx, stageIds, cursor, tick) => {
     ctx.restore();
     ctx.fillStyle = '#0a0616cc';
     ctx.fillRect(0, 0, VW, VH);
-    text(ctx, 'SELECT STAGE', VW / 2, 62, 30, GOLD_LT);
+    display(ctx, 'SELECT STAGE', VW / 2, 60, 32);
     const cell = 172, cellH = 108, gap = 22;
     const cols = stageIds.length;
     const gridW = cols * cell + (cols - 1) * gap;
@@ -3236,27 +3356,65 @@ const drawStageSelect = (ctx, stageIds, cursor, tick) => {
         bevel(ctx, x - 3, y - 3, cell + 6, cellH + 6, PANEL, on ? GOLD : GOLD_DK, GOLD_DK, on ? 3 : 2);
         ctx.fillStyle = PANEL_LT;
         ctx.fillRect(x, y, cell, cellH);
-        text(ctx, id.toUpperCase(), x + cell / 2, y + cellH / 2 + 6, 16, on ? '#fff' : '#ffffffaa');
-        if (on && tick % 30 < 20) {
+        label(ctx, id.toUpperCase(), x + cell / 2, y + cellH / 2 + 6, 16, on ? '#fff' : '#ffffffaa');
+        if (on) {
+            const pulse = 0.6 + 0.4 * (0.5 + 0.5 * Math.sin(tick / 8));
+            ctx.save();
+            ctx.globalAlpha = pulse;
             ctx.strokeStyle = GOLD_LT;
             ctx.lineWidth = 4;
             ctx.strokeRect(x - 8, y - 8, cell + 16, cellH + 16);
-            ctx.lineWidth = 1;
+            ctx.restore();
         }
     });
-    text(ctx, '◄/► CHOOSE STAGE      ENTER: FIGHT      ESC: BACK', VW / 2, VH - 30, 13, '#ffffffaa');
+    label(ctx, '◄ / ►  CHOOSE STAGE      ENTER  FIGHT      ESC  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
 };
-// ---------------------------------------------------------------- results
-const drawResults = (ctx, g, rosters, tick) => {
+const drawResults = (ctx, g, rosters, tick, age, // ticks since the results screen appeared — drives the pop-in
+xp) => {
     ctx.fillStyle = '#0a0616bb';
     ctx.fillRect(0, 0, VW, VH);
+    const pop = easeOutBack(clamp01(age / 16));
+    const boxW = 600, boxH = 120;
+    const boxX = VW / 2 - boxW / 2, boxY = VH / 2 - 80;
+    ctx.save();
+    ctx.translate(VW / 2, VH / 2 - 20);
+    ctx.scale(pop, pop);
+    ctx.translate(-VW / 2, -(VH / 2 - 20));
+    bevel(ctx, boxX, boxY, boxW, boxH, PANEL, GOLD, GOLD_DK, 3);
     const w = g.winner;
     const title = w === 2 ? 'DRAW GAME' : `${rosters[w].bundle.name.toUpperCase()} WINS`;
-    bevel(ctx, VW / 2 - 300, VH / 2 - 80, 600, 120, PANEL, GOLD, GOLD_DK, 3);
-    text(ctx, title, VW / 2, VH / 2 - 20, 44, GOLD_LT);
-    text(ctx, `${g.roundsWon0} — ${g.roundsWon1}`, VW / 2, VH / 2 + 22, 24, '#fff');
+    display(ctx, title, VW / 2, VH / 2 - 20, 44, w === 2 ? COOL_OPTS : {});
+    label(ctx, `${g.roundsWon0} — ${g.roundsWon1}`, VW / 2, VH / 2 + 22, 24, '#fff');
+    ctx.restore();
+    // XP section: fully below the box, own vertical rhythm, never touches
+    // the fixed bottom hint line.
+    if (xp && age > 10) {
+        const xpPop = clamp01((age - 10) / 14);
+        ctx.save();
+        ctx.globalAlpha = xpPop;
+        let y = boxY + boxH + 30;
+        if (xp.levelsUp > 0) {
+            const flash = tick % 40 < 28;
+            if (flash)
+                display(ctx, `LEVEL UP!  LV ${xp.level}`, VW / 2, y, 26, { glow: 'rgba(255,209,102,0.6)' });
+            y += 32;
+        }
+        display(ctx, `+${xp.gained} XP`, VW / 2, y, 22, { from: '#d9ffcf', mid: '#7ee85a', to: '#2f7a1f', outline: '#0e2a08' });
+        y += 16;
+        const barW = 300, barH = 8;
+        const bx = VW / 2 - barW / 2;
+        ctx.fillStyle = '#101116';
+        ctx.fillRect(bx - 2, y - 2, barW + 4, barH + 4);
+        ctx.fillStyle = '#23242e';
+        ctx.fillRect(bx, y, barW, barH);
+        ctx.fillStyle = '#6fd3ff';
+        ctx.fillRect(bx, y, Math.round((barW * Math.min(xp.xp, xp.xpNeed)) / Math.max(1, xp.xpNeed)), barH);
+        y += 28;
+        label(ctx, `LV ${xp.level}  ·  ${xp.xp}/${xp.xpNeed} XP  ·  ${xp.wins}W ${xp.losses}L`, VW / 2, y, 13, '#ffffffcc');
+        ctx.restore();
+    }
     if (tick % 60 < 42) {
-        text(ctx, 'ENTER: REMATCH    ESC: CHARACTER SELECT', VW / 2, VH / 2 + 90, 16, '#ffffffcc');
+        label(ctx, 'ENTER: REMATCH    ESC: CHARACTER SELECT', VW / 2, VH - 26, 15, '#ffffffcc');
     }
 };
 
@@ -3319,6 +3477,7 @@ let cpuAi = null;
 let statDmg = 0; // damage the human dealt this match
 let statBestCombo = 0;
 let xpBanner = null;
+let resultsAge = 0; // ticks since the results screen appeared — drives its pop-in
 let stageIds = [];
 let stageAssets = [];
 let stageCursor = 0;
@@ -3331,7 +3490,7 @@ let sparks = [];
 let shake = 0;
 let cam = { x: 0, y: 0, zoom: 1.5 };
 let hitStopFlash = 0;
-const fx = { flash: [1, 1], comboOwner: -1, comboHits: 0, announce: '', announceAge: 0 };
+const fx = { flash: [1, 1], comboOwner: -1, comboHits: 0, comboAge: 0, announce: '', announceAge: 0 };
 let prevHealth = [0, 0];
 let prevPhase = 0 /* Phase.PreRound */;
 // ---------------------------------------------------------------- canvas
@@ -3341,6 +3500,7 @@ const px = (v) => Math.trunc(v / 256);
 // ---------------------------------------------------------------- boot
 const boot = async () => {
     try {
+        await loadDisplayFont(); // awaited so the title screen never flashes the Impact fallback
         setUiKit(await loadUiKit());
         stageIds = await listStages();
         stageAssets = await Promise.all(stageIds.map(loadStage));
@@ -3374,6 +3534,7 @@ const startFight = () => {
     fx.flash = [1, 1];
     fx.comboOwner = -1;
     fx.comboHits = 0;
+    fx.comboAge = 0;
     fx.announce = `ROUND ${game.roundNum + 1}`;
     fx.announceAge = 0;
     sparks = [];
@@ -3451,14 +3612,21 @@ const updateJuice = (g) => {
     // Combo counter tracks whoever is being hit.
     const v0 = g.fighters[0], v1 = g.fighters[1];
     const inCombo = (a) => a === 10 /* Action.Hitstun */ || a === 11 /* Action.AirHitstun */;
-    if (inCombo(v1.action) && v1.comboHits >= 2) {
-        fx.comboOwner = 0;
-        fx.comboHits = v1.comboHits;
-    }
-    else if (inCombo(v0.action) && v0.comboHits >= 2) {
-        fx.comboOwner = 1;
-        fx.comboHits = v0.comboHits;
-    }
+    const bumpCombo = (owner, hits) => {
+        // Re-pop on the OWNER changing or the hit count climbing (each new hit
+        // in the string gets its own little punch), not on every frame the
+        // counter merely stays on screen.
+        if (fx.comboOwner !== owner || hits > fx.comboHits)
+            fx.comboAge = 0;
+        else
+            fx.comboAge++;
+        fx.comboOwner = owner;
+        fx.comboHits = hits;
+    };
+    if (inCombo(v1.action) && v1.comboHits >= 2)
+        bumpCombo(0, v1.comboHits);
+    else if (inCombo(v0.action) && v0.comboHits >= 2)
+        bumpCombo(1, v0.comboHits);
     else if (!inCombo(v0.action) && !inCombo(v1.action))
         fx.comboOwner = -1;
     // Announcements on phase changes.
@@ -3618,51 +3786,6 @@ const tickStageSelect = () => {
     if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space'))
         startFight();
 };
-// ---------------------------------------------------------------- overlays
-const ARCADE = 'Impact, "Arial Black", sans-serif';
-const overlayText = (s, x, y, size, color, align = 'center') => {
-    ctx.font = `${size}px ${ARCADE}`;
-    ctx.textAlign = align;
-    ctx.fillStyle = '#000000aa';
-    ctx.fillText(s, x + 2, y + 2);
-    ctx.fillStyle = color;
-    ctx.fillText(s, x, y);
-};
-const drawModePicker = () => {
-    const y0 = VH - 168;
-    const rows = [['cpu', `VS CPU  ·  LV ${cpuLevelFor(profile, lever)}`], ['2p', '2 PLAYERS']];
-    rows.forEach(([m, label], k) => {
-        const y = y0 + k * 30;
-        const on = mode === m;
-        overlayText(`${on ? '▶ ' : ''}${label}`, VW / 2, y, on ? 22 : 18, on ? '#f7e0a3' : '#ffffff77');
-    });
-    overlayText('W/S: MODE', VW / 2, y0 + 62, 12, '#ffffff55');
-};
-const drawCpuLever = () => {
-    const cl = cpuLevelFor(profile, lever);
-    overlayText(`YOU: LV ${profile.level}    CPU: LV ${cl}  ${lever === 0 ? '' : lever > 0 ? `(+${lever})` : `(${lever})`}`, VW / 2, 96, 20, '#f7e0a3');
-    overlayText('[ / ] ADJUST CPU LEVEL', VW / 2, 118, 12, '#ffffff88');
-};
-const drawXpBanner = () => {
-    if (!xpBanner)
-        return;
-    const y = VH / 2 + 128;
-    overlayText(`+${xpBanner.gained} XP`, VW / 2, y, 26, '#7ee85a');
-    // XP progress bar toward next level.
-    const need = xpForNext(profile.level);
-    const w = 300, h = 10;
-    const x = VW / 2 - w / 2;
-    ctx.fillStyle = '#101116';
-    ctx.fillRect(x - 2, y + 12 - 2, w + 4, h + 4);
-    ctx.fillStyle = '#23242e';
-    ctx.fillRect(x, y + 12, w, h);
-    ctx.fillStyle = '#6fd3ff';
-    ctx.fillRect(x, y + 12, Math.round((w * Math.min(profile.xp, need)) / need), h);
-    overlayText(`LV ${profile.level}  ·  ${profile.xp}/${need} XP  ·  ${profile.wins}W ${profile.losses}L`, VW / 2, y + 40, 13, '#ffffffcc');
-    if (xpBanner.levelsUp > 0 && uiTick % 40 < 28) {
-        overlayText(`LEVEL UP!  LV ${profile.level}`, VW / 2, VH / 2 - 100, 32, '#ffd166');
-    }
-};
 const frame = () => {
     uiTick++;
     if (screen === 'loading') {
@@ -3679,8 +3802,7 @@ const frame = () => {
         }
     }
     else if (screen === 'title') {
-        drawTitle(ctx, allRosters, uiTick);
-        drawModePicker();
+        drawTitle(ctx, allRosters, uiTick, { mode, cpuLevel: cpuLevelFor(profile, lever) });
         if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')
             || pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
             mode = mode === 'cpu' ? '2p' : 'cpu';
@@ -3692,9 +3814,7 @@ const frame = () => {
     }
     else if (screen === 'select') {
         tickSelect();
-        drawSelect(ctx, allRosters, picks, locked, uiTick);
-        if (mode === 'cpu')
-            drawCpuLever();
+        drawSelect(ctx, allRosters, picks, locked, uiTick, mode === 'cpu' ? { cpuLevel: cpuLevelFor(profile, lever), lever } : undefined);
     }
     else if (screen === 'stageSelect') {
         tickStageSelect();
@@ -3714,20 +3834,29 @@ const frame = () => {
         renderFight(game);
         if (game.phase === 3 /* Phase.MatchOver */) {
             if (cpuAi && !xpBanner) {
-                xpBanner = awardXp(profile, {
+                const award = awardXp(profile, {
                     won: game.winner === 0,
                     damageDealt: statDmg,
                     bestCombo: statBestCombo,
                 });
+                xpBanner = {
+                    gained: award.gained, levelsUp: award.levelsUp,
+                    level: profile.level, xp: profile.xp, xpNeed: xpForNext(profile.level),
+                    wins: profile.wins, losses: profile.losses,
+                };
             }
+            // Stale fight-screen state (a lingering "K.O." banner, a frozen combo
+            // counter) must not bleed into the results screen's own layout.
+            fx.announce = '';
+            fx.comboOwner = -1;
+            resultsAge = 0;
             screen = 'results';
         }
     }
     else if (screen === 'results' && game) {
+        resultsAge++;
         renderFight(game);
-        drawResults(ctx, game, fighters, uiTick);
-        if (cpuAi)
-            drawXpBanner();
+        drawResults(ctx, game, fighters, uiTick, resultsAge, xpBanner);
         if (pressedThisFrame.has('Enter'))
             startFight();
         if (pressedThisFrame.has('Escape')) {

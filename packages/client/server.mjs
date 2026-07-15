@@ -18,6 +18,7 @@ const PORT = Number(process.env.PORT || 8475);
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json',
   '.png': 'image/png', '.webp': 'image/webp', '.css': 'text/css', '.svg': 'image/svg+xml',
+  '.woff2': 'font/woff2',
 };
 
 const send = (res, code, type, body) => {

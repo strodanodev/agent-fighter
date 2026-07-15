@@ -22,8 +22,8 @@ import {
   currentStageCamLimits, drawHud, drawResults, drawSelect, drawStage,
   drawStageSelect, drawTitle, setStageAsset, setUiKit, worldTransform,
 } from './ui.js';
-import type { Cam, HudFx } from './ui.js';
-import { listStages, loadStage, loadUiKit } from './chrome.js';
+import type { Cam, HudFx, Mode, XpInfo } from './ui.js';
+import { listStages, loadDisplayFont, loadStage, loadUiKit } from './chrome.js';
 import type { StageAsset } from './chrome.js';
 
 const TICK_MS = 1000 / TICKS_PER_SEC;
@@ -60,7 +60,6 @@ const pollPad = (map: [string, number][]): InputFrame => {
 
 // ---------------------------------------------------------------- state
 type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'fight' | 'results';
-type Mode = 'cpu' | '2p';
 
 let screen: Screen = 'loading';
 let mode: Mode = 'cpu';
@@ -75,7 +74,8 @@ let lever = loadLever();
 let cpuAi: AiState | null = null;
 let statDmg = 0; // damage the human dealt this match
 let statBestCombo = 0;
-let xpBanner: { gained: number; levelsUp: number } | null = null;
+let xpBanner: XpInfo | null = null;
+let resultsAge = 0; // ticks since the results screen appeared — drives its pop-in
 let stageIds: string[] = [];
 let stageAssets: (StageAsset | null)[] = [];
 let stageCursor = 0;
@@ -91,7 +91,7 @@ let sparks: Spark[] = [];
 let shake = 0;
 let cam: Cam = { x: 0, y: 0, zoom: 1.5 };
 let hitStopFlash = 0;
-const fx: HudFx = { flash: [1, 1], comboOwner: -1, comboHits: 0, announce: '', announceAge: 0 };
+const fx: HudFx = { flash: [1, 1], comboOwner: -1, comboHits: 0, comboAge: 0, announce: '', announceAge: 0 };
 let prevHealth: [number, number] = [0, 0];
 let prevPhase: Phase = Phase.PreRound;
 
@@ -103,6 +103,7 @@ const px = (v: number): number => Math.trunc(v / 256);
 // ---------------------------------------------------------------- boot
 const boot = async (): Promise<void> => {
   try {
+    await loadDisplayFont(); // awaited so the title screen never flashes the Impact fallback
     setUiKit(await loadUiKit());
     stageIds = await listStages();
     stageAssets = await Promise.all(stageIds.map(loadStage));
@@ -134,6 +135,7 @@ const startFight = (): void => {
   fx.flash = [1, 1];
   fx.comboOwner = -1;
   fx.comboHits = 0;
+  fx.comboAge = 0;
   fx.announce = `ROUND ${game.roundNum + 1}`;
   fx.announceAge = 0;
   sparks = [];
@@ -221,8 +223,16 @@ const updateJuice = (g: GameState): void => {
   // Combo counter tracks whoever is being hit.
   const v0 = g.fighters[0], v1 = g.fighters[1];
   const inCombo = (a: Action): boolean => a === Action.Hitstun || a === Action.AirHitstun;
-  if (inCombo(v1.action) && v1.comboHits >= 2) { fx.comboOwner = 0; fx.comboHits = v1.comboHits; }
-  else if (inCombo(v0.action) && v0.comboHits >= 2) { fx.comboOwner = 1; fx.comboHits = v0.comboHits; }
+  const bumpCombo = (owner: 0 | 1, hits: number): void => {
+    // Re-pop on the OWNER changing or the hit count climbing (each new hit
+    // in the string gets its own little punch), not on every frame the
+    // counter merely stays on screen.
+    if (fx.comboOwner !== owner || hits > fx.comboHits) fx.comboAge = 0; else fx.comboAge++;
+    fx.comboOwner = owner;
+    fx.comboHits = hits;
+  };
+  if (inCombo(v1.action) && v1.comboHits >= 2) bumpCombo(0, v1.comboHits);
+  else if (inCombo(v0.action) && v0.comboHits >= 2) bumpCombo(1, v0.comboHits);
   else if (!inCombo(v0.action) && !inCombo(v1.action)) fx.comboOwner = -1;
 
   // Announcements on phase changes.
@@ -361,60 +371,6 @@ const tickStageSelect = (): void => {
   if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space')) startFight();
 };
 
-// ---------------------------------------------------------------- overlays
-const ARCADE = 'Impact, "Arial Black", sans-serif';
-
-const overlayText = (
-  s: string, x: number, y: number, size: number, color: string,
-  align: CanvasTextAlign = 'center',
-): void => {
-  ctx.font = `${size}px ${ARCADE}`;
-  ctx.textAlign = align;
-  ctx.fillStyle = '#000000aa';
-  ctx.fillText(s, x + 2, y + 2);
-  ctx.fillStyle = color;
-  ctx.fillText(s, x, y);
-};
-
-const drawModePicker = (): void => {
-  const y0 = VH - 168;
-  const rows: [Mode, string][] = [['cpu', `VS CPU  ·  LV ${cpuLevelFor(profile, lever)}`], ['2p', '2 PLAYERS']];
-  rows.forEach(([m, label], k) => {
-    const y = y0 + k * 30;
-    const on = mode === m;
-    overlayText(`${on ? '▶ ' : ''}${label}`, VW / 2, y, on ? 22 : 18, on ? '#f7e0a3' : '#ffffff77');
-  });
-  overlayText('W/S: MODE', VW / 2, y0 + 62, 12, '#ffffff55');
-};
-
-const drawCpuLever = (): void => {
-  const cl = cpuLevelFor(profile, lever);
-  overlayText(`YOU: LV ${profile.level}    CPU: LV ${cl}  ${lever === 0 ? '' : lever > 0 ? `(+${lever})` : `(${lever})`}`,
-    VW / 2, 96, 20, '#f7e0a3');
-  overlayText('[ / ] ADJUST CPU LEVEL', VW / 2, 118, 12, '#ffffff88');
-};
-
-const drawXpBanner = (): void => {
-  if (!xpBanner) return;
-  const y = VH / 2 + 128;
-  overlayText(`+${xpBanner.gained} XP`, VW / 2, y, 26, '#7ee85a');
-  // XP progress bar toward next level.
-  const need = xpForNext(profile.level);
-  const w = 300, h = 10;
-  const x = VW / 2 - w / 2;
-  ctx.fillStyle = '#101116';
-  ctx.fillRect(x - 2, y + 12 - 2, w + 4, h + 4);
-  ctx.fillStyle = '#23242e';
-  ctx.fillRect(x, y + 12, w, h);
-  ctx.fillStyle = '#6fd3ff';
-  ctx.fillRect(x, y + 12, Math.round((w * Math.min(profile.xp, need)) / need), h);
-  overlayText(`LV ${profile.level}  ·  ${profile.xp}/${need} XP  ·  ${profile.wins}W ${profile.losses}L`,
-    VW / 2, y + 40, 13, '#ffffffcc');
-  if (xpBanner.levelsUp > 0 && uiTick % 40 < 28) {
-    overlayText(`LEVEL UP!  LV ${profile.level}`, VW / 2, VH / 2 - 100, 32, '#ffd166');
-  }
-};
-
 const frame = (): void => {
   uiTick++;
 
@@ -431,8 +387,7 @@ const frame = (): void => {
       ctx.fillText('run `npm run play` from the repo root so characters/ is served', VW / 2, VH / 2 + 28);
     }
   } else if (screen === 'title') {
-    drawTitle(ctx, allRosters, uiTick);
-    drawModePicker();
+    drawTitle(ctx, allRosters, uiTick, { mode, cpuLevel: cpuLevelFor(profile, lever) });
     if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')
       || pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
       mode = mode === 'cpu' ? '2p' : 'cpu';
@@ -442,8 +397,8 @@ const frame = (): void => {
     }
   } else if (screen === 'select') {
     tickSelect();
-    drawSelect(ctx, allRosters, picks, locked, uiTick);
-    if (mode === 'cpu') drawCpuLever();
+    drawSelect(ctx, allRosters, picks, locked, uiTick,
+      mode === 'cpu' ? { cpuLevel: cpuLevelFor(profile, lever), lever } : undefined);
   } else if (screen === 'stageSelect') {
     tickStageSelect();
     drawStageSelect(ctx, stageIds, stageCursor, uiTick);
@@ -457,18 +412,28 @@ const frame = (): void => {
     renderFight(game);
     if (game.phase === Phase.MatchOver) {
       if (cpuAi && !xpBanner) {
-        xpBanner = awardXp(profile, {
+        const award = awardXp(profile, {
           won: game.winner === 0,
           damageDealt: statDmg,
           bestCombo: statBestCombo,
         });
+        xpBanner = {
+          gained: award.gained, levelsUp: award.levelsUp,
+          level: profile.level, xp: profile.xp, xpNeed: xpForNext(profile.level),
+          wins: profile.wins, losses: profile.losses,
+        };
       }
+      // Stale fight-screen state (a lingering "K.O." banner, a frozen combo
+      // counter) must not bleed into the results screen's own layout.
+      fx.announce = '';
+      fx.comboOwner = -1;
+      resultsAge = 0;
       screen = 'results';
     }
   } else if (screen === 'results' && game) {
+    resultsAge++;
     renderFight(game);
-    drawResults(ctx, game, fighters!, uiTick);
-    if (cpuAi) drawXpBanner();
+    drawResults(ctx, game, fighters!, uiTick, resultsAge, xpBanner);
     if (pressedThisFrame.has('Enter')) startFight();
     if (pressedThisFrame.has('Escape')) { screen = 'select'; locked = [false, false]; }
   }

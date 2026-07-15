@@ -2,7 +2,9 @@ import { STAGE, TICKS_PER_SEC, TUNING } from '@af/core';
 import type { GameState } from '@af/core';
 import { drawPortrait } from './atlas.js';
 import type { Roster } from './atlas.js';
-import { HUD_GEO, clipPoly, drawChrome, drawStageLayers, stageCamLimits } from './chrome.js';
+import {
+  DISPLAY_FONT_STACK, HUD_GEO, clipPoly, drawChrome, drawStageLayers, stageCamLimits,
+} from './chrome.js';
 import type { StageAsset, StageCamLimits, UiKit } from './chrome.js';
 
 // Injected at boot (null = procedural fallbacks everywhere).
@@ -20,14 +22,15 @@ export const currentStageCamLimits = (): StageCamLimits | null =>
     ? stageCamLimits(stageAsset, VW, VH)
     : null;
 
-const ARCADE_FONT = 'Impact, "Arial Black", "Franklin Gothic Medium", sans-serif';
-
 /**
  * Arcade presentation layer: rooftop stage, framed HUD, title / select /
  * results screens. Pure drawing — zero game logic, zero sim reads beyond the
- * exported GameState fields. Everything is procedural (no art assets): the
- * only images in the game are the character sprites.
+ * exported GameState fields. Character art is the only thing not authored
+ * here; everything else (chrome, stage fallback, typography) is procedural
+ * or a customizable asset file (assets/ui/*.svg, assets/fonts/).
  */
+
+export type Mode = 'cpu' | '2p';
 
 export const VW = STAGE.viewportW; // 960 — screen px
 export const VH = STAGE.viewportH; // 540
@@ -80,6 +83,16 @@ const METER_FULL = '#ffd166';
 
 export const P_COLORS = ['#e94560', '#4ea8de'] as const;
 
+// ---------------------------------------------------------------- easing
+/** Ease-out cubic — snappy start, soft landing. Used for pop-ins. */
+const easeOutCubic = (t: number): number => 1 - (1 - t) ** 3;
+/** Ease-out back — slight overshoot, the "arrives with a little bounce" feel. */
+const easeOutBack = (t: number): number => {
+  const c1 = 1.70158, c3 = c1 + 1;
+  return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2;
+};
+const clamp01 = (v: number): number => Math.max(0, Math.min(1, v));
+
 // ---------------------------------------------------------------- helpers
 /** Beveled plate: the workhorse of the arcade frame look. */
 const bevel = (
@@ -97,15 +110,19 @@ const bevel = (
   ctx.fillRect(x + w - t, y, t, h); // right
 };
 
-const text = (
+/**
+ * Clean condensed-bold label text — nameplates, hints, HUD numbers. Same
+ * type family as the display treatment (Anton) for a cohesive "one game, one
+ * font" arcade look, but flat (no skew/outline) so small/fast-changing text
+ * stays crisp and legible.
+ */
+const label = (
   ctx: CanvasRenderingContext2D, s: string, x: number, y: number,
   size: number, color: string, align: CanvasTextAlign = 'center', shadow = true,
-  font: 'arcade' | 'mono' = 'arcade',
 ): void => {
-  ctx.font = font === 'arcade'
-    ? `${size}px ${ARCADE_FONT}`
-    : `bold ${size}px "Courier New", monospace`;
+  ctx.font = `${size}px ${DISPLAY_FONT_STACK}`;
   ctx.textAlign = align;
+  ctx.textBaseline = 'alphabetic';
   if (shadow) {
     ctx.fillStyle = '#000000aa';
     ctx.fillText(s, x + 2, y + 2);
@@ -113,6 +130,71 @@ const text = (
   ctx.fillStyle = color;
   ctx.fillText(s, x, y);
 };
+/** @deprecated alias kept for readability at call sites migrated gradually. */
+const text = label;
+
+export interface DisplayOpts {
+  align?: CanvasTextAlign;
+  skew?: number; // italic shear, 0 = upright
+  from?: string; // gradient top stop
+  mid?: string;
+  to?: string; // gradient bottom stop
+  outline?: string;
+  rim?: string; // thin bright inner stroke
+  glow?: string;
+  glowBlur?: number;
+  scale?: number; // pop-in / pulse animation hook
+  alpha?: number;
+}
+
+/**
+ * SF-style display type: italic-sheared Anton, heavy dark outline, warm
+ * vertical gradient fill, thin bright rim for pop. Used for anything that
+ * should feel like arcade-cabinet marquee text — logo, round announcements,
+ * results title, combo counter, level-up banner.
+ */
+const display = (
+  ctx: CanvasRenderingContext2D, s: string, x: number, y: number, size: number,
+  opts: DisplayOpts = {},
+): void => {
+  const {
+    align = 'center', skew = 0.16,
+    from = '#fff8e6', mid = '#ffd166', to = '#c9781a',
+    outline = '#33101a', rim = 'rgba(255,255,255,0.55)',
+    glow, glowBlur = 18, scale = 1, alpha = 1,
+  } = opts;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(x, y);
+  if (scale !== 1) ctx.scale(scale, scale);
+  ctx.transform(1, 0, -skew, 1, 0, 0);
+  ctx.font = `${size}px ${DISPLAY_FONT_STACK}`;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'alphabetic';
+  ctx.lineJoin = 'round';
+  ctx.miterLimit = 2;
+
+  if (glow) { ctx.shadowColor = glow; ctx.shadowBlur = glowBlur; }
+  ctx.strokeStyle = outline;
+  ctx.lineWidth = Math.max(2, size * 0.16);
+  ctx.strokeText(s, 0, 0);
+  ctx.shadowBlur = 0; // glow only wants the outline pass, not a double-blur on fill
+
+  const g = ctx.createLinearGradient(0, -size * 0.78, 0, size * 0.12);
+  g.addColorStop(0, from);
+  g.addColorStop(0.5, mid);
+  g.addColorStop(1, to);
+  ctx.fillStyle = g;
+  ctx.fillText(s, 0, 0);
+
+  ctx.strokeStyle = rim;
+  ctx.lineWidth = Math.max(1, size * 0.035);
+  ctx.strokeText(s, 0, 0);
+  ctx.restore();
+};
+
+const DANGER_OPTS: DisplayOpts = { from: '#ffe3e6', mid: '#ff6b81', to: '#8f1626', outline: '#2a0810' };
+const COOL_OPTS: DisplayOpts = { from: '#eaf6ff', mid: '#7fd0ff', to: '#1a5f8f', outline: '#0a1a2a' };
 
 // ---------------------------------------------------------------- stage
 /**
@@ -258,11 +340,12 @@ const HUD = {
 
 const drawHealthBar = (
   ctx: CanvasRenderingContext2D,
-  i: 0 | 1, ratio: number, flashRatio: number,
+  i: 0 | 1, ratio: number, flashRatio: number, tick: number,
 ): void => {
   const { barW, barH, barY: y } = HUD;
   const x = i === 0 ? HUD.edge : VW - HUD.edge - barW;
   const mirror = i === 1;
+  const danger = ratio < 0.25 && ratio > 0;
 
   const fillBar = (r: number, style: string | CanvasGradient): void => {
     const g = HUD_GEO.healthframe;
@@ -276,12 +359,22 @@ const drawHealthBar = (
     ctx.restore();
   };
 
+  // Low-health urgency: a soft pulsing red glow behind the frame.
+  if (danger) {
+    const pulse = 0.35 + 0.35 * (0.5 + 0.5 * Math.sin(tick / 8));
+    ctx.save();
+    ctx.shadowColor = `rgba(233,69,96,${pulse})`;
+    ctx.shadowBlur = 16;
+    ctx.fillStyle = 'rgba(233,69,96,0.01)'; // near-invisible fill just to cast the shadow
+    ctx.fillRect(x - 4, y - 4, barW + 8, barH + 8);
+    ctx.restore();
+  }
+
   if (uiKit?.healthframe) {
     // Paint order under the frame: dark tray → damage flash → health → gloss.
     fillBar(1, '#0c0e13');
     fillBar(flashRatio, '#ffffff66');
     const grad = ctx.createLinearGradient(0, y, 0, y + barH);
-    const danger = ratio < 0.25;
     grad.addColorStop(0, danger ? '#ff8d9e' : '#b9f66d');
     grad.addColorStop(0.45, danger ? HP_DANGER : HP_HI);
     grad.addColorStop(1, danger ? '#7a1b2b' : HP_LO);
@@ -303,7 +396,7 @@ const drawHealthBar = (
   ctx.fillStyle = '#ffffff55';
   ctx.fillRect(i === 0 ? x + 2 : x + barW - 2 - Math.round((barW - 4) * flashRatio), y + 2,
     Math.round((barW - 4) * flashRatio), barH - 4);
-  ctx.fillStyle = ratio < 0.25 ? HP_DANGER : HP_HI;
+  ctx.fillStyle = danger ? HP_DANGER : HP_HI;
   ctx.fillRect(i === 0 ? x + 2 : x + barW - 2 - fw, y + 2, fw, barH - 4);
 };
 
@@ -364,7 +457,7 @@ const drawPortraitFrame = (
   ctx.fillStyle = P_COLORS[i];
   const tagX = i === 0 ? x + 4 : x + s - 30;
   ctx.fillRect(tagX, y + s - 20, 26, 14);
-  text(ctx, `P${i + 1}`, tagX + 13, y + s - 9, 12, '#fff', 'center', false);
+  label(ctx, `P${i + 1}`, tagX + 13, y + s - 9, 12, '#fff', 'center', false);
 };
 
 const drawNameplate = (ctx: CanvasRenderingContext2D, i: 0 | 1, name: string): void => {
@@ -376,7 +469,7 @@ const drawNameplate = (ctx: CanvasRenderingContext2D, i: 0 | 1, name: string): v
   } else {
     bevel(ctx, x, y, w, h, PANEL, GOLD, GOLD_DK, 2);
   }
-  text(ctx, name.toUpperCase(), i === 0 ? x + 16 : x + w - 16, y + h - 7, 15, '#e8e4da',
+  label(ctx, name.toUpperCase(), i === 0 ? x + 16 : x + w - 16, y + h - 7, 15, '#e8e4da',
     i === 0 ? 'left' : 'right');
 };
 
@@ -398,14 +491,22 @@ const drawRoundPips = (ctx: CanvasRenderingContext2D, i: 0 | 1, wins: number): v
   }
 };
 
-const drawTimer = (ctx: CanvasRenderingContext2D, secs: number): void => {
+const drawTimer = (ctx: CanvasRenderingContext2D, secs: number, tick: number): void => {
   const s = 96;
   const cx = VW / 2, y = 6;
-  const urgent = secs <= 10;
+  const urgent = secs <= 10 && secs > 0;
+  // Urgent pulse: a small scale breathing so the last ten seconds read as tense.
+  const pulse = urgent ? 1 + 0.06 * Math.sin(tick / 6) : 1;
+
+  ctx.save();
+  ctx.translate(cx, y + s / 2);
+  ctx.scale(pulse, pulse);
+  ctx.translate(-cx, -(y + s / 2));
   if (uiKit?.timer) {
     drawChrome(ctx, uiKit.timer, cx - s / 2, y, s, s);
-    text(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, y + s / 2 + 15, 40,
+    label(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, y + s / 2 + 15, 40,
       urgent ? HP_DANGER : '#ffffff');
+    ctx.restore();
     return;
   }
   const cy = y + s / 2, r = 42;
@@ -423,14 +524,16 @@ const drawTimer = (ctx: CanvasRenderingContext2D, secs: number): void => {
   oct(r - 4);
   ctx.fillStyle = PANEL;
   ctx.fill();
-  text(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, cy + 12, 34,
+  label(ctx, String(Math.max(0, secs)).padStart(2, '0'), cx, cy + 12, 34,
     urgent ? HP_DANGER : '#ffffff');
+  ctx.restore();
 };
 
 export interface HudFx {
   flash: [number, number]; // lagging health ratio per player (damage flash)
   comboOwner: number; // -1 none
   comboHits: number;
+  comboAge: number; // ticks since comboOwner last went from none → set (drives the pop-in)
   announce: string;
   announceAge: number;
 }
@@ -446,31 +549,35 @@ export const drawHud = (
     const f = g.fighters[i];
     const max = rosters[i].ch.b.maxHealth;
     const ratio = Math.max(0, f.health) / max;
-    drawHealthBar(ctx, i, ratio, fx.flash[i]);
+    drawHealthBar(ctx, i, ratio, fx.flash[i], g.tick);
     drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
     drawNameplate(ctx, i, rosters[i].bundle.name + (tags?.[i] ? ` · ${tags[i]}` : ''));
     drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
     drawMeter(ctx, i, f.meter);
   }
-  drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC));
+  drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
 
-  // Combo counter.
+  // Combo counter: punches in on each new hit (re-triggered via comboAge
+  // reset in main.ts whenever comboHits increases), settles with overshoot.
   if (fx.comboOwner >= 0 && fx.comboHits >= 2) {
     const i = fx.comboOwner as 0 | 1;
     const x = i === 0 ? 110 : VW - 110;
     const align: CanvasTextAlign = i === 0 ? 'left' : 'right';
-    text(ctx, `${fx.comboHits}`, x, 200, 46, GOLD_LT, align);
-    text(ctx, 'HITS', i === 0 ? x + 62 : x - 62, 200, 20, '#fff', align);
+    const pop = 0.7 + 0.3 * easeOutBack(clamp01(fx.comboAge / 8));
+    display(ctx, `${fx.comboHits}`, x, 200, 46, { align, scale: pop, ...(fx.comboHits >= 6 ? DANGER_OPTS : {}) });
+    label(ctx, 'HITS', i === 0 ? x + 62 : x - 62, 200, 20, '#fff', align);
   }
 
-  // Center announcements (ROUND 1 / FIGHT! / KO).
+  // Center announcements (ROUND 1 / FIGHT! / KO): pop in with overshoot, hold, fade.
   if (fx.announce) {
-    const t = Math.min(1, fx.announceAge / 8);
-    const size = 64 * (0.6 + 0.4 * t);
-    ctx.save();
-    ctx.globalAlpha = Math.max(0, Math.min(1, 1.6 - fx.announceAge / 60));
-    text(ctx, fx.announce, VW / 2, VH / 2 - 40, size, GOLD_LT);
-    ctx.restore();
+    const inT = clamp01(fx.announceAge / 10);
+    const scale = 0.5 + 0.5 * easeOutBack(inT);
+    const alpha = clamp01(1.6 - fx.announceAge / 60);
+    const danger = fx.announce === 'K.O.' || fx.announce === 'DOUBLE KO';
+    display(ctx, fx.announce, VW / 2, VH / 2 - 40, 64, {
+      scale, alpha, ...(danger ? DANGER_OPTS : {}),
+      glow: danger ? 'rgba(233,69,96,0.7)' : 'rgba(255,209,102,0.6)',
+    });
   }
 
   // Controls strip (dark band like the reference).
@@ -478,13 +585,18 @@ export const drawHud = (
   ctx.fillRect(0, VH - 24, VW, 24);
   ctx.fillStyle = '#2e3140';
   ctx.fillRect(0, VH - 24, VW, 1);
-  text(ctx, 'P1: WASD · TYU / GHJ        P2: ARROWS · IOP / KL;        B: HITBOXES        ESC: MENU',
-    VW / 2, VH - 8, 11, '#c8c4ba', 'center', false, 'mono');
+  label(ctx, 'P1: WASD · TYU / GHJ        P2: ARROWS · IOP / KL;        B: HITBOXES        ESC: MENU',
+    VW / 2, VH - 8, 11, '#c8c4ba');
 };
 
 // ---------------------------------------------------------------- title
+export interface TitleMenuState {
+  mode: Mode;
+  cpuLevel: number;
+}
+
 export const drawTitle = (
-  ctx: CanvasRenderingContext2D, rosters: Roster[], tick: number,
+  ctx: CanvasRenderingContext2D, rosters: Roster[], tick: number, menu: TitleMenuState,
 ): void => {
   ctx.save();
   const cam = menuCam();
@@ -494,8 +606,9 @@ export const drawTitle = (
   // Vignette so the logo reads.
   const vig = ctx.createLinearGradient(0, 0, 0, VH);
   vig.addColorStop(0, '#0a0616dd');
-  vig.addColorStop(0.55, '#0a061633');
-  vig.addColorStop(1, '#0a0616cc');
+  vig.addColorStop(0.5, '#0a061640');
+  vig.addColorStop(0.78, '#0a0616aa');
+  vig.addColorStop(1, '#0a0616ee');
   ctx.fillStyle = vig;
   ctx.fillRect(0, 0, VW, VH);
 
@@ -511,44 +624,68 @@ export const drawTitle = (
     ctx.restore();
   });
 
-  // Logo.
+  // Logo — a slow sine bob keeps it feeling alive without being distracting.
   const cx = VW / 2;
-  ctx.save();
-  ctx.textAlign = 'center';
-  const logo = (s: string, y: number, size: number): void => {
-    ctx.font = `bold ${size}px "Courier New", monospace`;
-    ctx.lineJoin = 'round';
-    ctx.strokeStyle = '#0d1b3a';
-    ctx.lineWidth = 12;
-    ctx.strokeText(s, cx, y);
-    ctx.strokeStyle = '#8fb8ff';
-    ctx.lineWidth = 5;
-    ctx.strokeText(s, cx, y);
-    const g = ctx.createLinearGradient(0, y - size, 0, y + 8);
-    g.addColorStop(0, '#ffffff');
-    g.addColorStop(0.45, '#cfe3ff');
-    g.addColorStop(0.5, '#4d7fd4');
-    g.addColorStop(1, '#e8f1ff');
-    ctx.fillStyle = g;
-    ctx.fillText(s, cx, y);
-  };
-  logo('AGENT', 150, 82);
-  logo('FIGHTER', 235, 82);
-  ctx.restore();
+  const bob = Math.sin(tick / 46) * 3;
+  display(ctx, 'AGENT', cx, 150 + bob, 84, {
+    glow: 'rgba(143,184,255,0.55)', from: '#ffffff', mid: '#cfe3ff', to: '#4d7fd4', outline: '#0d1b3a',
+  });
+  display(ctx, 'FIGHTER', cx, 235 + bob, 84, {
+    glow: 'rgba(143,184,255,0.55)', from: '#ffffff', mid: '#cfe3ff', to: '#4d7fd4', outline: '#0d1b3a',
+  });
 
-  if (tick % 60 < 40) {
-    text(ctx, 'PRESS ANY KEY TO BEGIN', cx, VH - 90, 20, GOLD_LT);
-  }
-  text(ctx, 'MILESTONE 2 · STUDIO BUILD', cx, VH - 40, 12, '#ffffff77');
+  // Menu: two modes, one hint line. Fully self-contained (no overlay drawn
+  // on top by the caller) so its layout never collides with the logo above
+  // or the build tag below.
+  const rows: [Mode, string][] = [
+    ['cpu', `VS CPU  ·  LV ${menu.cpuLevel}`],
+    ['2p', '2 PLAYERS'],
+  ];
+  const menuY0 = 356;
+  rows.forEach(([m, txt], k) => {
+    const y = menuY0 + k * 38;
+    const on = menu.mode === m;
+    if (on) {
+      const pulse = 1 + 0.035 * Math.sin(tick / 10);
+      display(ctx, txt, cx, y, 26, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+      // A small bouncing arrow marker to the left, arcade-menu style.
+      const bounce = 3 * Math.sin(tick / 9);
+      label(ctx, '▶', cx - 118 + bounce, y, 20, GOLD_LT);
+    } else {
+      label(ctx, txt, cx, y, 19, '#ffffff70');
+    }
+  });
+  label(ctx, '↑ / ↓  SELECT       ENTER  START', cx, menuY0 + 74, 13, '#ffffffaa');
+
+  label(ctx, 'MILESTONE 4 · AI + LEVELING BUILD', cx, VH - 14, 10, '#ffffff55');
 };
 
 // ---------------------------------------------------------------- select
+export interface CpuBadgeInfo { cpuLevel: number; lever: number }
+
+const drawCpuBadge = (ctx: CanvasRenderingContext2D, info: CpuBadgeInfo, tick: number): void => {
+  const w = 168, h = 60;
+  const x = VW - 16 - w, y = 12;
+  const glow = 0.5 + 0.5 * Math.sin(tick / 14);
+  ctx.save();
+  ctx.shadowColor = `rgba(217,164,65,${0.25 + 0.2 * glow})`;
+  ctx.shadowBlur = 10;
+  bevel(ctx, x, y, w, h, PANEL, GOLD, GOLD_DK, 2);
+  ctx.restore();
+  label(ctx, 'CPU DIFFICULTY', x + w / 2, y + 15, 10, '#c8b98a');
+  const delta = info.lever === 0 ? '' : info.lever > 0 ? ` (+${info.lever})` : ` (${info.lever})`;
+  display(ctx, `LV ${info.cpuLevel}`, x + w / 2, y + 42, 22, { scale: 1 });
+  if (delta) label(ctx, delta, x + w / 2 + 46, y + 42, 11, '#7ee85a');
+  label(ctx, '[  /  ]  ADJUST', x + w / 2, y + h - 4, 9, '#c8c4ba99');
+};
+
 export const drawSelect = (
   ctx: CanvasRenderingContext2D,
   rosters: Roster[],
   cursors: [number, number],
   locked: [boolean, boolean],
   tick: number,
+  cpuInfo?: CpuBadgeInfo,
 ): void => {
   ctx.save();
   const cam = menuCam();
@@ -558,35 +695,37 @@ export const drawSelect = (
   ctx.fillStyle = '#0a0616cc';
   ctx.fillRect(0, 0, VW, VH);
 
-  text(ctx, 'SELECT YOUR FIGHTER', VW / 2, 62, 30, GOLD_LT);
+  display(ctx, 'SELECT YOUR FIGHTER', VW / 2, 60, 32);
+  if (cpuInfo) drawCpuBadge(ctx, cpuInfo, tick);
 
   // Portrait grid.
   const cell = 132, gap = 18;
   const cols = Math.min(rosters.length, 5);
   const gridW = cols * cell + (cols - 1) * gap;
   const gx = (VW - gridW) / 2;
-  const gy = 110;
+  const gy = 118;
   rosters.forEach((r, k) => {
     const x = gx + (k % cols) * (cell + gap);
     const y = gy + Math.floor(k / cols) * (cell + gap + 26);
     bevel(ctx, x - 3, y - 3, cell + 6, cell + 6, PANEL, GOLD, GOLD_DK, 3);
     drawPortrait(ctx, r, x, y, cell, cell);
-    text(ctx, r.bundle.name.toUpperCase(), x + cell / 2, y + cell + 20, 14, '#fff');
+    label(ctx, r.bundle.name.toUpperCase(), x + cell / 2, y + cell + 20, 14, '#fff');
 
-    // Selection cursors.
+    // Selection cursors: smooth pulsing glow instead of a hard blink.
     for (const i of [0, 1] as const) {
       if (cursors[i] !== k) continue;
-      const blink = locked[i] || tick % 30 < 20;
-      if (!blink) continue;
+      const pulse = locked[i] ? 1 : 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(tick / 8));
+      ctx.save();
+      ctx.globalAlpha = pulse;
       ctx.strokeStyle = P_COLORS[i];
       ctx.lineWidth = 4;
       const o = i === 0 ? 0 : 5; // offset so both cursors are visible on the same cell
       ctx.strokeRect(x - 6 - o, y - 6 - o, cell + 12 + o * 2, cell + 12 + o * 2);
-      ctx.lineWidth = 1;
+      ctx.restore();
       ctx.fillStyle = P_COLORS[i];
       const tagX = i === 0 ? x - 6 : x + cell + 6;
       ctx.fillRect(tagX - (i === 0 ? 0 : 30), y - 26, 30, 18);
-      text(ctx, locked[i] ? `P${i + 1}✓` : `P${i + 1}`, tagX + (i === 0 ? 15 : -15), y - 12, 12, '#fff', 'center', false);
+      label(ctx, locked[i] ? `P${i + 1}✓` : `P${i + 1}`, tagX + (i === 0 ? 15 : -15), y - 12, 12, '#fff', 'center', false);
     }
   });
 
@@ -606,10 +745,11 @@ export const drawSelect = (
 
   const bothLocked = locked[0] && locked[1];
   if (bothLocked) {
-    if (tick % 60 < 42) text(ctx, 'PRESS START TO FIGHT', VW / 2, VH - 30, 20, GOLD_LT);
+    const pulse = 1 + 0.04 * Math.sin(tick / 9);
+    display(ctx, 'PRESS START TO FIGHT', VW / 2, VH - 26, 22, { scale: pulse, glow: 'rgba(255,209,102,0.5)' });
   } else {
-    text(ctx, 'P1: A/D MOVE · F CONFIRM      P2: ←/→ MOVE · K CONFIRM',
-      VW / 2, VH - 30, 13, '#ffffffaa');
+    label(ctx, 'P1: A/D MOVE · F CONFIRM      P2: ←/→ MOVE · K CONFIRM',
+      VW / 2, VH - 26, 13, '#ffffffaa');
   }
 };
 
@@ -630,7 +770,7 @@ export const drawStageSelect = (
   ctx.fillStyle = '#0a0616cc';
   ctx.fillRect(0, 0, VW, VH);
 
-  text(ctx, 'SELECT STAGE', VW / 2, 62, 30, GOLD_LT);
+  display(ctx, 'SELECT STAGE', VW / 2, 60, 32);
 
   const cell = 172, cellH = 108, gap = 22;
   const cols = stageIds.length;
@@ -644,34 +784,87 @@ export const drawStageSelect = (
     bevel(ctx, x - 3, y - 3, cell + 6, cellH + 6, PANEL, on ? GOLD : GOLD_DK, GOLD_DK, on ? 3 : 2);
     ctx.fillStyle = PANEL_LT;
     ctx.fillRect(x, y, cell, cellH);
-    text(ctx, id.toUpperCase(), x + cell / 2, y + cellH / 2 + 6, 16, on ? '#fff' : '#ffffffaa');
+    label(ctx, id.toUpperCase(), x + cell / 2, y + cellH / 2 + 6, 16, on ? '#fff' : '#ffffffaa');
 
-    if (on && tick % 30 < 20) {
+    if (on) {
+      const pulse = 0.6 + 0.4 * (0.5 + 0.5 * Math.sin(tick / 8));
+      ctx.save();
+      ctx.globalAlpha = pulse;
       ctx.strokeStyle = GOLD_LT;
       ctx.lineWidth = 4;
       ctx.strokeRect(x - 8, y - 8, cell + 16, cellH + 16);
-      ctx.lineWidth = 1;
+      ctx.restore();
     }
   });
 
-  text(ctx, '◄/► CHOOSE STAGE      ENTER: FIGHT      ESC: BACK', VW / 2, VH - 30, 13, '#ffffffaa');
+  label(ctx, '◄ / ►  CHOOSE STAGE      ENTER  FIGHT      ESC  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
 };
 
 // ---------------------------------------------------------------- results
+export interface XpInfo {
+  gained: number;
+  levelsUp: number;
+  level: number;
+  xp: number;
+  xpNeed: number;
+  wins: number;
+  losses: number;
+}
+
 export const drawResults = (
   ctx: CanvasRenderingContext2D,
   g: GameState,
   rosters: [Roster, Roster],
   tick: number,
+  age: number, // ticks since the results screen appeared — drives the pop-in
+  xp?: XpInfo | null,
 ): void => {
   ctx.fillStyle = '#0a0616bb';
   ctx.fillRect(0, 0, VW, VH);
+
+  const pop = easeOutBack(clamp01(age / 16));
+  const boxW = 600, boxH = 120;
+  const boxX = VW / 2 - boxW / 2, boxY = VH / 2 - 80;
+
+  ctx.save();
+  ctx.translate(VW / 2, VH / 2 - 20);
+  ctx.scale(pop, pop);
+  ctx.translate(-VW / 2, -(VH / 2 - 20));
+  bevel(ctx, boxX, boxY, boxW, boxH, PANEL, GOLD, GOLD_DK, 3);
   const w = g.winner;
   const title = w === 2 ? 'DRAW GAME' : `${rosters[w as 0 | 1].bundle.name.toUpperCase()} WINS`;
-  bevel(ctx, VW / 2 - 300, VH / 2 - 80, 600, 120, PANEL, GOLD, GOLD_DK, 3);
-  text(ctx, title, VW / 2, VH / 2 - 20, 44, GOLD_LT);
-  text(ctx, `${g.roundsWon0} — ${g.roundsWon1}`, VW / 2, VH / 2 + 22, 24, '#fff');
+  display(ctx, title, VW / 2, VH / 2 - 20, 44, w === 2 ? COOL_OPTS : {});
+  label(ctx, `${g.roundsWon0} — ${g.roundsWon1}`, VW / 2, VH / 2 + 22, 24, '#fff');
+  ctx.restore();
+
+  // XP section: fully below the box, own vertical rhythm, never touches
+  // the fixed bottom hint line.
+  if (xp && age > 10) {
+    const xpPop = clamp01((age - 10) / 14);
+    ctx.save();
+    ctx.globalAlpha = xpPop;
+    let y = boxY + boxH + 30;
+    if (xp.levelsUp > 0) {
+      const flash = tick % 40 < 28;
+      if (flash) display(ctx, `LEVEL UP!  LV ${xp.level}`, VW / 2, y, 26, { glow: 'rgba(255,209,102,0.6)' });
+      y += 32;
+    }
+    display(ctx, `+${xp.gained} XP`, VW / 2, y, 22, { from: '#d9ffcf', mid: '#7ee85a', to: '#2f7a1f', outline: '#0e2a08' });
+    y += 16;
+    const barW = 300, barH = 8;
+    const bx = VW / 2 - barW / 2;
+    ctx.fillStyle = '#101116';
+    ctx.fillRect(bx - 2, y - 2, barW + 4, barH + 4);
+    ctx.fillStyle = '#23242e';
+    ctx.fillRect(bx, y, barW, barH);
+    ctx.fillStyle = '#6fd3ff';
+    ctx.fillRect(bx, y, Math.round((barW * Math.min(xp.xp, xp.xpNeed)) / Math.max(1, xp.xpNeed)), barH);
+    y += 28;
+    label(ctx, `LV ${xp.level}  ·  ${xp.xp}/${xp.xpNeed} XP  ·  ${xp.wins}W ${xp.losses}L`, VW / 2, y, 13, '#ffffffcc');
+    ctx.restore();
+  }
+
   if (tick % 60 < 42) {
-    text(ctx, 'ENTER: REMATCH    ESC: CHARACTER SELECT', VW / 2, VH / 2 + 90, 16, '#ffffffcc');
+    label(ctx, 'ENTER: REMATCH    ESC: CHARACTER SELECT', VW / 2, VH - 26, 15, '#ffffffcc');
   }
 };
