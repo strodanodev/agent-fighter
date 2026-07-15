@@ -34,7 +34,14 @@ export interface Roster {
   ch: LoadedCharacter;
   atlas: AtlasData | null;
   sheet: HTMLImageElement | null; // packed atlas.png
-  portrait: HTMLImageElement | null; // _reference.png — used on select screen + HUD
+  portrait: HTMLImageElement | null; // select-screen + HUD portrait
+  /**
+   * True when `portrait` is a DEDICATED character-select portrait
+   * (meta.selectPortrait → _select.png): composed art that fills its frame, so
+   * it's drawn cover-fit. False when it's the sprite `_reference.png` fallback,
+   * which sits in a mostly-empty cell and must be alpha-cropped to the figure.
+   */
+  portraitDedicated: boolean;
   /** Alpha bounds of the portrait art, so frames crop to the figure, not the cell. */
   portraitBox: { x: number; y: number; w: number; h: number } | null;
 }
@@ -89,20 +96,75 @@ export const loadRoster = async (id: string): Promise<Roster> => {
   // Atlases ship as WebP (a fraction of the bytes); `image` names the file.
   // Older atlases predate the field and are always atlas.png.
   const sheetFile = atlas?.image ?? 'atlas.png';
-  const [sheet, portrait] = await Promise.all([
+  // Dedicated character-select portrait, authored in Studio (meta.selectPortrait
+  // → _select.png). Only honored when the bundle still references it — "remove"
+  // in Studio clears the field but leaves the file, and we must respect that.
+  const portraitFile = (bundle as CharacterBundle & { meta?: { selectPortrait?: string } })
+    .meta?.selectPortrait;
+  const safePortrait = portraitFile && /^[\w.-]+\.(png|webp|jpe?g)$/.test(portraitFile)
+    ? portraitFile : null;
+  const [sheet, refPortrait, selectPortrait] = await Promise.all([
     loadImage(`/characters/${id}/sprites/${sheetFile}`),
     loadImage(`/characters/${id}/sprites/_reference.png`),
+    safePortrait ? loadImage(`/characters/${id}/sprites/${safePortrait}`) : Promise.resolve(null),
   ]);
+  const dedicated = !!selectPortrait;
+  const portrait = selectPortrait ?? refPortrait;
   return {
     id, bundle, ch: loadCharacter(bundle), atlas, sheet, portrait,
-    portraitBox: portrait ? alphaBounds(portrait) : null,
+    portraitDedicated: dedicated,
+    // A composed portrait fills its frame (cover-fit); only the sprite fallback
+    // needs alpha bounds to crop away the empty cell.
+    portraitBox: !dedicated && portrait ? alphaBounds(portrait) : null,
   };
 };
+
+/** Blit one resolved atlas frame at (x, y = feet), mirrored by facing. */
+const blitFrame = (
+  ctx: CanvasRenderingContext2D, roster: Roster, name: string,
+  x: number, y: number, facing: 1 | -1, alpha: number,
+): boolean => {
+  const atlas = roster.atlas;
+  const frame = atlas?.frames[name];
+  if (!atlas || !frame || !roster.sheet) return false;
+  const s = atlas.scale ?? 1;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(x, y);
+  ctx.scale(facing, 1);
+  ctx.imageSmoothingEnabled = atlas.smooth ?? false;
+  if (ctx.imageSmoothingEnabled) ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(
+    roster.sheet,
+    frame.x, frame.y, frame.w, frame.h,
+    -frame.pivotX * s, -frame.pivotY * s, frame.w * s, frame.h * s,
+  );
+  ctx.restore();
+  return true;
+};
+
+/**
+ * MOTION AFTERIMAGE (spec: cosmetic, client-only). Characters animate on just
+ * 3-5 keyframes per action, so fast movement reads as a choppy pose-snap. A
+ * short trail of faded copies of the recent frames — the classic 2D-fighter
+ * "smear" — fills the visual gap between keyframes and sells speed. It fires
+ * ONLY above a velocity threshold (dashes, jumps, knockback, air), so ordinary
+ * standing/walking never gets ghosted (which would read as lag).
+ */
+interface EchoSample { name: string; x: number; y: number; facing: 1 | -1 }
+const ECHO_LEN = 5;
+const echoHist: EchoSample[][] = [[], []];
+/** Clear trails between rounds/matches so stale echoes don't flash on reset. */
+export const resetFighterTrails = (): void => { echoHist[0] = []; echoHist[1] = []; };
 
 /**
  * Draw a fighter at world position (x, y = feet), mirrored by facing.
  * Falls back to a colored rectangle if the frame is missing, so a
  * half-authored character is still playable.
+ *
+ * `opts.slot` (0/1) enables the per-fighter motion afterimage; `opts.motion`
+ * is a 0..1 speed intensity (caller derives it from velocity) that scales how
+ * many echoes show and how opaque they are.
  */
 export const drawFighter = (
   ctx: CanvasRenderingContext2D,
@@ -112,34 +174,43 @@ export const drawFighter = (
   x: number,
   y: number,
   fallback: string,
+  opts?: { slot?: 0 | 1; motion?: number },
 ): void => {
   const name = spriteForFighter(f, roster.ch, tick);
-  const frame = name && roster.atlas ? roster.atlas.frames[name] : undefined;
 
+  // Afterimage trail: draw the recent samples oldest→newest, ramping alpha,
+  // BEFORE the crisp current frame lands on top.
+  const slot = opts?.slot;
+  const motion = Math.max(0, Math.min(1, opts?.motion ?? 0));
+  if (slot !== undefined && name) {
+    const hist = echoHist[slot]!;
+    if (motion > 0.05 && roster.sheet) {
+      hist.forEach((s, k) => {
+        const depth = (k + 1) / (hist.length + 1); // 0 oldest → ~1 newest
+        blitFrame(ctx, roster, s.name, s.x, s.y, s.facing, motion * 0.45 * depth);
+      });
+    }
+    hist.push({ name, x, y, facing: f.facing });
+    if (hist.length > ECHO_LEN) hist.shift();
+  }
+
+  // Crisp current frame on top; fall back to a rect if the art is missing.
+  if (name && blitFrame(ctx, roster, name, x, y, f.facing, 1)) return;
   ctx.save();
   ctx.translate(x, y);
   ctx.scale(f.facing, 1);
-  if (frame && roster.sheet) {
-    const s = roster.atlas?.scale ?? 1;
-    ctx.imageSmoothingEnabled = roster.atlas?.smooth ?? false;
-    if (ctx.imageSmoothingEnabled) ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(
-      roster.sheet,
-      frame.x, frame.y, frame.w, frame.h,
-      -frame.pivotX * s, -frame.pivotY * s, frame.w * s, frame.h * s,
-    );
-  } else {
-    ctx.imageSmoothingEnabled = false;
-    ctx.fillStyle = fallback;
-    ctx.fillRect(-26, -108, 52, 108);
-  }
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = fallback;
+  ctx.fillRect(-26, -108, 52, 108);
   ctx.restore();
 };
 
 /**
- * Draw the reference art as a portrait: a square crop centered on the head and
- * chest of the actual figure (the reference cell is mostly empty space), scaled
- * to fill the frame.
+ * Draw a character portrait into (x, y, w, h).
+ *  - Dedicated portrait (_select.png): composed art → cover-fit (fill the frame,
+ *    center-crop the overflow), no alpha cropping.
+ *  - Reference-sprite fallback: a square crop centered on the head and chest of
+ *    the figure (the reference cell is mostly empty space), scaled to fill.
  */
 export const drawPortrait = (
   ctx: CanvasRenderingContext2D,
@@ -147,22 +218,28 @@ export const drawPortrait = (
   x: number, y: number, w: number, h: number,
 ): void => {
   const img = roster.portrait;
-  const box = roster.portraitBox;
-  if (!img || !box) {
+  if (!img || (!roster.portraitDedicated && !roster.portraitBox)) {
     ctx.fillStyle = '#1b1e30';
     ctx.fillRect(x, y, w, h);
     return;
   }
-  // Square crop around the upper body, sized to the figure's width.
-  const side = Math.max(box.w * 1.15, box.h * 0.55);
-  const cropX = box.x + box.w / 2 - side / 2;
-  const cropY = box.y - side * 0.05;
   ctx.save();
   ctx.beginPath();
   ctx.rect(x, y, w, h);
   ctx.clip();
-  ctx.imageSmoothingEnabled = roster.atlas?.smooth ?? false;
+  ctx.imageSmoothingEnabled = roster.portraitDedicated ? true : (roster.atlas?.smooth ?? false);
   if (ctx.imageSmoothingEnabled) ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(img, cropX, cropY, side, side, x, y, w, h);
+  if (roster.portraitDedicated) {
+    // Cover-fit: scale so the frame is fully covered, center the overflow.
+    const scale = Math.max(w / img.naturalWidth, h / img.naturalHeight);
+    const dw = img.naturalWidth * scale, dh = img.naturalHeight * scale;
+    ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  } else {
+    const box = roster.portraitBox!;
+    const side = Math.max(box.w * 1.15, box.h * 0.55);
+    const cropX = box.x + box.w / 2 - side / 2;
+    const cropY = box.y - side * 0.05;
+    ctx.drawImage(img, cropX, cropY, side, side, x, y, w, h);
+  }
   ctx.restore();
 };

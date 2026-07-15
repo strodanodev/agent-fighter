@@ -15,7 +15,7 @@ import {
   awardXp, cpuLevelFor, loadLever, loadProfile, saveLever, skillForCpuLevel, xpForNext,
 } from './progress.js';
 import type { Profile } from './progress.js';
-import { listCharacters, loadRoster, drawFighter } from './atlas.js';
+import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './atlas.js';
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, VH, VW, ZOOM_MAX, ZOOM_MIN,
@@ -25,7 +25,7 @@ import {
 import type { Cam, HudFx, Mode, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadLogo, loadStage, loadUiKit } from './chrome.js';
 import type { StageAsset } from './chrome.js';
-import { audio } from './audio.js';
+import { audio, hitSfxFor, swingSfx } from './audio.js';
 import {
   auraGlow, drawFx, emitAura, emitBurst, emitRing, fxPulse, updateFx,
 } from './fx.js';
@@ -101,6 +101,7 @@ let cam: Cam = { x: 0, y: 0, zoom: 1.5 };
 let hitStopFlash = 0;
 const fx: HudFx = { flash: [1, 1], comboOwner: -1, comboHits: 0, comboAge: 0, announce: '', announceAge: 0 };
 let prevHealth: [number, number] = [0, 0];
+let prevConnected: [number, number] = [0, 0]; // fighters[i].attackConnected last frame — edge-detects new hits/blocks
 let prevPhase: Phase = Phase.PreRound;
 let prevSuperFlash = 0; // rising-edge detect for the super-activation shockwave
 let prevMeter: [number, number] = [0, 0]; // to spot which fighter spent meter
@@ -150,6 +151,7 @@ const startFight = (): void => {
   cam = { x: STAGE.widthPx / 2 - VW / 2 / 1.5, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5 };
   updateCamera(game); // settle before the first frame so round 1 opens framed
   prevHealth = [game.fighters[0].health, game.fighters[1].health];
+  prevConnected = [0, 0];
   prevPhase = game.phase;
   fx.flash = [1, 1];
   fx.comboOwner = -1;
@@ -160,6 +162,7 @@ const startFight = (): void => {
   sparks = [];
   shake = 0;
   hurryPlayed = false;
+  resetFighterTrails(); // no stale motion echoes carried into the new match
   screen = 'fight';
   void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
@@ -234,6 +237,22 @@ const updateJuice = (g: GameState): void => {
       shake = big ? 11 : 6;
       hitStopFlash = big ? 3 : 0;
     }
+    // Hit SFX: a swoosh on every swing (attack's very first tick), plus a
+    // punch/kick impact or block clip on the tick the attack actually makes
+    // contact (attackConnected's rising edge: 0→1 hit, 0→2 block).
+    if (f.action === Action.Attack && f.actionFrame === 0 && f.moveIdx >= 0) {
+      audio.playSfx(swingSfx(), { volume: 0.45 });
+    }
+    if (f.attackConnected !== 0 && f.attackConnected !== prevConnected[i]) {
+      if (f.attackConnected === 1) {
+        const move = fighters![i].ch.b.moves[f.moveIdx];
+        audio.playSfx(hitSfxFor(move?.button));
+        if (g.fighters[(1 - i) as 0 | 1].comboHits >= 2) audio.playSfx('combo_accent', { volume: 0.6 });
+      } else if (f.attackConnected === 2) {
+        audio.playSfx('block_hit');
+      }
+    }
+    prevConnected[i] = f.attackConnected;
     // Aura motes: a fighter that is CHARGED (≥1 super bar) or on CRITICAL
     // health smoulders — a steady trickle of embers rising off the body.
     const meterN = f.meter / TUNING.meterMax;
@@ -333,7 +352,11 @@ const renderFight = (g: GameState): void => {
     ctx.beginPath();
     ctx.ellipse(px(f.x), STAGE.floorYPx + 2, 26 * sc, 6 * sc, 0, 0, Math.PI * 2);
     ctx.fill();
-    drawFighter(ctx, fighters![i], f, g.tick, px(f.x), px(f.y), P_COLORS[i]);
+    // Motion afterimage intensity from speed (fixed-point → px/tick): off while
+    // standing/walking (~4px), ramping in over dashes/jumps/knockback (~10px+).
+    const spd = (Math.abs(f.velX) + Math.abs(f.velY)) / 256;
+    const motion = Math.max(0, Math.min(1, (spd - 3) / 7));
+    drawFighter(ctx, fighters![i], f, g.tick, px(f.x), px(f.y), P_COLORS[i], { slot: i, motion });
   }
 
   // Projectiles.

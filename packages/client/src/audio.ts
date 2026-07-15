@@ -1,17 +1,33 @@
 /**
- * Music playback — Web Audio API, no dependency. Source tracks are the MvC:
- * Clash of Super Heroes BRSTM rips (decoded/re-encoded to ogg offline, see
- * tools/README.md), one file per arcade-mode screen. There's no dedicated
- * stage BGM yet, so the 4 "Ending" themes double as the title-screen loop
- * AND the in-match stage loop (ROTATION), picked round-robin so neither
- * screen repeats the same track back-to-back.
+ * Sound playback — Web Audio API, no dependency.
+ *
+ * Music (MusicId): the MvC: Clash of Super Heroes BRSTM rips (decoded/
+ * re-encoded to ogg offline, see tools/README.md), one file per arcade-mode
+ * screen. There's no dedicated stage BGM yet, so the 4 "Ending" themes double
+ * as the title-screen loop AND the in-match stage loop (ROTATION), picked
+ * round-robin so neither screen repeats the same track back-to-back.
+ *
+ * Hit SFX (SfxId): a 10-clip pack (sounds/SFX HITS/, see tools/README.md)
+ * covering swing, punch/kick impact by weight class, block, and a combo
+ * accent. `hitSfxFor()` maps a connecting move's button (LP/MP/HP/LK/MK/HK)
+ * to the right impact clip — the client-side juice layer (main.ts) is the
+ * only caller, keyed off `attackConnected` state changes per the "cosmetic
+ * effects live client-side, never inside the sim" rule.
  */
 
 export type MusicId =
   | 'continue' | 'ending_after_the_battle' | 'ending_gambit' | 'ending_grief' | 'ending_megaman1'
   | 'game_over' | 'here_comes_a_new_challenger' | 'hurry_up' | 'player_select' | 'ranking' | 'vs' | 'win';
 
-const FILES: Record<MusicId, string> = {
+export type SfxId =
+  | 'swing_a' | 'swing_b'
+  | 'punch_light' | 'punch_medium' | 'punch_heavy_a' | 'punch_heavy_b'
+  | 'kick_light' | 'kick_heavy'
+  | 'block_hit' | 'combo_accent';
+
+type SoundId = MusicId | SfxId;
+
+const MUSIC_FILES: Record<MusicId, string> = {
   continue: '/assets/audio/bgm/continue.ogg',
   ending_after_the_battle: '/assets/audio/bgm/ending_after_the_battle.ogg',
   ending_gambit: '/assets/audio/bgm/ending_gambit.ogg',
@@ -26,10 +42,44 @@ const FILES: Record<MusicId, string> = {
   win: '/assets/audio/bgm/win.ogg',
 };
 
+const SFX_FILES: Record<SfxId, string> = {
+  swing_a: '/assets/audio/sfx/swing_a.mp3',
+  swing_b: '/assets/audio/sfx/swing_b.mp3',
+  punch_light: '/assets/audio/sfx/punch_light.mp3',
+  punch_medium: '/assets/audio/sfx/punch_medium.mp3',
+  punch_heavy_a: '/assets/audio/sfx/punch_heavy_a.mp3',
+  punch_heavy_b: '/assets/audio/sfx/punch_heavy_b.mp3',
+  kick_light: '/assets/audio/sfx/kick_light.mp3',
+  kick_heavy: '/assets/audio/sfx/kick_heavy.mp3',
+  block_hit: '/assets/audio/sfx/block_hit.mp3',
+  combo_accent: '/assets/audio/sfx/combo_accent.mp3',
+};
+
+const FILES: Record<SoundId, string> = { ...MUSIC_FILES, ...SFX_FILES };
+
 /** Shared title-screen / stage-BGM pool — the 4 "Ending" themes. */
 export const ROTATION: MusicId[] = [
   'ending_after_the_battle', 'ending_gambit', 'ending_grief', 'ending_megaman1',
 ];
+
+/** Every button's normal-hit weight class → which impact clip(s) to draw from. */
+const PUNCH: Record<'L' | 'M' | 'H', SfxId[]> = {
+  L: ['punch_light'], M: ['punch_medium'], H: ['punch_heavy_a', 'punch_heavy_b'],
+};
+const KICK: Record<'L' | 'M' | 'H', SfxId[]> = {
+  L: ['kick_light'], M: ['kick_light'], H: ['kick_heavy'], // only 2 kick clips in the pack
+};
+const SWING: SfxId[] = ['swing_a', 'swing_b'];
+
+/** Picks the impact clip for a connecting normal, e.g. hitSfxFor('HP') → a heavy punch variant. */
+export const hitSfxFor = (button: string | undefined): SfxId => {
+  const kind: 'L' | 'M' | 'H' = button?.[0] === 'L' ? 'L' : button?.[0] === 'H' ? 'H' : 'M';
+  const pool = button?.[1] === 'K' ? KICK[kind] : PUNCH[kind];
+  return pool[Math.floor(Math.random() * pool.length)]!;
+};
+
+/** Every swing gets a whiff swoosh, whether or not it lands — classic fighting-game layering. */
+export const swingSfx = (): SfxId => SWING[Math.floor(Math.random() * SWING.length)]!;
 
 const BGM_LEVEL = 0.55;
 const SFX_LEVEL = 0.85;
@@ -39,8 +89,8 @@ class AudioManager {
   private ctx: AudioContext | null = null;
   private bgmGain: GainNode | null = null;
   private sfxGain: GainNode | null = null;
-  private buffers = new Map<MusicId, AudioBuffer>();
-  private loading = new Map<MusicId, Promise<AudioBuffer>>();
+  private buffers = new Map<SoundId, AudioBuffer>();
+  private loading = new Map<SoundId, Promise<AudioBuffer>>();
   private bgmSource: AudioBufferSourceNode | null = null;
   private bgmId: MusicId | null = null;
   private rotationIndex = 0;
@@ -68,7 +118,7 @@ class AudioManager {
     if (ctx.state === 'suspended') void ctx.resume();
   }
 
-  private load(id: MusicId): Promise<AudioBuffer> {
+  private load(id: SoundId): Promise<AudioBuffer> {
     const cached = this.buffers.get(id);
     if (cached) return Promise.resolve(cached);
     const pending = this.loading.get(id);
@@ -86,9 +136,9 @@ class AudioManager {
     return p;
   }
 
-  /** Warm the decode cache for every track — total payload is ~5.7MB. */
+  /** Warm the decode cache for every track/clip — total payload is ~6MB. */
   preload(): void {
-    for (const id of Object.keys(FILES) as MusicId[]) void this.load(id);
+    for (const id of Object.keys(FILES) as SoundId[]) void this.load(id);
   }
 
   /** Next track in the shared title/stage rotation pool. */
@@ -151,6 +201,27 @@ class AudioManager {
       opts.onEnded?.();
     };
     src.start();
+  }
+
+  /**
+   * Fire-and-forget hit/impact clip. Freely overlaps (each call is its own
+   * source node) — combat routinely needs two of these in the same tick
+   * (P1's swing landing while P2's counter also connects). A small random
+   * pitch/gain wobble keeps rapid-fire jabs from sounding mechanically
+   * identical.
+   */
+  playSfx(id: SfxId, opts: { volume?: number } = {}): void {
+    const ctx = this.ctxOf();
+    void this.load(id).then((buffer) => {
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.playbackRate.value = 0.94 + Math.random() * 0.12;
+      const gain = ctx.createGain();
+      gain.gain.value = (opts.volume ?? 1) * (0.9 + Math.random() * 0.1);
+      src.connect(gain);
+      gain.connect(this.sfxGain!);
+      src.start();
+    });
   }
 }
 

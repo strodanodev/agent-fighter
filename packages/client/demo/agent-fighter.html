@@ -2331,65 +2331,122 @@ const loadRoster = async (id) => {
     // Atlases ship as WebP (a fraction of the bytes); `image` names the file.
     // Older atlases predate the field and are always atlas.png.
     const sheetFile = atlas?.image ?? 'atlas.png';
-    const [sheet, portrait] = await Promise.all([
+    // Dedicated character-select portrait, authored in Studio (meta.selectPortrait
+    // → _select.png). Only honored when the bundle still references it — "remove"
+    // in Studio clears the field but leaves the file, and we must respect that.
+    const portraitFile = bundle
+        .meta?.selectPortrait;
+    const safePortrait = portraitFile && /^[\w.-]+\.(png|webp|jpe?g)$/.test(portraitFile)
+        ? portraitFile : null;
+    const [sheet, refPortrait, selectPortrait] = await Promise.all([
         loadImage(`/characters/${id}/sprites/${sheetFile}`),
         loadImage(`/characters/${id}/sprites/_reference.png`),
+        safePortrait ? loadImage(`/characters/${id}/sprites/${safePortrait}`) : Promise.resolve(null),
     ]);
+    const dedicated = !!selectPortrait;
+    const portrait = selectPortrait ?? refPortrait;
     return {
         id, bundle, ch: loadCharacter(bundle), atlas, sheet, portrait,
-        portraitBox: portrait ? alphaBounds(portrait) : null,
+        portraitDedicated: dedicated,
+        // A composed portrait fills its frame (cover-fit); only the sprite fallback
+        // needs alpha bounds to crop away the empty cell.
+        portraitBox: !dedicated && portrait ? alphaBounds(portrait) : null,
     };
 };
+/** Blit one resolved atlas frame at (x, y = feet), mirrored by facing. */
+const blitFrame = (ctx, roster, name, x, y, facing, alpha) => {
+    const atlas = roster.atlas;
+    const frame = atlas?.frames[name];
+    if (!atlas || !frame || !roster.sheet)
+        return false;
+    const s = atlas.scale ?? 1;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(x, y);
+    ctx.scale(facing, 1);
+    ctx.imageSmoothingEnabled = atlas.smooth ?? false;
+    if (ctx.imageSmoothingEnabled)
+        ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(roster.sheet, frame.x, frame.y, frame.w, frame.h, -frame.pivotX * s, -frame.pivotY * s, frame.w * s, frame.h * s);
+    ctx.restore();
+    return true;
+};
+const ECHO_LEN = 5;
+const echoHist = [[], []];
+/** Clear trails between rounds/matches so stale echoes don't flash on reset. */
+const resetFighterTrails = () => { echoHist[0] = []; echoHist[1] = []; };
 /**
  * Draw a fighter at world position (x, y = feet), mirrored by facing.
  * Falls back to a colored rectangle if the frame is missing, so a
  * half-authored character is still playable.
+ *
+ * `opts.slot` (0/1) enables the per-fighter motion afterimage; `opts.motion`
+ * is a 0..1 speed intensity (caller derives it from velocity) that scales how
+ * many echoes show and how opaque they are.
  */
-const drawFighter = (ctx, roster, f, tick, x, y, fallback) => {
+const drawFighter = (ctx, roster, f, tick, x, y, fallback, opts) => {
     const name = spriteForFighter(f, roster.ch, tick);
-    const frame = name && roster.atlas ? roster.atlas.frames[name] : undefined;
+    // Afterimage trail: draw the recent samples oldest→newest, ramping alpha,
+    // BEFORE the crisp current frame lands on top.
+    const slot = opts?.slot;
+    const motion = Math.max(0, Math.min(1, opts?.motion ?? 0));
+    if (slot !== undefined && name) {
+        const hist = echoHist[slot];
+        if (motion > 0.05 && roster.sheet) {
+            hist.forEach((s, k) => {
+                const depth = (k + 1) / (hist.length + 1); // 0 oldest → ~1 newest
+                blitFrame(ctx, roster, s.name, s.x, s.y, s.facing, motion * 0.45 * depth);
+            });
+        }
+        hist.push({ name, x, y, facing: f.facing });
+        if (hist.length > ECHO_LEN)
+            hist.shift();
+    }
+    // Crisp current frame on top; fall back to a rect if the art is missing.
+    if (name && blitFrame(ctx, roster, name, x, y, f.facing, 1))
+        return;
     ctx.save();
     ctx.translate(x, y);
     ctx.scale(f.facing, 1);
-    if (frame && roster.sheet) {
-        const s = roster.atlas?.scale ?? 1;
-        ctx.imageSmoothingEnabled = roster.atlas?.smooth ?? false;
-        if (ctx.imageSmoothingEnabled)
-            ctx.imageSmoothingQuality = 'high';
-        ctx.drawImage(roster.sheet, frame.x, frame.y, frame.w, frame.h, -frame.pivotX * s, -frame.pivotY * s, frame.w * s, frame.h * s);
-    }
-    else {
-        ctx.imageSmoothingEnabled = false;
-        ctx.fillStyle = fallback;
-        ctx.fillRect(-26, -108, 52, 108);
-    }
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = fallback;
+    ctx.fillRect(-26, -108, 52, 108);
     ctx.restore();
 };
 /**
- * Draw the reference art as a portrait: a square crop centered on the head and
- * chest of the actual figure (the reference cell is mostly empty space), scaled
- * to fill the frame.
+ * Draw a character portrait into (x, y, w, h).
+ *  - Dedicated portrait (_select.png): composed art → cover-fit (fill the frame,
+ *    center-crop the overflow), no alpha cropping.
+ *  - Reference-sprite fallback: a square crop centered on the head and chest of
+ *    the figure (the reference cell is mostly empty space), scaled to fill.
  */
 const drawPortrait = (ctx, roster, x, y, w, h) => {
     const img = roster.portrait;
-    const box = roster.portraitBox;
-    if (!img || !box) {
+    if (!img || (!roster.portraitDedicated && !roster.portraitBox)) {
         ctx.fillStyle = '#1b1e30';
         ctx.fillRect(x, y, w, h);
         return;
     }
-    // Square crop around the upper body, sized to the figure's width.
-    const side = Math.max(box.w * 1.15, box.h * 0.55);
-    const cropX = box.x + box.w / 2 - side / 2;
-    const cropY = box.y - side * 0.05;
     ctx.save();
     ctx.beginPath();
     ctx.rect(x, y, w, h);
     ctx.clip();
-    ctx.imageSmoothingEnabled = roster.atlas?.smooth ?? false;
+    ctx.imageSmoothingEnabled = roster.portraitDedicated ? true : (roster.atlas?.smooth ?? false);
     if (ctx.imageSmoothingEnabled)
         ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(img, cropX, cropY, side, side, x, y, w, h);
+    if (roster.portraitDedicated) {
+        // Cover-fit: scale so the frame is fully covered, center the overflow.
+        const scale = Math.max(w / img.naturalWidth, h / img.naturalHeight);
+        const dw = img.naturalWidth * scale, dh = img.naturalHeight * scale;
+        ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+    }
+    else {
+        const box = roster.portraitBox;
+        const side = Math.max(box.w * 1.15, box.h * 0.55);
+        const cropX = box.x + box.w / 2 - side / 2;
+        const cropY = box.y - side * 0.05;
+        ctx.drawImage(img, cropX, cropY, side, side, x, y, w, h);
+    }
     ctx.restore();
 };
 
@@ -3063,14 +3120,22 @@ const marchingOutline = (ctx, x, y, w, h, tick, color = '#ffd166', dash = 10, sp
 
 // ---- client/src/audio.js ----
 /**
- * Music playback — Web Audio API, no dependency. Source tracks are the MvC:
- * Clash of Super Heroes BRSTM rips (decoded/re-encoded to ogg offline, see
- * tools/README.md), one file per arcade-mode screen. There's no dedicated
- * stage BGM yet, so the 4 "Ending" themes double as the title-screen loop
- * AND the in-match stage loop (ROTATION), picked round-robin so neither
- * screen repeats the same track back-to-back.
+ * Sound playback — Web Audio API, no dependency.
+ *
+ * Music (MusicId): the MvC: Clash of Super Heroes BRSTM rips (decoded/
+ * re-encoded to ogg offline, see tools/README.md), one file per arcade-mode
+ * screen. There's no dedicated stage BGM yet, so the 4 "Ending" themes double
+ * as the title-screen loop AND the in-match stage loop (ROTATION), picked
+ * round-robin so neither screen repeats the same track back-to-back.
+ *
+ * Hit SFX (SfxId): a 10-clip pack (sounds/SFX HITS/, see tools/README.md)
+ * covering swing, punch/kick impact by weight class, block, and a combo
+ * accent. `hitSfxFor()` maps a connecting move's button (LP/MP/HP/LK/MK/HK)
+ * to the right impact clip — the client-side juice layer (main.ts) is the
+ * only caller, keyed off `attackConnected` state changes per the "cosmetic
+ * effects live client-side, never inside the sim" rule.
  */
-const FILES = {
+const MUSIC_FILES = {
     continue: '/assets/audio/bgm/continue.ogg',
     ending_after_the_battle: '/assets/audio/bgm/ending_after_the_battle.ogg',
     ending_gambit: '/assets/audio/bgm/ending_gambit.ogg',
@@ -3084,10 +3149,39 @@ const FILES = {
     vs: '/assets/audio/bgm/vs.ogg',
     win: '/assets/audio/bgm/win.ogg',
 };
+const SFX_FILES = {
+    swing_a: '/assets/audio/sfx/swing_a.mp3',
+    swing_b: '/assets/audio/sfx/swing_b.mp3',
+    punch_light: '/assets/audio/sfx/punch_light.mp3',
+    punch_medium: '/assets/audio/sfx/punch_medium.mp3',
+    punch_heavy_a: '/assets/audio/sfx/punch_heavy_a.mp3',
+    punch_heavy_b: '/assets/audio/sfx/punch_heavy_b.mp3',
+    kick_light: '/assets/audio/sfx/kick_light.mp3',
+    kick_heavy: '/assets/audio/sfx/kick_heavy.mp3',
+    block_hit: '/assets/audio/sfx/block_hit.mp3',
+    combo_accent: '/assets/audio/sfx/combo_accent.mp3',
+};
+const FILES = { ...MUSIC_FILES, ...SFX_FILES };
 /** Shared title-screen / stage-BGM pool — the 4 "Ending" themes. */
 const ROTATION = [
     'ending_after_the_battle', 'ending_gambit', 'ending_grief', 'ending_megaman1',
 ];
+/** Every button's normal-hit weight class → which impact clip(s) to draw from. */
+const PUNCH = {
+    L: ['punch_light'], M: ['punch_medium'], H: ['punch_heavy_a', 'punch_heavy_b'],
+};
+const KICK = {
+    L: ['kick_light'], M: ['kick_light'], H: ['kick_heavy'], // only 2 kick clips in the pack
+};
+const SWING = ['swing_a', 'swing_b'];
+/** Picks the impact clip for a connecting normal, e.g. hitSfxFor('HP') → a heavy punch variant. */
+const hitSfxFor = (button) => {
+    const kind = button?.[0] === 'L' ? 'L' : button?.[0] === 'H' ? 'H' : 'M';
+    const pool = button?.[1] === 'K' ? KICK[kind] : PUNCH[kind];
+    return pool[Math.floor(Math.random() * pool.length)];
+};
+/** Every swing gets a whiff swoosh, whether or not it lands — classic fighting-game layering. */
+const swingSfx = () => SWING[Math.floor(Math.random() * SWING.length)];
 const BGM_LEVEL = 0.55;
 const SFX_LEVEL = 0.85;
 const DUCK_LEVEL = 0.12;
@@ -3142,7 +3236,7 @@ class AudioManager {
         this.loading.set(id, p);
         return p;
     }
-    /** Warm the decode cache for every track — total payload is ~5.7MB. */
+    /** Warm the decode cache for every track/clip — total payload is ~6MB. */
     preload() {
         for (const id of Object.keys(FILES))
             void this.load(id);
@@ -3210,6 +3304,26 @@ class AudioManager {
             opts.onEnded?.();
         };
         src.start();
+    }
+    /**
+     * Fire-and-forget hit/impact clip. Freely overlaps (each call is its own
+     * source node) — combat routinely needs two of these in the same tick
+     * (P1's swing landing while P2's counter also connects). A small random
+     * pitch/gain wobble keeps rapid-fire jabs from sounding mechanically
+     * identical.
+     */
+    playSfx(id, opts = {}) {
+        const ctx = this.ctxOf();
+        void this.load(id).then((buffer) => {
+            const src = ctx.createBufferSource();
+            src.buffer = buffer;
+            src.playbackRate.value = 0.94 + Math.random() * 0.12;
+            const gain = ctx.createGain();
+            gain.gain.value = (opts.volume ?? 1) * (0.9 + Math.random() * 0.1);
+            src.connect(gain);
+            gain.connect(this.sfxGain);
+            src.start();
+        });
     }
 }
 const audio = new AudioManager();
@@ -4180,6 +4294,7 @@ let cam = { x: 0, y: 0, zoom: 1.5 };
 let hitStopFlash = 0;
 const fx = { flash: [1, 1], comboOwner: -1, comboHits: 0, comboAge: 0, announce: '', announceAge: 0 };
 let prevHealth = [0, 0];
+let prevConnected = [0, 0]; // fighters[i].attackConnected last frame — edge-detects new hits/blocks
 let prevPhase = 0 /* Phase.PreRound */;
 let prevSuperFlash = 0; // rising-edge detect for the super-activation shockwave
 let prevMeter = [0, 0]; // to spot which fighter spent meter
@@ -4229,6 +4344,7 @@ const startFight = () => {
     cam = { x: STAGE.widthPx / 2 - VW / 2 / 1.5, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5 };
     updateCamera(game); // settle before the first frame so round 1 opens framed
     prevHealth = [game.fighters[0].health, game.fighters[1].health];
+    prevConnected = [0, 0];
     prevPhase = game.phase;
     fx.flash = [1, 1];
     fx.comboOwner = -1;
@@ -4239,6 +4355,7 @@ const startFight = () => {
     sparks = [];
     shake = 0;
     hurryPlayed = false;
+    resetFighterTrails(); // no stale motion echoes carried into the new match
     screen = 'fight';
     void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
@@ -4303,6 +4420,24 @@ const updateJuice = (g) => {
             shake = big ? 11 : 6;
             hitStopFlash = big ? 3 : 0;
         }
+        // Hit SFX: a swoosh on every swing (attack's very first tick), plus a
+        // punch/kick impact or block clip on the tick the attack actually makes
+        // contact (attackConnected's rising edge: 0→1 hit, 0→2 block).
+        if (f.action === 9 /* Action.Attack */ && f.actionFrame === 0 && f.moveIdx >= 0) {
+            audio.playSfx(swingSfx(), { volume: 0.45 });
+        }
+        if (f.attackConnected !== 0 && f.attackConnected !== prevConnected[i]) {
+            if (f.attackConnected === 1) {
+                const move = fighters[i].ch.b.moves[f.moveIdx];
+                audio.playSfx(hitSfxFor(move?.button));
+                if (g.fighters[(1 - i)].comboHits >= 2)
+                    audio.playSfx('combo_accent', { volume: 0.6 });
+            }
+            else if (f.attackConnected === 2) {
+                audio.playSfx('block_hit');
+            }
+        }
+        prevConnected[i] = f.attackConnected;
         // Aura motes: a fighter that is CHARGED (≥1 super bar) or on CRITICAL
         // health smoulders — a steady trickle of embers rising off the body.
         const meterN = f.meter / TUNING.meterMax;
@@ -4408,7 +4543,11 @@ const renderFight = (g) => {
         ctx.beginPath();
         ctx.ellipse(px(f.x), STAGE.floorYPx + 2, 26 * sc, 6 * sc, 0, 0, Math.PI * 2);
         ctx.fill();
-        drawFighter(ctx, fighters[i], f, g.tick, px(f.x), px(f.y), P_COLORS[i]);
+        // Motion afterimage intensity from speed (fixed-point → px/tick): off while
+        // standing/walking (~4px), ramping in over dashes/jumps/knockback (~10px+).
+        const spd = (Math.abs(f.velX) + Math.abs(f.velY)) / 256;
+        const motion = Math.max(0, Math.min(1, (spd - 3) / 7));
+        drawFighter(ctx, fighters[i], f, g.tick, px(f.x), px(f.y), P_COLORS[i], { slot: i, motion });
     }
     // Projectiles.
     for (const p of g.projectiles) {
