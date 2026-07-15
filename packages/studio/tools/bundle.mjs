@@ -96,6 +96,8 @@ const html = `<!DOCTYPE html>
   .genframe{display:flex;flex-direction:column;gap:4px;align-items:center}
   .thumb{border:1px solid #262b40;border-radius:4px;image-rendering:pixelated}
   .thumb.empty{width:150px;height:150px;display:flex;align-items:center;justify-content:center;color:#3d4260}
+  .modal{position:fixed;inset:0;background:#000a;display:flex;align-items:center;justify-content:center;z-index:50}
+  .modalbox{background:#141724;border:1px solid #3d4260;border-radius:10px;padding:20px 24px;display:flex;flex-direction:column;gap:10px;min-width:440px;box-shadow:0 20px 60px #000c}
   .upload{background:#222738;border:1px solid #3d4260;border-radius:4px;padding:4px 10px;cursor:pointer;display:inline-block}
   .upload:hover{background:#2c3350}
   .genframe .thumb{transition:outline .1s}

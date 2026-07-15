@@ -323,14 +323,30 @@ const spriteCanvas = (name: string): HTMLCanvasElement | null => {
   return null;
 };
 
+/**
+ * Usable sprite for `name`, or null if it isn't drawable yet/at all.
+ *
+ * CRITICAL: never return a BROKEN image. A 404 (e.g. a new character with no
+ * _reference.png yet) leaves the Image with `complete === true` but
+ * `naturalWidth === 0`; drawing it throws "The HTMLImageElement provided is in
+ * the 'broken' state." — which, thrown inside a renderAll(), surfaced as a
+ * bogus "generation failed". Gate on naturalWidth, and cache a `null` sentinel
+ * for a broken load so we neither redraw it nor refetch forever.
+ */
 const getSprite = (name: string, charId = stCharId): HTMLCanvasElement | HTMLImageElement | null => {
   const key = `${charId}/${name}`;
   const hit = spriteImgs.get(key);
-  if (hit) return hit;
+  if (hit instanceof HTMLCanvasElement) return hit;
+  if (hit instanceof HTMLImageElement) {
+    if (hit.naturalWidth > 0) return hit; // loaded ok
+    if (hit.complete) return null; // finished loading but broke (404) — give up
+    return null; // still loading
+  }
   const img = new Image();
+  img.onerror = () => { spriteImgs.set(key, img); }; // keep the broken img so we don't refetch
   img.src = `/characters/${charId}/sprites/${name}`;
   spriteImgs.set(key, img);
-  return img.complete ? img : null;
+  return img.complete && img.naturalWidth > 0 ? img : null;
 };
 
 // ------------------------------------------------------------------ dom

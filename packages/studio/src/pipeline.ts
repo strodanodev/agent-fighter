@@ -49,12 +49,27 @@ const mkCanvas = (w: number, h: number): HTMLCanvasElement => {
   return c;
 };
 
+/**
+ * Sniff the image format from base64 magic bytes so the data URL carries the
+ * RIGHT mime. Providers differ (flux → JPEG, Gemini → PNG, and Gemini now
+ * embeds C2PA metadata), and a wrong mime label makes the browser refuse the
+ * image ("broken state" → drawImage throws). PNG `iVBORw0`, JPEG `/9j/`,
+ * WebP `UklGR`, GIF `R0lGOD`.
+ */
+const sniffMime = (b64: string): string => {
+  if (b64.startsWith('iVBORw0')) return 'image/png';
+  if (b64.startsWith('/9j/')) return 'image/jpeg';
+  if (b64.startsWith('UklGR')) return 'image/webp';
+  if (b64.startsWith('R0lGOD')) return 'image/gif';
+  return 'image/png'; // safest default for the current provider
+};
+
 export const decodeBase64Image = (b64: string): Promise<HTMLImageElement> =>
   new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => resolve(img);
     img.onerror = () => reject(new Error('image decode failed'));
-    img.src = b64.startsWith('data:') ? b64 : `data:image/jpeg;base64,${b64}`;
+    img.src = b64.startsWith('data:') ? b64 : `data:${sniffMime(b64)};base64,${b64}`;
   });
 
 const dist2 = (r: number, g: number, b: number, c: RGB): number => {

@@ -380,7 +380,13 @@ const server = createServer(async (req, res) => {
     }
     if (filePath && existsSync(filePath)) {
       const ext = filePath.slice(filePath.lastIndexOf('.'));
-      res.writeHead(200, { 'Content-Type': MIME[ext] ?? 'application/octet-stream' });
+      res.writeHead(200, {
+        'Content-Type': MIME[ext] ?? 'application/octet-stream',
+        // Never cache: this is a dev tool whose SPA and sprites are rewritten
+        // constantly. A cached studio.html silently runs yesterday's code
+        // (and a cached sprite hides the frame you just regenerated).
+        'Cache-Control': 'no-store, must-revalidate',
+      });
       return res.end(readFileSync(filePath));
     }
 

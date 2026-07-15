@@ -2,7 +2,7 @@
   "name": "Rooftop",
   "imageW": 1536,
   "imageH": 640,
-  "floorY": 480,
+  "floorY": 546,
   "skyColor": "#7a6cae",
   "deckColor": "#8f8c98",
   "layers": [
@@ -15,17 +15,9 @@
       "file": "layer-mid.png",
       "depth": 0.45,
       "stretch": false,
-      "scale": 1.518987341772152,
-      "offsetX": 0,
-      "offsetY": -726
-    },
-    {
-      "file": "layer-fg.png",
-      "depth": 0.75,
-      "stretch": false,
-      "scale": 0.3325942350332594,
-      "offsetX": 0,
-      "offsetY": -180
+      "scale": 0.7233072916666666,
+      "offsetX": -212,
+      "offsetY": -240
     }
   ]
 }

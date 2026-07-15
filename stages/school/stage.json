@@ -1,0 +1,18 @@
+{
+  "name": "school",
+  "imageW": 1536,
+  "imageH": 640,
+  "floorY": 520,
+  "skyColor": "#2b1b4d",
+  "deckColor": "#3a3644",
+  "layers": [
+    {
+      "file": "layer-fg.png",
+      "depth": 0.75,
+      "stretch": false,
+      "scale": 0.22,
+      "offsetX": 0,
+      "offsetY": -150
+    }
+  ]
+}
