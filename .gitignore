@@ -1,5 +1,6 @@
 node_modules/
 dist/
+public/
 .bundle-tmp/
 *.log
 .env
@@ -13,3 +14,5 @@ packages/client/shots/
 /tools/ffmpeg/
 # raw brstm sources kept out of git (unclear license); converted .ogg in packages/client/assets/audio/ is what ships
 /sounds/
+
+.vercel

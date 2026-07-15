@@ -1,23 +1,24 @@
-# Exclude large asset and tool directories
+# Build artifacts & deps (Vercel installs/builds these itself)
 node_modules/
 dist/
+public/
 .bundle-tmp/
 *.log
 
-# Large binary tools
+# Binary tools — the ffmpeg .exe files exceed Vercel's 100MB per-file limit
 tools/ffmpeg/
 tools/vgmstream/
 
-# Large raw assets (source of truth in development, not needed for build)
+# Authoring scratch — raw frames are re-processed into atlases, never shipped
 characters/*/frames-raw/
-assets/*.mp4
-assets/*.svg
 
-# Development and reference
+# Raw audio sources (converted .ogg/.mp3 ship under packages/client/assets/audio)
+sounds/
+
+# Dev-only / reference
 .git
 .claude
 .cursor
 .github
 docs
-sounds/
 packages/client/shots/
