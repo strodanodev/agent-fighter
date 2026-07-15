@@ -2,14 +2,23 @@ import { STAGE, TICKS_PER_SEC, TUNING } from '@af/core';
 import type { GameState } from '@af/core';
 import { drawPortrait } from './atlas.js';
 import type { Roster } from './atlas.js';
-import { HUD_GEO, clipPoly, drawChrome, drawStageLayers } from './chrome.js';
-import type { StageAsset, UiKit } from './chrome.js';
+import { HUD_GEO, clipPoly, drawChrome, drawStageLayers, stageCamLimits } from './chrome.js';
+import type { StageAsset, StageCamLimits, UiKit } from './chrome.js';
 
 // Injected at boot (null = procedural fallbacks everywhere).
 let uiKit: UiKit | null = null;
 let stageAsset: StageAsset | null = null;
 export const setUiKit = (k: UiKit): void => { uiKit = k; };
 export const setStageAsset = (s: StageAsset | null): void => { stageAsset = s; };
+
+/**
+ * Camera limits for the active stage, or null when there's no art (procedural
+ * fallback stage) — in which case the camera keeps its old unbounded behavior.
+ */
+export const currentStageCamLimits = (): StageCamLimits | null =>
+  stageAsset && (stageAsset.image || stageAsset.layers.length > 0)
+    ? stageCamLimits(stageAsset, VW, VH)
+    : null;
 
 const ARCADE_FONT = 'Impact, "Arial Black", "Franklin Gothic Medium", sans-serif';
 

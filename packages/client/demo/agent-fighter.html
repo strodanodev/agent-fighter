@@ -2005,6 +2005,14 @@ const loadStage = async (id) => {
         return null;
     }
 };
+const stageCamLimits = (stage, vw, vh) => {
+    const m = stage.meta;
+    const scale = STAGE.widthPx / m.imageW;
+    const topY = STAGE.floorYPx - m.floorY * scale;
+    const botY = topY + m.imageH * scale;
+    const minZoom = Math.max(vw / STAGE.widthPx, vh / Math.max(1, botY - topY));
+    return { topY, botY, minZoom };
+};
 /**
  * Draw an image stage in WORLD coordinates (call under worldTransform).
  * The image spans the full stage width; its floorY row is pinned to the world
@@ -2127,6 +2135,13 @@ let uiKit = null;
 let stageAsset = null;
 const setUiKit = (k) => { uiKit = k; };
 const setStageAsset = (s) => { stageAsset = s; };
+/**
+ * Camera limits for the active stage, or null when there's no art (procedural
+ * fallback stage) — in which case the camera keeps its old unbounded behavior.
+ */
+const currentStageCamLimits = () => stageAsset && (stageAsset.image || stageAsset.layers.length > 0)
+    ? stageCamLimits(stageAsset, VW, VH)
+    : null;
 const ARCADE_FONT = 'Impact, "Arial Black", "Franklin Gothic Medium", sans-serif';
 /**
  * Arcade presentation layer: rooftop stage, framed HUD, title / select /
@@ -2808,15 +2823,29 @@ const updateCamera = (g) => {
     const highestFeet = Math.min(px(g.fighters[0].y), px(g.fighters[1].y));
     const boxT = highestFeet - FIGHTER_H - 50; // head + headroom
     const boxB = STAGE.floorYPx + 24; // a little deck below the feet
+    // Stage art bounds the camera: it may not zoom out past the point where the
+    // viewport would exceed the art (`limits.minZoom`), and cam.y is clamped so
+    // the art always covers top and bottom — no flat sky/deck fill ever shows.
+    const limits = currentStageCamLimits();
+    const zoomFloor = limits ? Math.max(ZOOM_MIN, limits.minZoom) : ZOOM_MIN;
     const zoomX = VW / Math.max(1, boxR - boxL);
     const zoomY = (CONTENT_BOT - CONTENT_TOP) / Math.max(1, boxB - boxT);
-    const targetZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.min(zoomX, zoomY)));
+    const targetZoom = Math.max(zoomFloor, Math.min(ZOOM_MAX, Math.min(zoomX, zoomY)));
     cam.zoom += (targetZoom - cam.zoom) * 0.08;
     // Place the camera so the action box sits inside the content band.
     const viewW = VW / cam.zoom;
+    const viewH = VH / cam.zoom;
     const midX = (x0 + x1) / 2;
     const targetX = Math.max(0, Math.min(STAGE.widthPx - viewW, midX - viewW / 2));
-    const targetY = boxT - CONTENT_TOP / cam.zoom;
+    let targetY = boxT - CONTENT_TOP / cam.zoom;
+    if (limits) {
+        // Keep the art covering: its top must be at/above the screen top and its
+        // bottom at/below the screen bottom. minZoom guarantees viewH ≤ art height,
+        // so the [top, bottom-viewH] window is non-empty and this pins the image's
+        // bottom edge to the screen bottom once fully zoomed out.
+        const maxY = limits.botY - viewH;
+        targetY = Math.max(limits.topY, Math.min(maxY, targetY));
+    }
     cam.x += (targetX - cam.x) * 0.16;
     cam.y += (targetY - cam.y) * 0.12;
 };

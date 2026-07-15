@@ -15,8 +15,8 @@ import { listCharacters, loadRoster, drawFighter } from './atlas.js';
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  drawHud, drawResults, drawSelect, drawStage, drawStageSelect, drawTitle,
-  setStageAsset, setUiKit, worldTransform,
+  currentStageCamLimits, drawHud, drawResults, drawSelect, drawStage,
+  drawStageSelect, drawTitle, setStageAsset, setUiKit, worldTransform,
 } from './ui.js';
 import type { Cam, HudFx } from './ui.js';
 import { listStages, loadStage, loadUiKit } from './chrome.js';
@@ -145,17 +145,33 @@ const updateCamera = (g: GameState): void => {
   const boxT = highestFeet - FIGHTER_H - 50; // head + headroom
   const boxB = STAGE.floorYPx + 24; // a little deck below the feet
 
+  // Stage art bounds the camera: it may not zoom out past the point where the
+  // viewport would exceed the art (`limits.minZoom`), and cam.y is clamped so
+  // the art always covers top and bottom — no flat sky/deck fill ever shows.
+  const limits = currentStageCamLimits();
+  const zoomFloor = limits ? Math.max(ZOOM_MIN, limits.minZoom) : ZOOM_MIN;
+
   const zoomX = VW / Math.max(1, boxR - boxL);
   const zoomY = (CONTENT_BOT - CONTENT_TOP) / Math.max(1, boxB - boxT);
-  const targetZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.min(zoomX, zoomY)));
+  const targetZoom = Math.max(zoomFloor, Math.min(ZOOM_MAX, Math.min(zoomX, zoomY)));
 
   cam.zoom += (targetZoom - cam.zoom) * 0.08;
 
   // Place the camera so the action box sits inside the content band.
   const viewW = VW / cam.zoom;
+  const viewH = VH / cam.zoom;
   const midX = (x0 + x1) / 2;
   const targetX = Math.max(0, Math.min(STAGE.widthPx - viewW, midX - viewW / 2));
-  const targetY = boxT - CONTENT_TOP / cam.zoom;
+  let targetY = boxT - CONTENT_TOP / cam.zoom;
+
+  if (limits) {
+    // Keep the art covering: its top must be at/above the screen top and its
+    // bottom at/below the screen bottom. minZoom guarantees viewH ≤ art height,
+    // so the [top, bottom-viewH] window is non-empty and this pins the image's
+    // bottom edge to the screen bottom once fully zoomed out.
+    const maxY = limits.botY - viewH;
+    targetY = Math.max(limits.topY, Math.min(maxY, targetY));
+  }
 
   cam.x += (targetX - cam.x) * 0.16;
   cam.y += (targetY - cam.y) * 0.12;

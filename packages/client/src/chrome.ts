@@ -199,6 +199,30 @@ export const loadStage = async (id: string): Promise<StageAsset | null> => {
 };
 
 /**
+ * Camera framing limits derived from a stage's art, in WORLD coordinates.
+ *
+ * The whole point: the camera must never pull back far enough to reveal the
+ * flat sky/deck fill outside the art. `topY`/`botY` are the art's world-y
+ * extent (the backdrop plane spans the full 1600px stage width, so horizontal
+ * coverage is already guaranteed by the existing cam.x clamp). `minZoom` is
+ * the most zoomed-OUT the camera may go before the viewport would be taller
+ * than the art (VH/artH) or wider than the stage (VW/stageW) — past that no
+ * cam.y clamp could keep the art covering, so we stop zooming out instead.
+ */
+export interface StageCamLimits { topY: number; botY: number; minZoom: number }
+
+export const stageCamLimits = (
+  stage: StageAsset, vw: number, vh: number,
+): StageCamLimits => {
+  const m = stage.meta;
+  const scale = STAGE.widthPx / m.imageW;
+  const topY = STAGE.floorYPx - m.floorY * scale;
+  const botY = topY + m.imageH * scale;
+  const minZoom = Math.max(vw / STAGE.widthPx, vh / Math.max(1, botY - topY));
+  return { topY, botY, minZoom };
+};
+
+/**
  * Draw an image stage in WORLD coordinates (call under worldTransform).
  * The image spans the full stage width; its floorY row is pinned to the world
  * floor. Sky/deck colors extend the art beyond the image's edges when the
