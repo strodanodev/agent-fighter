@@ -119,6 +119,8 @@ export const createMatchServer = (opts: {
   root?: string;
   /** Test hook: overrides the Supabase-backed persistence (null = off). */
   persistence?: Persistence | null;
+  /** House-bot emission cadence (ms). 16 = real-time (default); tests use 1. */
+  housePaceMs?: number;
 } = {}): Promise<MatchServer> => {
   const root = opts.root ?? REPO_ROOT;
   const charactersDir = join(root, 'characters');
@@ -210,7 +212,16 @@ export const createMatchServer = (opts: {
         engine: ENGINE_VERSION,
       }).then((awards) => {
         for (const a of awards) {
-          send(m.clients[a.side], {
+          const cl = m.clients[a.side];
+          // Keep the connection's snapshot fresh — the pre-queue credit
+          // check reads it (escrow re-checks authoritatively anyway).
+          if (cl.account) {
+            cl.account = {
+              ...cl.account, credits: a.credits, level: a.level,
+              xp: a.xp, wins: a.wins, losses: a.losses,
+            };
+          }
+          send(cl, {
             t: 'xp', gained: a.gained, levelsUp: a.levelsUp,
             level: a.level, xp: a.xp, wins: a.wins, losses: a.losses,
             creditsDelta: a.creditsDelta, credits: a.credits,
@@ -338,7 +349,7 @@ export const createMatchServer = (opts: {
       name: `HOUSE LV${level}`,
       character, skill, charactersDir,
       aiSeed: (Date.now() % 100000) + nextMatch,
-      paceMs: 16, // real-time — it's playing a human
+      paceMs: opts.housePaceMs ?? 16, // real-time — it's playing a human
       soloFor: player.id,
     }).catch((e) => {
       console.log(`[solo] house bot failed: ${String(e)}`);
@@ -486,6 +497,7 @@ export const createMatchServer = (opts: {
     clients.delete(c);
     const qi = queue.indexOf(c);
     if (qi >= 0) queue.splice(qi, 1);
+    for (const [k, v] of soloWaiting) if (v === c) soloWaiting.delete(k);
     const m = c.match;
     if (m && !m.finished) {
       // Reconnect grace, then forfeit (ADR 0003 disconnect policy).
@@ -494,35 +506,60 @@ export const createMatchServer = (opts: {
     }
   };
 
+  // Browser clients call /me and /leaderboard cross-origin (the game is
+  // served from a different port/host than the match server).
+  const CORS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Dev-Name',
+  };
+  const json = (res: import('node:http').ServerResponse, code: number, body: unknown): void => {
+    res.writeHead(code, { 'Content-Type': 'application/json', ...CORS });
+    res.end(JSON.stringify(body));
+  };
+
   const http = createHttpServer((req, res) => {
     const path = new URL(req.url ?? '/', 'http://x').pathname;
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, CORS);
+      return res.end();
+    }
     if (path === '/leaderboard') {
-      if (!persistence) {
-        res.writeHead(503, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'persistence not configured' }));
-      }
-      void persistence.leaderboard(20).then((rows) => {
-        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-        res.end(JSON.stringify(rows));
-      }).catch((e) => {
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: String(e) }));
-      });
+      if (!persistence) return json(res, 503, { error: 'persistence not configured' });
+      void persistence.leaderboard(20)
+        .then((rows) => json(res, 200, rows))
+        .catch((e) => json(res, 502, { error: String(e) }));
       return;
     }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+    // Account snapshot for the title screen (also claims the daily bonus —
+    // "logging in" = first authenticated contact of the day, whichever
+    // surface it lands on). Auth: AIR session JWT; in the DEV economy an
+    // X-Dev-Name header stands in so the loop is testable without AIR.
+    if (path === '/me') {
+      if (!persistence) return json(res, 503, { error: 'persistence not configured' });
+      const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '')?.[1];
+      const devName = persistence.dev ? String(req.headers['x-dev-name'] ?? '') : '';
+      void (async () => {
+        const identity = bearer ? await verifyAirToken(bearer)
+          : devName ? { sub: `dev:${devName.slice(0, 24)}` }
+          : null;
+        if (!identity) return json(res, 401, { error: 'sign in required' });
+        const name = devName || identity.sub.slice(0, 12);
+        return json(res, 200, await persistence.getAccount(identity, name, false));
+      })().catch((e) => json(res, 502, { error: String(e) }));
+      return;
+    }
+    return json(res, 200, {
       game: 'agent-fighter', engine: ENGINE_VERSION, protocol: PROTOCOL_VERSION,
       characters: characterIds, stages: stageIds,
       online: clients.size, queued: queue.length,
       persistence: !!persistence,
-    }));
+    });
   });
   const wss = new WebSocketServer({ server: http });
 
   wss.on('connection', (ws, req) => {
-    const remote = req.socket.remoteAddress ?? '';
-    const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === ':ffff:127.0.0.1';
+    const remote = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
+    const isLoopback = remote === '127.0.0.1' || remote === '::1';
     const c: Client = {
       ws, id: `c${nextId++}`, name: 'anon', agent: false,
       state: 'lobby', character: '', match: null, side: 0, identity: null,

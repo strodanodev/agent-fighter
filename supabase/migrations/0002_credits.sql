@@ -176,8 +176,11 @@ begin
     pid := case when s = 0 then _p0 else _p1 end;
     if pid is null then continue; end if;
 
-    i_deviated   := _deviator = s;
-    opp_deviated := _deviator = 1 - s;
+    -- COALESCE is load-bearing: _deviator is usually NULL, and in SQL
+    -- `NULL = s` is NULL, which silently poisons every boolean below —
+    -- both sides then settle as losers. (Found by live smoke-testing.)
+    i_deviated   := coalesce(_deviator = s, false);
+    opp_deviated := coalesce(_deviator = 1 - s, false);
     won  := (not i_deviated) and (not undecided)
             and (_winner = s or opp_deviated);
     draw := (not undecided) and (not won) and _winner = 2 and not i_deviated;

@@ -753,6 +753,15 @@ export interface TitleMenuState {
   /** AIR account chip: display handle when logged in, null when out. */
   authLabel?: string | null;
   authBusy?: boolean;
+  authError?: string;
+  /** Sign-in required (M5): menu locked until the player authenticates. */
+  gate?: boolean;
+  /** Smart-account address (upper-left wallet line). */
+  address?: string;
+  /** Server account snapshot — credits/level/W-L (null = server offline). */
+  account?: { credits: number; level: number; wins: number; losses: number } | null;
+  /** Animate the "+10 DAILY CREDITS" toast. */
+  dailyToast?: boolean;
 }
 
 export const drawTitle = (
@@ -811,35 +820,64 @@ export const drawTitle = (
   // display()/label() already carry their own outline+glow for contrast.
   const barH = 178, barY = VH - barH;
 
-  // 2-player local is disabled (single-controller / mobile focus) — omitted here.
-  const rows: [Mode, string][] = [
-    ['cpu', `VS AGENT  ·  LV ${menu.cpuLevel}`],
-    ['online', 'ONLINE  ·  HUMANS & AGENTS'],
-  ];
   const menuY0 = barY + 30;
-  rows.forEach(([m, txt], k) => {
-    const y = menuY0 + k * 34;
-    const on = menu.mode === m;
-    if (on) {
-      const pulse = 1 + 0.035 * Math.sin(tick / 10);
-      display(ctx, txt, cx, y, 24, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
-      // A small bouncing arrow marker to the left, arcade-menu style.
-      const bounce = 3 * Math.sin(tick / 9);
-      label(ctx, '▶', cx - 148 + bounce, y, 18, GOLD_LT);
+  if (menu.gate) {
+    // M5: signing in is REQUIRED — the AIR account is the wallet the whole
+    // credits economy settles into, so there is nothing to enter as a ghost.
+    const pulse = 1 + 0.04 * Math.sin(tick / 9);
+    if (menu.authBusy) {
+      display(ctx, 'SIGNING IN…', cx, menuY0 + 18, 26, { glow: 'rgba(143,184,255,0.55)' });
+      label(ctx, 'complete the AIR dialog to continue', cx, menuY0 + 48, 13, '#ffffffaa');
     } else {
-      label(ctx, txt, cx, y, 17, '#ffffff70');
+      display(ctx, 'SIGN IN TO ENTER', cx, menuY0 + 18, 28, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+      label(ctx, 'PRESS  L  ·  AIR ACCOUNT (GOOGLE / EMAIL / WALLET)', cx, menuY0 + 48, 14, '#ffd166');
+      label(ctx, '10 FREE CREDITS EVERY DAY YOU LOG IN', cx, menuY0 + 70, 12, '#ffffff88');
     }
-  });
-  label(ctx, '↑ / ↓  SELECT       ENTER  START', cx, menuY0 + rows.length * 34 + 6, 13, '#ffffffaa');
+    if (menu.authError) label(ctx, `⚠ ${menu.authError.slice(0, 64)}`, cx, menuY0 + 92, 12, '#ff9d9d');
+  } else {
+    // 2-player local is disabled (single-controller / mobile focus) — omitted.
+    const rows: [Mode, string][] = [
+      ['cpu', 'VS AGENT  ·  RANKED  ·  1 CREDIT'],
+      ['online', 'ONLINE WAGER  ·  10 CREDITS  ·  WINNER TAKES POT'],
+    ];
+    rows.forEach(([m, txt], k) => {
+      const y = menuY0 + k * 34;
+      const on = menu.mode === m;
+      if (on) {
+        const pulse = 1 + 0.035 * Math.sin(tick / 10);
+        display(ctx, txt, cx, y, 22, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+        // A small bouncing arrow marker to the left, arcade-menu style.
+        const bounce = 3 * Math.sin(tick / 9);
+        label(ctx, '▶', cx - 236 + bounce, y, 18, GOLD_LT);
+      } else {
+        label(ctx, txt, cx, y, 16, '#ffffff70');
+      }
+    });
+    label(ctx, '↑ / ↓  SELECT       ENTER  START       L  SIGN OUT', cx, menuY0 + rows.length * 34 + 6, 13, '#ffffffaa');
+  }
 
-  // AIR account chip (top-right): identity when signed in, the key hint when
-  // out. Signing in is optional — it unlocks persistent XP + the leaderboard.
-  const chip = menu.authBusy ? 'SIGNING IN…'
-    : menu.authLabel ? `◆ ${menu.authLabel}   ·   L: SIGN OUT`
-    : 'L: SIGN IN  ·  SAVE XP & RANK';
-  label(ctx, chip, VW - 16, 22, 12, menu.authLabel ? '#8fe8a0' : '#ffffff88', 'right');
+  // Account/wallet block — upper LEFT, minimal text (M5 spec).
+  if (menu.authLabel) {
+    label(ctx, `◆ ${menu.authLabel}`, 16, 22, 13, '#8fe8a0', 'left');
+    if (menu.address) {
+      label(ctx, `${menu.address.slice(0, 6)}…${menu.address.slice(-4)}`, 16, 40, 11, '#ffffff77', 'left');
+    }
+    const acctY = menu.address ? 58 : 40;
+    if (menu.account) {
+      const a = menu.account;
+      label(ctx, `⛁ ${a.credits} CR   ·   LV ${a.level}   ·   ${a.wins}W ${a.losses}L`, 16, acctY, 12, '#ffd166', 'left');
+    } else {
+      label(ctx, 'SERVER OFFLINE · CREDITS UNAVAILABLE', 16, acctY, 11, '#ff9d9d', 'left');
+    }
+  }
 
-  label(ctx, 'MILESTONE 4 · AI + LEVELING BUILD', cx, VH - 12, 10, '#ffffff55');
+  // Daily login bonus toast — under the account block, gold, hard to miss.
+  if (menu.dailyToast) {
+    const flash = tick % 30 < 22;
+    if (flash) label(ctx, `+${10} DAILY LOGIN CREDITS`, 16, menu.address ? 80 : 62, 14, '#ffe9a3', 'left');
+  }
+
+  label(ctx, 'MILESTONE 5 · CREDITS BUILD', cx, VH - 12, 10, '#ffffff55');
 };
 
 // ---------------------------------------------------------------- select
@@ -1299,13 +1337,17 @@ export const drawStageSelect = (
 
 // ---------------------------------------------------------------- results
 export interface XpInfo {
-  gained: number;
+  gained: number; // negative on a ranked-solo loss (the "loser burns XP" rule)
   levelsUp: number;
   level: number;
   xp: number;
   xpNeed: number;
   wins: number;
   losses: number;
+  /** Net credits vs before the entrance fee (wager win +10, loss −10 …). */
+  creditsDelta?: number;
+  /** Balance after settlement. */
+  credits?: number;
 }
 
 export const drawResults = (
@@ -1346,7 +1388,16 @@ export const drawResults = (
       if (flash) display(ctx, `LEVEL UP!  LV ${xp.level}`, VW / 2, y, 26, { glow: 'rgba(255,209,102,0.6)' });
       y += 32;
     }
-    display(ctx, `+${xp.gained} XP`, VW / 2, y, 22, { from: '#d9ffcf', mid: '#7ee85a', to: '#2f7a1f', outline: '#0e2a08' });
+    const xpTxt = `${xp.gained >= 0 ? '+' : ''}${xp.gained} XP`;
+    display(ctx, xpTxt, VW / 2, y, 22, xp.gained >= 0
+      ? { from: '#d9ffcf', mid: '#7ee85a', to: '#2f7a1f', outline: '#0e2a08' }
+      : { from: '#ffd7d7', mid: '#ff6b6b', to: '#8a1f1f', outline: '#2a0808' });
+    if (xp.creditsDelta !== undefined) {
+      const cd = xp.creditsDelta;
+      const cTxt = `${cd >= 0 ? '+' : '−'}${Math.abs(cd)} CREDIT${Math.abs(cd) === 1 ? '' : 'S'}   ·   BALANCE ${xp.credits ?? '?'}`;
+      label(ctx, cTxt, VW / 2, y + 22, 15, cd >= 0 ? '#ffd166' : '#ff9d9d');
+      y += 24;
+    }
     y += 16;
     const barW = 300, barH = 8;
     const bx = VW / 2 - barW / 2;

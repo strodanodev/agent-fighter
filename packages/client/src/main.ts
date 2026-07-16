@@ -12,7 +12,7 @@ import {
 } from '@af/core';
 import type { AiState, GameState, InputFrame } from '@af/core';
 import {
-  awardXp, cpuLevelFor, loadLever, loadProfile, saveLever, skillForCpuLevel, xpForNext,
+  cpuLevelFor, loadLever, loadProfile, saveLever, skillForCpuLevel, xpForNext,
 } from './progress.js';
 import type { Profile } from './progress.js';
 import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './atlas.js';
@@ -28,6 +28,7 @@ import type { StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
 import { auth, authLogin, authLogout, authName, authRehydrate, authToken } from './auth.js';
 import { NetSession } from './net.js';
+import type { NetAccount } from './net.js';
 import {
   auraGlow, drawFx, emitAura, emitBurst, emitRing, fxPulse, updateFx,
 } from './fx.js';
@@ -74,6 +75,44 @@ let screen: Screen = 'loading';
 let mode: Mode = 'cpu';
 let net: NetSession | null = null;
 let netInstalled = false;
+
+// ---- M5 credits: the AIR sign-in gate + the server-side account.
+// ?dev=NAME bypasses the gate against a DEV-economy match server (in-memory
+// persistence, name-keyed identities) — for development only; a production
+// server (real Supabase) ignores dev names and demands a verified AIR token.
+const DEV_GUEST = new URLSearchParams(location.search).get('dev');
+let account: NetAccount | null = null;
+let accountFetch: 'idle' | 'busy' | 'done' | 'fail' = 'idle';
+let accountToastAge = -1; // ≥0 → the "+10 DAILY CREDITS" toast is animating
+let queuedMode: 'solo' | 'wager' = 'wager';
+let practiceFree = false; // offline-fallback match: no fee, no XP, no records
+
+/** Match-server endpoints (?ws= overrides for deploys/dev). */
+const matchWsUrl = (): string =>
+  new URLSearchParams(location.search).get('ws') ?? `ws://${location.hostname}:8477`;
+const matchHttpUrl = (): string => matchWsUrl().replace(/^ws/, 'http');
+
+/**
+ * Pull the account snapshot from the match server (also claims the daily
+ * +10 login bonus — first authenticated contact of the day wins it).
+ */
+const fetchAccount = async (): Promise<void> => {
+  accountFetch = 'busy';
+  try {
+    const headers: Record<string, string> = {};
+    const token = await authToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    else if (DEV_GUEST) headers['X-Dev-Name'] = DEV_GUEST;
+    else { accountFetch = 'idle'; return; }
+    const res = await fetch(`${matchHttpUrl()}/me`, { headers });
+    if (!res.ok) { accountFetch = 'fail'; return; }
+    account = (await res.json()) as NetAccount;
+    if (account.dailyGranted) accountToastAge = 0;
+    accountFetch = 'done';
+  } catch {
+    accountFetch = 'fail'; // server offline — title shows it, local play still fine
+  }
+};
 let uiTick = 0;
 let allRosters: Roster[] = [];
 let picks: [number, number] = [0, 0];
@@ -167,20 +206,23 @@ const resetMatchFx = (g: GameState): void => {
   resetFighterTrails();
 };
 
-/** Queue for an online match (ADR 0003): connect, pin bundle hash, wait. */
-const startOnline = (): void => {
+/**
+ * Queue for a server match (ADR 0003 + M5 credits).
+ * 'wager' = PvP, 10-credit entrance each, winner takes the pot.
+ * 'solo'  = ranked vs the HOUSE agent at your level, 1 credit.
+ */
+const startOnline = (m: 'solo' | 'wager'): void => {
   const roster = allRosters[picks[0]]!;
-  // ?ws=ws://host:port overrides the default match server (deploys, dev).
-  const url = new URLSearchParams(location.search).get('ws')
-    ?? `ws://${location.hostname}:8477`;
+  queuedMode = m;
+  practiceFree = false;
   netInstalled = false;
   screen = 'online';
-  // Signed in → play under the AIR identity (fresh token; the server verifies
-  // it against the JWKS and persists XP/W-L). Anonymous stays fully playable.
-  const name = authName() ?? `PLAYER-${(profile.wins + profile.losses) % 1000}`;
+  // Play under the AIR identity (fresh token; the server verifies it against
+  // the JWKS and settles credits/XP). ?dev=NAME plays a dev-economy account.
+  const name = authName() ?? DEV_GUEST ?? `PLAYER-${(profile.wins + profile.losses) % 1000}`;
   void authToken().then((token) => {
     if (screen !== 'online' || net) return; // player backed out while fetching
-    net = new NetSession(url, name, roster.id, roster.bundle.versionHash, token);
+    net = new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m);
   });
 };
 
@@ -509,9 +551,11 @@ const tickSelect = (): void => {
 
   // A disabled fighter under the cursor cannot be confirmed.
   if (enabled(picks[0]) && CONFIRM[0]!.some((k) => pressedThisFrame.has(k))) locked[0] = true;
-  if (mode === 'online') {
-    // Online: your pick is the queue ticket — opponent comes from matchmaking.
-    if (locked[0]) startOnline();
+  if (mode === 'online' || mode === 'cpu') {
+    // Server modes (M5): your pick is the queue ticket. Wager matchmakes a
+    // PvP opponent; ranked VS AGENT gets a house bot at your level — the
+    // server picks its character (and charges the entrance fee).
+    if (locked[0]) startOnline(mode === 'cpu' ? 'solo' : 'wager');
     return;
   }
   if (mode === '2p') {
@@ -562,9 +606,23 @@ const frame = (): void => {
       ctx.fillText('run `npm run play` from the repo root so characters/ is served', VW / 2, VH / 2 + 28);
     }
   } else if (screen === 'title') {
+    // M5: the AIR account IS the wallet the credits settle into — signing in
+    // is required to proceed (?dev=NAME bypasses against a dev server).
+    const signedIn = auth.status === 'in' || !!DEV_GUEST;
+    if (signedIn && accountFetch === 'idle') void fetchAccount();
+    if (!signedIn && account) { account = null; accountFetch = 'idle'; } // signed out
+    if (accountToastAge >= 0 && ++accountToastAge > 300) accountToastAge = -1;
     drawTitle(ctx, allRosters, uiTick, {
       mode, cpuLevel: cpuLevelFor(profile, lever),
-      authLabel: authName(), authBusy: auth.status === 'busy',
+      authLabel: authName() ?? (DEV_GUEST ? `DEV·${DEV_GUEST.toUpperCase()}` : null),
+      authBusy: auth.status === 'busy',
+      authError: auth.status === 'error' ? auth.error : undefined,
+      gate: !signedIn,
+      address: auth.address || undefined,
+      account: accountFetch === 'done' && account
+        ? { credits: account.credits, level: account.level, wins: account.wins, losses: account.losses }
+        : null,
+      dailyToast: accountToastAge >= 0,
     });
     // 2-player local is disabled on all platforms (single-controller / mobile
     // focus). The '2p' Mode value + its handling stay in the codebase, just no
@@ -572,7 +630,15 @@ const frame = (): void => {
     const MODES: Mode[] = ['cpu', 'online'];
     if (pressedThisFrame.has('KeyL')) {
       // AIR sign-in/out toggle — must not fall through to "any key starts".
-      void (auth.status === 'in' ? authLogout() : authLogin());
+      if (auth.status === 'in') {
+        void authLogout();
+        account = null;
+        accountFetch = 'idle';
+      } else {
+        void authLogin();
+      }
+    } else if (!signedIn) {
+      // Gated: every other key waits for the sign-in.
     } else if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')) {
       mode = MODES[(MODES.indexOf(mode) + MODES.length - 1) % MODES.length]!;
     } else if (pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
@@ -597,22 +663,38 @@ const frame = (): void => {
     ctx.fillStyle = '#0a0616';
     ctx.fillRect(0, 0, VW, VH);
     const dots = '.'.repeat(1 + (Math.trunc(uiTick / 20) % 3));
+    const solo = queuedMode === 'solo';
+    const failed = net?.status === 'error';
     const msg = !net ? `CONNECTING${dots}` // token fetch in flight
-      : net.status === 'error' ? `OFFLINE: ${net.error}`
+      : failed ? `OFFLINE: ${net.error}`
       : net.setup ? 'OPPONENT FOUND — STARTING'
-      : net.status === 'queued' ? `SEARCHING FOR OPPONENT${dots}`
+      : net.status === 'queued' ? (solo ? `CALLING THE HOUSE AGENT${dots}` : `SEARCHING FOR OPPONENT${dots}`)
       : `CONNECTING${dots}`;
     ctx.font = 'bold 22px "Courier New", monospace';
     ctx.textAlign = 'center';
-    ctx.fillStyle = net?.status === 'error' ? '#e94560' : '#f7e0a3';
-    ctx.fillText(msg, VW / 2, VH / 2 - 10);
+    ctx.fillStyle = failed ? '#e94560' : '#f7e0a3';
+    ctx.fillText(msg, VW / 2, VH / 2 - 34);
+    ctx.font = 'bold 14px "Courier New", monospace';
+    ctx.fillStyle = '#ffd166';
+    ctx.fillText(solo
+      ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
+      : 'WAGER · 10 CREDITS ENTRY EACH · WINNER TAKES THE 20 POT', VW / 2, VH / 2 - 4);
     ctx.font = '13px "Courier New", monospace';
     ctx.fillStyle = '#ffffff88';
-    ctx.fillText(net?.status === 'error'
-      ? 'is the match server running?  npm run server  ·  ESC: back'
+    ctx.fillText(failed
+      ? (solo ? 'ENTER: FREE PRACTICE (no fee · no XP · no records)  ·  ESC: back'
+        : 'is the match server running?  npm run server  ·  ESC: back')
       : 'humans and agents share this queue  ·  ESC: cancel', VW / 2, VH / 2 + 24);
     if (net?.setup && !netInstalled) installOnlineMatch();
-    if (pressedThisFrame.has('Escape')) {
+    if (failed && solo && pressedThisFrame.has('Enter')) {
+      // Server unreachable → the old local match, explicitly reward-free.
+      practiceFree = true;
+      net?.close();
+      net = null;
+      const en = allRosters.map((r, i) => (r.disabled ? -1 : i)).filter((i) => i >= 0);
+      picks[1] = en[(seed * 13 + uiTick) % en.length] ?? picks[0];
+      startFight();
+    } else if (pressedThisFrame.has('Escape')) {
       net?.close();
       net = null;
       screen = 'select';
@@ -645,18 +727,8 @@ const frame = (): void => {
       void audio.playStinger('hurry_up', { duck: false }); // layers over the stage loop, like the arcade original
     }
     if (game.phase === Phase.MatchOver) {
-      if (cpuAi && !xpBanner) {
-        const award = awardXp(profile, {
-          won: game.winner === 0,
-          damageDealt: statDmg,
-          bestCombo: statBestCombo,
-        });
-        xpBanner = {
-          gained: award.gained, levelsUp: award.levelsUp,
-          level: profile.level, xp: profile.xp, xpNeed: xpForNext(profile.level),
-          wins: profile.wins, losses: profile.losses,
-        };
-      }
+      // Progression is SERVER-AWARDED (M5): ranked/wager XP + credits arrive
+      // in the post-result xp message. Free practice pays nothing by design.
       // Stale fight-screen state (a lingering "K.O." banner, a frozen combo
       // counter) must not bleed into the results screen's own layout.
       fx.announce = '';
@@ -679,7 +751,15 @@ const frame = (): void => {
         gained: net.xp.gained, levelsUp: net.xp.levelsUp,
         level: net.xp.level, xp: net.xp.xp, xpNeed: xpForNext(net.xp.level),
         wins: net.xp.wins, losses: net.xp.losses,
+        creditsDelta: net.xp.creditsDelta, credits: net.xp.credits,
       };
+      // Keep the title-screen chip in sync without a refetch.
+      if (account) {
+        account = {
+          ...account, credits: net.xp.credits, level: net.xp.level,
+          xp: net.xp.xp, wins: net.xp.wins, losses: net.xp.losses,
+        };
+      }
     }
     renderFight(game);
     drawResults(ctx, game, fighters!, uiTick, resultsAge, xpBanner);
@@ -689,9 +769,11 @@ const frame = (): void => {
       ctx.textAlign = 'center';
       if (net.result) {
         const ok = net.result.reason === 'verified';
+        const pot = net.setup?.mode === 'wager' && (net.setup.fee ?? 0) > 0
+          ? ` · POT ${(net.setup.fee ?? 0) * 2} CR` : '';
         ctx.fillStyle = ok ? '#7ee85a' : '#ffd166';
         ctx.fillText(
-          ok ? `✓ SERVER-VERIFIED RESULT · ${net.result.rounds[0]}-${net.result.rounds[1]}`
+          ok ? `✓ SERVER-VERIFIED RESULT · ${net.result.rounds[0]}-${net.result.rounds[1]}${pot}`
             : `RESULT: ${net.result.reason.toUpperCase()}`,
           VW / 2, VH - 44);
       } else {
@@ -750,6 +832,7 @@ Object.assign(globalThis, {
   afRelease: (code: string) => { keys.delete(code); },
   afMode: (m?: Mode) => { if (m) mode = m; return mode; },
   afProfile: () => ({ ...profile, lever }),
+  afAccount: () => (account ? { ...account, fetch: accountFetch } : { fetch: accountFetch }),
   afSetLever: (v: number) => { lever = Math.max(-10, Math.min(10, v | 0)); saveLever(lever); },
   afNet: () => (net ? {
     status: net.status, error: net.error, setup: net.setup, result: net.result,

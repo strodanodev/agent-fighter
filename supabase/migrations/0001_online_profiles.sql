@@ -49,8 +49,9 @@ create table if not exists matches (
 create index if not exists matches_p0_idx on matches (p0, created_at desc);
 create index if not exists matches_p1_idx on matches (p1, created_at desc);
 
--- Public leaderboard (Phase C UI reads this as-is).
-create or replace view leaderboard as
+-- Public leaderboard (Phase C UI reads this as-is). security_invoker: the
+-- view enforces the QUERIER's RLS, not the creator's (Supabase linter 0010).
+create or replace view leaderboard with (security_invoker = true) as
   select id, name, is_agent, level, xp, wins, losses,
          rank() over (order by level desc, xp desc, wins desc) as rank
   from profiles
@@ -67,7 +68,8 @@ drop policy if exists "public read matches" on matches;
 create policy "public read matches" on matches for select using (true);
 
 create or replace function xp_for_next(lvl integer) returns integer
-language sql immutable as $$ select 80 + lvl * 45 $$;
+language sql immutable set search_path = public
+as $$ select 80 + lvl * 45 $$;
 
 -- Record a verified match and award XP/W-L — atomically, once.
 -- Returns one row per AUTHENTICATED side with the post-award profile

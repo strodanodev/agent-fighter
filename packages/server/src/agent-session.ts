@@ -47,6 +47,8 @@ export interface AgentOptions {
    * the server pairs this agent with the waiting human (loopback-only).
    */
   soloFor?: string;
+  /** Queue mode — 'wager' (default, PvP pot) or 'solo' (vs the house). */
+  mode?: 'wager' | 'solo';
 }
 
 export interface AgentResult {
@@ -69,6 +71,13 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
     let ai: AiState | null = null;
     let side: 0 | 1 = 0;
     let delay = 3;
+    // This match's loaded characters, re-pinned into the ENGINE-GLOBAL slots
+    // before every sim burst: concurrent in-process sessions (house bots,
+    // tests, the server's own verifier) share those globals, and two matches
+    // with different character pairs would silently corrupt each other's
+    // lockstep sims without this.
+    let myChars: [ReturnType<typeof loadCharacter>, ReturnType<typeof loadCharacter>] | null = null;
+    const pinChars = (): void => { if (myChars) setCharacters(myChars[0], myChars[1]); };
 
     const myInputs: number[] = [];
     const oppInputs: (number | undefined)[] = [];
@@ -115,6 +124,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
         t: 'queue',
         character: opts.character,
         bundleHash: bundleOf(opts.character).versionHash,
+        mode: opts.mode ?? 'wager',
         ...(opts.soloFor ? { soloFor: opts.soloFor } : {}),
       });
     });
@@ -128,10 +138,11 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
           setup = msg;
           side = msg.side;
           delay = msg.delay;
-          setCharacters(
+          myChars = [
             loadCharacter(bundleOf(msg.chars[0].id)),
             loadCharacter(bundleOf(msg.chars[1].id)),
-          );
+          ];
+          pinChars();
           game = createGameState(msg.seed);
           ai = createAi(side, opts.skill, opts.aiSeed ?? msg.seed ^ (side + 1) * 0x9e37);
           // First `delay` ticks are neutral by convention (symmetric).
@@ -148,6 +159,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
           const paceMs = opts.paceMs ?? 16;
           const burst = paceMs <= 2 ? 64 : 1;
           pacer = setInterval(() => {
+            pinChars();
             for (let b = 0; b < burst && sendTick - simTick < delay + 8; b++) emitOne();
             advance();
           }, paceMs);
@@ -155,6 +167,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
         }
         case 'i': {
           oppInputs[msg.k] = msg.v;
+          pinChars();
           return advance();
         }
         case 'result': {
