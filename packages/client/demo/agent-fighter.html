@@ -3054,7 +3054,7 @@ Object.assign(globalThis, {
  * (the classic GGPO throttle) rather than drift.
  */
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 2;
+const NET_PROTOCOL = 3;
 const MAX_AHEAD = 10;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -3080,10 +3080,10 @@ class NetSession {
     resimFrom = -1;
     overSent = false;
     nextHashTick = 0; // last CONFIRMED checkpoint reported to the server
-    constructor(url, name, character, bundleHash, authToken, mode = 'wager') {
+    constructor(url, name, character, bundleHash, authToken, mode = 'wager', email) {
         this.ws = new WebSocket(url);
         this.ws.onopen = () => {
-            this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION, auth: authToken });
+            this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION, auth: authToken, email });
             this.send({ t: 'queue', character, bundleHash, mode });
             this.status = 'queued';
         };
@@ -3250,6 +3250,120 @@ class NetSession {
         if (this.game.phase === 3 /* Phase.MatchOver */ && !this.overSent) {
             this.overSent = true;
             this.send({ t: 'over', k: this.localTick });
+        }
+        return true;
+    }
+}
+// ---------------------------------------------------------- local-sim solo
+/**
+ * Ranked solo, protocol v3: ZERO-LATENCY local simulation. The server pins a
+ * deterministic house AI (skill, aiSeed) in the match setup; this session
+ * steps the ENTIRE match locally — your pad against aiPoll — exactly like
+ * offline play (no input delay, no prediction, no stalls), and streams only
+ * your per-tick inputs. Settlement stays trustless: the verifier re-derives
+ * the same AI from the same seed, so a client that simulated any other
+ * opponent fails the re-sim. Wall-clock pacing is checked server-side
+ * (SOLO_PACE_*) — slow-motion or fast-forward tampering refunds as
+ * incomplete instead of settling.
+ *
+ * Public surface mirrors NetSession — main.ts uses them interchangeably.
+ */
+class SoloSession {
+    status = 'connecting';
+    error = '';
+    setup = null;
+    result = null;
+    account = null;
+    xp = null;
+    game = null;
+    stalled = 0; // never stalls — kept for the shared interface
+    ws;
+    houseAi = null;
+    tick = 0;
+    overSent = false;
+    constructor(url, name, character, bundleHash, authToken, email) {
+        this.ws = new WebSocket(url);
+        this.ws.onopen = () => {
+            this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION, auth: authToken, email });
+            this.send({ t: 'queue', character, bundleHash, mode: 'solo' });
+            this.status = 'queued';
+        };
+        this.ws.onerror = () => {
+            if (this.status !== 'done') {
+                this.status = 'error';
+                this.error = 'connection failed';
+            }
+        };
+        this.ws.onclose = () => {
+            if (this.status !== 'done' && this.status !== 'error') {
+                this.status = 'error';
+                this.error = 'connection lost';
+            }
+        };
+        this.ws.onmessage = (ev) => {
+            const msg = JSON.parse(String(ev.data));
+            switch (msg.t) {
+                case 'error':
+                    this.status = 'error';
+                    this.error = String(msg.msg ?? 'server error');
+                    return;
+                case 'account':
+                    this.account = msg;
+                    return;
+                case 'match':
+                    this.setup = msg;
+                    return;
+                case 'result':
+                    this.result = msg;
+                    this.status = 'done';
+                    return;
+                case 'xp':
+                    this.xp = msg;
+                    return;
+                default:
+            }
+        };
+    }
+    get side() { return 0; } // solo player is always side 0
+    close() {
+        try {
+            this.ws.close();
+        }
+        catch { /* already closed */ }
+    }
+    send(msg) {
+        if (this.ws.readyState === WebSocket.OPEN)
+            this.ws.send(JSON.stringify(msg));
+    }
+    /** Call after installing characters for the pinned setup. */
+    begin() {
+        const s = this.setup;
+        this.game = createGameState(s.seed);
+        this.houseAi = createAi(1, s.solo.skill, s.solo.aiSeed);
+        this.status = 'playing';
+    }
+    /** Advance one tick — pure local sim; always succeeds while playing. */
+    frame(pad) {
+        if (!this.game || !this.houseAi || this.status !== 'playing')
+            return false;
+        const g = this.game;
+        if (g.phase === 3 /* Phase.MatchOver */) {
+            if (!this.overSent) {
+                this.overSent = true;
+                this.send({ t: 'over', k: this.tick });
+            }
+            return false;
+        }
+        this.send({ t: 'i', k: this.tick, v: pad });
+        const opp = aiPoll(this.houseAi, g); // aiPoll BEFORE step — verifier ordering
+        step(g, [pad, opp]);
+        this.tick++;
+        if (this.tick % HASH_EVERY === 0)
+            this.send({ t: 'h', k: this.tick, x: stateHash(g) });
+        // step() mutates phase — TS's narrowing from the guard above is stale.
+        if (g.phase === 3 /* Phase.MatchOver */ && !this.overSent) {
+            this.overSent = true;
+            this.send({ t: 'over', k: this.tick });
         }
         return true;
     }
@@ -4277,6 +4391,23 @@ const ZOOM_MAX = 1.9;
 /** Fighters must be framed below the HUD and above the bottom edge. */
 const CONTENT_TOP = 132;
 const CONTENT_BOT = VH - 12;
+let tapRegions = [];
+const resetTaps = () => { tapRegions = []; };
+/** Register a tappable rect (canvas space). Cheap — just a push. */
+const tapZone = (x, y, w, h, action) => {
+    tapRegions.push({ x, y, w, h, action });
+};
+/** Topmost region containing the point, or null. Later draws win overlaps. */
+const tapHit = (vx, vy) => {
+    for (let i = tapRegions.length - 1; i >= 0; i--) {
+        const r = tapRegions[i];
+        if (vx >= r.x && vx < r.x + r.w && vy >= r.y && vy < r.y + r.h)
+            return r.action;
+    }
+    return null;
+};
+/** Debug/test hook: what's currently tappable. */
+const tapRegionList = () => tapRegions.slice();
 const worldTransform = (ctx, cam) => {
     ctx.scale(cam.zoom, cam.zoom);
     ctx.translate(-cam.x, -cam.y);
@@ -4909,34 +5040,85 @@ const drawTitle = (ctx, rosters, tick, menu) => {
     // behind it (by design): the key art / video backdrop shows through, and
     // display()/label() already carry their own outline+glow for contrast.
     const barH = 178, barY = VH - barH;
-    // 2-player local is disabled (single-controller / mobile focus) — omitted here.
-    const rows = [
-        ['cpu', `VS AGENT  ·  LV ${menu.cpuLevel}`],
-        ['online', 'ONLINE  ·  HUMANS & AGENTS'],
-    ];
     const menuY0 = barY + 30;
-    rows.forEach(([m, txt], k) => {
-        const y = menuY0 + k * 34;
-        const on = menu.mode === m;
-        if (on) {
-            const pulse = 1 + 0.035 * Math.sin(tick / 10);
-            display(ctx, txt, cx, y, 24, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
-            // A small bouncing arrow marker to the left, arcade-menu style.
-            const bounce = 3 * Math.sin(tick / 9);
-            label(ctx, '▶', cx - 148 + bounce, y, 18, GOLD_LT);
+    if (menu.gate) {
+        // M5: signing in is REQUIRED — the AIR account is the wallet the whole
+        // credits economy settles into, so there is nothing to enter as a ghost.
+        const pulse = 1 + 0.04 * Math.sin(tick / 9);
+        if (menu.authBusy) {
+            display(ctx, 'SIGNING IN…', cx, menuY0 + 18, 26, { glow: 'rgba(143,184,255,0.55)' });
+            label(ctx, 'complete the AIR dialog to continue', cx, menuY0 + 48, 13, '#ffffffaa');
         }
         else {
-            label(ctx, txt, cx, y, 17, '#ffffff70');
+            display(ctx, 'SIGN IN TO ENTER', cx, menuY0 + 18, 28, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+            label(ctx, 'TAP / PRESS  L  ·  AIR ACCOUNT (GOOGLE / EMAIL / WALLET)', cx, menuY0 + 48, 14, '#ffd166');
+            label(ctx, '10 FREE CREDITS EVERY DAY YOU LOG IN   ·   R: RANKINGS', cx, menuY0 + 70, 12, '#ffffff88');
+            // The gate is mandatory and phones have no `L` key — the sign-in
+            // headline itself has to be tappable or mobile can never get in.
+            tapZone(cx - 260, menuY0 - 4, 520, 60, 'signin');
+            tapZone(cx - 260, menuY0 + 60, 520, 22, 'ranks');
         }
-    });
-    label(ctx, '↑ / ↓  SELECT       ENTER  START', cx, menuY0 + rows.length * 34 + 6, 13, '#ffffffaa');
-    // AIR account chip (top-right): identity when signed in, the key hint when
-    // out. Signing in is optional — it unlocks persistent XP + the leaderboard.
-    const chip = menu.authBusy ? 'SIGNING IN…'
-        : menu.authLabel ? `◆ ${menu.authLabel}   ·   L: SIGN OUT`
-            : 'L: SIGN IN  ·  SAVE XP & RANK';
-    label(ctx, chip, VW - 16, 22, 12, menu.authLabel ? '#8fe8a0' : '#ffffff88', 'right');
-    label(ctx, 'MILESTONE 4 · AI + LEVELING BUILD', cx, VH - 12, 10, '#ffffff55');
+        if (menu.authError)
+            label(ctx, `⚠ ${menu.authError.slice(0, 64)}`, cx, menuY0 + 92, 12, '#ff9d9d');
+    }
+    else {
+        // 2-player local is disabled (single-controller / mobile focus) — omitted.
+        const rows = [
+            ['cpu', 'VS AGENT  ·  RANKED  ·  1 CREDIT'],
+            ['online', 'ONLINE WAGER  ·  10 CREDITS  ·  WINNER TAKES POT'],
+        ];
+        rows.forEach(([m, txt], k) => {
+            const y = menuY0 + k * 34;
+            const on = menu.mode === m;
+            tapZone(cx - 260, y - 17, 520, 34, `mode:${m}`);
+            if (on) {
+                const pulse = 1 + 0.035 * Math.sin(tick / 10);
+                display(ctx, txt, cx, y, 22, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+                // A small bouncing arrow marker to the left, arcade-menu style.
+                const bounce = 3 * Math.sin(tick / 9);
+                label(ctx, '▶', cx - 236 + bounce, y, 18, GOLD_LT);
+            }
+            else {
+                label(ctx, txt, cx, y, 16, '#ffffff70');
+            }
+        });
+        const hintY = menuY0 + rows.length * 34 + 6;
+        // Quick match (P0): ENTER launches with the remembered fighter — the
+        // select screen is the C detour, not a toll booth on every match.
+        if (menu.fighter) {
+            label(ctx, `FIGHTING AS  ${menu.fighter.toUpperCase()}   ·   C  CHANGE FIGHTER`, cx, hintY, 12, '#8fd0ff');
+        }
+        label(ctx, 'TAP / ENTER  QUICK MATCH       R  RANKINGS       L  SIGN OUT', cx, hintY + 18, 13, '#ffffffaa');
+        // Split the hint line into two halves so RANKINGS and SIGN OUT are each
+        // reachable by touch (no keyboard on a phone).
+        tapZone(cx - 20, hintY + 7, 150, 22, 'ranks');
+        tapZone(cx + 130, hintY + 7, 150, 22, 'signin');
+        // The fighter line is the touch path to the select screen.
+        if (menu.fighter)
+            tapZone(cx - 260, hintY - 11, 520, 20, 'changefighter');
+    }
+    // Account/wallet block — upper LEFT, minimal text (M5 spec).
+    if (menu.authLabel) {
+        label(ctx, `◆ ${menu.authLabel}`, 16, 22, 13, '#8fe8a0', 'left');
+        if (menu.address) {
+            label(ctx, `${menu.address.slice(0, 6)}…${menu.address.slice(-4)}`, 16, 40, 11, '#ffffff77', 'left');
+        }
+        const acctY = menu.address ? 58 : 40;
+        if (menu.account) {
+            const a = menu.account;
+            label(ctx, `⛁ ${a.credits} CR   ·   LV ${a.level}   ·   ${a.wins}W ${a.losses}L`, 16, acctY, 12, '#ffd166', 'left');
+        }
+        else {
+            label(ctx, 'SERVER OFFLINE · CREDITS UNAVAILABLE', 16, acctY, 11, '#ff9d9d', 'left');
+        }
+    }
+    // Daily login bonus toast — under the account block, gold, hard to miss.
+    if (menu.dailyToast) {
+        const flash = tick % 30 < 22;
+        if (flash)
+            label(ctx, `+${10} DAILY LOGIN CREDITS`, 16, menu.address ? 80 : 62, 14, '#ffe9a3', 'left');
+    }
+    label(ctx, 'MILESTONE 5 · CREDITS BUILD', cx, VH - 12, 10, '#ffffff55');
 };
 /**
  * Peak single-hit damage the character can deal (normals, specials, super,
@@ -5234,6 +5416,10 @@ const drawSelect = (ctx, rosters, cursors, locked, tick, cpuInfo) => {
     rosters.forEach((r, k) => {
         const x = gx + (k % cols) * (cell + gap);
         const y = gy + Math.floor(k / cols) * (cell + gap + 20);
+        // Tap the portrait to move the cursor here; tap the selected one again to
+        // confirm (main.ts). Disabled fighters register nothing — untappable.
+        if (!r.disabled)
+            tapZone(x - 2, y - 2, cell + 4, cell + 24, `pick:${k}`);
         bevel(ctx, x - 2, y - 2, cell + 4, cell + 4, PANEL, GOLD, GOLD_DK, 2);
         drawPortrait(ctx, r, x, y, cell, cell);
         if (r.disabled) {
@@ -5322,6 +5508,7 @@ const drawStageSelect = (ctx, stageIds, cursor, tick) => {
         const x = gx + k * (cell + gap);
         const y = gy;
         const on = k === cursor;
+        tapZone(x - 3, y - 3, cell + 6, cellH + 6, `stage:${k}`);
         bevel(ctx, x - 3, y - 3, cell + 6, cellH + 6, PANEL, on ? GOLD : GOLD_DK, GOLD_DK, on ? 3 : 2);
         ctx.fillStyle = PANEL_LT;
         ctx.fillRect(x, y, cell, cellH);
@@ -5336,10 +5523,11 @@ const drawStageSelect = (ctx, stageIds, cursor, tick) => {
             ctx.restore();
         }
     });
-    label(ctx, '◄ / ►  CHOOSE STAGE      ENTER  FIGHT      ESC  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
+    label(ctx, 'TAP / ◄ ►  CHOOSE STAGE      ENTER  FIGHT      ESC  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
+    tapZone(24, VH - 44, 150, 36, 'back');
 };
 const drawResults = (ctx, g, rosters, tick, age, // ticks since the results screen appeared — drives the pop-in
-xp) => {
+xp, hint) => {
     ctx.fillStyle = '#0a0616bb';
     ctx.fillRect(0, 0, VW, VH);
     const pop = easeOutBack(clamp01(age / 16));
@@ -5368,7 +5556,16 @@ xp) => {
                 display(ctx, `LEVEL UP!  LV ${xp.level}`, VW / 2, y, 26, { glow: 'rgba(255,209,102,0.6)' });
             y += 32;
         }
-        display(ctx, `+${xp.gained} XP`, VW / 2, y, 22, { from: '#d9ffcf', mid: '#7ee85a', to: '#2f7a1f', outline: '#0e2a08' });
+        const xpTxt = `${xp.gained >= 0 ? '+' : ''}${xp.gained} XP`;
+        display(ctx, xpTxt, VW / 2, y, 22, xp.gained >= 0
+            ? { from: '#d9ffcf', mid: '#7ee85a', to: '#2f7a1f', outline: '#0e2a08' }
+            : { from: '#ffd7d7', mid: '#ff6b6b', to: '#8a1f1f', outline: '#2a0808' });
+        if (xp.creditsDelta !== undefined) {
+            const cd = xp.creditsDelta;
+            const cTxt = `${cd >= 0 ? '+' : '−'}${Math.abs(cd)} CREDIT${Math.abs(cd) === 1 ? '' : 'S'}   ·   BALANCE ${xp.credits ?? '?'}`;
+            label(ctx, cTxt, VW / 2, y + 22, 15, cd >= 0 ? '#ffd166' : '#ff9d9d');
+            y += 24;
+        }
         y += 16;
         const barW = 300, barH = 8;
         const bx = VW / 2 - barW / 2;
@@ -5383,7 +5580,135 @@ xp) => {
         ctx.restore();
     }
     if (tick % 60 < 42) {
-        label(ctx, 'ENTER: REMATCH    ESC: CHARACTER SELECT', VW / 2, VH - 26, 15, '#ffffffcc');
+        label(ctx, hint ?? 'TAP / ENTER: REMATCH        ESC: CHARACTER SELECT', VW / 2, VH - 26, 15, '#ffffffcc');
+    }
+    // Rematch fills the screen; the smaller "back" strip sits on the left.
+    tapZone(0, 0, VW, VH, 'start');
+    tapZone(0, VH - 48, 240, 48, 'back');
+};
+const RANK_TABS = ['ALL', 'HUMANS', 'AGENTS'];
+/**
+ * Public standings screen (M5): humans and agents ranked together, with tab
+ * filters — the "one game, two kinds of players" pitch made visible.
+ * `you` highlights the signed-in player's own row (matched upstream).
+ */
+const drawRanks = (ctx, rows, // null = still loading
+tab, error, tick, you) => {
+    drawMenuBackdrop(ctx);
+    ctx.fillStyle = '#0a0616cc';
+    ctx.fillRect(0, 0, VW, VH);
+    display(ctx, 'LEADERBOARD', VW / 2, 64, 40, { glow: 'rgba(255,209,102,0.5)' });
+    // Tabs — ◄ ► cycles, arcade style.
+    const tabY = 104;
+    RANK_TABS.forEach((t, i) => {
+        const x = VW / 2 + (i - 1) * 170;
+        tapZone(x - 80, tabY - 16, 160, 32, `ranktab:${i}`);
+        if (i === tab) {
+            const pulse = 1 + 0.04 * Math.sin(tick / 10);
+            display(ctx, t, x, tabY, 18, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+        }
+        else {
+            label(ctx, t, x, tabY, 14, '#ffffff66');
+        }
+    });
+    const boxX = VW / 2 - 380, boxW = 760, boxY = 126, boxH = 356;
+    bevel(ctx, boxX, boxY, boxW, boxH, PANEL, GOLD, GOLD_DK, 3);
+    // Column layout (x offsets inside the box).
+    const cols = { rank: 40, name: 90, kind: 380, lv: 490, xp: 560, wl: 680 };
+    label(ctx, '#', boxX + cols.rank, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'FIGHTER', boxX + cols.name + 60, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'TYPE', boxX + cols.kind + 24, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'LV', boxX + cols.lv, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'XP', boxX + cols.xp + 16, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'W — L', boxX + cols.wl, boxY + 28, 12, GOLD_LT);
+    ctx.fillStyle = '#ffffff22';
+    ctx.fillRect(boxX + 16, boxY + 38, boxW - 32, 1);
+    if (error) {
+        label(ctx, `⚠ ${error}`, VW / 2, boxY + boxH / 2, 15, '#ff9d9d');
+        label(ctx, 'is the match server running?  npm run server', VW / 2, boxY + boxH / 2 + 26, 12, '#ffffff77');
+    }
+    else if (!rows) {
+        const dots = '.'.repeat(1 + (Math.trunc(tick / 20) % 3));
+        label(ctx, `FETCHING STANDINGS${dots}`, VW / 2, boxY + boxH / 2, 15, '#f7e0a3');
+    }
+    else {
+        const filtered = rows.filter((r) => tab === 0 || (tab === 1 ? !r.is_agent : r.is_agent));
+        if (filtered.length === 0) {
+            label(ctx, 'NO RANKED FIGHTERS YET — WIN A MATCH TO CLAIM #1', VW / 2, boxY + boxH / 2, 14, '#ffffff88');
+        }
+        filtered.slice(0, 10).forEach((r, i) => {
+            const y = boxY + 62 + i * 30;
+            const isYou = !!you && r.name === you;
+            if (isYou) {
+                ctx.fillStyle = '#ffd16622';
+                ctx.fillRect(boxX + 12, y - 18, boxW - 24, 26);
+            }
+            const medal = r.rank === 1 ? '#ffd166' : r.rank === 2 ? '#cfd8e3' : r.rank === 3 ? '#d9915b' : '#ffffffbb';
+            label(ctx, String(r.rank), boxX + cols.rank, y, 15, medal);
+            label(ctx, r.name.slice(0, 22).toUpperCase() + (isYou ? '  (YOU)' : ''), boxX + cols.name, y, 15, isYou ? GOLD_LT : '#ffffffdd', 'left');
+            label(ctx, r.is_agent ? '🤖 AGENT' : 'HUMAN', boxX + cols.kind, y, 12, r.is_agent ? '#8fd0ff' : '#8fe8a0', 'left');
+            label(ctx, String(r.level), boxX + cols.lv, y, 15, '#ffffffdd');
+            label(ctx, String(r.xp), boxX + cols.xp + 16, y, 13, '#ffffff99');
+            label(ctx, `${r.wins} — ${r.losses}`, boxX + cols.wl, y, 14, '#ffffffdd');
+        });
+    }
+    label(ctx, 'TAP  TAB       R  REFRESH       ESC / TAP HERE  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
+    tapZone(24, VH - 44, 170, 36, 'back');
+};
+const drawWallet = (ctx, w, delta) => {
+    if (!w)
+        return;
+    label(ctx, `⛁ ${w.credits} CR   ·   LV ${w.level}   ·   ${w.wins}W ${w.losses}L`, 16, 22, 12, '#ffd166', 'left');
+    if (delta && delta.age < 120 && delta.amt !== 0) {
+        const t = delta.age / 120;
+        ctx.save();
+        ctx.globalAlpha = 1 - t * t;
+        const up = delta.age * 0.22;
+        label(ctx, `${delta.amt > 0 ? '+' : '−'}${Math.abs(delta.amt)} CR`, 16, 42 - up, 15, delta.amt > 0 ? '#7ee85a' : '#ff6b6b', 'left');
+        ctx.restore();
+    }
+};
+// ---------------------------------------------------------------- VS card
+/**
+ * Pre-fight stakes card (P0): 2½ seconds of "this is what's on the line" —
+ * portraits, names, and the exact credit/XP terms of the match. Doubles as
+ * the fight's establishing beat (the 'vs' stinger already plays under it).
+ * Pure overlay: the caller decides whether the sim runs beneath it.
+ */
+const drawVsCard = (ctx, rosters, names, stakes, // 1-3 short lines, most important first
+age) => {
+    const inT = easeOutBack(clamp01(age / 14));
+    ctx.fillStyle = `rgba(6,4,12,${0.9 * clamp01(age / 8)})`;
+    ctx.fillRect(0, 0, VW, VH);
+    // Portraits slide in from their edges, facing each other — kept tight to
+    // the sides so the stakes text in the middle stays clear.
+    const slide = (1 - inT) * 220;
+    [0, 1].forEach((i) => {
+        const img = rosters[i].portrait;
+        if (!img)
+            return;
+        ctx.save();
+        ctx.translate(i === 0 ? 185 - slide : VW - 185 + slide, VH - 55);
+        ctx.scale(i === 0 ? 1.9 : -1.9, 1.9);
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(img, -96, -176);
+        ctx.restore();
+        // Nameplate under each fighter.
+        const nx = i === 0 ? 185 : VW - 185;
+        label(ctx, names[i].toUpperCase().slice(0, 20), nx, VH - 38, 15, i === 0 ? '#8fe8a0' : '#ff9d9d');
+    });
+    ctx.save();
+    ctx.translate(VW / 2, 150);
+    ctx.scale(inT, inT);
+    ctx.translate(-VW / 2, -150);
+    display(ctx, 'VS', VW / 2, 165, 92, { glow: 'rgba(255,209,102,0.6)' });
+    ctx.restore();
+    // The terms — gold, dead center, unmissable.
+    stakes.forEach((s, k) => {
+        label(ctx, s, VW / 2, 235 + k * 26, k === 0 ? 17 : 13, k === 0 ? GOLD_LT : '#ffffff99');
+    });
+    if (age > 40 && age % 50 < 36) {
+        label(ctx, 'ANY KEY — FIGHT', VW / 2, VH - 16, 12, '#ffffff77');
     }
 };
 
@@ -5465,16 +5790,21 @@ const initPwa = () => {
     }
     if (isStandalone())
         return; // already installed — nothing to offer
-    let seen = false;
-    try {
-        seen = localStorage.getItem(SEEN_KEY) === '1';
-    }
-    catch { /* private mode */ }
+    // Read the flag live rather than caching it: dismissing writes it, and
+    // Chromium may re-fire beforeinstallprompt within the same page session.
+    const seen = () => {
+        try {
+            return localStorage.getItem(SEEN_KEY) === '1';
+        }
+        catch {
+            return false; /* private mode */
+        }
+    };
     let deferred = null;
     addEventListener('beforeinstallprompt', (e) => {
         e.preventDefault(); // suppress the mini-infobar; we drive our own
         deferred = e;
-        if (!seen)
+        if (!seen())
             showBanner('install', () => { void deferred?.prompt(); deferred = null; });
     });
     addEventListener('appinstalled', () => {
@@ -5486,8 +5816,8 @@ const initPwa = () => {
     });
     // iOS never fires beforeinstallprompt → show the manual hint shortly after
     // landing (once), giving the page a moment to settle first.
-    if (isIos() && !seen)
-        setTimeout(() => { if (!isStandalone())
+    if (isIos() && !seen())
+        setTimeout(() => { if (!isStandalone() && !seen())
             showBanner('ios'); }, 2500);
 };
 
@@ -5506,6 +5836,16 @@ const initPwa = () => {
  * Multi-touch is fully supported (throws = LP+LK, super = 2 punches, etc.) via
  * global pointer tracking keyed by pointerId.
  */
+/**
+ * Set by initTouchControls once the overlay exists. Kept as a module-level
+ * hook so main.ts can push the current screen from inside its own game frame
+ * (see setTouchScreen) rather than the overlay running a second rAF loop of
+ * its own — one clock, no extra wakeups on a phone, and it stays in step with
+ * what the renderer just drew.
+ */
+let applyScreen = null;
+/** Tell the touch overlay which screen is live. No-op on desktop. */
+const setTouchScreen = (screen) => { applyScreen?.(screen); };
 /** True on iOS/iPadOS/Android or any primary coarse-pointer (touch) device. */
 const isMobileDevice = () => {
     // Manual override for touchscreen laptops / QA: ?touch=1 forces on, ?touch=0 off.
@@ -5549,6 +5889,9 @@ const initTouchControls = () => {
         down.delete(code);
         window.dispatchEvent(new KeyboardEvent('keyup', { code, bubbles: true }));
     };
+    /** Drop every held key — used when the overlay hides, backgrounds, or opens a menu. */
+    const releaseAll = () => { for (const c of [...down])
+        release(c); };
     // ---- styles ------------------------------------------------------------
     const style = document.createElement('style');
     style.textContent = `
@@ -5559,36 +5902,62 @@ const initTouchControls = () => {
     #af-touch .zone{position:absolute;bottom:0;pointer-events:none}
     #af-touch button,#af-touch .pad{pointer-events:auto;touch-action:none;
       -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+    /* Frosted translucent white throughout — the controls must read clearly
+       over both the bright stage art and a dark KO screen without ever
+       becoming the thing you look at. Glass, not paint. */
     /* motion stick */
     #af-pad{position:fixed;left:max(3.5vmin,env(safe-area-inset-left));
       bottom:max(4vmin,env(safe-area-inset-bottom));
       width:34vmin;height:34vmin;max-width:210px;max-height:210px;border-radius:50%;
-      background:radial-gradient(circle at 50% 42%,#1c1730cc,#0a0616e6);
-      border:2px solid #d9a44166;box-shadow:0 6px 22px #000a,inset 0 0 18px #0008}
-    #af-pad .stick{position:absolute;left:50%;top:50%;width:42%;height:42%;
+      background:rgba(255,255,255,0.08);border:2px solid rgba(255,255,255,0.28);
+      -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);
+      box-shadow:0 4px 18px rgba(0,0,0,0.28),inset 0 0 22px rgba(255,255,255,0.06)}
+    #af-pad .stick{position:absolute;left:50%;top:50%;width:44%;height:44%;
       border-radius:50%;transform:translate(-50%,-50%);
-      background:radial-gradient(circle at 42% 38%,#ffd166,#d9a441);
-      box-shadow:0 2px 10px #000a,inset 0 -3px 6px #0006;transition:transform .04s linear}
-    #af-pad .ring{position:absolute;inset:14%;border-radius:50%;border:1px dashed #ffffff1a}
+      background:rgba(255,255,255,0.30);border:2px solid rgba(255,255,255,0.55);
+      box-shadow:0 2px 10px rgba(0,0,0,0.30);transition:transform .04s linear}
+    #af-pad .ring{position:absolute;inset:14%;border-radius:50%;border:1px dashed rgba(255,255,255,0.16)}
     /* attack cluster */
     #af-atk{position:fixed;right:max(3vmin,env(safe-area-inset-right));
       bottom:max(4vmin,env(safe-area-inset-bottom));
       display:grid;grid-template-columns:repeat(3,1fr);gap:1.6vmin}
     #af-atk button{width:13.5vmin;height:13.5vmin;max-width:88px;max-height:88px;
-      border-radius:50%;border:2px solid #ffffff26;color:#0a0616;font-weight:700;
-      font-size:4.4vmin;line-height:1;display:flex;align-items:center;justify-content:center;
-      box-shadow:0 4px 14px #0009,inset 0 -3px 6px #0004;transition:transform .05s,filter .05s}
-    #af-atk button:active,#af-atk button.on{transform:scale(.9);filter:brightness(1.25)}
-    #af-atk .p{background:radial-gradient(circle at 40% 35%,#ff6b8b,#e94560)}
-    #af-atk .k{background:radial-gradient(circle at 40% 35%,#66d9ff,#2b8fd9)}
-    /* menu utility buttons */
-    #af-util{position:fixed;top:max(2vmin,env(safe-area-inset-top));
-      right:max(3vmin,env(safe-area-inset-right));display:flex;gap:1.4vmin}
-    #af-util button{min-width:15vmin;height:8vmin;max-height:46px;padding:0 3vmin;
-      border-radius:10px;border:2px solid #d9a44166;background:#0a0616cc;color:#f7e0a3;
-      font-weight:700;font-size:3.4vmin;letter-spacing:1px}
-    #af-util button:active{filter:brightness(1.4)}
-    @media (max-width:520px){#af-atk button{font-size:5vmin}#af-util button{font-size:4vmin}}
+      border-radius:50%;border:2px solid rgba(255,255,255,0.34);
+      background:rgba(255,255,255,0.12);color:rgba(255,255,255,0.92);
+      -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);
+      font-weight:700;font-size:4.4vmin;line-height:1;letter-spacing:0.5px;
+      text-shadow:0 1px 3px rgba(0,0,0,0.55);
+      display:flex;align-items:center;justify-content:center;
+      box-shadow:0 3px 12px rgba(0,0,0,0.30);transition:transform .05s,background .05s}
+    #af-atk button:active,#af-atk button.on{transform:scale(.9);
+      background:rgba(255,255,255,0.42);border-color:rgba(255,255,255,0.85)}
+    /* Punch row reads slightly brighter than kicks — a hairline of hierarchy
+       without reintroducing colour. */
+    #af-atk .p{background:rgba(255,255,255,0.17)}
+    #af-atk .k{background:rgba(255,255,255,0.10)}
+    /* in-match menu button (upper LEFT) + its popup */
+    #af-pause{position:fixed;top:max(2vmin,env(safe-area-inset-top));
+      left:max(2vmin,env(safe-area-inset-left));
+      min-width:11vmin;height:7.5vmin;max-height:44px;padding:0 2.4vmin;border-radius:10px;
+      border:2px solid rgba(255,255,255,0.30);background:rgba(255,255,255,0.12);
+      -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);
+      color:rgba(255,255,255,0.92);font-weight:700;font-size:3.2vmin;letter-spacing:1px;
+      text-shadow:0 1px 3px rgba(0,0,0,0.55)}
+    #af-pause:active{background:rgba(255,255,255,0.34)}
+    #af-menu{position:fixed;inset:0;z-index:60;display:flex;align-items:center;
+      justify-content:center;background:rgba(7,5,13,0.62);
+      -webkit-backdrop-filter:blur(5px);backdrop-filter:blur(5px);pointer-events:auto}
+    #af-menu.hidden{display:none}
+    #af-menu .card{display:flex;flex-direction:column;gap:2vmin;padding:4vmin 5vmin;
+      border-radius:16px;border:2px solid rgba(255,255,255,0.26);
+      background:rgba(255,255,255,0.10);text-align:center}
+    #af-menu h2{margin:0 0 1vmin;color:rgba(255,255,255,0.95);font-size:4vmin;letter-spacing:2px}
+    #af-menu button{min-width:44vmin;padding:2.4vmin 4vmin;border-radius:12px;
+      border:2px solid rgba(255,255,255,0.34);background:rgba(255,255,255,0.14);
+      color:rgba(255,255,255,0.95);font-family:inherit;font-weight:700;font-size:3.4vmin;
+      letter-spacing:1px}
+    #af-menu button:active{background:rgba(255,255,255,0.4)}
+    @media (max-width:520px){#af-atk button{font-size:5vmin}#af-pause{font-size:4vmin}}
   `;
     document.head.appendChild(style);
     // ---- DOM ---------------------------------------------------------------
@@ -5604,13 +5973,19 @@ const initTouchControls = () => {
       <button class="k" data-code="${K.mk}">MK</button>
       <button class="k" data-code="${K.hk}">HK</button>
     </div>
-    <div id="af-util">
-      <button data-code="${K.back}">BACK</button>
-      <button data-code="${K.start}">START</button>
+    <button id="af-pause" aria-label="match menu">❚❚ MENU</button>
+    <div id="af-menu" class="hidden">
+      <div class="card">
+        <h2>MATCH MENU</h2>
+        <button class="resume">RESUME</button>
+        <button class="quit">QUIT MATCH</button>
+      </div>
     </div>`;
     document.body.appendChild(root);
     const pad = root.querySelector('#af-pad');
     const stick = pad.querySelector('.stick');
+    const menu = root.querySelector('#af-menu');
+    const pauseBtn = root.querySelector('#af-pause');
     const pointers = new Map();
     const padDirs = new Set();
     const clearPad = () => {
@@ -5619,6 +5994,36 @@ const initTouchControls = () => {
         padDirs.clear();
         stick.style.transform = 'translate(-50%,-50%)';
     };
+    // ---- match menu --------------------------------------------------------
+    // NOTE: this does NOT freeze the simulation. Matches are server-verified
+    // (ADR 0003) and a local pause would desync the running match, so this is
+    // an overlay menu, not a true pause — the fight continues underneath it.
+    const setMenu = (open) => {
+        menu.classList.toggle('hidden', !open);
+        if (open) {
+            clearPad();
+            pointers.clear();
+            releaseAll();
+        } // never strand a held key behind the menu
+    };
+    pauseBtn.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setMenu(true);
+    });
+    menu.querySelector('.resume').addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setMenu(false);
+    });
+    menu.querySelector('.quit').addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setMenu(false);
+        // Escape is already what the fight screen treats as "leave the match".
+        press(K.back);
+        release(K.back);
+    });
     const updatePad = (clientX, clientY) => {
         const r = pad.getBoundingClientRect();
         const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
@@ -5696,28 +6101,33 @@ const initTouchControls = () => {
     // Kill iOS long-press callout / context menu / double-tap zoom on the pad.
     root.addEventListener('contextmenu', (e) => e.preventDefault());
     root.addEventListener('dblclick', (e) => e.preventDefault());
-    // ---- visibility: hide during the loading + online-lobby screens --------
-    const af = globalThis;
-    const sync = () => {
-        const screen = af.afScreen?.() ?? 'loading';
-        const show = screen !== 'loading' && screen !== 'online';
-        root.classList.toggle('hidden', !show);
-        if (!show && (padDirs.size || pointers.size)) {
+    // ---- visibility: the arcade controls belong to the MATCH only ----------
+    // Everywhere else (title, fighter/stage select, leaderboard, results) the
+    // canvas UI is directly tappable — see ui.ts tapZone / main.ts tapAt — so a
+    // stick and six buttons would just be clutter over the art.
+    // Edge-triggered off the screen main.ts pushes each frame — no per-frame DOM
+    // writes, and leaving a match always drops any key still held down.
+    let wasFight = false;
+    applyScreen = (screen) => {
+        const fighting = screen === 'fight';
+        if (fighting === wasFight)
+            return;
+        wasFight = fighting;
+        root.classList.toggle('hidden', !fighting);
+        if (!fighting) {
             clearPad();
             pointers.clear();
-            for (const c of [...down])
-                release(c);
+            releaseAll();
+            setMenu(false);
         }
-        requestAnimationFrame(sync);
     };
-    requestAnimationFrame(sync);
+    root.classList.add('hidden'); // boots on the title screen — nothing to show yet
     // Release everything if the app is backgrounded mid-hold (avoids stuck keys).
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) {
             clearPad();
             pointers.clear();
-            for (const c of [...down])
-                release(c);
+            releaseAll();
         }
     });
 };
@@ -5775,10 +6185,119 @@ const pollPad = (map) => {
             f |= bit;
     return f;
 };
+/**
+ * Menu taps. The draw functions register their tappable rects every frame
+ * (ui.ts tapZone), so a pointer press just hit-tests the CURRENT layout and
+ * queues a semantic action ('mode:cpu', 'pick:3'). Screen handlers drain this
+ * exactly like `pressedThisFrame`, and it's cleared at the end of each frame.
+ *
+ * Mouse and touch both land here, so clicking menus works on desktop too.
+ */
+const taps = new Set();
+const tapAt = (clientX, clientY) => {
+    const r = canvas.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0)
+        return;
+    // CSS-scaled + letterboxed canvas → virtual 960×540 space.
+    const vx = ((clientX - r.left) / r.width) * VW;
+    const vy = ((clientY - r.top) / r.height) * VH;
+    if (vx < 0 || vy < 0 || vx > VW || vy > VH)
+        return;
+    const action = tapHit(vx, vy);
+    if (action)
+        taps.add(action);
+};
 let screen = 'loading';
 let mode = 'cpu';
 let net = null;
 let netInstalled = false;
+// ---- M5 credits: the AIR sign-in gate + the server-side account.
+// ?dev=NAME bypasses the gate against a DEV-economy match server (in-memory
+// persistence, name-keyed identities) — for development only; a production
+// server (real Supabase) ignores dev names and demands a verified AIR token.
+const DEV_GUEST = new URLSearchParams(location.search).get('dev');
+let account = null;
+let accountFetch = 'idle';
+let accountToastAge = -1; // ≥0 → the "+10 DAILY CREDITS" toast is animating
+let queuedMode = 'wager';
+let practiceFree = false; // offline-fallback match: no fee, no XP, no records
+// ---- P0 loop redesign: quick play, VS card, wallet strip.
+// The remembered fighter makes the title's ENTER a one-input path to a match.
+const LAST_FIGHTER_KEY = 'af-last-fighter';
+let lastFighter = localStorage.getItem(LAST_FIGHTER_KEY) ?? '';
+/** Ticks the pre-fight stakes card has been showing (-1 = off). */
+let vsCardAge = -1;
+const VS_CARD_TICKS = 150; // ~2.5s; any key skips
+let vsStakes = [];
+// Wallet strip delta: animate credits the moment the balance visibly moves.
+let walletShown = null;
+let walletDelta = null;
+const drawWalletStrip = () => {
+    if (!account)
+        return;
+    walletShown ??= account.credits;
+    if (account.credits !== walletShown) {
+        walletDelta = { amt: account.credits - walletShown, age: 0 };
+        walletShown = account.credits;
+    }
+    if (walletDelta && ++walletDelta.age > 130)
+        walletDelta = null;
+    drawWallet(ctx, account, walletDelta);
+};
+/** Match-server endpoints (?ws= overrides for deploys/dev). */
+const matchWsUrl = () => new URLSearchParams(location.search).get('ws') ?? `ws://${location.hostname}:8477`;
+const matchHttpUrl = () => matchWsUrl().replace(/^ws/, 'http');
+// Public standings (drawRanks) — fetched from the match server on entry.
+let ranksRows = null;
+let ranksTab = 0;
+let ranksErr = '';
+let ranksBusy = false;
+const fetchRanks = () => {
+    if (ranksBusy)
+        return;
+    ranksBusy = true;
+    ranksRows = null;
+    ranksErr = '';
+    void fetch(`${matchHttpUrl()}/leaderboard?limit=100`)
+        .then(async (res) => {
+        if (!res.ok)
+            throw new Error(`server said ${res.status}`);
+        ranksRows = (await res.json());
+    })
+        .catch((e) => { ranksErr = e.message || 'unreachable'; })
+        .finally(() => { ranksBusy = false; });
+};
+/**
+ * Pull the account snapshot from the match server (also claims the daily
+ * +10 login bonus — first authenticated contact of the day wins it).
+ */
+const fetchAccount = async () => {
+    accountFetch = 'busy';
+    try {
+        const headers = {};
+        const token = await authToken();
+        if (token)
+            headers.Authorization = `Bearer ${token}`;
+        else if (DEV_GUEST)
+            headers['X-Dev-Name'] = DEV_GUEST;
+        else {
+            accountFetch = 'idle';
+            return;
+        }
+        const res = await fetch(`${matchHttpUrl()}/me`, { headers });
+        if (!res.ok) {
+            accountFetch = 'fail';
+            return;
+        }
+        account = (await res.json());
+        if (account.dailyGranted)
+            accountToastAge = 0;
+        accountFetch = 'done';
+    }
+    catch {
+        accountFetch = 'fail'; // server offline — title shows it, local play still fine
+    }
+};
 let uiTick = 0;
 let allRosters = [];
 let picks = [0, 0];
@@ -5817,6 +6336,13 @@ let prevMeter = [0, 0]; // to spot which fighter spent meter
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 const px = (v) => Math.trunc(v / 256);
+// Menus are tappable/clickable: hit-test the layout the last frame drew.
+// The in-match arcade overlay (touch.ts) sits above this and swallows its own
+// presses, so a fight's controls never leak through as menu taps.
+canvas.addEventListener('pointerdown', (e) => {
+    audio.unlock(); // same first-gesture unlock the keydown path does
+    tapAt(e.clientX, e.clientY);
+});
 // ---------------------------------------------------------------- boot
 const boot = async () => {
     try {
@@ -5841,7 +6367,11 @@ const boot = async () => {
         picks = [0, Math.min(1, allRosters.length - 1)];
         screen = 'title';
         audio.preload();
-        void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1.5 });
+        // Landing / share deep-links: ?screen=title|select|ranks|play &mode=cpu|online &char=<id>
+        applyBootDeepLink();
+        if (screen === 'title') {
+            void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1.5 });
+        }
         // Restore a previous AIR session silently (30-day sessions) — never blocks
         // boot, and offline play works identically if it fails or is skipped.
         void authRehydrate();
@@ -5849,6 +6379,58 @@ const boot = async () => {
     catch (e) {
         loadError = e.message;
     }
+};
+/**
+ * Apply one-shot entry from the URL so the marketing site can open the real
+ * in-game screens (select / play / leaderboards) without a path router.
+ */
+const applyBootDeepLink = () => {
+    let q;
+    try {
+        q = new URLSearchParams(location.search);
+    }
+    catch {
+        return;
+    }
+    const screenQ = (q.get('screen') ?? '').toLowerCase();
+    const modeQ = (q.get('mode') ?? '').toLowerCase();
+    const charQ = q.get('char');
+    if (modeQ === 'cpu' || modeQ === 'online' || modeQ === '2p') {
+        mode = modeQ;
+    }
+    const pickChar = () => {
+        if (!charQ)
+            return;
+        const idx = allRosters.findIndex((r) => r.id === charQ && !r.disabled);
+        if (idx >= 0)
+            picks = [idx, idx];
+    };
+    const enterSelectFromLink = () => {
+        screen = 'select';
+        locked = [false, false];
+        const fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+        picks = [fe, fe];
+        pickChar();
+        void audio.playBgm('player_select', { fadeInSec: 0.5 });
+    };
+    if (screenQ === 'ranks' || screenQ === 'leaderboard' || screenQ === 'leaderboards') {
+        screen = 'ranks';
+        fetchRanks();
+        return;
+    }
+    if (screenQ === 'select' || screenQ === 'character' || screenQ === 'characters') {
+        enterSelectFromLink();
+        return;
+    }
+    if (screenQ === 'play') {
+        // "Play now" → fighter select with VS AGENT (cpu) unless mode= was set.
+        if (modeQ !== 'online' && modeQ !== '2p')
+            mode = 'cpu';
+        enterSelectFromLink();
+        return;
+    }
+    // Title (default): still honor ?char= so a shared fighter opens ready to pick.
+    pickChar();
 };
 /** Reset per-match juice/announce state (shared by local + online starts). */
 const resetMatchFx = (g) => {
@@ -5868,21 +6450,31 @@ const resetMatchFx = (g) => {
     hurryPlayed = false;
     resetFighterTrails();
 };
-/** Queue for an online match (ADR 0003): connect, pin bundle hash, wait. */
-const startOnline = () => {
+/**
+ * Queue for a server match (ADR 0003 + M5 credits).
+ * 'wager' = PvP, 10-credit entrance each, winner takes the pot.
+ * 'solo'  = ranked vs the HOUSE agent at your level, 1 credit.
+ */
+const startOnline = (m) => {
     const roster = allRosters[picks[0]];
-    // ?ws=ws://host:port overrides the default match server (deploys, dev).
-    const url = new URLSearchParams(location.search).get('ws')
-        ?? `ws://${location.hostname}:8477`;
+    lastFighter = roster.id;
+    localStorage.setItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
+    queuedMode = m;
+    practiceFree = false;
     netInstalled = false;
     screen = 'online';
-    // Signed in → play under the AIR identity (fresh token; the server verifies
-    // it against the JWKS and persists XP/W-L). Anonymous stays fully playable.
-    const name = authName() ?? `PLAYER-${(profile.wins + profile.losses) % 1000}`;
+    // Play under the AIR identity (fresh token; the server verifies it against
+    // the JWKS and settles credits/XP). ?dev=NAME plays a dev-economy account.
+    const name = authName() ?? DEV_GUEST ?? `PLAYER-${(profile.wins + profile.losses) % 1000}`;
     void authToken().then((token) => {
         if (screen !== 'online' || net)
             return; // player backed out while fetching
-        net = new NetSession(url, name, roster.id, roster.bundle.versionHash, token);
+        const email = auth.email || undefined; // AIR write-back target (ADR 0004)
+        // Solo (v3): pure LOCAL simulation of the pinned house AI — zero added
+        // latency; the server re-derives the AI to verify. Wager: rollback PvP.
+        net = m === 'solo'
+            ? new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email)
+            : new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email);
     });
 };
 /** Match setup arrived — install the pinned characters/stage and begin. */
@@ -5909,6 +6501,11 @@ const installOnlineMatch = () => {
     resetMatchFx(game);
     netInstalled = true;
     screen = 'fight';
+    // Stakes card (P0): what this match costs and pays, up front.
+    vsCardAge = 0;
+    vsStakes = s.mode === 'solo'
+        ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP', 'RANKED · SERVER-VERIFIED']
+        : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
     void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
 const startFight = () => {
@@ -5924,6 +6521,10 @@ const startFight = () => {
     net = null;
     resetMatchFx(game);
     screen = 'fight';
+    vsCardAge = 0;
+    vsStakes = mode === '2p'
+        ? ['LOCAL VERSUS', '']
+        : ['FREE PRACTICE      NO FEE · NO XP · NO RECORDS', ''];
     void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
 /**
@@ -6197,6 +6798,21 @@ const tickSelect = () => {
         move(0, -1);
     if (pressedThisFrame.has('KeyD'))
         move(0, 1);
+    // Touch: tapping a portrait moves the cursor onto it so its stats can be
+    // read; tapping the one already under the cursor commits. Two light taps
+    // beat one blind commit — you get to look before you lock.
+    let tapConfirm = false;
+    for (let k = 0; k < n; k++) {
+        if (!taps.has(`pick:${k}`))
+            continue;
+        if (!enabled(k) || locked[0])
+            break;
+        if (picks[0] === k)
+            tapConfirm = true; // second tap on the same fighter
+        else
+            picks[0] = k;
+        break;
+    }
     // The CPU difficulty lever: [ and ] on the select screen (CPU mode).
     if (mode === 'cpu') {
         if (pressedThisFrame.has('BracketLeft')) {
@@ -6215,12 +6831,14 @@ const tickSelect = () => {
             move(1, 1);
     }
     // A disabled fighter under the cursor cannot be confirmed.
-    if (enabled(picks[0]) && CONFIRM[0].some((k) => pressedThisFrame.has(k)))
+    if (enabled(picks[0]) && (tapConfirm || CONFIRM[0].some((k) => pressedThisFrame.has(k))))
         locked[0] = true;
-    if (mode === 'online') {
-        // Online: your pick is the queue ticket — opponent comes from matchmaking.
+    if (mode === 'online' || mode === 'cpu') {
+        // Server modes (M5): your pick is the queue ticket. Wager matchmakes a
+        // PvP opponent; ranked VS AGENT gets a house bot at your level — the
+        // server picks its character (and charges the entrance fee).
         if (locked[0])
-            startOnline();
+            startOnline(mode === 'cpu' ? 'solo' : 'wager');
         return;
     }
     if (mode === '2p') {
@@ -6256,16 +6874,35 @@ const tickStageSelect = () => {
         move(-1);
     if (pressedThisFrame.has('KeyD') || pressedThisFrame.has('ArrowRight'))
         move(1);
-    if (pressedThisFrame.has('Escape')) {
+    // Same look-then-commit rule as the fighter grid: tap to preview the stage
+    // (the backdrop swaps), tap the highlighted one again to fight.
+    let tapStart = false;
+    for (let k = 0; k < n; k++) {
+        if (!taps.has(`stage:${k}`))
+            continue;
+        if (stageCursor === k)
+            tapStart = true;
+        else {
+            stageCursor = k;
+            setStageAsset(stageAssets[k] ?? null);
+        }
+        break;
+    }
+    if (pressedThisFrame.has('Escape') || taps.has('back')) {
         screen = 'select';
         locked = [false, false];
+        return;
     }
-    if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space'))
+    if (tapStart || pressedThisFrame.has('Enter') || pressedThisFrame.has('Space'))
         startFight();
 };
 const frame = () => {
     uiTick++;
     updateFx(); // advance cosmetic particles/rings every frame (fight AND results)
+    // Tap targets are rebuilt by this frame's draw calls. Clearing here (rather
+    // than after) means a press landing between frames still hit-tests the
+    // layout the player can actually see.
+    resetTaps();
     if (screen === 'loading') {
         ctx.fillStyle = '#0a0616';
         ctx.fillRect(0, 0, VW, VH);
@@ -6280,17 +6917,81 @@ const frame = () => {
         }
     }
     else if (screen === 'title') {
+        // M5: the AIR account IS the wallet the credits settle into — signing in
+        // is required to proceed (?dev=NAME bypasses against a dev server).
+        const signedIn = auth.status === 'in' || !!DEV_GUEST;
+        if (signedIn && accountFetch === 'idle')
+            void fetchAccount();
+        if (!signedIn && account) {
+            account = null;
+            accountFetch = 'idle';
+        } // signed out
+        if (accountToastAge >= 0 && ++accountToastAge > 300)
+            accountToastAge = -1;
         drawTitle(ctx, allRosters, uiTick, {
             mode, cpuLevel: cpuLevelFor(profile, lever),
-            authLabel: authName(), authBusy: auth.status === 'busy',
+            authLabel: authName() ?? (DEV_GUEST ? `DEV·${DEV_GUEST.toUpperCase()}` : null),
+            authBusy: auth.status === 'busy',
+            authError: auth.status === 'error' ? auth.error : undefined,
+            gate: !signedIn,
+            address: auth.address || undefined,
+            account: accountFetch === 'done' && account
+                ? { credits: account.credits, level: account.level, wins: account.wins, losses: account.losses }
+                : null,
+            dailyToast: accountToastAge >= 0,
+            fighter: (allRosters.find((r) => r.id === lastFighter && !r.disabled)
+                ?? allRosters.find((r) => !r.disabled))?.bundle.name,
         });
         // 2-player local is disabled on all platforms (single-controller / mobile
         // focus). The '2p' Mode value + its handling stay in the codebase, just no
         // longer offered on the menu.
         const MODES = ['cpu', 'online'];
-        if (pressedThisFrame.has('KeyL')) {
+        /** Leave the title for the fighter select (C — "change fighter"). */
+        const enterSelect = () => {
+            screen = 'select';
+            locked = [false, false];
+            // Cursor starts on the REMEMBERED fighter so select is one confirm away.
+            let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
+            if (fe < 0)
+                fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+            picks = [fe, fe];
+            void audio.playBgm('player_select', { fadeInSec: 0.5 });
+        };
+        /**
+         * QUICK MATCH (P0): title → queue in ONE input, with the remembered
+         * fighter. The select screen becomes an opt-in detour (C), not a toll.
+         */
+        const quickPlay = () => {
+            let idx = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
+            if (idx < 0)
+                idx = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+            picks[0] = idx;
+            startOnline(mode === 'cpu' ? 'solo' : 'wager');
+        };
+        // A tapped mode row picks the mode AND launches — one tap to a match.
+        const tappedMode = MODES.find((m) => taps.has(`mode:${m}`));
+        if (pressedThisFrame.has('KeyL') || taps.has('signin')) {
             // AIR sign-in/out toggle — must not fall through to "any key starts".
-            void (auth.status === 'in' ? authLogout() : authLogin());
+            if (auth.status === 'in') {
+                void authLogout();
+                account = null;
+                accountFetch = 'idle';
+            }
+            else {
+                void authLogin();
+            }
+        }
+        else if (pressedThisFrame.has('KeyR') || taps.has('ranks')) {
+            // Standings are public — viewable even from the sign-in gate.
+            screen = 'ranks';
+            fetchRanks();
+        }
+        else if (!signedIn) {
+            // Gated: every other key/tap waits for the sign-in.
+        }
+        else if (tappedMode) {
+            mode = tappedMode;
+            quickPlay();
         }
         else if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')) {
             mode = MODES[(MODES.indexOf(mode) + MODES.length - 1) % MODES.length];
@@ -6298,18 +6999,33 @@ const frame = () => {
         else if (pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
             mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length];
         }
-        else if (pressedThisFrame.size > 0) {
-            screen = 'select';
-            locked = [false, false];
-            // Start both cursors on the first selectable (non-disabled) fighter.
-            const fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
-            picks = [fe, fe];
-            void audio.playBgm('player_select', { fadeInSec: 0.5 });
+        else if (pressedThisFrame.has('KeyC') || taps.has('changefighter')) {
+            enterSelect();
         }
+        else if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('start')) {
+            quickPlay();
+        }
+    }
+    else if (screen === 'ranks') {
+        drawRanks(ctx, ranksRows, ranksTab, ranksErr, uiTick, authName() ?? (DEV_GUEST ?? undefined));
+        if (pressedThisFrame.has('ArrowLeft') || pressedThisFrame.has('KeyA')) {
+            ranksTab = (ranksTab + RANK_TABS.length - 1) % RANK_TABS.length;
+        }
+        if (pressedThisFrame.has('ArrowRight') || pressedThisFrame.has('KeyD')) {
+            ranksTab = (ranksTab + 1) % RANK_TABS.length;
+        }
+        for (let i = 0; i < RANK_TABS.length; i++)
+            if (taps.has(`ranktab:${i}`))
+                ranksTab = i;
+        if (pressedThisFrame.has('KeyR'))
+            fetchRanks();
+        if (pressedThisFrame.has('Escape') || taps.has('back'))
+            screen = 'title';
     }
     else if (screen === 'select') {
         tickSelect();
         drawSelect(ctx, allRosters, picks, locked, uiTick, mode === 'cpu' ? { cpuLevel: cpuLevelFor(profile, lever), lever } : undefined);
+        drawWalletStrip();
     }
     else if (screen === 'stageSelect') {
         tickStageSelect();
@@ -6320,23 +7036,41 @@ const frame = () => {
         ctx.fillStyle = '#0a0616';
         ctx.fillRect(0, 0, VW, VH);
         const dots = '.'.repeat(1 + (Math.trunc(uiTick / 20) % 3));
+        const solo = queuedMode === 'solo';
+        const failed = net?.status === 'error';
         const msg = !net ? `CONNECTING${dots}` // token fetch in flight
-            : net.status === 'error' ? `OFFLINE: ${net.error}`
+            : failed ? `OFFLINE: ${net.error}`
                 : net.setup ? 'OPPONENT FOUND — STARTING'
-                    : net.status === 'queued' ? `SEARCHING FOR OPPONENT${dots}`
+                    : net.status === 'queued' ? (solo ? `CALLING THE HOUSE AGENT${dots}` : `SEARCHING FOR OPPONENT${dots}`)
                         : `CONNECTING${dots}`;
         ctx.font = 'bold 22px "Courier New", monospace';
         ctx.textAlign = 'center';
-        ctx.fillStyle = net?.status === 'error' ? '#e94560' : '#f7e0a3';
-        ctx.fillText(msg, VW / 2, VH / 2 - 10);
+        ctx.fillStyle = failed ? '#e94560' : '#f7e0a3';
+        ctx.fillText(msg, VW / 2, VH / 2 - 34);
+        ctx.font = 'bold 14px "Courier New", monospace';
+        ctx.fillStyle = '#ffd166';
+        ctx.fillText(solo
+            ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
+            : 'WAGER · 10 CREDITS ENTRY EACH · WINNER TAKES THE 20 POT', VW / 2, VH / 2 - 4);
         ctx.font = '13px "Courier New", monospace';
         ctx.fillStyle = '#ffffff88';
-        ctx.fillText(net?.status === 'error'
-            ? 'is the match server running?  npm run server  ·  ESC: back'
+        ctx.fillText(failed
+            ? (solo ? 'ENTER: FREE PRACTICE (no fee · no XP · no records)  ·  ESC: back'
+                : 'is the match server running?  npm run server  ·  ESC: back')
             : 'humans and agents share this queue  ·  ESC: cancel', VW / 2, VH / 2 + 24);
+        drawWalletStrip();
         if (net?.setup && !netInstalled)
             installOnlineMatch();
-        if (pressedThisFrame.has('Escape')) {
+        if (failed && solo && pressedThisFrame.has('Enter')) {
+            // Server unreachable → the old local match, explicitly reward-free.
+            practiceFree = true;
+            net?.close();
+            net = null;
+            const en = allRosters.map((r, i) => (r.disabled ? -1 : i)).filter((i) => i >= 0);
+            picks[1] = en[(seed * 13 + uiTick) % en.length] ?? picks[0];
+            startFight();
+        }
+        else if (pressedThisFrame.has('Escape')) {
             net?.close();
             net = null;
             screen = 'select';
@@ -6353,38 +7087,43 @@ const frame = () => {
             locked = [false, false];
             void audio.playBgm('player_select', { fadeInSec: 0.5 });
         }
-        if (net) {
-            net.frame(pollPad(P0_MAP)); // rollback session owns stepping
+        // Stakes card: shown for the first ~2.5s; any key skips. Solo and local
+        // matches HOLD the sim under it (nothing is waiting on us); wager keeps
+        // stepping — the peer's card runs on the same clock and rollback absorbs
+        // the difference if one side skips early.
+        const cardUp = vsCardAge >= 0 && vsCardAge < VS_CARD_TICKS;
+        if (cardUp && pressedThisFrame.size > 0 && vsCardAge > 20)
+            vsCardAge = VS_CARD_TICKS;
+        const holdSim = cardUp && net?.setup?.mode !== 'wager';
+        if (net && !holdSim) {
+            net.frame(pollPad(P0_MAP)); // session owns stepping (rollback or local-sim)
             if (net.status === 'error' && !net.result) {
                 // Connection died mid-match: back out gracefully.
                 fx.announce = 'CONNECTION LOST';
                 fx.announceAge = 0;
             }
         }
-        else {
+        else if (!net && !holdSim) {
             const p2 = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
             step(game, [pollPad(P0_MAP), p2]);
         }
         updateJuice(game);
         updateCamera(game);
         renderFight(game);
+        if (cardUp && fighters) {
+            drawVsCard(ctx, fighters, net?.setup ? net.setup.names : [fighters[0].bundle.name, cpuAi ? `AGENT LV ${cpuLevelFor(profile, lever)}` : fighters[1].bundle.name], vsStakes.filter((s) => s), vsCardAge);
+            vsCardAge++;
+        }
+        else if (vsCardAge >= 0) {
+            vsCardAge = -1;
+        }
         if (game.phase === 1 /* Phase.Fighting */ && !hurryPlayed && game.timerTicks <= HURRY_UP_TICKS) {
             hurryPlayed = true;
             void audio.playStinger('hurry_up', { duck: false }); // layers over the stage loop, like the arcade original
         }
         if (game.phase === 3 /* Phase.MatchOver */) {
-            if (cpuAi && !xpBanner) {
-                const award = awardXp(profile, {
-                    won: game.winner === 0,
-                    damageDealt: statDmg,
-                    bestCombo: statBestCombo,
-                });
-                xpBanner = {
-                    gained: award.gained, levelsUp: award.levelsUp,
-                    level: profile.level, xp: profile.xp, xpNeed: xpForNext(profile.level),
-                    wins: profile.wins, losses: profile.losses,
-                };
-            }
+            // Progression is SERVER-AWARDED (M5): ranked/wager XP + credits arrive
+            // in the post-result xp message. Free practice pays nothing by design.
             // Stale fight-screen state (a lingering "K.O." banner, a frozen combo
             // counter) must not bleed into the results screen's own layout.
             fx.announce = '';
@@ -6408,18 +7147,30 @@ const frame = () => {
                 gained: net.xp.gained, levelsUp: net.xp.levelsUp,
                 level: net.xp.level, xp: net.xp.xp, xpNeed: xpForNext(net.xp.level),
                 wins: net.xp.wins, losses: net.xp.losses,
+                creditsDelta: net.xp.creditsDelta, credits: net.xp.credits,
             };
+            // Keep the title-screen chip in sync without a refetch.
+            if (account) {
+                account = {
+                    ...account, credits: net.xp.credits, level: net.xp.level,
+                    xp: net.xp.xp, wins: net.xp.wins, losses: net.xp.losses,
+                };
+            }
         }
         renderFight(game);
-        drawResults(ctx, game, fighters, uiTick, resultsAge, xpBanner);
+        drawResults(ctx, game, fighters, uiTick, resultsAge, xpBanner, net
+            ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : '10 CR'}        ESC: CHANGE FIGHTER`
+            : undefined);
         // Online: the server's verdict is the real result (ADR 0003).
         if (net) {
             ctx.font = 'bold 15px "Courier New", monospace';
             ctx.textAlign = 'center';
             if (net.result) {
                 const ok = net.result.reason === 'verified';
+                const pot = net.setup?.mode === 'wager' && (net.setup.fee ?? 0) > 0
+                    ? ` · POT ${(net.setup.fee ?? 0) * 2} CR` : '';
                 ctx.fillStyle = ok ? '#7ee85a' : '#ffd166';
-                ctx.fillText(ok ? `✓ SERVER-VERIFIED RESULT · ${net.result.rounds[0]}-${net.result.rounds[1]}`
+                ctx.fillText(ok ? `✓ SERVER-VERIFIED RESULT · ${net.result.rounds[0]}-${net.result.rounds[1]}${pot}`
                     : `RESULT: ${net.result.reason.toUpperCase()}`, VW / 2, VH - 44);
             }
             else {
@@ -6427,40 +7178,77 @@ const frame = () => {
                 ctx.fillText('VERIFYING WITH SERVER…', VW / 2, VH - 44);
             }
         }
-        if (pressedThisFrame.has('Enter')) {
-            if (net) {
-                net.close();
-                net = null;
-                screen = 'select';
-                locked = [false, false];
-            }
-            else
-                startFight();
-        }
-        if (pressedThisFrame.has('Escape')) {
+        drawWalletStrip();
+        // 'back' overlaps the full-screen 'start' region, so check it first.
+        if (pressedThisFrame.has('Escape') || taps.has('back')) {
             net?.close();
             net = null;
             screen = 'select';
             locked = [false, false];
             void audio.playBgm('player_select', { fadeInSec: 0.5 });
         }
+        else if (pressedThisFrame.has('Enter') || taps.has('start')) {
+            // INSTANT REMATCH (P0): one input → straight back into the queue with
+            // the same fighter and mode. No select detour, no re-confirm.
+            if (net) {
+                const again = queuedMode;
+                net.close();
+                net = null;
+                startOnline(again);
+            }
+            else {
+                startFight();
+            }
+        }
     }
+    // The arcade overlay belongs to the match only — push the screen this frame
+    // ended on, so it appears/disappears in lockstep with what was just drawn.
+    setTouchScreen(screen);
     pressedThisFrame.clear();
+    taps.clear();
 };
 // ---------------------------------------------------------------- loop
 let last = performance.now();
 let acc = 0;
+// Perf overlay (F): live FPS (rAF cadence), frame cost (sim+render ms), and
+// the netcode stall counter — the triage tool for "the game feels slow":
+// low FPS = this machine/browser; high ms/f = our renderer; stalls = network.
+let perfShow = false;
+let perfFps = 60;
+let perfMs = 0;
+addEventListener('keydown', (e) => { if (e.code === 'KeyF')
+    perfShow = !perfShow; });
+const drawPerf = () => {
+    const stalled = net ? net.stalled : 0;
+    const txt = `${perfFps.toFixed(0)} FPS  ·  ${perfMs.toFixed(1)} ms/f${net ? `  ·  stall ${stalled}` : ''}`;
+    ctx.save();
+    ctx.font = 'bold 11px "Courier New", monospace';
+    ctx.textAlign = 'right';
+    const w = ctx.measureText(txt).width + 14;
+    ctx.fillStyle = '#000000aa';
+    ctx.fillRect(VW - w - 6, VH - 40, w, 18);
+    ctx.fillStyle = perfFps > 55 ? '#7ee85a' : perfFps > 40 ? '#ffd166' : '#ff6b6b';
+    ctx.fillText(txt, VW - 13, VH - 27);
+    ctx.restore();
+};
 const loop = (now) => {
-    acc = Math.min(acc + (now - last), 200); // tab-switch guard
+    const rafDt = now - last;
+    acc = Math.min(acc + rafDt, 200); // tab-switch guard
     last = now;
+    perfFps += ((1000 / Math.max(1, rafDt)) - perfFps) * 0.05; // EMA
     let ran = false;
+    const t0 = performance.now();
     while (acc >= TICK_MS) {
         frame();
         acc -= TICK_MS;
         ran = true;
     }
+    if (ran)
+        perfMs += (performance.now() - t0 - perfMs) * 0.1; // EMA
     if (!ran && screen === 'loading')
         frame(); // keep the loading screen painted
+    if (perfShow)
+        drawPerf();
     requestAnimationFrame(loop);
 };
 void boot();
@@ -6483,6 +7271,7 @@ Object.assign(globalThis, {
     afMode: (m) => { if (m)
         mode = m; return mode; },
     afProfile: () => ({ ...profile, lever }),
+    afAccount: () => (account ? { ...account, fetch: accountFetch } : { fetch: accountFetch }),
     afSetLever: (v) => { lever = Math.max(-10, Math.min(10, v | 0)); saveLever(lever); },
     afNet: () => (net ? {
         status: net.status, error: net.error, setup: net.setup, result: net.result,

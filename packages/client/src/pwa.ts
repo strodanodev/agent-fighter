@@ -78,14 +78,17 @@ export const initPwa = (): void => {
   }
 
   if (isStandalone()) return; // already installed — nothing to offer
-  let seen = false;
-  try { seen = localStorage.getItem(SEEN_KEY) === '1'; } catch { /* private mode */ }
+  // Read the flag live rather than caching it: dismissing writes it, and
+  // Chromium may re-fire beforeinstallprompt within the same page session.
+  const seen = (): boolean => {
+    try { return localStorage.getItem(SEEN_KEY) === '1'; } catch { return false; /* private mode */ }
+  };
 
   let deferred: BipEvent | null = null;
   addEventListener('beforeinstallprompt', (e) => {
     e.preventDefault();            // suppress the mini-infobar; we drive our own
     deferred = e as BipEvent;
-    if (!seen) showBanner('install', () => { void deferred?.prompt(); deferred = null; });
+    if (!seen()) showBanner('install', () => { void deferred?.prompt(); deferred = null; });
   });
 
   addEventListener('appinstalled', () => {
@@ -95,5 +98,5 @@ export const initPwa = (): void => {
 
   // iOS never fires beforeinstallprompt → show the manual hint shortly after
   // landing (once), giving the page a moment to settle first.
-  if (isIos() && !seen) setTimeout(() => { if (!isStandalone()) showBanner('ios'); }, 2500);
+  if (isIos() && !seen()) setTimeout(() => { if (!isStandalone() && !seen()) showBanner('ios'); }, 2500);
 };
