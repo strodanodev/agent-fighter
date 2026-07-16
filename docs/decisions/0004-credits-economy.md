@@ -54,14 +54,33 @@ usually NULL and `NULL = s` is NULL in SQL — it silently poisoned every
 settlement boolean until coalesced. The TS mirror couldn't catch it;
 smoke-test SQL on the real database, always.
 
-## AIR reputation write-back (not built yet)
+## AIR reputation write-back (built — activates on dashboard config)
 
-XP/credit attestation on AIR (issueCredential) needs partner-JWT signing —
-a keypair whose public JWKS must be hosted at a public HTTPS URL and
-registered in the AIR dashboard ("JWKS URL" field), plus a credential
-schema in their Verifier console. Supabase is the system of record until
-that lands; the hook is `record_match`'s award rows, which contain
-everything a credential would attest.
+After every settled ranked/wager match, the server re-issues an
+"Agent Fighter Reputation" credential (level, xp, wins, losses, credits,
+is_agent, engine) to the player's AIR account via the **Issue-on-Behalf
+REST API** (`POST {AIR_API_URL}/credentials/issue-on-behalf`), authorized
+by a Partner JWT we sign (RS256, 5-min expiry, recipient's email claim)
+that AIR validates against our public JWKS.
+
+- `tools/air-keygen.mjs` → `air/partner_rs256.pem` (secret, gitignored) +
+  `air/jwks.json` (public, committed; served at `/.well-known/jwks.json`
+  by both the match server and the Vercel deploy).
+- `packages/server/src/air-issuer.ts` — JWT signer + issuance queue.
+  Fire-and-forget (attestation must never touch settlement), per-profile
+  60s cooldown with a trailing re-issue carrying the LATEST stats, and
+  `onDuplicate: 'revoke'` — the credential is a snapshot, not a stack.
+- Recipient email comes from the client hello and addresses delivery
+  ONLY (progression keys on the verified token `sub`; AIR additionally
+  asks the recipient for consent — a wrong email can't steal progression).
+  Dev-economy identities (`dev:*`) are never written to AIR.
+
+Activation checklist (dashboard, one-time): register the JWKS URL
+(Account → General Settings), create an Issuer DID + a credential schema
+matching `ReputationSubject` + an issuance program, then set
+`AIR_ISSUER_DID` and `AIR_CREDENTIAL_ID` in `.env`. Until then the server
+logs `[air] reputation write-back off` and Supabase remains the sole
+system of record.
 
 ## Knobs deliberately left open
 

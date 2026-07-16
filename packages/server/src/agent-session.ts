@@ -49,6 +49,8 @@ export interface AgentOptions {
   soloFor?: string;
   /** Queue mode — 'wager' (default, PvP pot) or 'solo' (vs the house). */
   mode?: 'wager' | 'solo';
+  /** Owner's AIR email — target for the reputation write-back (ADR 0004). */
+  email?: string;
 }
 
 export interface AgentResult {
@@ -119,7 +121,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
     };
 
     ws.on('open', () => {
-      sendMsg({ t: 'hello', v: PROTOCOL_VERSION, name: opts.name, agent: true, engine: ENGINE_VERSION, auth: opts.authToken });
+      sendMsg({ t: 'hello', v: PROTOCOL_VERSION, name: opts.name, agent: true, engine: ENGINE_VERSION, auth: opts.authToken, email: opts.email });
       sendMsg({
         t: 'queue',
         character: opts.character,

@@ -30,6 +30,8 @@ import {
 } from './persist.js';
 import type { Account, MatchMode, Persistence } from './persist.js';
 import { playOneMatch } from './agent-session.js';
+import { createAirIssuer, loadIssuerConfig } from './air-issuer.js';
+import type { AirIssuer } from './air-issuer.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(here, '..', '..', '..');
@@ -53,6 +55,8 @@ interface Client {
   /** True for the server's own in-process house bots. */
   house: boolean;
   isLoopback: boolean;
+  /** AIR-account email — only the reputation write-back target (ADR 0004). */
+  email: string;
 }
 
 interface Match {
@@ -121,12 +125,20 @@ export const createMatchServer = (opts: {
   persistence?: Persistence | null;
   /** House-bot emission cadence (ms). 16 = real-time (default); tests use 1. */
   housePaceMs?: number;
+  /** Test hook: overrides the env-configured AIR issuer (null = off). */
+  airIssuer?: AirIssuer | null;
 } = {}): Promise<MatchServer> => {
   const root = opts.root ?? REPO_ROOT;
   const charactersDir = join(root, 'characters');
   const stagesDir = join(root, 'stages');
-  loadDotEnv(root); // SUPABASE_URL / SUPABASE_SERVICE_KEY / AIR_JWKS_URL
+  loadDotEnv(root); // SUPABASE_URL / SUPABASE_SERVICE_KEY / AIR_* config
   const persistence = opts.persistence !== undefined ? opts.persistence : createPersistence();
+  // AIR reputation write-back (ADR 0004) — on only when fully configured.
+  const airCfg = opts.airIssuer === undefined ? loadIssuerConfig(root) : null;
+  const airIssuer: AirIssuer | null = opts.airIssuer !== undefined
+    ? opts.airIssuer
+    : airCfg ? createAirIssuer(airCfg) : null;
+  console.log(`[air] reputation write-back ${airIssuer ? `ON → ${airCfg?.apiUrl ?? 'custom'}` : 'off (set AIR_ISSUER_DID + AIR_CREDENTIAL_ID + key)'}`);
 
   const bundleOf = (id: string): CharacterBundle => {
     const file = join(charactersDir, id, 'character.json');
@@ -226,6 +238,16 @@ export const createMatchServer = (opts: {
             level: a.level, xp: a.xp, wins: a.wins, losses: a.losses,
             creditsDelta: a.creditsDelta, credits: a.credits,
           });
+          // AIR reputation write-back (ADR 0004): best-effort, post-award,
+          // real identities only (dev accounts have no AIR side), addressed
+          // to the player's own AIR email.
+          const rid = cl.identity?.sub;
+          if (airIssuer && rid && !rid.startsWith('dev:') && cl.email) {
+            airIssuer.queueReputation(rid, cl.email, {
+              level: a.level, xp: a.xp, wins: a.wins, losses: a.losses,
+              credits: a.credits, is_agent: cl.agent, engine: ENGINE_VERSION,
+            });
+          }
         }
       }).catch((e) => console.log(`[match ${m.id}] persist failed: ${String(e)}`));
     }
@@ -375,6 +397,9 @@ export const createMatchServer = (opts: {
         if (msg.engine !== ENGINE_VERSION) return send(c, { t: 'error', msg: `engine ${ENGINE_VERSION} required (got ${msg.engine})` });
         c.name = String(msg.name ?? 'anon').slice(0, 24) || 'anon';
         c.agent = !!msg.agent;
+        // Attestation target only — progression keys on the VERIFIED sub.
+        const email = String(msg.email ?? '').slice(0, 120);
+        c.email = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : '';
         // Identity + account resolve async — the welcome goes out immediately
         // and queueing AWAITS identityReady (fees need a verified account).
         const auth = typeof msg.auth === 'string' && msg.auth ? msg.auth : null;
@@ -523,6 +548,14 @@ export const createMatchServer = (opts: {
       res.writeHead(204, CORS);
       return res.end();
     }
+    // Public partner JWKS (tools/air-keygen.mjs) — AIR validates our Partner
+    // JWTs against this. Long cache is safe: the key basically never rotates.
+    if (path === '/.well-known/jwks.json') {
+      const f = join(root, 'air', 'jwks.json');
+      if (!existsSync(f)) return json(res, 404, { error: 'no JWKS — run: node tools/air-keygen.mjs' });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600', ...CORS });
+      return res.end(readFileSync(f));
+    }
     if (path === '/leaderboard') {
       if (!persistence) return json(res, 503, { error: 'persistence not configured' });
       void persistence.leaderboard(20)
@@ -567,6 +600,7 @@ export const createMatchServer = (opts: {
       account: null,
       house: false,
       isLoopback,
+      email: '',
     };
     clients.add(c);
     ws.on('message', (data) => onMessage(c, String(data)));

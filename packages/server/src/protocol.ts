@@ -30,6 +30,12 @@ export interface CHello {
   agent?: boolean;
   engine: string; // ENGINE_VERSION — pinned
   /**
+   * AIR-account email — the TARGET for the reputation-credential write-back
+   * (ADR 0004), nothing else. Progression keys on the verified token's sub;
+   * this only addresses where AIR delivers the attestation.
+   */
+  email?: string;
+  /**
    * AIR Kit session JWT (optional). The server verifies it against the AIR
    * JWKS and, if valid, ties this connection to the account (`sub`) for
    * persistent XP/W-L. Anonymous play stays allowed — identity only gates

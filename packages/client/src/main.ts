@@ -222,7 +222,8 @@ const startOnline = (m: 'solo' | 'wager'): void => {
   const name = authName() ?? DEV_GUEST ?? `PLAYER-${(profile.wins + profile.losses) % 1000}`;
   void authToken().then((token) => {
     if (screen !== 'online' || net) return; // player backed out while fetching
-    net = new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m);
+    net = new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m,
+      auth.email || undefined); // AIR write-back target (ADR 0004)
   });
 };
 

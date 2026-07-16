@@ -19,3 +19,4 @@ packages/client/demo/vendor/
 /sounds/
 
 .vercel
+air/partner_rs256.pem

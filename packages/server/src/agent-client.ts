@@ -25,13 +25,14 @@ const matches = Number(process.env.AF_MATCHES ?? 1);
 const paceMs = Number(process.env.AF_PACE ?? 16); // 16 = real-time; 1 = as fast as the peer allows
 const authToken = process.env.AF_TOKEN; // owner's AIR session JWT → persistent XP/W-L
 const mode = process.env.AF_MODE === 'solo' ? 'solo' as const : 'wager' as const; // wager: 10-credit pot
+const email = process.env.AF_EMAIL; // owner's AIR email → on-chain reputation write-back
 
 console.log(`${name} → ${url} as ${character} (skill ${skill}), ${matches} match(es)`);
 
 for (let n = 1; n <= matches; n++) {
   try {
     const { result, localHash } = await playOneMatch({
-      url, name, character, skill, charactersDir, aiSeed: (Date.now() % 100000) + n, paceMs, authToken, mode,
+      url, name, character, skill, charactersDir, aiSeed: (Date.now() % 100000) + n, paceMs, authToken, mode, email,
     });
     const hashOk = localHash === (result.hash >>> 0);
     console.log(`[${n}/${matches}] ${result.reason} · winner side ${result.winner} · `

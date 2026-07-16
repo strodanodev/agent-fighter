@@ -130,3 +130,16 @@ try {
 } catch {
   console.log('WARNING: @mocanetwork/airkit not installed — online sign-in disabled in this bundle');
 }
+
+// Public partner JWKS (tools/air-keygen.mjs → air/jwks.json, committed) —
+// published at /.well-known/jwks.json so the Vercel domain can be registered
+// as the JWKS URL in the AIR dashboard. Public-key material only.
+const jwksSrc = join(pkg, '..', '..', 'air', 'jwks.json');
+try {
+  const wellKnown = join(pkg, 'demo', '.well-known');
+  mkdirSync(wellKnown, { recursive: true });
+  copyFileSync(jwksSrc, join(wellKnown, 'jwks.json'));
+  console.log('jwks → demo/.well-known/jwks.json');
+} catch {
+  console.log('note: air/jwks.json absent (run node tools/air-keygen.mjs) — AIR write-back JWKS not published');
+}

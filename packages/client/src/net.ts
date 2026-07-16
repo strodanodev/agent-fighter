@@ -101,10 +101,11 @@ export class NetSession {
     bundleHash?: string,
     authToken?: string,
     mode: 'wager' | 'solo' = 'wager',
+    email?: string, // AIR-account email — reputation write-back target only
   ) {
     this.ws = new WebSocket(url);
     this.ws.onopen = () => {
-      this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION, auth: authToken });
+      this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION, auth: authToken, email });
       this.send({ t: 'queue', character, bundleHash, mode });
       this.status = 'queued';
     };
