@@ -20,7 +20,7 @@ import {
 } from '@af/core';
 import type { CharacterBundle } from '@af/core';
 import {
-  DEFAULT_PORT, FORFEIT_GRACE_MS, INPUT_DELAY, PROTOCOL_VERSION,
+  DEFAULT_PORT, FORFEIT_GRACE_MS, INPUT_DELAY, PROTOCOL_VERSION, SOLO_INPUT_DELAY,
 } from './protocol.js';
 import type { ClientMsg, SMatch, SResult, ServerMsg } from './protocol.js';
 import { verifyAirToken } from './airjwt.js';
@@ -297,7 +297,7 @@ export const createMatchServer = (opts: {
     for (const c of m.clients) {
       const setup: SMatch = {
         t: 'match', matchId: m.id, side: c.side, seed: m.seed, stage: m.stage,
-        delay: INPUT_DELAY,
+        delay: mode === 'solo' ? SOLO_INPUT_DELAY : INPUT_DELAY,
         chars: [
           { id: m.chars[0], hash: bundleOf(m.chars[0]).versionHash },
           { id: m.chars[1], hash: bundleOf(m.chars[1]).versionHash },

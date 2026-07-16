@@ -13,6 +13,15 @@ export const DEFAULT_PORT = 8477;
 /** Local-input delay (ticks) applied by both sides — symmetric by design. */
 export const INPUT_DELAY = 3;
 
+/**
+ * Ranked-solo delay: 1 tick (~17ms — imperceptible). The opponent is the
+ * server's own house bot, so the effective RTT is client↔server only and
+ * rollback absorbs the prediction misses; 3 ticks (50ms) of button lag made
+ * VS AGENT feel sluggish next to the old local mode. Wager (PvP through the
+ * relay = two legs of latency) keeps INPUT_DELAY.
+ */
+export const SOLO_INPUT_DELAY = 1;
+
 /** Client must not simulate further than this past the opponent's inputs. */
 export const MAX_AHEAD = 10;
 
