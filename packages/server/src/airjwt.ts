@@ -17,7 +17,14 @@
 import { createPublicKey, verify as cryptoVerify } from 'node:crypto';
 import type { KeyObject } from 'node:crypto';
 
-export const DEFAULT_JWKS_URL = 'https://static.air3.com/.well-known/jwks.json';
+/**
+ * AIR publishes SEPARATE signing keys per environment; a token minted by the
+ * sandbox (Moca testnet — what BUILD_ENV.SANDBOX logins produce) verifies
+ * only against the sandbox JWKS. Default to trying BOTH so a server works
+ * against either environment; AIR_JWKS_URL overrides (comma-separated).
+ */
+export const DEFAULT_JWKS_URL = 'https://static.air3.com/.well-known/jwks.json,'
+  + 'https://static.sandbox.air3.com/.well-known/jwks.json';
 
 export interface AirIdentity {
   /** AIR user UUID (`sub`) — the primary key for profiles. */
@@ -92,12 +99,20 @@ let cachedKeys: Jwk[] = [];
 let cachedAt = 0;
 let cachedUrl = '';
 
-const fetchJwks = async (url: string): Promise<Jwk[]> => {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`JWKS fetch ${res.status}`);
-  const body = (await res.json()) as { keys?: Jwk[] };
-  if (!Array.isArray(body.keys)) throw new Error('JWKS has no keys');
-  return body.keys;
+/** Fetch + merge every JWKS in a comma-separated URL list (one may be down). */
+const fetchJwks = async (urls: string): Promise<Jwk[]> => {
+  const results = await Promise.allSettled(urls.split(',').map(async (url) => {
+    const res = await fetch(url.trim());
+    if (!res.ok) throw new Error(`JWKS fetch ${res.status}`);
+    const body = (await res.json()) as { keys?: Jwk[] };
+    if (!Array.isArray(body.keys)) throw new Error('JWKS has no keys');
+    return body.keys;
+  }));
+  const keys = results.flatMap((r) => (r.status === 'fulfilled' ? r.value : []));
+  if (keys.length === 0) {
+    throw new Error(`no JWKS reachable: ${results.map((r) => (r.status === 'rejected' ? String(r.reason) : 'ok')).join(' | ')}`);
+  }
+  return keys;
 };
 
 /**
