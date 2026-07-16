@@ -1867,3 +1867,46 @@ export const drawVsCard = (
     label(ctx, 'ANY KEY — FIGHT', VW / 2, VH - 8, 12, '#ffffff77');
   }
 };
+
+// ------------------------------------------------------- connection failure
+/**
+ * Mid-match connection loss (ADR 0005). The sim is frozen behind this — say
+ * so plainly, say what it costs, and always offer the way out. Never leave a
+ * dead match rendering a live-looking frame with no exit, which reads as a
+ * crash.
+ */
+export const drawNetError = (
+  ctx: CanvasRenderingContext2D,
+  error: string,
+  mode: 'solo' | 'wager',
+  tick: number,
+): void => {
+  ctx.fillStyle = 'rgba(6,4,12,0.82)';
+  ctx.fillRect(0, 0, VW, VH);
+
+  const boxW = 620, boxH = 190;
+  const boxX = VW / 2 - boxW / 2, boxY = VH / 2 - boxH / 2;
+  bevel(ctx, boxX, boxY, boxW, boxH, PANEL, '#e94560', '#5a1220', 3);
+
+  const pulse = 1 + 0.03 * Math.sin(tick / 10);
+  display(ctx, 'CONNECTION LOST', VW / 2, boxY + 52, 30, {
+    scale: pulse, from: '#ffd7d7', mid: '#ff6b6b', to: '#8a1f1f', outline: '#2a0808',
+  });
+  // Only surface the raw reason when it adds something over the headline.
+  const detail = error.trim().toUpperCase();
+  if (detail && detail !== 'CONNECTION LOST') {
+    label(ctx, detail.slice(0, 60), VW / 2, boxY + 78, 12, '#ffffff77');
+  }
+
+  // What happens to the money — the first thing a player wants to know.
+  label(ctx, 'THE SERVER SETTLES THIS MATCH FROM ITS OWN RECORD.', VW / 2, boxY + 108, 13, '#ffffffcc');
+  label(ctx, mode === 'wager'
+    ? 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE THE POT IS REFUNDED'
+    : 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE YOUR CREDIT IS REFUNDED',
+  VW / 2, boxY + 128, 11, '#ffd166');
+
+  if (tick % 60 < 44) {
+    label(ctx, 'ENTER / ESC — BACK TO MENU', VW / 2, boxY + 162, 14, GOLD_LT);
+  }
+  tapZone(boxX, boxY + 140, boxW, 40, 'back');
+};

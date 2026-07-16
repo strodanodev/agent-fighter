@@ -33,6 +33,16 @@ export const HASH_EVERY = 60;
 /** Reconnect grace before a mid-match disconnect becomes a forfeit (ms). */
 export const FORFEIT_GRACE_MS = 10_000;
 
+/**
+ * A connected-but-silent client forfeits after this long without sending an
+ * input (ADR 0003 disconnect policy). Closing the socket is only the HONEST
+ * way to quit — without this, a wager griefer could hold the socket open,
+ * stop playing, and freeze the opponent's escrowed credits forever. Generous
+ * enough to survive a tab-switch stutter or a long stall, short enough that
+ * nobody's pot is held hostage.
+ */
+export const IDLE_FORFEIT_MS = 30_000;
+
 // ---- client → server
 export interface CHello {
   t: 'hello';

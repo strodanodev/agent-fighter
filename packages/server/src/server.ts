@@ -20,7 +20,7 @@ import {
 } from '@af/core';
 import type { CharacterBundle } from '@af/core';
 import {
-  DEFAULT_PORT, FORFEIT_GRACE_MS, INPUT_DELAY, PROTOCOL_VERSION,
+  DEFAULT_PORT, FORFEIT_GRACE_MS, IDLE_FORFEIT_MS, INPUT_DELAY, PROTOCOL_VERSION,
   SOLO_PACE_MAX, SOLO_PACE_MIN, SOLO_PACE_SLACK_MS,
 } from './protocol.js';
 import type { ClientMsg, SMatch, SResult, ServerMsg } from './protocol.js';
@@ -68,6 +68,10 @@ interface Match {
   /** Local-sim solo: the deterministic house AI the client must simulate. */
   solo: { skill: number; aiSeed: number } | null;
   startedAt: number; // wall clock — solo pace sanity (SOLO_PACE_*)
+  /** Sides whose socket has dropped — both gone = no-contest, not a forfeit. */
+  gone: [boolean, boolean];
+  /** Wall clock of each side's last input — silence forfeits (IDLE_FORFEIT_MS). */
+  lastInputAt: [number, number];
   /** The ledger: per side, inputs by tick. TCP keeps them in order. */
   inputs: [number[], number[]];
   /** Client-reported state hashes by tick (forensics). */
@@ -207,48 +211,59 @@ export const createMatchServer = (opts: {
       ? verifySoloLedger(bundles, m.seed, m.inputs[0], m.solo)
       : verifyLedger(bundles, m.seed, m.inputs));
 
-    let result: SResult;
-    if (forfeitLoser !== null) {
-      // Rage-quit policy (ADR 0003): the quitter loses. Verify what we have
-      // anyway so the partial ledger is still checked + archived.
-      const v = verify();
-      result = {
-        t: 'result', winner: 1 - forfeitLoser, reason: 'forfeit',
-        rounds: v.rounds, endTick: v.endTick, hash: v.hash,
-      };
-    } else {
-      const v = verify();
-      // Desync forensics: whose reported hashes diverge from the re-sim?
-      // Solo has one human side; the opponent is the server's own AI.
-      let deviator: 0 | 1 | undefined;
-      outer:
-      for (const side of (m.solo ? [0] : [0, 1]) as (0 | 1)[]) {
-        for (const [tick, h] of m.hashes[side]) {
-          if (tick > v.endTick) continue;
-          const truth = replayHashAt(m, tick);
-          if (truth !== null && truth !== h) {
-            console.log(`[match ${m.id}] hash mismatch side=${side} tick=${tick} reported=${h} truth=${truth}`);
-            deviator = side;
-            break outer;
-          }
+    const v = verify();
+    // Desync forensics: whose reported hashes diverge from the re-sim?
+    // Solo has one human side; the opponent is the server's own AI.
+    let deviator: 0 | 1 | undefined;
+    outer:
+    for (const side of (m.solo ? [0] : [0, 1]) as (0 | 1)[]) {
+      for (const [tick, h] of m.hashes[side]) {
+        if (tick > v.endTick) continue;
+        const truth = replayHashAt(m, tick);
+        if (truth !== null && truth !== h) {
+          console.log(`[match ${m.id}] hash mismatch side=${side} tick=${tick} reported=${h} truth=${truth}`);
+          deviator = side;
+          break outer;
         }
       }
+    }
+
+    // THE SETTLEMENT LADDER (ADR 0003/0005). The input ledger is the truth;
+    // a dropped socket never overrules it:
+    //  1. Ledger reached MatchOver → VERIFIED, whatever happened to the
+    //     connections. Winning and then losing your wifi still wins; ragequit
+    //     after the final KO still loses. This closes the "pull the cable the
+    //     instant you lose" hole AND protects an honest winner from a blip.
+    //  2. Undecided + exactly one side gone/silent → FORFEIT, that side loses.
+    //  3. Undecided + nobody to blame (both gone, server shutdown) →
+    //     INCOMPLETE, a no-contest that refunds both entry fees.
+    let result: SResult;
+    if (v.reachedEnd) {
       result = {
-        t: 'result',
-        winner: v.reachedEnd ? v.winner : -1,
-        reason: v.reachedEnd ? 'verified' : 'incomplete',
+        t: 'result', winner: v.winner, reason: 'verified',
         rounds: v.rounds, endTick: v.endTick, hash: v.hash, deviator,
       };
-      // Solo pace sanity: the client sims locally, so wall time is the only
-      // pacing signal. Scripted fast-forward or tool-assisted slow-motion
-      // settles as incomplete — fees refund, nothing progresses.
-      if (m.solo && result.reason === 'verified' && !opts.noPaceCheck) {
-        const simMs = result.endTick * (1000 / 60);
-        const wallMs = Date.now() - m.startedAt;
-        if (wallMs < simMs * SOLO_PACE_MIN || wallMs > simMs * SOLO_PACE_MAX + SOLO_PACE_SLACK_MS) {
-          console.log(`[match ${m.id}] pace anomaly: wall ${Math.round(wallMs)}ms vs sim ${Math.round(simMs)}ms → incomplete`);
-          result = { ...result, winner: -1, reason: 'incomplete' };
-        }
+    } else if (forfeitLoser !== null) {
+      result = {
+        t: 'result', winner: 1 - forfeitLoser, reason: 'forfeit',
+        rounds: v.rounds, endTick: v.endTick, hash: v.hash, deviator,
+      };
+    } else {
+      result = {
+        t: 'result', winner: -1, reason: 'incomplete',
+        rounds: v.rounds, endTick: v.endTick, hash: v.hash, deviator,
+      };
+    }
+
+    // Solo pace sanity: the client sims locally, so wall time is the only
+    // pacing signal. Scripted fast-forward or tool-assisted slow-motion
+    // settles as incomplete — fees refund, nothing progresses.
+    if (m.solo && result.reason === 'verified' && !opts.noPaceCheck) {
+      const simMs = result.endTick * (1000 / 60);
+      const wallMs = Date.now() - m.startedAt;
+      if (wallMs < simMs * SOLO_PACE_MIN || wallMs > simMs * SOLO_PACE_MAX + SOLO_PACE_SLACK_MS) {
+        console.log(`[match ${m.id}] pace anomaly: wall ${Math.round(wallMs)}ms vs sim ${Math.round(simMs)}ms → incomplete`);
+        result = { ...result, winner: -1, reason: 'incomplete' };
       }
     }
     for (const c of m.clients) {
@@ -347,6 +362,8 @@ export const createMatchServer = (opts: {
       chars: [c0.character, c1 ? c1.character : solo!.character],
       solo: solo ? { skill: solo.skill, aiSeed: solo.aiSeed } : null,
       startedAt: Date.now(),
+      gone: [false, false],
+      lastInputAt: [Date.now(), Date.now()],
       inputs: [[], []],
       hashes: [new Map(), new Map()],
       overAt: [-1, -1],
@@ -537,6 +554,7 @@ export const createMatchServer = (opts: {
         // Sanity caps: no negative ticks, no absurd future, first write wins.
         if (k < 0 || k > 60 * 60 * 30 || m.inputs[c.side][k] !== undefined) return;
         m.inputs[c.side][k] = msg.v | 0;
+        m.lastInputAt[c.side] = Date.now(); // proof of life (anti lag-switch)
         // Solo: nothing to relay — the opponent lives in the verifier.
         const opp = m.clients[1 - c.side];
         if (opp) send(opp, { t: 'i', k, v: msg.v | 0 });
@@ -567,12 +585,41 @@ export const createMatchServer = (opts: {
     const qi = queue.indexOf(c);
     if (qi >= 0) queue.splice(qi, 1);
     const m = c.match;
-    if (m && !m.finished) {
-      // Reconnect grace, then forfeit (ADR 0003 disconnect policy).
-      const loser = c.side;
-      m.forfeitTimer = setTimeout(() => finishMatch(m, loser), FORFEIT_GRACE_MS);
-    }
+    if (!m || m.finished) return;
+    m.gone[c.side] = true;
+    // Grace, then settle (ADR 0003 disconnect policy). Whoever is still here
+    // when it fires is the survivor; if NOBODY is, it's a no-contest, not an
+    // arbitrary loss for whichever socket happened to close first.
+    if (m.forfeitTimer) clearTimeout(m.forfeitTimer);
+    m.forfeitTimer = setTimeout(() => {
+      if (m.finished) return;
+      const bothGone = m.gone[0] && (m.gone[1] || !!m.solo);
+      finishMatch(m, bothGone ? null : c.side);
+    }, FORFEIT_GRACE_MS);
   };
+
+  /**
+   * Idle sweep: a socket that stays open but stops sending inputs stalls the
+   * match forever — in wager mode that freezes the opponent's escrowed
+   * credits, which is griefing (or a lag switch). Silence past
+   * IDLE_FORFEIT_MS settles the match exactly like a disconnect.
+   */
+  const idleSweep = setInterval(() => {
+    const now = Date.now();
+    for (const c of clients) {
+      const m = c.match;
+      if (!m || m.finished) continue;
+      // Only sides with a real client can be silent — solo's side 1 is the
+      // server's own AI and never sends anything.
+      const silent = ([0, 1] as const).filter((s) =>
+        m.clients[s] && now - m.lastInputAt[s] > IDLE_FORFEIT_MS);
+      if (silent.length === 0) continue;
+      const loser = silent.length === 1 ? silent[0]! : null;
+      console.log(`[match ${m.id}] idle ${IDLE_FORFEIT_MS}ms → ${loser === null ? 'no contest' : `forfeit side ${loser}`}`);
+      finishMatch(m, loser);
+    }
+  }, 5_000);
+  idleSweep.unref?.();
 
   // Browser clients call /me and /leaderboard cross-origin (the game is
   // served from a different port/host than the match server).
@@ -654,7 +701,7 @@ export const createMatchServer = (opts: {
       const port = typeof address === 'object' && address ? address.port : DEFAULT_PORT;
       resolve({
         port,
-        close: () => { wss.close(); http.close(); },
+        close: () => { clearInterval(idleSweep); wss.close(); http.close(); },
       });
     });
   });
@@ -663,10 +710,19 @@ export const createMatchServer = (opts: {
 // ---------------------------------------------------------------- CLI
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
+  // Solo pace sanity is the only thing standing between a local-sim ranked
+  // match and tool-assisted slow-motion, so the escape hatch that disables it
+  // may only be pulled alongside the throwaway dev economy. Tests don't come
+  // through here — they pass noPaceCheck directly to createMatchServer.
+  if (process.env.AF_NO_PACE_CHECK && process.env.AF_ALLOW_DEV_ECONOMY !== '1') {
+    throw new Error(
+      'AF_NO_PACE_CHECK disables the solo pace check that stops tool-assisted '
+      + 'slow-motion. It is a dev-only hatch: it may only be set together with '
+      + 'AF_ALLOW_DEV_ECONOMY=1. Refusing to start on a real economy.',
+    );
+  }
   const server = await createMatchServer({
     port: Number(process.env.PORT || DEFAULT_PORT),
-    // Dev/CI escape hatch — NEVER set in production: solo pace sanity is
-    // what stops tool-assisted slow-motion and scripted fast-forward.
     noPaceCheck: !!process.env.AF_NO_PACE_CHECK,
   });
   console.log(`Agent Fighter match server → ws://localhost:${server.port}`);

@@ -19,7 +19,7 @@ import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './a
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  currentStageCamLimits, drawHud, drawRanks, drawResults, drawSelect, drawStage,
+  currentStageCamLimits, drawHud, drawNetError, drawRanks, drawResults, drawSelect, drawStage,
   drawStageSelect, drawTitle, drawVsCard, drawWallet, resetTaps, setBgVideo, setGameLogo,
   setLogo, setStageAsset, setUiKit, tapHit, tapZone, worldTransform,
 } from './ui.js';
@@ -131,9 +131,25 @@ const drawWalletStrip = (): void => {
   drawWallet(ctx, account, walletDelta);
 };
 
-/** Match-server endpoints (?ws= overrides for deploys/dev). */
-const matchWsUrl = (): string =>
-  new URLSearchParams(location.search).get('ws') ?? `ws://${location.hostname}:8477`;
+/**
+ * The deployed match server (Railway). MUST be wss:// — the game is served
+ * over https and browsers block ws:// from an https origin as mixed content,
+ * so a ws:// default here means online play dies before a packet moves.
+ * Railway terminates TLS; the server itself still speaks plain ws.
+ */
+const PROD_MATCH_WS = '';
+
+/**
+ * Match-server endpoints. `?ws=` overrides everything (dev/staging/testing);
+ * an https page uses the deployed server; anything else is a local dev box
+ * running the server beside the page (`npm run play`).
+ */
+const matchWsUrl = (): string => {
+  const override = new URLSearchParams(location.search).get('ws');
+  if (override) return override;
+  if (location.protocol === 'https:') return PROD_MATCH_WS;
+  return `ws://${location.hostname}:8477`;
+};
 const matchHttpUrl = (): string => matchWsUrl().replace(/^ws/, 'http');
 
 // Public standings (drawRanks) — fetched from the match server on entry.
@@ -939,13 +955,12 @@ const frame = (): void => {
       vsCardAge = VS_CARD_TICKS;
     }
     const holdSim = cardUp && net?.setup?.mode !== 'wager';
-    if (net && !holdSim) {
+    // The socket died mid-match: the sim CANNOT continue (its opponent inputs
+    // are gone, and the server owns the verdict anyway). Freeze, explain, and
+    // offer the exit — never silently stall on a live-looking frame.
+    const netDead = !!net && net.status === 'error' && !net.result;
+    if (net && !holdSim && !netDead) {
       net.frame(pollPad(P0_MAP)); // session owns stepping (rollback or local-sim)
-      if (net.status === 'error' && !net.result) {
-        // Connection died mid-match: back out gracefully.
-        fx.announce = 'CONNECTION LOST';
-        fx.announceAge = 0;
-      }
     } else if (!net && !holdSim) {
       const p2: InputFrame = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
       step(game, [pollPad(P0_MAP), p2]);
@@ -953,13 +968,24 @@ const frame = (): void => {
     updateJuice(game);
     updateCamera(game);
     renderFight(game);
-    if (cardUp && fighters) {
+    if (cardUp && fighters && !netDead) {
       drawVsCard(ctx, fighters,
         net?.setup ? net.setup.names : [fighters[0].bundle.name, cpuAi ? `AGENT LV ${cpuLevelFor(profile, lever)}` : fighters[1].bundle.name],
         vsStakes.filter((s) => s), vsCardAge);
       vsCardAge++;
-    } else if (vsCardAge >= 0) {
+    } else if (vsCardAge >= 0 && !netDead) {
       vsCardAge = -1;
+    }
+    if (netDead) {
+      drawNetError(ctx, net!.error, queuedMode, uiTick);
+      if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('back')) {
+        net!.close();
+        net = null;
+        vsCardAge = -1;
+        screen = 'select';
+        locked = [false, false];
+        void audio.playBgm('player_select', { fadeInSec: 0.5 });
+      }
     }
     if (game.phase === Phase.Fighting && !hurryPlayed && game.timerTicks <= HURRY_UP_TICKS) {
       hurryPlayed = true;
