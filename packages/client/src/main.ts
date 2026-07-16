@@ -21,7 +21,7 @@ import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
   currentStageCamLimits, drawHud, drawRanks, drawResults, drawSelect, drawStage,
   drawStageSelect, drawTitle, drawVsCard, drawWallet, resetTaps, setBgVideo, setGameLogo,
-  setLogo, setStageAsset, setUiKit, tapHit, worldTransform,
+  setLogo, setStageAsset, setUiKit, tapHit, tapZone, worldTransform,
 } from './ui.js';
 import type { Cam, HudFx, Mode, RankRow, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit } from './chrome.js';
@@ -893,12 +893,21 @@ const frame = (): void => {
     ctx.font = '13px "Courier New", monospace';
     ctx.fillStyle = '#ffffff88';
     ctx.fillText(failed
-      ? (solo ? 'ENTER: FREE PRACTICE (no fee · no XP · no records)  ·  ESC: back'
-        : 'is the match server running?  npm run server  ·  ESC: back')
+      ? (solo ? 'TAP / ENTER: FREE PRACTICE (no fee · no XP · no records)'
+        : 'is the match server running?  npm run server')
       : 'humans and agents share this queue  ·  ESC: cancel', VW / 2, VH / 2 + 24);
+    if (failed) {
+      ctx.fillText('TAP BACK / ESC: leave', VW / 2, VH / 2 + 46);
+      // Phones have no Enter/Esc — without these zones iOS is stuck on OFFLINE.
+      if (solo) tapZone(VW / 2 - 280, VH / 2 - 70, 560, 100, 'practice');
+      tapZone(24, VH - 52, 200, 40, 'back');
+      ctx.font = 'bold 14px "Courier New", monospace';
+      ctx.fillStyle = '#ffd166';
+      ctx.fillText('← BACK', 40, VH - 28);
+    }
     drawWalletStrip();
     if (net?.setup && !netInstalled) installOnlineMatch();
-    if (failed && solo && pressedThisFrame.has('Enter')) {
+    if (failed && solo && (pressedThisFrame.has('Enter') || taps.has('practice') || taps.has('start'))) {
       // Server unreachable → the old local match, explicitly reward-free.
       practiceFree = true;
       net?.close();
@@ -906,7 +915,7 @@ const frame = (): void => {
       const en = allRosters.map((r, i) => (r.disabled ? -1 : i)).filter((i) => i >= 0);
       picks[1] = en[(seed * 13 + uiTick) % en.length] ?? picks[0];
       startFight();
-    } else if (pressedThisFrame.has('Escape')) {
+    } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
       net?.close();
       net = null;
       screen = 'select';
@@ -925,7 +934,10 @@ const frame = (): void => {
     // stepping — the peer's card runs on the same clock and rollback absorbs
     // the difference if one side skips early.
     const cardUp = vsCardAge >= 0 && vsCardAge < VS_CARD_TICKS;
-    if (cardUp && pressedThisFrame.size > 0 && vsCardAge > 20) vsCardAge = VS_CARD_TICKS;
+    // Keyboard OR a menu tap skips the stakes card (phones never populate pressedThisFrame).
+    if (cardUp && (pressedThisFrame.size > 0 || taps.size > 0) && vsCardAge > 20) {
+      vsCardAge = VS_CARD_TICKS;
+    }
     const holdSim = cardUp && net?.setup?.mode !== 'wager';
     if (net && !holdSim) {
       net.frame(pollPad(P0_MAP)); // session owns stepping (rollback or local-sim)

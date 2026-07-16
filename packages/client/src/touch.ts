@@ -53,17 +53,26 @@ export const initTouchControls = (): void => {
   if (!isMobileDevice()) return;
   if (document.getElementById('af-touch')) return;
 
-  // ---- key dispatch (single code path with the physical keyboard) --------
+  // ---- key dispatch ------------------------------------------------------
+  // Prefer the client's afPress/afRelease hooks (direct Set mutation). Synthetic
+  // KeyboardEvents are unreliable on iOS Safari — `code` has historically been
+  // empty on constructed events, which would silently kill the whole pad.
+  type KeyHooks = { afPress?: (c: string) => void; afRelease?: (c: string) => void };
+  const hooks = (): KeyHooks => globalThis as KeyHooks;
   const down = new Set<string>();
   const press = (code: string): void => {
     if (down.has(code)) return; // keydown fires once per hold, like a real key
     down.add(code);
-    window.dispatchEvent(new KeyboardEvent('keydown', { code, bubbles: true }));
+    const h = hooks();
+    if (h.afPress) h.afPress(code);
+    else window.dispatchEvent(new KeyboardEvent('keydown', { code, key: code, bubbles: true }));
   };
   const release = (code: string): void => {
     if (!down.has(code)) return;
     down.delete(code);
-    window.dispatchEvent(new KeyboardEvent('keyup', { code, bubbles: true }));
+    const h = hooks();
+    if (h.afRelease) h.afRelease(code);
+    else window.dispatchEvent(new KeyboardEvent('keyup', { code, key: code, bubbles: true }));
   };
   /** Drop every held key — used when the overlay hides, backgrounds, or opens a menu. */
   const releaseAll = (): void => { for (const c of [...down]) release(c); };

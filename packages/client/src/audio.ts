@@ -98,7 +98,14 @@ class AudioManager {
 
   private ctxOf(): AudioContext {
     if (!this.ctx) {
-      const ctx = new AudioContext();
+      // Safari (esp. older iOS) still exposes webkitAudioContext as the ctor.
+      const g = globalThis as typeof globalThis & {
+        AudioContext?: typeof AudioContext;
+        webkitAudioContext?: typeof AudioContext;
+      };
+      const AC = g.AudioContext || g.webkitAudioContext;
+      if (!AC) throw new Error('Web Audio API unavailable');
+      const ctx = new AC();
       this.bgmGain = ctx.createGain();
       this.bgmGain.gain.value = BGM_LEVEL;
       this.bgmGain.connect(ctx.destination);
@@ -118,20 +125,52 @@ class AudioManager {
     if (ctx.state === 'suspended') void ctx.resume();
   }
 
+  /** True when this engine can decode Ogg Vorbis (Safari / iOS: never). */
+  private static canOgg(): boolean {
+    try {
+      const a = document.createElement('audio');
+      return a.canPlayType('audio/ogg; codecs="vorbis"') !== '';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Candidate URLs for a clip. iOS/Safari cannot decode Ogg Vorbis, so any
+   * `.ogg` path is paired with a `.mp3` sibling — prefer mp3 when ogg is
+   * unsupported. Decode failures fall through the list silently.
+   */
+  private urlsFor(id: SoundId): string[] {
+    const primary = FILES[id];
+    if (!primary.endsWith('.ogg')) return [primary];
+    const mp3 = primary.slice(0, -4) + '.mp3';
+    return AudioManager.canOgg() ? [primary, mp3] : [mp3, primary];
+  }
+
   private load(id: SoundId): Promise<AudioBuffer> {
     const cached = this.buffers.get(id);
     if (cached) return Promise.resolve(cached);
     const pending = this.loading.get(id);
     if (pending) return pending;
     const ctx = this.ctxOf();
-    const p = fetch(FILES[id])
-      .then((r) => r.arrayBuffer())
-      .then((raw) => ctx.decodeAudioData(raw))
-      .then((decoded) => {
-        this.buffers.set(id, decoded);
-        this.loading.delete(id);
-        return decoded;
-      });
+    const urls = this.urlsFor(id);
+    const p = (async (): Promise<AudioBuffer> => {
+      let lastErr: unknown;
+      for (const url of urls) {
+        try {
+          const res = await fetch(url);
+          if (!res.ok) { lastErr = new Error(`${url} → ${res.status}`); continue; }
+          const raw = await res.arrayBuffer();
+          // copy: decodeAudioData may detach the buffer; keep retries clean
+          const decoded = await ctx.decodeAudioData(raw.slice(0));
+          this.buffers.set(id, decoded);
+          return decoded;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      throw lastErr instanceof Error ? lastErr : new Error(`audio load failed: ${id}`);
+    })().finally(() => { this.loading.delete(id); });
     this.loading.set(id, p);
     return p;
   }
@@ -160,25 +199,29 @@ class AudioManager {
   /** Loop a track as the current BGM. No-op if it's already the active loop. */
   async playBgm(id: MusicId, opts: { fadeInSec?: number } = {}): Promise<void> {
     if (this.bgmId === id) return;
-    const ctx = this.ctxOf();
-    const buffer = await this.load(id);
-    this.stopBgm();
-    const src = ctx.createBufferSource();
-    src.buffer = buffer;
-    src.loop = true;
-    src.connect(this.bgmGain!);
-    const fade = opts.fadeInSec ?? 0;
-    if (fade > 0 && this.bgmGain) {
-      this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
-      this.bgmGain.gain.setValueAtTime(0, ctx.currentTime);
-      this.bgmGain.gain.linearRampToValueAtTime(BGM_LEVEL, ctx.currentTime + fade);
-    } else if (this.bgmGain) {
-      this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
-      this.bgmGain.gain.setValueAtTime(BGM_LEVEL, ctx.currentTime);
+    try {
+      const ctx = this.ctxOf();
+      const buffer = await this.load(id);
+      this.stopBgm();
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.loop = true;
+      src.connect(this.bgmGain!);
+      const fade = opts.fadeInSec ?? 0;
+      if (fade > 0 && this.bgmGain) {
+        this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
+        this.bgmGain.gain.setValueAtTime(0, ctx.currentTime);
+        this.bgmGain.gain.linearRampToValueAtTime(BGM_LEVEL, ctx.currentTime + fade);
+      } else if (this.bgmGain) {
+        this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
+        this.bgmGain.gain.setValueAtTime(BGM_LEVEL, ctx.currentTime);
+      }
+      src.start();
+      this.bgmSource = src;
+      this.bgmId = id;
+    } catch {
+      /* iOS without a playable BGM codec, or offline — game stays silent */
     }
-    src.start();
-    this.bgmSource = src;
-    this.bgmId = id;
   }
 
   /**
@@ -186,21 +229,25 @@ class AudioManager {
    * warning). Ducks the BGM bed while it plays and restores after.
    */
   async playStinger(id: MusicId, opts: { duck?: boolean; onEnded?: () => void } = {}): Promise<void> {
-    const ctx = this.ctxOf();
-    const buffer = await this.load(id);
-    const src = ctx.createBufferSource();
-    src.buffer = buffer;
-    src.connect(this.sfxGain!);
-    const duck = opts.duck ?? true;
-    if (duck && this.bgmGain) {
-      this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
-      this.bgmGain.gain.setTargetAtTime(DUCK_LEVEL, ctx.currentTime, 0.05);
+    try {
+      const ctx = this.ctxOf();
+      const buffer = await this.load(id);
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(this.sfxGain!);
+      const duck = opts.duck ?? true;
+      if (duck && this.bgmGain) {
+        this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
+        this.bgmGain.gain.setTargetAtTime(DUCK_LEVEL, ctx.currentTime, 0.05);
+      }
+      src.onended = () => {
+        if (duck && this.bgmGain) this.bgmGain.gain.setTargetAtTime(BGM_LEVEL, ctx.currentTime, 0.4);
+        opts.onEnded?.();
+      };
+      src.start();
+    } catch {
+      opts.onEnded?.(); // still advance BGM sequencing if the stinger can't decode
     }
-    src.onended = () => {
-      if (duck && this.bgmGain) this.bgmGain.gain.setTargetAtTime(BGM_LEVEL, ctx.currentTime, 0.4);
-      opts.onEnded?.();
-    };
-    src.start();
   }
 
   /**

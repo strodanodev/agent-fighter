@@ -11,7 +11,7 @@
  * Bump CACHE_VERSION whenever the shell changes; the old cache is purged on
  * activate so a new deploy is picked up on the next launch.
  */
-const CACHE_VERSION = 'af-v1';
+const CACHE_VERSION = 'af-v2';
 const SHELL = '/';
 
 self.addEventListener('install', (event) => {
