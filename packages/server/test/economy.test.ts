@@ -145,7 +145,7 @@ test('solo: win nets +1 credit; loss burns the fee and −15 XP clamped at 0', a
 // ------------------------------------------------------------- integration
 test('LIVE ranked solo: house bot spawns, fee + settlement land on the account', async (t) => {
   const persistence = memoryPersistence();
-  const server = await createMatchServer({ port: 0, persistence, housePaceMs: 1 });
+  const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true });
   t.after(() => server.close());
 
   const { result, localHash } = await playOneMatch({
@@ -174,7 +174,7 @@ test('LIVE ranked solo: house bot spawns, fee + settlement land on the account',
 
 test('LIVE wager: pot settles winner +10 / loser −10; broke player is refused', async (t) => {
   const persistence = memoryPersistence();
-  const server = await createMatchServer({ port: 0, persistence, housePaceMs: 1 });
+  const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true });
   t.after(() => server.close());
   const url = `ws://127.0.0.1:${server.port}`;
 

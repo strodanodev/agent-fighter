@@ -43,11 +43,11 @@ export interface AgentOptions {
    */
   authToken?: string;
   /**
-   * Ranked-solo house bot: when set, the queue message carries `soloFor` so
-   * the server pairs this agent with the waiting human (loopback-only).
+   * Queue mode — 'wager' (default, PvP pot) or 'solo' (vs the house AI).
+   * Solo is LOCAL-SIM (protocol v3): the server pins a deterministic house
+   * AI in the match setup; this session simulates it locally and streams
+   * only its own inputs. No opponent packets exist at all.
    */
-  soloFor?: string;
-  /** Queue mode — 'wager' (default, PvP pot) or 'solo' (vs the house). */
   mode?: 'wager' | 'solo';
   /** Owner's AIR email — target for the reputation write-back (ADR 0004). */
   email?: string;
@@ -127,7 +127,6 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
         character: opts.character,
         bundleHash: bundleOf(opts.character).versionHash,
         mode: opts.mode ?? 'wager',
-        ...(opts.soloFor ? { soloFor: opts.soloFor } : {}),
       });
     });
 
@@ -147,7 +146,37 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
           pinChars();
           game = createGameState(msg.seed);
           ai = createAi(side, opts.skill, opts.aiSeed ?? msg.seed ^ (side + 1) * 0x9e37);
-          // First `delay` ticks are neutral by convention (symmetric).
+          const paceMs = opts.paceMs ?? 16;
+          const burst = paceMs <= 2 ? 64 : 1;
+
+          if (msg.solo) {
+            // LOCAL-SIM SOLO (protocol v3): no opponent packets — simulate
+            // the pinned deterministic house AI locally (aiPoll BEFORE step,
+            // the exact ordering the server's verifier re-derives) and
+            // stream only OUR inputs.
+            const houseAi = createAi(1, msg.solo.skill, msg.solo.aiSeed);
+            pacer = setInterval(() => {
+              if (!game || !ai) return;
+              pinChars();
+              for (let b = 0; b < burst && game.phase !== Phase.MatchOver; b++) {
+                const mine = opts.policy ? opts.policy(game, ai) : aiPoll(ai, game);
+                myInputs[simTick] = mine;
+                sendMsg({ t: 'i', k: simTick, v: mine });
+                const opp = aiPoll(houseAi, game);
+                step(game, [mine, opp]);
+                simTick++;
+                if (simTick % HASH_EVERY === 0) sendMsg({ t: 'h', k: simTick, x: stateHash(game) });
+              }
+              if (game.phase === Phase.MatchOver && !overSent) {
+                overSent = true;
+                sendMsg({ t: 'over', k: simTick });
+              }
+            }, paceMs);
+            return;
+          }
+
+          // WAGER (PvP lockstep): first `delay` ticks are neutral by
+          // convention (symmetric).
           for (let k = 0; k < delay; k++) {
             myInputs[k] = 0;
             sendMsg({ t: 'i', k, v: 0 });
@@ -158,8 +187,6 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
           // humans). Fast mode (paceMs ≤ 2) bursts to the ahead-cap so
           // agent-vs-agent matches run as fast as round-trips allow — OS
           // timers are too coarse (Windows ~15ms) for a 1ms interval to help.
-          const paceMs = opts.paceMs ?? 16;
-          const burst = paceMs <= 2 ? 64 : 1;
           pacer = setInterval(() => {
             pinChars();
             for (let b = 0; b < burst && sendTick - simTick < delay + 8; b++) emitOne();

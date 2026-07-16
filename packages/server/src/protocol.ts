@@ -7,20 +7,22 @@
  * server relays it and re-simulates the ledger to derive the result.
  */
 
-export const PROTOCOL_VERSION = 2; // v2: accounts + the credits economy
+export const PROTOCOL_VERSION = 3; // v3: local-sim ranked solo (zero-latency)
 export const DEFAULT_PORT = 8477;
 
 /** Local-input delay (ticks) applied by both sides — symmetric by design. */
 export const INPUT_DELAY = 3;
 
 /**
- * Ranked-solo delay: 1 tick (~17ms — imperceptible). The opponent is the
- * server's own house bot, so the effective RTT is client↔server only and
- * rollback absorbs the prediction misses; 3 ticks (50ms) of button lag made
- * VS AGENT feel sluggish next to the old local mode. Wager (PvP through the
- * relay = two legs of latency) keeps INPUT_DELAY.
+ * Ranked-solo pace sanity (server-side): the client sims locally, so wall
+ * time is the ONLY honesty signal about pacing. A finished match whose wall
+ * time is under MIN×sim (scripted fast-forward) or over MAX×sim + slack
+ * (tool-assisted slow-motion) settles as 'incomplete' → fees refund, no
+ * XP/credits move. Generous bounds: pauses/alt-tabs stay legal.
  */
-export const SOLO_INPUT_DELAY = 1;
+export const SOLO_PACE_MIN = 0.7;
+export const SOLO_PACE_MAX = 3;
+export const SOLO_PACE_SLACK_MS = 20_000;
 
 /** Client must not simulate further than this past the opponent's inputs. */
 export const MAX_AHEAD = 10;
@@ -64,11 +66,6 @@ export interface CQueue {
   character: string;
   bundleHash?: string;
   mode?: 'wager' | 'solo'; // default 'wager'
-  /**
-   * Internal: house bot pairing for ranked solo. Only accepted from
-   * loopback connections — the server spawns these, clients never send them.
-   */
-  soloFor?: string;
 }
 export interface CInput { t: 'i'; k: number; v: number }
 export interface CHash { t: 'h'; k: number; x: number }
@@ -91,6 +88,16 @@ export interface SMatch {
   mode: 'wager' | 'solo';
   /** Credits escrowed per side (pot = fee×2 in wager mode). */
   fee: number;
+  /**
+   * v3 LOCAL-SIM SOLO: present iff mode === 'solo'. There is NO house-bot
+   * connection and NO input relay — the client simulates the opponent
+   * ITSELF with the deterministic built-in AI pinned here, at ZERO added
+   * latency (identical feel to offline play), and streams only its own
+   * per-tick inputs. The server re-derives the SAME AI from (skill, aiSeed)
+   * during verification, so the opponent cannot be puppeteered: any client
+   * that simulates a different opponent fails the ledger re-sim.
+   */
+  solo?: { skill: number; aiSeed: number };
 }
 export interface SInput { t: 'i'; k: number; v: number }
 export interface SResult {

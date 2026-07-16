@@ -1,7 +1,7 @@
 import {
-  ENGINE_VERSION, Phase, createGameState, restore, snapshot, stateHash, step,
+  ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, restore, snapshot, stateHash, step,
 } from '@af/core';
-import type { GameState, InputFrame } from '@af/core';
+import type { AiState, GameState, InputFrame } from '@af/core';
 
 /**
  * Online netplay session — GGPO-style rollback over the match-server relay
@@ -19,7 +19,7 @@ import type { GameState, InputFrame } from '@af/core';
  */
 
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 2;
+const NET_PROTOCOL = 3;
 const MAX_AHEAD = 10;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -35,6 +35,8 @@ export interface NetSetup {
   agents: [boolean, boolean];
   mode?: 'wager' | 'solo';
   fee?: number;
+  /** v3 local-sim solo: the deterministic house AI this client simulates. */
+  solo?: { skill: number; aiSeed: number };
 }
 
 export interface NetResult {
@@ -281,3 +283,123 @@ export class NetSession {
     return true;
   }
 }
+
+// ---------------------------------------------------------- local-sim solo
+/**
+ * Ranked solo, protocol v3: ZERO-LATENCY local simulation. The server pins a
+ * deterministic house AI (skill, aiSeed) in the match setup; this session
+ * steps the ENTIRE match locally — your pad against aiPoll — exactly like
+ * offline play (no input delay, no prediction, no stalls), and streams only
+ * your per-tick inputs. Settlement stays trustless: the verifier re-derives
+ * the same AI from the same seed, so a client that simulated any other
+ * opponent fails the re-sim. Wall-clock pacing is checked server-side
+ * (SOLO_PACE_*) — slow-motion or fast-forward tampering refunds as
+ * incomplete instead of settling.
+ *
+ * Public surface mirrors NetSession — main.ts uses them interchangeably.
+ */
+export class SoloSession {
+  status: NetStatus = 'connecting';
+  error = '';
+  setup: NetSetup | null = null;
+  result: NetResult | null = null;
+  account: NetAccount | null = null;
+  xp: NetXp | null = null;
+  game: GameState | null = null;
+  stalled = 0; // never stalls — kept for the shared interface
+
+  private ws: WebSocket;
+  private houseAi: AiState | null = null;
+  private tick = 0;
+  private overSent = false;
+
+  constructor(
+    url: string,
+    name: string,
+    character: string,
+    bundleHash?: string,
+    authToken?: string,
+    email?: string,
+  ) {
+    this.ws = new WebSocket(url);
+    this.ws.onopen = () => {
+      this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION, auth: authToken, email });
+      this.send({ t: 'queue', character, bundleHash, mode: 'solo' });
+      this.status = 'queued';
+    };
+    this.ws.onerror = () => {
+      if (this.status !== 'done') { this.status = 'error'; this.error = 'connection failed'; }
+    };
+    this.ws.onclose = () => {
+      if (this.status !== 'done' && this.status !== 'error') {
+        this.status = 'error';
+        this.error = 'connection lost';
+      }
+    };
+    this.ws.onmessage = (ev) => {
+      const msg = JSON.parse(String(ev.data)) as { t: string } & Record<string, unknown>;
+      switch (msg.t) {
+        case 'error':
+          this.status = 'error';
+          this.error = String(msg.msg ?? 'server error');
+          return;
+        case 'account':
+          this.account = msg as unknown as NetAccount;
+          return;
+        case 'match':
+          this.setup = msg as unknown as NetSetup;
+          return;
+        case 'result':
+          this.result = msg as unknown as NetResult;
+          this.status = 'done';
+          return;
+        case 'xp':
+          this.xp = msg as unknown as NetXp;
+          return;
+        default:
+      }
+    };
+  }
+
+  get side(): 0 | 1 { return 0; } // solo player is always side 0
+
+  close(): void {
+    try { this.ws.close(); } catch { /* already closed */ }
+  }
+
+  private send(msg: unknown): void {
+    if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
+  }
+
+  /** Call after installing characters for the pinned setup. */
+  begin(): void {
+    const s = this.setup!;
+    this.game = createGameState(s.seed);
+    this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed);
+    this.status = 'playing';
+  }
+
+  /** Advance one tick — pure local sim; always succeeds while playing. */
+  frame(pad: InputFrame): boolean {
+    if (!this.game || !this.houseAi || this.status !== 'playing') return false;
+    const g = this.game;
+    if (g.phase === Phase.MatchOver) {
+      if (!this.overSent) { this.overSent = true; this.send({ t: 'over', k: this.tick }); }
+      return false;
+    }
+    this.send({ t: 'i', k: this.tick, v: pad });
+    const opp = aiPoll(this.houseAi, g); // aiPoll BEFORE step — verifier ordering
+    step(g, [pad, opp]);
+    this.tick++;
+    if (this.tick % HASH_EVERY === 0) this.send({ t: 'h', k: this.tick, x: stateHash(g) });
+    // step() mutates phase — TS's narrowing from the guard above is stale.
+    if ((g.phase as Phase) === Phase.MatchOver && !this.overSent) {
+      this.overSent = true;
+      this.send({ t: 'over', k: this.tick });
+    }
+    return true;
+  }
+}
+
+/** What main.ts programs against — rollback PvP or local-sim solo. */
+export type Session = NetSession | SoloSession;

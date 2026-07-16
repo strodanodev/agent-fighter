@@ -15,12 +15,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
-  ENGINE_VERSION, Phase, createGameState, loadCharacter, setCharacters,
-  stateHash, step,
+  ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, loadCharacter,
+  setCharacters, stateHash, step,
 } from '@af/core';
 import type { CharacterBundle } from '@af/core';
 import {
-  DEFAULT_PORT, FORFEIT_GRACE_MS, INPUT_DELAY, PROTOCOL_VERSION, SOLO_INPUT_DELAY,
+  DEFAULT_PORT, FORFEIT_GRACE_MS, INPUT_DELAY, PROTOCOL_VERSION,
+  SOLO_PACE_MAX, SOLO_PACE_MIN, SOLO_PACE_SLACK_MS,
 } from './protocol.js';
 import type { ClientMsg, SMatch, SResult, ServerMsg } from './protocol.js';
 import { verifyAirToken } from './airjwt.js';
@@ -29,7 +30,6 @@ import {
   InsufficientCredits, SOLO_FEE, WAGER_FEE, createPersistence, loadDotEnv,
 } from './persist.js';
 import type { Account, MatchMode, Persistence } from './persist.js';
-import { playOneMatch } from './agent-session.js';
 import { createAirIssuer, loadIssuerConfig } from './air-issuer.js';
 import type { AirIssuer } from './air-issuer.js';
 
@@ -52,9 +52,6 @@ interface Client {
   identityReady: Promise<void>;
   /** Account snapshot from persistence (null = anonymous / persistence off). */
   account: Account | null;
-  /** True for the server's own in-process house bots. */
-  house: boolean;
-  isLoopback: boolean;
   /** AIR-account email — only the reputation write-back target (ADR 0004). */
   email: string;
 }
@@ -63,10 +60,14 @@ interface Match {
   id: string;
   mode: MatchMode;
   fee: number;
-  clients: [Client, Client];
+  /** Solo (v3): clients[1] is null — the opponent is the pinned AI below. */
+  clients: [Client, Client | null];
   seed: number;
   stage: string;
   chars: [string, string];
+  /** Local-sim solo: the deterministic house AI the client must simulate. */
+  solo: { skill: number; aiSeed: number } | null;
+  startedAt: number; // wall clock — solo pace sanity (SOLO_PACE_*)
   /** The ledger: per side, inputs by tick. TCP keeps them in order. */
   inputs: [number[], number[]];
   /** Client-reported state hashes by tick (forensics). */
@@ -117,14 +118,46 @@ const verifyLedger = (
   };
 };
 
+/**
+ * LOCAL-SIM SOLO verification (protocol v3): the client streamed only ITS
+ * inputs; the opponent is re-derived here from the pinned deterministic AI —
+ * same (skill, aiSeed), same aiPoll-before-step ordering as the client. A
+ * client that simulated any other opponent produces different hashes and a
+ * different outcome, so the house cannot be puppeteered.
+ */
+const verifySoloLedger = (
+  bundles: [CharacterBundle, CharacterBundle],
+  seed: number,
+  playerInputs: number[],
+  solo: { skill: number; aiSeed: number },
+  stopAtTick = Number.MAX_SAFE_INTEGER,
+): VerifyOutcome => {
+  setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
+  const g = createGameState(seed);
+  const ai = createAi(1, solo.skill, solo.aiSeed);
+  let t = 0;
+  while (g.phase !== Phase.MatchOver && t < playerInputs.length && t < stopAtTick) {
+    const opp = aiPoll(ai, g);
+    step(g, [playerInputs[t]! | 0, opp]);
+    t++;
+  }
+  return {
+    winner: g.phase === Phase.MatchOver ? g.winner : -1,
+    rounds: [g.roundsWon0, g.roundsWon1],
+    endTick: t,
+    hash: stateHash(g),
+    reachedEnd: g.phase === Phase.MatchOver,
+  };
+};
+
 // ---------------------------------------------------------------- server
 export const createMatchServer = (opts: {
   port?: number;
   root?: string;
   /** Test hook: overrides the Supabase-backed persistence (null = off). */
   persistence?: Persistence | null;
-  /** House-bot emission cadence (ms). 16 = real-time (default); tests use 1. */
-  housePaceMs?: number;
+  /** Test hook: skip the solo wall-clock pace sanity (tests sim >>realtime). */
+  noPaceCheck?: boolean;
   /** Test hook: overrides the env-configured AIR issuer (null = off). */
   airIssuer?: AirIssuer | null;
 } = {}): Promise<MatchServer> => {
@@ -159,7 +192,6 @@ export const createMatchServer = (opts: {
   let nextMatch = 1;
   let matchSeed = (Date.now() % 100_000) | 0; // server-side is allowed wall clock
   /** Filled once http.listen resolves — house bots dial back to this port. */
-  let boundPort = opts.port && opts.port > 0 ? opts.port : DEFAULT_PORT;
 
   const send = (c: Client, msg: ServerMsg): void => {
     if (c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(msg));
@@ -170,21 +202,27 @@ export const createMatchServer = (opts: {
     m.finished = true;
     if (m.forfeitTimer) clearTimeout(m.forfeitTimer);
 
+    const bundles: [CharacterBundle, CharacterBundle] = [bundleOf(m.chars[0]), bundleOf(m.chars[1])];
+    const verify = (): VerifyOutcome => (m.solo
+      ? verifySoloLedger(bundles, m.seed, m.inputs[0], m.solo)
+      : verifyLedger(bundles, m.seed, m.inputs));
+
     let result: SResult;
     if (forfeitLoser !== null) {
       // Rage-quit policy (ADR 0003): the quitter loses. Verify what we have
       // anyway so the partial ledger is still checked + archived.
-      const v = verifyLedger([bundleOf(m.chars[0]), bundleOf(m.chars[1])], m.seed, m.inputs);
+      const v = verify();
       result = {
         t: 'result', winner: 1 - forfeitLoser, reason: 'forfeit',
         rounds: v.rounds, endTick: v.endTick, hash: v.hash,
       };
     } else {
-      const v = verifyLedger([bundleOf(m.chars[0]), bundleOf(m.chars[1])], m.seed, m.inputs);
+      const v = verify();
       // Desync forensics: whose reported hashes diverge from the re-sim?
+      // Solo has one human side; the opponent is the server's own AI.
       let deviator: 0 | 1 | undefined;
       outer:
-      for (const side of [0, 1] as const) {
+      for (const side of (m.solo ? [0] : [0, 1]) as (0 | 1)[]) {
         for (const [tick, h] of m.hashes[side]) {
           if (tick > v.endTick) continue;
           const truth = replayHashAt(m, tick);
@@ -201,8 +239,20 @@ export const createMatchServer = (opts: {
         reason: v.reachedEnd ? 'verified' : 'incomplete',
         rounds: v.rounds, endTick: v.endTick, hash: v.hash, deviator,
       };
+      // Solo pace sanity: the client sims locally, so wall time is the only
+      // pacing signal. Scripted fast-forward or tool-assisted slow-motion
+      // settles as incomplete — fees refund, nothing progresses.
+      if (m.solo && result.reason === 'verified' && !opts.noPaceCheck) {
+        const simMs = result.endTick * (1000 / 60);
+        const wallMs = Date.now() - m.startedAt;
+        if (wallMs < simMs * SOLO_PACE_MIN || wallMs > simMs * SOLO_PACE_MAX + SOLO_PACE_SLACK_MS) {
+          console.log(`[match ${m.id}] pace anomaly: wall ${Math.round(wallMs)}ms vs sim ${Math.round(simMs)}ms → incomplete`);
+          result = { ...result, winner: -1, reason: 'incomplete' };
+        }
+      }
     }
     for (const c of m.clients) {
+      if (!c) continue;
       send(c, result);
       c.state = 'lobby';
       c.match = null;
@@ -214,9 +264,9 @@ export const createMatchServer = (opts: {
     if (persistence) {
       void persistence.recordMatch({
         matchId: m.id, mode: m.mode, fee: m.fee,
-        identities: [m.clients[0].identity, m.clients[1].identity],
-        names: [m.clients[0].name, m.clients[1].name],
-        agents: [m.clients[0].agent, m.clients[1].agent],
+        identities: [m.clients[0].identity, m.clients[1]?.identity ?? null],
+        names: [m.clients[0].name, m.clients[1]?.name ?? `HOUSE AI`],
+        agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
         chars: m.chars,
         winner: result.winner, reason: result.reason,
         rounds: result.rounds, endTick: result.endTick, hash: result.hash,
@@ -225,6 +275,7 @@ export const createMatchServer = (opts: {
       }).then((awards) => {
         for (const a of awards) {
           const cl = m.clients[a.side];
+          if (!cl) continue; // the house side never has an account
           // Keep the connection's snapshot fresh — the pre-queue credit
           // check reads it (escrow re-checks authoritatively anyway).
           if (cl.account) {
@@ -267,6 +318,12 @@ export const createMatchServer = (opts: {
 
   /** Ground-truth hash at a tick (re-sim prefix) — only used on suspicion. */
   const replayHashAt = (m: Match, tick: number): number | null => {
+    if (m.solo) {
+      if (tick > m.inputs[0].length) return null;
+      return verifySoloLedger(
+        [bundleOf(m.chars[0]), bundleOf(m.chars[1])], m.seed, m.inputs[0], m.solo, tick,
+      ).hash;
+    }
     const n = Math.min(m.inputs[0].length, m.inputs[1].length);
     if (tick > n) return null;
     setCharacters(loadCharacter(bundleOf(m.chars[0])), loadCharacter(bundleOf(m.chars[1])));
@@ -277,14 +334,19 @@ export const createMatchServer = (opts: {
     return stateHash(g);
   };
 
-  const startMatch = (c0: Client, c1: Client, mode: MatchMode, fee: number, id?: string): void => {
+  const startMatch = (
+    c0: Client, c1: Client | null, mode: MatchMode, fee: number, id?: string,
+    solo?: { skill: number; aiSeed: number; character: string; level: number },
+  ): void => {
     const m: Match = {
       id: id ?? `m${nextMatch++}`,
       mode, fee,
       clients: [c0, c1],
       seed: (matchSeed = (matchSeed * 1103515245 + 12345) & 0x7fffffff),
       stage: stageIds.length > 0 ? stageIds[matchSeed % stageIds.length]! : '',
-      chars: [c0.character, c1.character],
+      chars: [c0.character, c1 ? c1.character : solo!.character],
+      solo: solo ? { skill: solo.skill, aiSeed: solo.aiSeed } : null,
+      startedAt: Date.now(),
       inputs: [[], []],
       hashes: [new Map(), new Map()],
       overAt: [-1, -1],
@@ -292,23 +354,27 @@ export const createMatchServer = (opts: {
       forfeitTimer: null,
     };
     c0.match = m; c0.side = 0; c0.state = 'playing';
-    c1.match = m; c1.side = 1; c1.state = 'playing';
+    if (c1) { c1.match = m; c1.side = 1; c1.state = 'playing'; }
 
+    const oppName = c1?.name ?? `HOUSE LV${solo!.level}`;
     for (const c of m.clients) {
+      if (!c) continue;
       const setup: SMatch = {
         t: 'match', matchId: m.id, side: c.side, seed: m.seed, stage: m.stage,
-        delay: mode === 'solo' ? SOLO_INPUT_DELAY : INPUT_DELAY,
+        // Local-sim solo has NO input scheduling at all — zero added latency.
+        delay: m.solo ? 0 : INPUT_DELAY,
         chars: [
           { id: m.chars[0], hash: bundleOf(m.chars[0]).versionHash },
           { id: m.chars[1], hash: bundleOf(m.chars[1]).versionHash },
         ],
-        names: [m.clients[0].name, m.clients[1].name],
-        agents: [m.clients[0].agent, m.clients[1].agent],
+        names: [m.clients[0].name, oppName],
+        agents: [m.clients[0].agent, c1?.agent ?? true],
         mode, fee,
+        solo: m.solo ?? undefined,
       };
       send(c, setup);
     }
-    console.log(`[match ${m.id}] ${mode}·fee ${fee} · ${c0.name}${c0.agent ? ' (agent)' : ''} vs ${c1.name}${c1.agent ? ' (agent)' : ''} · seed ${m.seed} · stage ${m.stage}`);
+    console.log(`[match ${m.id}] ${mode}·fee ${fee} · ${c0.name}${c0.agent ? ' (agent)' : ''} vs ${oppName}${c1?.agent ? ' (agent)' : ''} · seed ${m.seed} · stage ${m.stage}`);
   };
 
   /**
@@ -358,29 +424,38 @@ export const createMatchServer = (opts: {
     if (queue.length >= 2) void tryPair();
   };
 
-  /** Pending ranked-solo players, waiting for their spawned house bot. */
-  const soloWaiting = new Map<string, Client>();
-
-  const spawnHouseBot = (player: Client, port: number): void => {
-    const level = player.account?.level ?? 1;
-    const skill = Math.max(3, Math.min(100, Math.round((level * 100) / 40)));
-    const character = characterIds[Math.floor(Math.random() * characterIds.length)]!;
-    soloWaiting.set(player.id, player);
-    void playOneMatch({
-      url: `ws://127.0.0.1:${port}`,
-      name: `HOUSE LV${level}`,
-      character, skill, charactersDir,
-      aiSeed: (Date.now() % 100000) + nextMatch,
-      paceMs: opts.housePaceMs ?? 16, // real-time — it's playing a human
-      soloFor: player.id,
-    }).catch((e) => {
-      console.log(`[solo] house bot failed: ${String(e)}`);
-      soloWaiting.delete(player.id);
-      if (player.state === 'queued') {
-        player.state = 'lobby';
-        send(player, { t: 'error', msg: 'house agent unavailable' });
+  /**
+   * Ranked solo (v3): no house-bot process, no relay. Escrow the fee, pin a
+   * deterministic house AI (skill from the player's level), and hand the
+   * whole sim to the client — verification re-derives the same AI.
+   */
+  const startSolo = async (c: Client): Promise<void> => {
+    const fee = persistence ? SOLO_FEE : 0;
+    const matchId = `m${nextMatch++}`;
+    if (fee > 0) {
+      try {
+        await persistence!.escrowMatch(matchId, [c.identity?.sub ?? null, null], fee);
+      } catch {
+        c.state = 'lobby';
+        return send(c, { t: 'error', code: 'credits', msg: `ranked match needs ${fee} credit` });
       }
-    });
+    }
+    if (c.ws.readyState !== WebSocket.OPEN) {
+      // Vanished after escrow → settle as incomplete so the fee refunds.
+      startMatch(c, null, 'solo', fee, matchId, soloOpts(c));
+      return finishMatch(c.match!, null);
+    }
+    startMatch(c, null, 'solo', fee, matchId, soloOpts(c));
+  };
+
+  const soloOpts = (c: Client): { skill: number; aiSeed: number; character: string; level: number } => {
+    const level = c.account?.level ?? 1;
+    return {
+      level,
+      skill: Math.max(3, Math.min(100, Math.round((level * 100) / 40))),
+      character: characterIds[Math.floor(Math.random() * characterIds.length)]!,
+      aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
+    };
   };
 
   const onMessage = (c: Client, raw: string): void => {
@@ -436,41 +511,6 @@ export const createMatchServer = (opts: {
         }
         c.character = msg.character;
 
-        // Internal: a spawned house bot joining its player's ranked match.
-        // Loopback-only — otherwise anyone could impersonate the house and
-        // farm ranked XP/credits by throwing matches to an accomplice.
-        if (msg.soloFor) {
-          if (!c.isLoopback) return send(c, { t: 'error', msg: 'house bots are server-local' });
-          const player = soloWaiting.get(msg.soloFor);
-          soloWaiting.delete(msg.soloFor);
-          if (!player || player.ws.readyState !== WebSocket.OPEN || player.state !== 'queued') {
-            return send(c, { t: 'error', msg: 'solo player gone' });
-          }
-          c.house = true;
-          void (async () => {
-            // The house plays for the HOUSE: strip any (dev) identity so
-            // settlement can never credit the bot's side.
-            await c.identityReady;
-            c.identity = null;
-            c.account = null;
-            const fee = persistence ? SOLO_FEE : 0;
-            const matchId = `m${nextMatch++}`;
-            if (fee > 0) {
-              try {
-                await persistence!.escrowMatch(matchId, [player.identity?.sub ?? null, null], fee);
-              } catch {
-                player.state = 'lobby';
-                send(player, { t: 'error', code: 'credits', msg: `ranked match needs ${fee} credit` });
-                send(c, { t: 'error', msg: 'player cannot cover the fee' });
-                return;
-              }
-            }
-            startMatch(player, c, 'solo', fee, matchId);
-            if (player.ws.readyState !== WebSocket.OPEN) finishMatch(player.match!, null); // → refund
-          })();
-          return;
-        }
-
         const mode: MatchMode = msg.mode === 'solo' ? 'solo' : 'wager';
         void (async () => {
           await c.identityReady;
@@ -485,7 +525,7 @@ export const createMatchServer = (opts: {
           }
           c.state = 'queued';
           send(c, { t: 'queued' });
-          if (mode === 'solo') spawnHouseBot(c, boundPort);
+          if (mode === 'solo') await startSolo(c);
           else { queue.push(c); void tryPair(); }
         })();
         return;
@@ -497,7 +537,10 @@ export const createMatchServer = (opts: {
         // Sanity caps: no negative ticks, no absurd future, first write wins.
         if (k < 0 || k > 60 * 60 * 30 || m.inputs[c.side][k] !== undefined) return;
         m.inputs[c.side][k] = msg.v | 0;
-        return send(m.clients[1 - c.side]!, { t: 'i', k, v: msg.v | 0 });
+        // Solo: nothing to relay — the opponent lives in the verifier.
+        const opp = m.clients[1 - c.side];
+        if (opp) send(opp, { t: 'i', k, v: msg.v | 0 });
+        return;
       }
       case 'h': {
         const m = c.match;
@@ -509,9 +552,10 @@ export const createMatchServer = (opts: {
         const m = c.match;
         if (!m || m.finished) return;
         m.overAt[c.side] = msg.k | 0;
-        // Verify once both sides agree the match ended (deterministic sims
-        // agree on the tick; a lone report gets a short grace then verifies).
-        if (m.overAt[0] >= 0 && m.overAt[1] >= 0) finishMatch(m, null);
+        // Solo: the single human report settles it. PvP: verify once both
+        // sides agree (deterministic sims agree on the tick; a lone report
+        // gets a short grace then verifies).
+        if (m.solo || (m.overAt[0] >= 0 && m.overAt[1] >= 0)) finishMatch(m, null);
         else setTimeout(() => { if (!m.finished) finishMatch(m, null); }, 3000);
         return;
       }
@@ -522,7 +566,6 @@ export const createMatchServer = (opts: {
     clients.delete(c);
     const qi = queue.indexOf(c);
     if (qi >= 0) queue.splice(qi, 1);
-    for (const [k, v] of soloWaiting) if (v === c) soloWaiting.delete(k);
     const m = c.match;
     if (m && !m.finished) {
       // Reconnect grace, then forfeit (ADR 0003 disconnect policy).
@@ -592,15 +635,11 @@ export const createMatchServer = (opts: {
   const wss = new WebSocketServer({ server: http });
 
   wss.on('connection', (ws, req) => {
-    const remote = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
-    const isLoopback = remote === '127.0.0.1' || remote === '::1';
     const c: Client = {
       ws, id: `c${nextId++}`, name: 'anon', agent: false,
       state: 'lobby', character: '', match: null, side: 0, identity: null,
       identityReady: Promise.resolve(),
       account: null,
-      house: false,
-      isLoopback,
       email: '',
     };
     clients.add(c);
@@ -613,7 +652,6 @@ export const createMatchServer = (opts: {
     http.listen(opts.port ?? DEFAULT_PORT, () => {
       const address = http.address();
       const port = typeof address === 'object' && address ? address.port : DEFAULT_PORT;
-      boundPort = port;
       resolve({
         port,
         close: () => { wss.close(); http.close(); },
@@ -625,7 +663,12 @@ export const createMatchServer = (opts: {
 // ---------------------------------------------------------------- CLI
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
-  const server = await createMatchServer({ port: Number(process.env.PORT || DEFAULT_PORT) });
+  const server = await createMatchServer({
+    port: Number(process.env.PORT || DEFAULT_PORT),
+    // Dev/CI escape hatch — NEVER set in production: solo pace sanity is
+    // what stops tool-assisted slow-motion and scripted fast-forward.
+    noPaceCheck: !!process.env.AF_NO_PACE_CHECK,
+  });
   console.log(`Agent Fighter match server → ws://localhost:${server.port}`);
   console.log(`engine ${ENGINE_VERSION} · protocol v${PROTOCOL_VERSION} · humans and agents welcome`);
 }

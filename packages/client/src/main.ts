@@ -20,19 +20,20 @@ import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
   currentStageCamLimits, drawHud, drawRanks, drawResults, drawSelect, drawStage,
-  drawStageSelect, drawTitle, setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit, worldTransform,
+  drawStageSelect, drawTitle, resetTaps, setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit,
+  tapHit, worldTransform,
 } from './ui.js';
 import type { Cam, HudFx, Mode, RankRow, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit } from './chrome.js';
 import type { StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
 import { auth, authLogin, authLogout, authName, authRehydrate, authToken } from './auth.js';
-import { NetSession } from './net.js';
-import type { NetAccount } from './net.js';
+import { NetSession, SoloSession } from './net.js';
+import type { NetAccount, Session } from './net.js';
 import {
   auraGlow, drawFx, emitAura, emitBurst, emitRing, fxPulse, updateFx,
 } from './fx.js';
-import { initTouchControls } from './touch.js';
+import { initTouchControls, setTouchScreen } from './touch.js';
 import { initPwa } from './pwa.js';
 
 const TICK_MS = 1000 / TICKS_PER_SEC;
@@ -68,12 +69,32 @@ const pollPad = (map: [string, number][]): InputFrame => {
   return f;
 };
 
+/**
+ * Menu taps. The draw functions register their tappable rects every frame
+ * (ui.ts tapZone), so a pointer press just hit-tests the CURRENT layout and
+ * queues a semantic action ('mode:cpu', 'pick:3'). Screen handlers drain this
+ * exactly like `pressedThisFrame`, and it's cleared at the end of each frame.
+ *
+ * Mouse and touch both land here, so clicking menus works on desktop too.
+ */
+const taps = new Set<string>();
+const tapAt = (clientX: number, clientY: number): void => {
+  const r = canvas.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return;
+  // CSS-scaled + letterboxed canvas → virtual 960×540 space.
+  const vx = ((clientX - r.left) / r.width) * VW;
+  const vy = ((clientY - r.top) / r.height) * VH;
+  if (vx < 0 || vy < 0 || vx > VW || vy > VH) return;
+  const action = tapHit(vx, vy);
+  if (action) taps.add(action);
+};
+
 // ---------------------------------------------------------------- state
 type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'ranks';
 
 let screen: Screen = 'loading';
 let mode: Mode = 'cpu';
-let net: NetSession | null = null;
+let net: Session | null = null;
 let netInstalled = false;
 
 // ---- M5 credits: the AIR sign-in gate + the server-side account.
@@ -176,6 +197,14 @@ const canvas = document.getElementById('game') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
 const px = (v: number): number => Math.trunc(v / 256);
 
+// Menus are tappable/clickable: hit-test the layout the last frame drew.
+// The in-match arcade overlay (touch.ts) sits above this and swallows its own
+// presses, so a fight's controls never leak through as menu taps.
+canvas.addEventListener('pointerdown', (e) => {
+  audio.unlock(); // same first-gesture unlock the keydown path does
+  tapAt(e.clientX, e.clientY);
+});
+
 // ---------------------------------------------------------------- boot
 const boot = async (): Promise<void> => {
   try {
@@ -242,8 +271,12 @@ const startOnline = (m: 'solo' | 'wager'): void => {
   const name = authName() ?? DEV_GUEST ?? `PLAYER-${(profile.wins + profile.losses) % 1000}`;
   void authToken().then((token) => {
     if (screen !== 'online' || net) return; // player backed out while fetching
-    net = new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m,
-      auth.email || undefined); // AIR write-back target (ADR 0004)
+    const email = auth.email || undefined; // AIR write-back target (ADR 0004)
+    // Solo (v3): pure LOCAL simulation of the pinned house AI — zero added
+    // latency; the server re-derives the AI to verify. Wager: rollback PvP.
+    net = m === 'solo'
+      ? new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email)
+      : new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email);
   });
 };
 
@@ -561,6 +594,18 @@ const tickSelect = (): void => {
   if (pressedThisFrame.has('KeyA')) move(0, -1);
   if (pressedThisFrame.has('KeyD')) move(0, 1);
 
+  // Touch: tapping a portrait moves the cursor onto it so its stats can be
+  // read; tapping the one already under the cursor commits. Two light taps
+  // beat one blind commit — you get to look before you lock.
+  let tapConfirm = false;
+  for (let k = 0; k < n; k++) {
+    if (!taps.has(`pick:${k}`)) continue;
+    if (!enabled(k) || locked[0]) break;
+    if (picks[0] === k) tapConfirm = true; // second tap on the same fighter
+    else picks[0] = k;
+    break;
+  }
+
   // The CPU difficulty lever: [ and ] on the select screen (CPU mode).
   if (mode === 'cpu') {
     if (pressedThisFrame.has('BracketLeft')) { lever = Math.max(-10, lever - 1); saveLever(lever); }
@@ -571,7 +616,7 @@ const tickSelect = (): void => {
   }
 
   // A disabled fighter under the cursor cannot be confirmed.
-  if (enabled(picks[0]) && CONFIRM[0]!.some((k) => pressedThisFrame.has(k))) locked[0] = true;
+  if (enabled(picks[0]) && (tapConfirm || CONFIRM[0]!.some((k) => pressedThisFrame.has(k)))) locked[0] = true;
   if (mode === 'online' || mode === 'cpu') {
     // Server modes (M5): your pick is the queue ticket. Wager matchmakes a
     // PvP opponent; ranked VS AGENT gets a house bot at your level — the
@@ -606,13 +651,26 @@ const tickStageSelect = (): void => {
   };
   if (pressedThisFrame.has('KeyA') || pressedThisFrame.has('ArrowLeft')) move(-1);
   if (pressedThisFrame.has('KeyD') || pressedThisFrame.has('ArrowRight')) move(1);
-  if (pressedThisFrame.has('Escape')) { screen = 'select'; locked = [false, false]; }
-  if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space')) startFight();
+  // Same look-then-commit rule as the fighter grid: tap to preview the stage
+  // (the backdrop swaps), tap the highlighted one again to fight.
+  let tapStart = false;
+  for (let k = 0; k < n; k++) {
+    if (!taps.has(`stage:${k}`)) continue;
+    if (stageCursor === k) tapStart = true;
+    else { stageCursor = k; setStageAsset(stageAssets[k] ?? null); }
+    break;
+  }
+  if (pressedThisFrame.has('Escape') || taps.has('back')) { screen = 'select'; locked = [false, false]; return; }
+  if (tapStart || pressedThisFrame.has('Enter') || pressedThisFrame.has('Space')) startFight();
 };
 
 const frame = (): void => {
   uiTick++;
   updateFx(); // advance cosmetic particles/rings every frame (fight AND results)
+  // Tap targets are rebuilt by this frame's draw calls. Clearing here (rather
+  // than after) means a press landing between frames still hit-tests the
+  // layout the player can actually see.
+  resetTaps();
 
   if (screen === 'loading') {
     ctx.fillStyle = '#0a0616';
@@ -649,7 +707,18 @@ const frame = (): void => {
     // focus). The '2p' Mode value + its handling stay in the codebase, just no
     // longer offered on the menu.
     const MODES: Mode[] = ['cpu', 'online'];
-    if (pressedThisFrame.has('KeyL')) {
+    /** Leave the title for the fighter select. */
+    const enterSelect = (): void => {
+      screen = 'select';
+      locked = [false, false];
+      // Start both cursors on the first selectable (non-disabled) fighter.
+      const fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+      picks = [fe, fe];
+      void audio.playBgm('player_select', { fadeInSec: 0.5 });
+    };
+    // A tapped mode row both picks the mode and enters — one tap, like a menu.
+    const tappedMode = MODES.find((m) => taps.has(`mode:${m}`));
+    if (pressedThisFrame.has('KeyL') || taps.has('signin')) {
       // AIR sign-in/out toggle — must not fall through to "any key starts".
       if (auth.status === 'in') {
         void authLogout();
@@ -658,23 +727,21 @@ const frame = (): void => {
       } else {
         void authLogin();
       }
-    } else if (pressedThisFrame.has('KeyR')) {
+    } else if (pressedThisFrame.has('KeyR') || taps.has('ranks')) {
       // Standings are public — viewable even from the sign-in gate.
       screen = 'ranks';
       fetchRanks();
     } else if (!signedIn) {
-      // Gated: every other key waits for the sign-in.
+      // Gated: every other key/tap waits for the sign-in.
+    } else if (tappedMode) {
+      mode = tappedMode;
+      enterSelect();
     } else if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')) {
       mode = MODES[(MODES.indexOf(mode) + MODES.length - 1) % MODES.length]!;
     } else if (pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
       mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length]!;
     } else if (pressedThisFrame.size > 0) {
-      screen = 'select';
-      locked = [false, false];
-      // Start both cursors on the first selectable (non-disabled) fighter.
-      const fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
-      picks = [fe, fe];
-      void audio.playBgm('player_select', { fadeInSec: 0.5 });
+      enterSelect();
     }
   } else if (screen === 'ranks') {
     drawRanks(ctx, ranksRows, ranksTab, ranksErr, uiTick,
@@ -685,8 +752,9 @@ const frame = (): void => {
     if (pressedThisFrame.has('ArrowRight') || pressedThisFrame.has('KeyD')) {
       ranksTab = (ranksTab + 1) % RANK_TABS.length;
     }
+    for (let i = 0; i < RANK_TABS.length; i++) if (taps.has(`ranktab:${i}`)) ranksTab = i;
     if (pressedThisFrame.has('KeyR')) fetchRanks();
-    if (pressedThisFrame.has('Escape')) screen = 'title';
+    if (pressedThisFrame.has('Escape') || taps.has('back')) screen = 'title';
   } else if (screen === 'select') {
     tickSelect();
     drawSelect(ctx, allRosters, picks, locked, uiTick,
@@ -817,35 +885,67 @@ const frame = (): void => {
         ctx.fillText('VERIFYING WITH SERVER…', VW / 2, VH - 44);
       }
     }
-    if (pressedThisFrame.has('Enter')) {
-      if (net) { net.close(); net = null; screen = 'select'; locked = [false, false]; }
-      else startFight();
-    }
-    if (pressedThisFrame.has('Escape')) {
+    // 'back' overlaps the full-screen 'start' region, so check it first.
+    if (pressedThisFrame.has('Escape') || taps.has('back')) {
       net?.close();
       net = null;
       screen = 'select'; locked = [false, false];
       void audio.playBgm('player_select', { fadeInSec: 0.5 });
+    } else if (pressedThisFrame.has('Enter') || taps.has('start')) {
+      if (net) { net.close(); net = null; screen = 'select'; locked = [false, false]; }
+      else startFight();
     }
   }
 
+  // The arcade overlay belongs to the match only — push the screen this frame
+  // ended on, so it appears/disappears in lockstep with what was just drawn.
+  setTouchScreen(screen);
+
   pressedThisFrame.clear();
+  taps.clear();
 };
 
 // ---------------------------------------------------------------- loop
 let last = performance.now();
 let acc = 0;
 
+// Perf overlay (F): live FPS (rAF cadence), frame cost (sim+render ms), and
+// the netcode stall counter — the triage tool for "the game feels slow":
+// low FPS = this machine/browser; high ms/f = our renderer; stalls = network.
+let perfShow = false;
+let perfFps = 60;
+let perfMs = 0;
+addEventListener('keydown', (e) => { if (e.code === 'KeyF') perfShow = !perfShow; });
+
+const drawPerf = (): void => {
+  const stalled = net ? net.stalled : 0;
+  const txt = `${perfFps.toFixed(0)} FPS  ·  ${perfMs.toFixed(1)} ms/f${net ? `  ·  stall ${stalled}` : ''}`;
+  ctx.save();
+  ctx.font = 'bold 11px "Courier New", monospace';
+  ctx.textAlign = 'right';
+  const w = ctx.measureText(txt).width + 14;
+  ctx.fillStyle = '#000000aa';
+  ctx.fillRect(VW - w - 6, VH - 40, w, 18);
+  ctx.fillStyle = perfFps > 55 ? '#7ee85a' : perfFps > 40 ? '#ffd166' : '#ff6b6b';
+  ctx.fillText(txt, VW - 13, VH - 27);
+  ctx.restore();
+};
+
 const loop = (now: number): void => {
-  acc = Math.min(acc + (now - last), 200); // tab-switch guard
+  const rafDt = now - last;
+  acc = Math.min(acc + rafDt, 200); // tab-switch guard
   last = now;
+  perfFps += ((1000 / Math.max(1, rafDt)) - perfFps) * 0.05; // EMA
   let ran = false;
+  const t0 = performance.now();
   while (acc >= TICK_MS) {
     frame();
     acc -= TICK_MS;
     ran = true;
   }
+  if (ran) perfMs += (performance.now() - t0 - perfMs) * 0.1; // EMA
   if (!ran && screen === 'loading') frame(); // keep the loading screen painted
+  if (perfShow) drawPerf();
   requestAnimationFrame(loop);
 };
 
