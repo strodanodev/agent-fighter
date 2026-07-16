@@ -106,7 +106,7 @@ export interface TapRegion { x: number; y: number; w: number; h: number; action:
 let tapRegions: TapRegion[] = [];
 export const resetTaps = (): void => { tapRegions = []; };
 /** Register a tappable rect (canvas space). Cheap — just a push. */
-const tapZone = (x: number, y: number, w: number, h: number, action: string): void => {
+export const tapZone = (x: number, y: number, w: number, h: number, action: string): void => {
   tapRegions.push({ x, y, w, h, action });
 };
 /** Topmost region containing the point, or null. Later draws win overlaps. */
@@ -1615,17 +1615,22 @@ export const drawVsCard = (
   ctx.fillStyle = `rgba(6,4,12,${0.9 * clamp01(age / 8)})`;
   ctx.fillRect(0, 0, VW, VH);
 
-  // Portraits slide in from their edges, facing each other — kept tight to
-  // the sides so the stakes text in the middle stays clear.
+  // Portraits slide in from their edges, facing each other. Portrait images
+  // are VARIABLE-SIZE reference art (not 192px sprite cells), so they must be
+  // contain-fitted and anchored by their BOTTOM edge — a fixed sprite offset
+  // cropped tall art below the canvas (feet cut off, the reported bug).
   const slide = (1 - inT) * 220;
   ([0, 1] as const).forEach((i) => {
     const img = rosters[i].portrait;
-    if (!img) return;
+    if (!img || !img.naturalWidth || !img.naturalHeight) return;
+    const fit = Math.min(330 / img.naturalHeight, 270 / img.naturalWidth);
+    const w = img.naturalWidth * fit;
+    const h = img.naturalHeight * fit;
     ctx.save();
-    ctx.translate(i === 0 ? 185 - slide : VW - 185 + slide, VH - 55);
-    ctx.scale(i === 0 ? 1.9 : -1.9, 1.9);
-    ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(img, -96, -176);
+    ctx.translate(i === 0 ? 185 - slide : VW - 185 + slide, VH - 58);
+    ctx.scale(i === 0 ? 1 : -1, 1); // face each other
+    ctx.imageSmoothingEnabled = true; // hi-res art, not pixel sprites
+    ctx.drawImage(img, -w / 2, -h, w, h); // bottom-anchored: feet always visible
     ctx.restore();
     // Nameplate under each fighter.
     const nx = i === 0 ? 185 : VW - 185;
