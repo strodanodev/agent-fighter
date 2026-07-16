@@ -20,8 +20,8 @@ import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
   currentStageCamLimits, drawHud, drawRanks, drawResults, drawSelect, drawStage,
-  drawStageSelect, drawTitle, resetTaps, setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit,
-  tapHit, worldTransform,
+  drawStageSelect, drawTitle, drawVsCard, drawWallet, resetTaps, setBgVideo, setGameLogo,
+  setLogo, setStageAsset, setUiKit, tapHit, worldTransform,
 } from './ui.js';
 import type { Cam, HudFx, Mode, RankRow, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit } from './chrome.js';
@@ -107,6 +107,29 @@ let accountFetch: 'idle' | 'busy' | 'done' | 'fail' = 'idle';
 let accountToastAge = -1; // ≥0 → the "+10 DAILY CREDITS" toast is animating
 let queuedMode: 'solo' | 'wager' = 'wager';
 let practiceFree = false; // offline-fallback match: no fee, no XP, no records
+
+// ---- P0 loop redesign: quick play, VS card, wallet strip.
+// The remembered fighter makes the title's ENTER a one-input path to a match.
+const LAST_FIGHTER_KEY = 'af-last-fighter';
+let lastFighter = localStorage.getItem(LAST_FIGHTER_KEY) ?? '';
+/** Ticks the pre-fight stakes card has been showing (-1 = off). */
+let vsCardAge = -1;
+const VS_CARD_TICKS = 150; // ~2.5s; any key skips
+let vsStakes: string[] = [];
+// Wallet strip delta: animate credits the moment the balance visibly moves.
+let walletShown: number | null = null;
+let walletDelta: { amt: number; age: number } | null = null;
+
+const drawWalletStrip = (): void => {
+  if (!account) return;
+  walletShown ??= account.credits;
+  if (account.credits !== walletShown) {
+    walletDelta = { amt: account.credits - walletShown, age: 0 };
+    walletShown = account.credits;
+  }
+  if (walletDelta && ++walletDelta.age > 130) walletDelta = null;
+  drawWallet(ctx, account, walletDelta);
+};
 
 /** Match-server endpoints (?ws= overrides for deploys/dev). */
 const matchWsUrl = (): string =>
@@ -227,13 +250,70 @@ const boot = async (): Promise<void> => {
     picks = [0, Math.min(1, allRosters.length - 1)];
     screen = 'title';
     audio.preload();
-    void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1.5 });
+    // Landing / share deep-links: ?screen=title|select|ranks|play &mode=cpu|online &char=<id>
+    applyBootDeepLink();
+    if (screen === 'title') {
+      void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1.5 });
+    }
     // Restore a previous AIR session silently (30-day sessions) — never blocks
     // boot, and offline play works identically if it fails or is skipped.
     void authRehydrate();
   } catch (e) {
     loadError = (e as Error).message;
   }
+};
+
+/**
+ * Apply one-shot entry from the URL so the marketing site can open the real
+ * in-game screens (select / play / leaderboards) without a path router.
+ */
+const applyBootDeepLink = (): void => {
+  let q: URLSearchParams;
+  try {
+    q = new URLSearchParams(location.search);
+  } catch {
+    return;
+  }
+  const screenQ = (q.get('screen') ?? '').toLowerCase();
+  const modeQ = (q.get('mode') ?? '').toLowerCase();
+  const charQ = q.get('char');
+
+  if (modeQ === 'cpu' || modeQ === 'online' || modeQ === '2p') {
+    mode = modeQ;
+  }
+
+  const pickChar = (): void => {
+    if (!charQ) return;
+    const idx = allRosters.findIndex((r) => r.id === charQ && !r.disabled);
+    if (idx >= 0) picks = [idx, idx];
+  };
+
+  const enterSelectFromLink = (): void => {
+    screen = 'select';
+    locked = [false, false];
+    const fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+    picks = [fe, fe];
+    pickChar();
+    void audio.playBgm('player_select', { fadeInSec: 0.5 });
+  };
+
+  if (screenQ === 'ranks' || screenQ === 'leaderboard' || screenQ === 'leaderboards') {
+    screen = 'ranks';
+    fetchRanks();
+    return;
+  }
+  if (screenQ === 'select' || screenQ === 'character' || screenQ === 'characters') {
+    enterSelectFromLink();
+    return;
+  }
+  if (screenQ === 'play') {
+    // "Play now" → fighter select with VS AGENT (cpu) unless mode= was set.
+    if (modeQ !== 'online' && modeQ !== '2p') mode = 'cpu';
+    enterSelectFromLink();
+    return;
+  }
+  // Title (default): still honor ?char= so a shared fighter opens ready to pick.
+  pickChar();
 };
 
 /** Reset per-match juice/announce state (shared by local + online starts). */
@@ -262,6 +342,8 @@ const resetMatchFx = (g: GameState): void => {
  */
 const startOnline = (m: 'solo' | 'wager'): void => {
   const roster = allRosters[picks[0]]!;
+  lastFighter = roster.id;
+  localStorage.setItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
   queuedMode = m;
   practiceFree = false;
   netInstalled = false;
@@ -303,6 +385,11 @@ const installOnlineMatch = (): void => {
   resetMatchFx(game!);
   netInstalled = true;
   screen = 'fight';
+  // Stakes card (P0): what this match costs and pays, up front.
+  vsCardAge = 0;
+  vsStakes = s.mode === 'solo'
+    ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP', 'RANKED · SERVER-VERIFIED']
+    : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
   void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
 
@@ -319,6 +406,10 @@ const startFight = (): void => {
   net = null;
   resetMatchFx(game);
   screen = 'fight';
+  vsCardAge = 0;
+  vsStakes = mode === '2p'
+    ? ['LOCAL VERSUS', '']
+    : ['FREE PRACTICE      NO FEE · NO XP · NO RECORDS', ''];
   void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
 
@@ -702,21 +793,34 @@ const frame = (): void => {
         ? { credits: account.credits, level: account.level, wins: account.wins, losses: account.losses }
         : null,
       dailyToast: accountToastAge >= 0,
+      fighter: (allRosters.find((r) => r.id === lastFighter && !r.disabled)
+        ?? allRosters.find((r) => !r.disabled))?.bundle.name,
     });
     // 2-player local is disabled on all platforms (single-controller / mobile
     // focus). The '2p' Mode value + its handling stay in the codebase, just no
     // longer offered on the menu.
     const MODES: Mode[] = ['cpu', 'online'];
-    /** Leave the title for the fighter select. */
+    /** Leave the title for the fighter select (C — "change fighter"). */
     const enterSelect = (): void => {
       screen = 'select';
       locked = [false, false];
-      // Start both cursors on the first selectable (non-disabled) fighter.
-      const fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+      // Cursor starts on the REMEMBERED fighter so select is one confirm away.
+      let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
+      if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
       picks = [fe, fe];
       void audio.playBgm('player_select', { fadeInSec: 0.5 });
     };
-    // A tapped mode row both picks the mode and enters — one tap, like a menu.
+    /**
+     * QUICK MATCH (P0): title → queue in ONE input, with the remembered
+     * fighter. The select screen becomes an opt-in detour (C), not a toll.
+     */
+    const quickPlay = (): void => {
+      let idx = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
+      if (idx < 0) idx = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+      picks[0] = idx;
+      startOnline(mode === 'cpu' ? 'solo' : 'wager');
+    };
+    // A tapped mode row picks the mode AND launches — one tap to a match.
     const tappedMode = MODES.find((m) => taps.has(`mode:${m}`));
     if (pressedThisFrame.has('KeyL') || taps.has('signin')) {
       // AIR sign-in/out toggle — must not fall through to "any key starts".
@@ -735,13 +839,15 @@ const frame = (): void => {
       // Gated: every other key/tap waits for the sign-in.
     } else if (tappedMode) {
       mode = tappedMode;
-      enterSelect();
+      quickPlay();
     } else if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')) {
       mode = MODES[(MODES.indexOf(mode) + MODES.length - 1) % MODES.length]!;
     } else if (pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) {
       mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length]!;
-    } else if (pressedThisFrame.size > 0) {
+    } else if (pressedThisFrame.has('KeyC') || taps.has('changefighter')) {
       enterSelect();
+    } else if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('start')) {
+      quickPlay();
     }
   } else if (screen === 'ranks') {
     drawRanks(ctx, ranksRows, ranksTab, ranksErr, uiTick,
@@ -759,6 +865,7 @@ const frame = (): void => {
     tickSelect();
     drawSelect(ctx, allRosters, picks, locked, uiTick,
       mode === 'cpu' ? { cpuLevel: cpuLevelFor(profile, lever), lever } : undefined);
+    drawWalletStrip();
   } else if (screen === 'stageSelect') {
     tickStageSelect();
     drawStageSelect(ctx, stageIds, stageCursor, uiTick);
@@ -789,6 +896,7 @@ const frame = (): void => {
       ? (solo ? 'ENTER: FREE PRACTICE (no fee · no XP · no records)  ·  ESC: back'
         : 'is the match server running?  npm run server  ·  ESC: back')
       : 'humans and agents share this queue  ·  ESC: cancel', VW / 2, VH / 2 + 24);
+    drawWalletStrip();
     if (net?.setup && !netInstalled) installOnlineMatch();
     if (failed && solo && pressedThisFrame.has('Enter')) {
       // Server unreachable → the old local match, explicitly reward-free.
@@ -812,20 +920,35 @@ const frame = (): void => {
       screen = 'select'; locked = [false, false];
       void audio.playBgm('player_select', { fadeInSec: 0.5 });
     }
-    if (net) {
-      net.frame(pollPad(P0_MAP)); // rollback session owns stepping
+    // Stakes card: shown for the first ~2.5s; any key skips. Solo and local
+    // matches HOLD the sim under it (nothing is waiting on us); wager keeps
+    // stepping — the peer's card runs on the same clock and rollback absorbs
+    // the difference if one side skips early.
+    const cardUp = vsCardAge >= 0 && vsCardAge < VS_CARD_TICKS;
+    if (cardUp && pressedThisFrame.size > 0 && vsCardAge > 20) vsCardAge = VS_CARD_TICKS;
+    const holdSim = cardUp && net?.setup?.mode !== 'wager';
+    if (net && !holdSim) {
+      net.frame(pollPad(P0_MAP)); // session owns stepping (rollback or local-sim)
       if (net.status === 'error' && !net.result) {
         // Connection died mid-match: back out gracefully.
         fx.announce = 'CONNECTION LOST';
         fx.announceAge = 0;
       }
-    } else {
+    } else if (!net && !holdSim) {
       const p2: InputFrame = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
       step(game, [pollPad(P0_MAP), p2]);
     }
     updateJuice(game);
     updateCamera(game);
     renderFight(game);
+    if (cardUp && fighters) {
+      drawVsCard(ctx, fighters,
+        net?.setup ? net.setup.names : [fighters[0].bundle.name, cpuAi ? `AGENT LV ${cpuLevelFor(profile, lever)}` : fighters[1].bundle.name],
+        vsStakes.filter((s) => s), vsCardAge);
+      vsCardAge++;
+    } else if (vsCardAge >= 0) {
+      vsCardAge = -1;
+    }
     if (game.phase === Phase.Fighting && !hurryPlayed && game.timerTicks <= HURRY_UP_TICKS) {
       hurryPlayed = true;
       void audio.playStinger('hurry_up', { duck: false }); // layers over the stage loop, like the arcade original
@@ -866,7 +989,10 @@ const frame = (): void => {
       }
     }
     renderFight(game);
-    drawResults(ctx, game, fighters!, uiTick, resultsAge, xpBanner);
+    drawResults(ctx, game, fighters!, uiTick, resultsAge, xpBanner,
+      net
+        ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : '10 CR'}        ESC: CHANGE FIGHTER`
+        : undefined);
     // Online: the server's verdict is the real result (ADR 0003).
     if (net) {
       ctx.font = 'bold 15px "Courier New", monospace';
@@ -885,6 +1011,7 @@ const frame = (): void => {
         ctx.fillText('VERIFYING WITH SERVER…', VW / 2, VH - 44);
       }
     }
+    drawWalletStrip();
     // 'back' overlaps the full-screen 'start' region, so check it first.
     if (pressedThisFrame.has('Escape') || taps.has('back')) {
       net?.close();
@@ -892,8 +1019,16 @@ const frame = (): void => {
       screen = 'select'; locked = [false, false];
       void audio.playBgm('player_select', { fadeInSec: 0.5 });
     } else if (pressedThisFrame.has('Enter') || taps.has('start')) {
-      if (net) { net.close(); net = null; screen = 'select'; locked = [false, false]; }
-      else startFight();
+      // INSTANT REMATCH (P0): one input → straight back into the queue with
+      // the same fighter and mode. No select detour, no re-confirm.
+      if (net) {
+        const again = queuedMode;
+        net.close();
+        net = null;
+        startOnline(again);
+      } else {
+        startFight();
+      }
     }
   }
 

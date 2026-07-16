@@ -88,6 +88,38 @@ export const ZOOM_MAX = 1.9;
 export const CONTENT_TOP = 132;
 export const CONTENT_BOT = VH - 12;
 
+// ------------------------------------------------------------ tap targets
+/**
+ * Tappable regions in canvas (960×540) space, rebuilt from scratch every
+ * frame by the draw functions as they lay their UI out.
+ *
+ * The point of registering a rect from inside the same code that draws the
+ * element is that a tap target can never silently drift away from what the
+ * player actually sees — move the art, the hitbox moves with it. main.ts
+ * clears the list each frame, then hit-tests pointer taps against it; touch
+ * and mouse both arrive through that one path.
+ *
+ * `action` is semantic ('mode:cpu', 'pick:3'), NOT a key code — the screen
+ * handlers in main.ts decide what each one means.
+ */
+export interface TapRegion { x: number; y: number; w: number; h: number; action: string }
+let tapRegions: TapRegion[] = [];
+export const resetTaps = (): void => { tapRegions = []; };
+/** Register a tappable rect (canvas space). Cheap — just a push. */
+const tapZone = (x: number, y: number, w: number, h: number, action: string): void => {
+  tapRegions.push({ x, y, w, h, action });
+};
+/** Topmost region containing the point, or null. Later draws win overlaps. */
+export const tapHit = (vx: number, vy: number): string | null => {
+  for (let i = tapRegions.length - 1; i >= 0; i--) {
+    const r = tapRegions[i]!;
+    if (vx >= r.x && vx < r.x + r.w && vy >= r.y && vy < r.y + r.h) return r.action;
+  }
+  return null;
+};
+/** Debug/test hook: what's currently tappable. */
+export const tapRegionList = (): TapRegion[] => tapRegions.slice();
+
 export const worldTransform = (ctx: CanvasRenderingContext2D, cam: Cam): void => {
   ctx.scale(cam.zoom, cam.zoom);
   ctx.translate(-cam.x, -cam.y);
@@ -762,6 +794,8 @@ export interface TitleMenuState {
   account?: { credits: number; level: number; wins: number; losses: number } | null;
   /** Animate the "+10 DAILY CREDITS" toast. */
   dailyToast?: boolean;
+  /** Remembered fighter (quick match) — shown as "FIGHTING AS …". */
+  fighter?: string;
 }
 
 export const drawTitle = (
@@ -830,8 +864,12 @@ export const drawTitle = (
       label(ctx, 'complete the AIR dialog to continue', cx, menuY0 + 48, 13, '#ffffffaa');
     } else {
       display(ctx, 'SIGN IN TO ENTER', cx, menuY0 + 18, 28, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
-      label(ctx, 'PRESS  L  ·  AIR ACCOUNT (GOOGLE / EMAIL / WALLET)', cx, menuY0 + 48, 14, '#ffd166');
+      label(ctx, 'TAP / PRESS  L  ·  AIR ACCOUNT (GOOGLE / EMAIL / WALLET)', cx, menuY0 + 48, 14, '#ffd166');
       label(ctx, '10 FREE CREDITS EVERY DAY YOU LOG IN   ·   R: RANKINGS', cx, menuY0 + 70, 12, '#ffffff88');
+      // The gate is mandatory and phones have no `L` key — the sign-in
+      // headline itself has to be tappable or mobile can never get in.
+      tapZone(cx - 260, menuY0 - 4, 520, 60, 'signin');
+      tapZone(cx - 260, menuY0 + 60, 520, 22, 'ranks');
     }
     if (menu.authError) label(ctx, `⚠ ${menu.authError.slice(0, 64)}`, cx, menuY0 + 92, 12, '#ff9d9d');
   } else {
@@ -843,6 +881,7 @@ export const drawTitle = (
     rows.forEach(([m, txt], k) => {
       const y = menuY0 + k * 34;
       const on = menu.mode === m;
+      tapZone(cx - 260, y - 17, 520, 34, `mode:${m}`);
       if (on) {
         const pulse = 1 + 0.035 * Math.sin(tick / 10);
         display(ctx, txt, cx, y, 22, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
@@ -853,7 +892,19 @@ export const drawTitle = (
         label(ctx, txt, cx, y, 16, '#ffffff70');
       }
     });
-    label(ctx, '↑ / ↓  SELECT       ENTER  START       R  RANKINGS       L  SIGN OUT', cx, menuY0 + rows.length * 34 + 6, 13, '#ffffffaa');
+    const hintY = menuY0 + rows.length * 34 + 6;
+    // Quick match (P0): ENTER launches with the remembered fighter — the
+    // select screen is the C detour, not a toll booth on every match.
+    if (menu.fighter) {
+      label(ctx, `FIGHTING AS  ${menu.fighter.toUpperCase()}   ·   C  CHANGE FIGHTER`, cx, hintY, 12, '#8fd0ff');
+    }
+    label(ctx, 'TAP / ENTER  QUICK MATCH       R  RANKINGS       L  SIGN OUT', cx, hintY + 18, 13, '#ffffffaa');
+    // Split the hint line into two halves so RANKINGS and SIGN OUT are each
+    // reachable by touch (no keyboard on a phone).
+    tapZone(cx - 20, hintY + 7, 150, 22, 'ranks');
+    tapZone(cx + 130, hintY + 7, 150, 22, 'signin');
+    // The fighter line is the touch path to the select screen.
+    if (menu.fighter) tapZone(cx - 260, hintY - 11, 520, 20, 'changefighter');
   }
 
   // Account/wallet block — upper LEFT, minimal text (M5 spec).
@@ -1218,6 +1269,9 @@ export const drawSelect = (
   rosters.forEach((r, k) => {
     const x = gx + (k % cols) * (cell + gap);
     const y = gy + Math.floor(k / cols) * (cell + gap + 20);
+    // Tap the portrait to move the cursor here; tap the selected one again to
+    // confirm (main.ts). Disabled fighters register nothing — untappable.
+    if (!r.disabled) tapZone(x - 2, y - 2, cell + 4, cell + 24, `pick:${k}`);
     bevel(ctx, x - 2, y - 2, cell + 4, cell + 4, PANEL, GOLD, GOLD_DK, 2);
     drawPortrait(ctx, r, x, y, cell, cell);
     if (r.disabled) {
@@ -1316,6 +1370,7 @@ export const drawStageSelect = (
     const x = gx + k * (cell + gap);
     const y = gy;
     const on = k === cursor;
+    tapZone(x - 3, y - 3, cell + 6, cellH + 6, `stage:${k}`);
     bevel(ctx, x - 3, y - 3, cell + 6, cellH + 6, PANEL, on ? GOLD : GOLD_DK, GOLD_DK, on ? 3 : 2);
     ctx.fillStyle = PANEL_LT;
     ctx.fillRect(x, y, cell, cellH);
@@ -1332,7 +1387,8 @@ export const drawStageSelect = (
     }
   });
 
-  label(ctx, '◄ / ►  CHOOSE STAGE      ENTER  FIGHT      ESC  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
+  label(ctx, 'TAP / ◄ ►  CHOOSE STAGE      ENTER  FIGHT      ESC  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
+  tapZone(24, VH - 44, 150, 36, 'back');
 };
 
 // ---------------------------------------------------------------- results
@@ -1357,6 +1413,7 @@ export const drawResults = (
   tick: number,
   age: number, // ticks since the results screen appeared — drives the pop-in
   xp?: XpInfo | null,
+  hint?: string, // bottom action line — callers label the rematch with its fee
 ): void => {
   ctx.fillStyle = '#0a0616bb';
   ctx.fillRect(0, 0, VW, VH);
@@ -1413,8 +1470,11 @@ export const drawResults = (
   }
 
   if (tick % 60 < 42) {
-    label(ctx, 'ENTER: REMATCH    ESC: CHARACTER SELECT', VW / 2, VH - 26, 15, '#ffffffcc');
+    label(ctx, hint ?? 'TAP / ENTER: REMATCH        ESC: CHARACTER SELECT', VW / 2, VH - 26, 15, '#ffffffcc');
   }
+  // Rematch fills the screen; the smaller "back" strip sits on the left.
+  tapZone(0, 0, VW, VH, 'start');
+  tapZone(0, VH - 48, 240, 48, 'back');
 };
 
 // ------------------------------------------------------------- leaderboard
@@ -1454,6 +1514,7 @@ export const drawRanks = (
   const tabY = 104;
   RANK_TABS.forEach((t, i) => {
     const x = VW / 2 + (i - 1) * 170;
+    tapZone(x - 80, tabY - 16, 160, 32, `ranktab:${i}`);
     if (i === tab) {
       const pulse = 1 + 0.04 * Math.sin(tick / 10);
       display(ctx, t, x, tabY, 18, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
@@ -1505,5 +1566,85 @@ export const drawRanks = (
     });
   }
 
-  label(ctx, '◄ / ►  TAB       R  REFRESH       ESC  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
+  label(ctx, 'TAP  TAB       R  REFRESH       ESC / TAP HERE  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
+  tapZone(24, VH - 44, 170, 36, 'back');
+};
+
+// ------------------------------------------------------------ wallet strip
+/**
+ * The persistent wallet (P0 loop redesign): the same minimal top-left text
+ * as the title chip, rendered on every screen where money matters (select,
+ * lobby, results). `delta` floats a "+2 CR" / "−1 CR" that drifts up and
+ * fades — credits you can watch move feel real.
+ */
+export interface WalletView { credits: number; level: number; wins: number; losses: number }
+
+export const drawWallet = (
+  ctx: CanvasRenderingContext2D,
+  w: WalletView | null,
+  delta: { amt: number; age: number } | null,
+): void => {
+  if (!w) return;
+  label(ctx, `⛁ ${w.credits} CR   ·   LV ${w.level}   ·   ${w.wins}W ${w.losses}L`, 16, 22, 12, '#ffd166', 'left');
+  if (delta && delta.age < 120 && delta.amt !== 0) {
+    const t = delta.age / 120;
+    ctx.save();
+    ctx.globalAlpha = 1 - t * t;
+    const up = delta.age * 0.22;
+    label(ctx, `${delta.amt > 0 ? '+' : '−'}${Math.abs(delta.amt)} CR`,
+      16, 42 - up, 15, delta.amt > 0 ? '#7ee85a' : '#ff6b6b', 'left');
+    ctx.restore();
+  }
+};
+
+// ---------------------------------------------------------------- VS card
+/**
+ * Pre-fight stakes card (P0): 2½ seconds of "this is what's on the line" —
+ * portraits, names, and the exact credit/XP terms of the match. Doubles as
+ * the fight's establishing beat (the 'vs' stinger already plays under it).
+ * Pure overlay: the caller decides whether the sim runs beneath it.
+ */
+export const drawVsCard = (
+  ctx: CanvasRenderingContext2D,
+  rosters: [Roster, Roster],
+  names: [string, string],
+  stakes: string[], // 1-3 short lines, most important first
+  age: number, // ticks since the card appeared — drives pop-in
+): void => {
+  const inT = easeOutBack(clamp01(age / 14));
+  ctx.fillStyle = `rgba(6,4,12,${0.9 * clamp01(age / 8)})`;
+  ctx.fillRect(0, 0, VW, VH);
+
+  // Portraits slide in from their edges, facing each other — kept tight to
+  // the sides so the stakes text in the middle stays clear.
+  const slide = (1 - inT) * 220;
+  ([0, 1] as const).forEach((i) => {
+    const img = rosters[i].portrait;
+    if (!img) return;
+    ctx.save();
+    ctx.translate(i === 0 ? 185 - slide : VW - 185 + slide, VH - 55);
+    ctx.scale(i === 0 ? 1.9 : -1.9, 1.9);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(img, -96, -176);
+    ctx.restore();
+    // Nameplate under each fighter.
+    const nx = i === 0 ? 185 : VW - 185;
+    label(ctx, names[i].toUpperCase().slice(0, 20), nx, VH - 38, 15, i === 0 ? '#8fe8a0' : '#ff9d9d');
+  });
+
+  ctx.save();
+  ctx.translate(VW / 2, 150);
+  ctx.scale(inT, inT);
+  ctx.translate(-VW / 2, -150);
+  display(ctx, 'VS', VW / 2, 165, 92, { glow: 'rgba(255,209,102,0.6)' });
+  ctx.restore();
+
+  // The terms — gold, dead center, unmissable.
+  stakes.forEach((s, k) => {
+    label(ctx, s, VW / 2, 235 + k * 26, k === 0 ? 17 : 13, k === 0 ? GOLD_LT : '#ffffff99');
+  });
+
+  if (age > 40 && age % 50 < 36) {
+    label(ctx, 'ANY KEY — FIGHT', VW / 2, VH - 16, 12, '#ffffff77');
+  }
 };
