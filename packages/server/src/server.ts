@@ -558,7 +558,8 @@ export const createMatchServer = (opts: {
     }
     if (path === '/leaderboard') {
       if (!persistence) return json(res, 503, { error: 'persistence not configured' });
-      void persistence.leaderboard(20)
+      const limit = Math.min(100, Math.max(1, Number(new URL(req.url ?? '/', 'http://x').searchParams.get('limit')) || 20));
+      void persistence.leaderboard(limit)
         .then((rows) => json(res, 200, rows))
         .catch((e) => json(res, 502, { error: String(e) }));
       return;

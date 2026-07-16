@@ -18,11 +18,11 @@ import type { Profile } from './progress.js';
 import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './atlas.js';
 import type { Roster } from './atlas.js';
 import {
-  CONTENT_BOT, CONTENT_TOP, P_COLORS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  currentStageCamLimits, drawHud, drawResults, drawSelect, drawStage,
+  CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
+  currentStageCamLimits, drawHud, drawRanks, drawResults, drawSelect, drawStage,
   drawStageSelect, drawTitle, setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit, worldTransform,
 } from './ui.js';
-import type { Cam, HudFx, Mode, XpInfo } from './ui.js';
+import type { Cam, HudFx, Mode, RankRow, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit } from './chrome.js';
 import type { StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
@@ -69,7 +69,7 @@ const pollPad = (map: [string, number][]): InputFrame => {
 };
 
 // ---------------------------------------------------------------- state
-type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results';
+type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'ranks';
 
 let screen: Screen = 'loading';
 let mode: Mode = 'cpu';
@@ -91,6 +91,26 @@ let practiceFree = false; // offline-fallback match: no fee, no XP, no records
 const matchWsUrl = (): string =>
   new URLSearchParams(location.search).get('ws') ?? `ws://${location.hostname}:8477`;
 const matchHttpUrl = (): string => matchWsUrl().replace(/^ws/, 'http');
+
+// Public standings (drawRanks) — fetched from the match server on entry.
+let ranksRows: RankRow[] | null = null;
+let ranksTab = 0;
+let ranksErr = '';
+let ranksBusy = false;
+
+const fetchRanks = (): void => {
+  if (ranksBusy) return;
+  ranksBusy = true;
+  ranksRows = null;
+  ranksErr = '';
+  void fetch(`${matchHttpUrl()}/leaderboard?limit=100`)
+    .then(async (res) => {
+      if (!res.ok) throw new Error(`server said ${res.status}`);
+      ranksRows = (await res.json()) as RankRow[];
+    })
+    .catch((e) => { ranksErr = (e as Error).message || 'unreachable'; })
+    .finally(() => { ranksBusy = false; });
+};
 
 /**
  * Pull the account snapshot from the match server (also claims the daily
@@ -638,6 +658,10 @@ const frame = (): void => {
       } else {
         void authLogin();
       }
+    } else if (pressedThisFrame.has('KeyR')) {
+      // Standings are public — viewable even from the sign-in gate.
+      screen = 'ranks';
+      fetchRanks();
     } else if (!signedIn) {
       // Gated: every other key waits for the sign-in.
     } else if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')) {
@@ -652,6 +676,17 @@ const frame = (): void => {
       picks = [fe, fe];
       void audio.playBgm('player_select', { fadeInSec: 0.5 });
     }
+  } else if (screen === 'ranks') {
+    drawRanks(ctx, ranksRows, ranksTab, ranksErr, uiTick,
+      authName() ?? (DEV_GUEST ?? undefined));
+    if (pressedThisFrame.has('ArrowLeft') || pressedThisFrame.has('KeyA')) {
+      ranksTab = (ranksTab + RANK_TABS.length - 1) % RANK_TABS.length;
+    }
+    if (pressedThisFrame.has('ArrowRight') || pressedThisFrame.has('KeyD')) {
+      ranksTab = (ranksTab + 1) % RANK_TABS.length;
+    }
+    if (pressedThisFrame.has('KeyR')) fetchRanks();
+    if (pressedThisFrame.has('Escape')) screen = 'title';
   } else if (screen === 'select') {
     tickSelect();
     drawSelect(ctx, allRosters, picks, locked, uiTick,

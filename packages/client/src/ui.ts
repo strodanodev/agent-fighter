@@ -831,7 +831,7 @@ export const drawTitle = (
     } else {
       display(ctx, 'SIGN IN TO ENTER', cx, menuY0 + 18, 28, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
       label(ctx, 'PRESS  L  ·  AIR ACCOUNT (GOOGLE / EMAIL / WALLET)', cx, menuY0 + 48, 14, '#ffd166');
-      label(ctx, '10 FREE CREDITS EVERY DAY YOU LOG IN', cx, menuY0 + 70, 12, '#ffffff88');
+      label(ctx, '10 FREE CREDITS EVERY DAY YOU LOG IN   ·   R: RANKINGS', cx, menuY0 + 70, 12, '#ffffff88');
     }
     if (menu.authError) label(ctx, `⚠ ${menu.authError.slice(0, 64)}`, cx, menuY0 + 92, 12, '#ff9d9d');
   } else {
@@ -853,7 +853,7 @@ export const drawTitle = (
         label(ctx, txt, cx, y, 16, '#ffffff70');
       }
     });
-    label(ctx, '↑ / ↓  SELECT       ENTER  START       L  SIGN OUT', cx, menuY0 + rows.length * 34 + 6, 13, '#ffffffaa');
+    label(ctx, '↑ / ↓  SELECT       ENTER  START       R  RANKINGS       L  SIGN OUT', cx, menuY0 + rows.length * 34 + 6, 13, '#ffffffaa');
   }
 
   // Account/wallet block — upper LEFT, minimal text (M5 spec).
@@ -1415,4 +1415,95 @@ export const drawResults = (
   if (tick % 60 < 42) {
     label(ctx, 'ENTER: REMATCH    ESC: CHARACTER SELECT', VW / 2, VH - 26, 15, '#ffffffcc');
   }
+};
+
+// ------------------------------------------------------------- leaderboard
+/** One row of the public standings (the server's /leaderboard shape). */
+export interface RankRow {
+  name: string;
+  is_agent: boolean;
+  level: number;
+  xp: number;
+  wins: number;
+  losses: number;
+  rank: number;
+}
+
+export const RANK_TABS = ['ALL', 'HUMANS', 'AGENTS'] as const;
+
+/**
+ * Public standings screen (M5): humans and agents ranked together, with tab
+ * filters — the "one game, two kinds of players" pitch made visible.
+ * `you` highlights the signed-in player's own row (matched upstream).
+ */
+export const drawRanks = (
+  ctx: CanvasRenderingContext2D,
+  rows: RankRow[] | null, // null = still loading
+  tab: number,
+  error: string,
+  tick: number,
+  you?: string,
+): void => {
+  drawMenuBackdrop(ctx);
+  ctx.fillStyle = '#0a0616cc';
+  ctx.fillRect(0, 0, VW, VH);
+
+  display(ctx, 'LEADERBOARD', VW / 2, 64, 40, { glow: 'rgba(255,209,102,0.5)' });
+
+  // Tabs — ◄ ► cycles, arcade style.
+  const tabY = 104;
+  RANK_TABS.forEach((t, i) => {
+    const x = VW / 2 + (i - 1) * 170;
+    if (i === tab) {
+      const pulse = 1 + 0.04 * Math.sin(tick / 10);
+      display(ctx, t, x, tabY, 18, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+    } else {
+      label(ctx, t, x, tabY, 14, '#ffffff66');
+    }
+  });
+
+  const boxX = VW / 2 - 380, boxW = 760, boxY = 126, boxH = 356;
+  bevel(ctx, boxX, boxY, boxW, boxH, PANEL, GOLD, GOLD_DK, 3);
+
+  // Column layout (x offsets inside the box).
+  const cols = { rank: 40, name: 90, kind: 380, lv: 490, xp: 560, wl: 680 };
+  label(ctx, '#', boxX + cols.rank, boxY + 28, 12, GOLD_LT);
+  label(ctx, 'FIGHTER', boxX + cols.name + 60, boxY + 28, 12, GOLD_LT);
+  label(ctx, 'TYPE', boxX + cols.kind + 24, boxY + 28, 12, GOLD_LT);
+  label(ctx, 'LV', boxX + cols.lv, boxY + 28, 12, GOLD_LT);
+  label(ctx, 'XP', boxX + cols.xp + 16, boxY + 28, 12, GOLD_LT);
+  label(ctx, 'W — L', boxX + cols.wl, boxY + 28, 12, GOLD_LT);
+  ctx.fillStyle = '#ffffff22';
+  ctx.fillRect(boxX + 16, boxY + 38, boxW - 32, 1);
+
+  if (error) {
+    label(ctx, `⚠ ${error}`, VW / 2, boxY + boxH / 2, 15, '#ff9d9d');
+    label(ctx, 'is the match server running?  npm run server', VW / 2, boxY + boxH / 2 + 26, 12, '#ffffff77');
+  } else if (!rows) {
+    const dots = '.'.repeat(1 + (Math.trunc(tick / 20) % 3));
+    label(ctx, `FETCHING STANDINGS${dots}`, VW / 2, boxY + boxH / 2, 15, '#f7e0a3');
+  } else {
+    const filtered = rows.filter((r) =>
+      tab === 0 || (tab === 1 ? !r.is_agent : r.is_agent));
+    if (filtered.length === 0) {
+      label(ctx, 'NO RANKED FIGHTERS YET — WIN A MATCH TO CLAIM #1', VW / 2, boxY + boxH / 2, 14, '#ffffff88');
+    }
+    filtered.slice(0, 10).forEach((r, i) => {
+      const y = boxY + 62 + i * 30;
+      const isYou = !!you && r.name === you;
+      if (isYou) {
+        ctx.fillStyle = '#ffd16622';
+        ctx.fillRect(boxX + 12, y - 18, boxW - 24, 26);
+      }
+      const medal = r.rank === 1 ? '#ffd166' : r.rank === 2 ? '#cfd8e3' : r.rank === 3 ? '#d9915b' : '#ffffffbb';
+      label(ctx, String(r.rank), boxX + cols.rank, y, 15, medal);
+      label(ctx, r.name.slice(0, 22).toUpperCase() + (isYou ? '  (YOU)' : ''), boxX + cols.name, y, 15, isYou ? GOLD_LT : '#ffffffdd', 'left');
+      label(ctx, r.is_agent ? '🤖 AGENT' : 'HUMAN', boxX + cols.kind, y, 12, r.is_agent ? '#8fd0ff' : '#8fe8a0', 'left');
+      label(ctx, String(r.level), boxX + cols.lv, y, 15, '#ffffffdd');
+      label(ctx, String(r.xp), boxX + cols.xp + 16, y, 13, '#ffffff99');
+      label(ctx, `${r.wins} — ${r.losses}`, boxX + cols.wl, y, 14, '#ffffffdd');
+    });
+  }
+
+  label(ctx, '◄ / ►  TAB       R  REFRESH       ESC  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
 };
