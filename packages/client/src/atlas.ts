@@ -50,6 +50,14 @@ export interface Roster {
   portraitFraming: { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean } | null;
   /** Alpha bounds of the portrait art, so frames crop to the figure, not the cell. */
   portraitBox: { x: number; y: number; w: number; h: number } | null;
+  /**
+   * Dedicated VS-screen pose (meta.vsPortrait → _vs.png) + its framing.
+   * When present the VS card COVER-fits it into a fixed frame, so every
+   * character fills the same box however its art is proportioned; null falls
+   * back to contain-fitting `portrait` (never cropped, but sizes vary).
+   */
+  vsPortrait: HTMLImageElement | null;
+  vsFraming: { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean } | null;
   /** Disabled in Studio (meta.disabled): greyed out and unselectable on the select screen. */
   disabled: boolean;
 }
@@ -107,20 +115,25 @@ export const loadRoster = async (id: string): Promise<Roster> => {
   // Dedicated character-select portrait, authored in Studio (meta.selectPortrait
   // → _select.png). Only honored when the bundle still references it — "remove"
   // in Studio clears the field but leaves the file, and we must respect that.
+  type Framing = { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean };
   const meta = (bundle as CharacterBundle & {
     meta?: {
       selectPortrait?: string;
-      selectFraming?: { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean };
+      selectFraming?: Framing;
+      vsPortrait?: string;
+      vsFraming?: Framing;
       disabled?: boolean;
     };
   }).meta;
-  const portraitFile = meta?.selectPortrait;
-  const safePortrait = portraitFile && /^[\w.-]+\.(png|webp|jpe?g)$/.test(portraitFile)
-    ? portraitFile : null;
-  const [sheet, refPortrait, selectPortrait] = await Promise.all([
+  const safeName = (f: string | undefined): string | null =>
+    f && /^[\w.-]+\.(png|webp|jpe?g)$/.test(f) ? f : null;
+  const safePortrait = safeName(meta?.selectPortrait);
+  const safeVs = safeName(meta?.vsPortrait);
+  const [sheet, refPortrait, selectPortrait, vsPortrait] = await Promise.all([
     loadImage(`/characters/${id}/sprites/${sheetFile}`),
     loadImage(`/characters/${id}/sprites/_reference.png`),
     safePortrait ? loadImage(`/characters/${id}/sprites/${safePortrait}`) : Promise.resolve(null),
+    safeVs ? loadImage(`/characters/${id}/sprites/${safeVs}`) : Promise.resolve(null),
   ]);
   const dedicated = !!selectPortrait;
   const portrait = selectPortrait ?? refPortrait;
@@ -131,6 +144,8 @@ export const loadRoster = async (id: string): Promise<Roster> => {
     // A composed portrait fills its frame (cover-fit); only the sprite fallback
     // needs alpha bounds to crop away the empty cell.
     portraitBox: !dedicated && portrait ? alphaBounds(portrait) : null,
+    vsPortrait,
+    vsFraming: vsPortrait ? (meta?.vsFraming ?? null) : null,
     disabled: !!meta?.disabled,
   };
 };
@@ -223,18 +238,28 @@ export const drawFighter = (
 
 /**
  * Draw a character portrait into (x, y, w, h).
- *  - Dedicated portrait (_select.png): composed art → cover-fit (fill the frame,
- *    center-crop the overflow), no alpha cropping.
+ *  - Dedicated portrait (_select.png / _vs.png): composed art → cover-fit (fill
+ *    the frame, center-crop the overflow), no alpha cropping.
  *  - Reference-sprite fallback: a square crop centered on the head and chest of
  *    the figure (the reference cell is mostly empty space), scaled to fill.
+ *
+ * `slot` picks which authored image to use: 'select' (the square select/HUD
+ * portrait) or 'vs' (the VS-card pose). 'vs' silently falls back to the select
+ * portrait when a character has no VS pose authored yet.
  */
+export type PortraitSlot = 'select' | 'vs';
+
 export const drawPortrait = (
   ctx: CanvasRenderingContext2D,
   roster: Roster,
   x: number, y: number, w: number, h: number,
+  slot: PortraitSlot = 'select',
 ): void => {
-  const img = roster.portrait;
-  if (!img || (!roster.portraitDedicated && !roster.portraitBox)) {
+  const useVs = slot === 'vs' && !!roster.vsPortrait;
+  const img = useVs ? roster.vsPortrait : roster.portrait;
+  const dedicated = useVs || roster.portraitDedicated;
+  const framing = useVs ? roster.vsFraming : roster.portraitFraming;
+  if (!img || (!dedicated && !roster.portraitBox)) {
     ctx.fillStyle = '#1b1e30';
     ctx.fillRect(x, y, w, h);
     return;
@@ -243,22 +268,30 @@ export const drawPortrait = (
   ctx.beginPath();
   ctx.rect(x, y, w, h);
   ctx.clip();
-  ctx.imageSmoothingEnabled = roster.portraitDedicated ? true : (roster.atlas?.smooth ?? false);
+  ctx.imageSmoothingEnabled = dedicated ? true : (roster.atlas?.smooth ?? false);
   if (ctx.imageSmoothingEnabled) ctx.imageSmoothingQuality = 'high';
-  if (roster.portraitDedicated) {
-    // Cover-fit scaled by zoom, then rotated (90° steps), flipped, and panned.
-    // Must match the Studio preview math (studio main.ts framedPreview).
-    const fr = roster.portraitFraming;
+  if (dedicated) {
+    // Fitted by zoom, then rotated (90° steps), flipped, and panned. Must match
+    // the Studio preview math (studio main.ts framedPreview).
+    //  · select → COVER: a square portrait should fill its frame edge to edge.
+    //  · vs → CONTAIN: the whole pose stays visible (never clipped) while the
+    //    fixed frame keeps every character the same size. zoom > 1 pushes in.
+    const fr = framing;
     const iw = img.naturalWidth, ih = img.naturalHeight;
     const zoom = Math.max(1, fr?.zoom ?? 1);
     const rot = ((((fr?.rotate ?? 0) % 360) + 360) % 360);
     const swap = rot === 90 || rot === 270;
     const bw = swap ? ih : iw, bh = swap ? iw : ih;
-    const scale = Math.max(w / bw, h / bh) * zoom;
+    const fitScale = useVs ? Math.min(w / bw, h / bh) : Math.max(w / bw, h / bh);
+    const scale = fitScale * zoom;
     const sw = bw * scale, sh = bh * scale;
     const panX = Math.max(-1, Math.min(1, fr?.panX ?? 0));
     const panY = Math.max(-1, Math.min(1, fr?.panY ?? 0));
-    ctx.translate(x + w / 2 + panX * (sw - w) / 2, y + h / 2 + panY * (sh - h) / 2);
+    // Only pan across real overflow — a contained image has none to slide.
+    ctx.translate(
+      x + w / 2 + panX * Math.max(0, sw - w) / 2,
+      y + h / 2 + panY * Math.max(0, sh - h) / 2,
+    );
     ctx.rotate(rot * Math.PI / 180);
     if (fr?.flipH) ctx.scale(-1, 1);
     ctx.drawImage(img, -iw * scale / 2, -ih * scale / 2, iw * scale, ih * scale);

@@ -35,6 +35,16 @@ interface StudioMeta {
   selectPortrait?: string; // character-select portrait sprite (e.g. _select.png)
   // Portrait framing: zoom/recenter + 90° rotation + horizontal flip.
   selectFraming?: { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean };
+  /**
+   * VS-screen pose (e.g. _vs.png) + its framing. Authored separately from the
+   * select portrait because the VS card wants a full-body fighting stance, not
+   * a face. When set, the game COVER-fits it into a fixed VS frame, so every
+   * character occupies the same box no matter how its source art is
+   * proportioned; without it the card falls back to contain-fitting the select
+   * portrait (safe, but sizes vary per character).
+   */
+  vsPortrait?: string;
+  vsFraming?: { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean };
   disabled?: boolean; // greyed out + unselectable on the character-select screen
 }
 
@@ -124,7 +134,7 @@ const loadChar = async (id: string): Promise<void> => {
   stSel = null;
   stGenResults = new Map();
   stDirty = false;
-  stPortraitPicker = false;
+  stPortraitPicker = null;
   spriteImgs.clear();
   const added = ensureSystemMoves(stBundle);
   if (added > 0) stDirty = true;
@@ -661,8 +671,62 @@ const renderHeader = (): HTMLElement => {
 // ------------------------------------------------------------------ character tab
 /** Fixed filename for the character-select portrait (see meta.selectPortrait). */
 const SELECT_PORTRAIT = '_select.png';
-/** Whether the "select from sprites" picker is expanded on the Character tab. */
-let stPortraitPicker = false;
+
+/**
+ * A portrait SLOT: one authored image + framing pair in meta. Two exist —
+ * the square character-select portrait and the VS-screen pose — and they
+ * share every control below (upload / from-sprite / from-reference / zoom /
+ * rotate / flip / drag-recenter), differing only in filename, meta keys, and
+ * the preview's aspect (WYSIWYG: the game draws select square, VS tall).
+ */
+interface PortraitSlot {
+  file: string;
+  imgKey: 'selectPortrait' | 'vsPortrait';
+  frameKey: 'selectFraming' | 'vsFraming';
+  title: string;
+  /** Preview box in px — matches the game's aspect for that slot. */
+  pw: number;
+  ph: number;
+  /**
+   * How the game fits the art into its frame — the preview mirrors it exactly.
+   * 'cover' fills the frame and center-crops the overflow (right for a square
+   * portrait); 'contain' keeps the whole pose visible inside a fixed box (right
+   * for VS: nothing clipped, and every character ends up the same size).
+   */
+  fit: 'cover' | 'contain';
+  hint: string;
+}
+
+const SELECT_SLOT: PortraitSlot = {
+  file: SELECT_PORTRAIT,
+  imgKey: 'selectPortrait',
+  frameKey: 'selectFraming',
+  title: 'Character Select portrait',
+  pw: 120,
+  ph: 120,
+  fit: 'cover',
+  hint: 'shown on the character-select screen (square). Drag to recenter; zoom, rotate (90°) and flip to '
+    + 'frame it — the game applies the same transform. Stored as sprites/_select.png + framing in the '
+    + 'bundle; persists on Save. Not a game sprite (never keyed or packed into the atlas).',
+};
+
+const VS_SLOT: PortraitSlot = {
+  file: '_vs.png',
+  imgKey: 'vsPortrait',
+  frameKey: 'vsFraming',
+  title: 'VS screen pose',
+  pw: 105,
+  ph: 140,
+  fit: 'contain',
+  hint: 'shown on the pre-fight VS card (tall). Pick a full-body fighting stance — "select from sprites" '
+    + 'is usually best: it crops to the figure, so the pose fills the card. The game fits this inside a '
+    + 'FIXED VS frame, so every character comes out the same size no matter how its art is proportioned, '
+    + 'and nothing is clipped. Zoom pushes in (and may crop); drag to recenter. Leave it empty and the card '
+    + 'falls back to the select portrait — safe, but sizes vary. Stored as sprites/_vs.png + framing.',
+};
+
+/** Which slot's "select from sprites" picker is expanded (null = none). */
+let stPortraitPicker: PortraitSlot | null = null;
 
 /**
  * Crop a canvas to its opaque alpha bounds plus a padding fraction. Sprite
@@ -692,27 +756,27 @@ const cropToAlpha = (c: HTMLCanvasElement, padFrac = 0.12): HTMLCanvasElement | 
   return out;
 };
 
-/** Set the portrait from one of this character's existing sprite frames. */
-const portraitFromSprite = async (name: string): Promise<void> => {
+/** Set a slot's portrait from one of this character's existing sprite frames. */
+const portraitFromSprite = async (slot: PortraitSlot, name: string): Promise<void> => {
   let c = spriteCanvas(name);
   for (let w = 0; w < 30 && !c; w++) {
     await new Promise((r) => setTimeout(r, 80));
     c = spriteCanvas(name);
   }
   if (!c) { stStatus = `sprite ${name} not loaded yet — try again`; renderAll(); return; }
-  await savePortrait(cropToAlpha(c) ?? c);
-  stPortraitPicker = false;
+  await savePortrait(slot, cropToAlpha(c) ?? c);
+  stPortraitPicker = null;
   renderAll();
 };
 
 /**
- * Save a character-select portrait: capped to 1024px on the long edge (bounds
- * file size), written to sprites/_select.png, and recorded in meta so it
- * persists on Save and the game's select screen can find it. Unlike sprite
- * frames it is NOT keyed/cropped — a portrait is framed art, not a game sprite,
- * and it never enters the atlas (the packer only touches referenced steps).
+ * Save a slot's portrait: capped to 1024px on the long edge (bounds file
+ * size), written to sprites/<slot.file>, and recorded in meta so it persists
+ * on Save and the game can find it. Unlike sprite frames it is NOT
+ * keyed/cropped — a portrait is framed art, not a game sprite, and it never
+ * enters the atlas (the packer only touches referenced steps).
  */
-const savePortrait = async (src: HTMLImageElement | HTMLCanvasElement): Promise<void> => {
+const savePortrait = async (slot: PortraitSlot, src: HTMLImageElement | HTMLCanvasElement): Promise<void> => {
   const iw = src instanceof HTMLCanvasElement ? src.width : src.naturalWidth;
   const ih = src instanceof HTMLCanvasElement ? src.height : src.naturalHeight;
   const s = Math.min(1, 1024 / Math.max(iw, ih));
@@ -723,19 +787,19 @@ const savePortrait = async (src: HTMLImageElement | HTMLCanvasElement): Promise<
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(src, 0, 0, out.width, out.height);
-  await saveSprite(SELECT_PORTRAIT, out);
-  meta().selectPortrait = SELECT_PORTRAIT;
+  await saveSprite(slot.file, out);
+  meta()[slot.imgKey] = slot.file;
   stDirty = true;
-  stStatus = `character-select portrait saved (${out.width}×${out.height}) — Save to persist`;
+  stStatus = `${slot.title} saved (${out.width}×${out.height}) — Save to persist`;
   renderAll();
 };
 
-const uploadPortrait = async (file: File): Promise<void> => {
+const uploadPortrait = async (slot: PortraitSlot, file: File): Promise<void> => {
   try {
     stStatus = `reading ${file.name}…`; renderAll();
-    await savePortrait(await fileToImage(file));
+    await savePortrait(slot, await fileToImage(file));
   } catch (e) {
-    stStatus = `portrait upload failed: ${(e as Error).message}`;
+    stStatus = `${slot.title} upload failed: ${(e as Error).message}`;
     renderAll();
   }
 };
@@ -743,44 +807,45 @@ const uploadPortrait = async (file: File): Promise<void> => {
 /** Convenience: reuse the locked reference sprite as the portrait. The PNG
  * streams in async (may be uncached if this tab opened straight to Character),
  * so wait for it like the reference-conditioned paths do before giving up. */
-const portraitFromReference = async (): Promise<void> => {
+const portraitFromReference = async (slot: PortraitSlot): Promise<void> => {
   let ref = spriteCanvas('_reference.png');
   for (let w = 0; w < 30 && !ref; w++) {
     await new Promise((r) => setTimeout(r, 100));
     ref = spriteCanvas('_reference.png');
   }
   if (!ref) { stStatus = 'no reference sprite yet — generate/lock one first'; renderAll(); return; }
-  await savePortrait(ref);
+  await savePortrait(slot, ref);
 };
 
-/** Drop the portrait (leaves the file on disk, just unreferenced). */
-const removePortrait = (): void => {
-  delete meta().selectPortrait;
-  delete meta().selectFraming;
+/** Drop a slot's portrait (leaves the file on disk, just unreferenced). */
+const removePortrait = (slot: PortraitSlot): void => {
+  delete meta()[slot.imgKey];
+  delete meta()[slot.frameKey];
   stDirty = true;
-  stStatus = 'character-select portrait removed — Save to persist';
+  stStatus = `${slot.title} removed — Save to persist`;
   renderAll();
 };
 
-const renderCharacterTab = (): HTMLElement => {
+/**
+ * One portrait slot's editor (used for BOTH the select portrait and the VS
+ * pose). Framing (zoom + recenter + 90° rotation + flip) is a non-destructive
+ * transform stored in meta and applied identically by the game (see client
+ * atlas.ts drawPortrait) — the preview is WYSIWYG at the slot's own aspect.
+ */
+const renderPortraitSlot = (slot: PortraitSlot): HTMLElement => {
   const b = stBundle!;
-  const field = (label: string, get: () => number, set: (v: number) => void): HTMLElement =>
-    mkEl('label', { class: 'field' }, label, numInput(get(), set, 70));
+  const portrait = meta()[slot.imgKey];
+  const { pw, ph } = slot;
 
-  const portrait = meta().selectPortrait;
-
-  // Framing (zoom + recenter) is a non-destructive transform stored in meta and
-  // applied identically by the game (see client atlas.ts drawPortrait). The
-  // preview is SQUARE because the game draws every portrait square (WYSIWYG).
   type Framing = { zoom: number; panX: number; panY: number; rotate: number; flipH: boolean };
   const getFraming = (): Framing => {
-    const f = meta().selectFraming;
+    const f = meta()[slot.frameKey];
     return { zoom: f?.zoom ?? 1, panX: f?.panX ?? 0, panY: f?.panY ?? 0, rotate: f?.rotate ?? 0, flipH: f?.flipH ?? false };
   };
-  const setFraming = (f: Framing): void => { meta().selectFraming = f; stDirty = true; };
+  const setFraming = (f: Framing): void => { meta()[slot.frameKey] = f; stDirty = true; };
   const norm90 = (r: number): number => (((r % 360) + 360) % 360);
-  const framedPreview = (size: number): { el: HTMLCanvasElement; repaint: () => void } => {
-    const cv = mkEl('canvas', { width: size, height: size, class: 'thumb', style: 'cursor:grab' });
+  const framedPreview = (): { el: HTMLCanvasElement; repaint: () => void } => {
+    const cv = mkEl('canvas', { width: pw, height: ph, class: 'thumb', style: 'cursor:grab' });
     const cx = cv.getContext('2d')!;
     const dims = (img: HTMLCanvasElement | HTMLImageElement): [number, number] =>
       img instanceof HTMLCanvasElement ? [img.width, img.height] : [img.naturalWidth, img.naturalHeight];
@@ -789,21 +854,22 @@ const renderCharacterTab = (): HTMLElement => {
     const bbox = (iw: number, ih: number, f: Framing): { scale: number; sw: number; sh: number } => {
       const swap = norm90(f.rotate) === 90 || norm90(f.rotate) === 270;
       const bw = swap ? ih : iw, bh = swap ? iw : ih;
-      const scale = Math.max(size / bw, size / bh) * Math.max(1, f.zoom);
+      const fitScale = slot.fit === 'contain' ? Math.min(pw / bw, ph / bh) : Math.max(pw / bw, ph / bh);
+      const scale = fitScale * Math.max(1, f.zoom);
       return { scale, sw: bw * scale, sh: bh * scale };
     };
     let tries = 0;
     const paint = (): void => {
-      const img = getSprite(SELECT_PORTRAIT);
-      cx.fillStyle = '#12141f'; cx.fillRect(0, 0, size, size);
+      const img = getSprite(slot.file);
+      cx.fillStyle = '#12141f'; cx.fillRect(0, 0, pw, ph);
       if (!img) { if (tries++ < 60) setTimeout(paint, 120); return; }
       const [iw, ih] = dims(img);
       const f = getFraming();
       const { scale, sw, sh } = bbox(iw, ih, f);
       const px = Math.max(-1, Math.min(1, f.panX)), py = Math.max(-1, Math.min(1, f.panY));
-      cx.save(); cx.beginPath(); cx.rect(0, 0, size, size); cx.clip();
+      cx.save(); cx.beginPath(); cx.rect(0, 0, pw, ph); cx.clip();
       cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
-      cx.translate(size / 2 + px * (sw - size) / 2, size / 2 + py * (sh - size) / 2);
+      cx.translate(pw / 2 + px * (sw - pw) / 2, ph / 2 + py * (sh - ph) / 2);
       cx.rotate(norm90(f.rotate) * Math.PI / 180);
       if (f.flipH) cx.scale(-1, 1);
       cx.drawImage(img, -iw * scale / 2, -ih * scale / 2, iw * scale, ih * scale);
@@ -814,11 +880,11 @@ const renderCharacterTab = (): HTMLElement => {
     // rebuild the DOM and drop the drag), commit with renderAll on release.
     let drag: { x: number; y: number; panX: number; panY: number; availX: number; availY: number } | null = null;
     cv.onmousedown = (e) => {
-      const img = getSprite(SELECT_PORTRAIT); if (!img) return;
+      const img = getSprite(slot.file); if (!img) return;
       const [iw, ih] = dims(img);
       const { sw, sh } = bbox(iw, ih, getFraming());
       const f = getFraming();
-      drag = { x: e.clientX, y: e.clientY, panX: f.panX, panY: f.panY, availX: sw - size, availY: sh - size };
+      drag = { x: e.clientX, y: e.clientY, panX: f.panX, panY: f.panY, availX: sw - pw, availY: sh - ph };
       cv.style.cursor = 'grabbing'; e.preventDefault();
     };
     cv.onmousemove = (e) => {
@@ -831,36 +897,37 @@ const renderCharacterTab = (): HTMLElement => {
     cv.onmouseup = cv.onmouseleave = () => { if (drag) { drag = null; cv.style.cursor = 'grab'; renderAll(); } };
     return { el: cv, repaint: paint };
   };
-  const previewCtl = portrait ? framedPreview(120) : null;
+  const previewCtl = portrait ? framedPreview() : null;
+  const pickerOpen = stPortraitPicker === slot;
 
-  const portraitSection = mkEl('div', {
+  return mkEl('div', {
     style: 'margin-bottom:14px;padding:10px 12px;background:#141724;border:1px solid #232840;'
       + 'border-radius:6px;max-width:1100px',
   },
-    mkEl('b', {}, 'Character Select portrait'),
+    mkEl('b', {}, slot.title),
     mkEl('div', { style: 'display:flex;gap:14px;align-items:center;margin-top:8px' },
       previewCtl
         ? previewCtl.el
-        : mkEl('div', { class: 'thumb empty', style: 'width:120px;height:120px' }, 'no portrait'),
+        : mkEl('div', { class: 'thumb empty', style: `width:${pw}px;height:${ph}px` }, 'none'),
       mkEl('div', { style: 'display:flex;flex-direction:column;gap:6px' },
-        mkEl('label', { class: 'upload', title: 'upload a character-select portrait (photo or art) — saved as-is, not keyed' },
-          '⬆ upload portrait',
+        mkEl('label', { class: 'upload', title: `upload a ${slot.title} (photo or art) — saved as-is, not keyed` },
+          '⬆ upload image',
           mkEl('input', {
             type: 'file', accept: 'image/*', style: 'display:none',
             onchange: (e: Event) => {
               const f = (e.target as HTMLInputElement).files?.[0];
-              if (f) void uploadPortrait(f);
+              if (f) void uploadPortrait(slot, f);
               (e.target as HTMLInputElement).value = '';
             },
           })),
         mkEl('button', {
-          title: 'use the locked reference sprite as the portrait',
-          onclick: () => void portraitFromReference(),
+          title: 'use the locked reference sprite',
+          onclick: () => void portraitFromReference(slot),
         }, 'use reference'),
         mkEl('button', {
           title: "pick from this character's already-generated sprites (cropped to the figure)",
-          onclick: () => { stPortraitPicker = !stPortraitPicker; renderAll(); },
-        }, stPortraitPicker ? 'close sprite list' : 'select from sprites'),
+          onclick: () => { stPortraitPicker = pickerOpen ? null : slot; renderAll(); },
+        }, pickerOpen ? 'close sprite list' : 'select from sprites'),
         previewCtl ? mkEl('label', { style: 'display:flex;align-items:center;gap:6px' },
           'zoom',
           mkEl('input', {
@@ -874,36 +941,36 @@ const renderCharacterTab = (): HTMLElement => {
           })) : null,
         previewCtl ? mkEl('div', { style: 'display:flex;gap:6px' },
           mkEl('button', {
-            title: 'rotate the portrait 90°',
+            title: 'rotate 90°',
             onclick: () => { const f = getFraming(); setFraming({ ...f, rotate: (f.rotate + 90) % 360 }); renderAll(); },
           }, `⟳ ${getFraming().rotate}°`),
           mkEl('button', {
-            title: 'mirror the portrait horizontally',
+            title: 'mirror horizontally',
             onclick: () => { const f = getFraming(); setFraming({ ...f, flipH: !f.flipH }); renderAll(); },
           }, getFraming().flipH ? '⇋ flip: on' : '⇋ flip'),
         ) : null,
         previewCtl ? mkEl('button', {
           title: 'reset zoom + recenter + rotation + flip',
-          onclick: () => { delete meta().selectFraming; stDirty = true; renderAll(); },
+          onclick: () => { delete meta()[slot.frameKey]; stDirty = true; renderAll(); },
         }, 'reset framing') : null,
-        portrait ? mkEl('button', { onclick: () => removePortrait() }, 'remove') : null,
+        portrait ? mkEl('button', { onclick: () => removePortrait(slot) }, 'remove') : null,
       ),
     ),
-    stPortraitPicker ? (() => {
+    pickerOpen ? (() => {
       const names = [...new Set(
         b.moves.flatMap((mv) => mv.steps.map((s) => s.sprite)).filter((s): s is string => !!s))];
       return mkEl('div', { style: 'margin-top:10px' },
         mkEl('p', { class: 'hint' }, names.length
-          ? `pick any of this character's ${names.length} sprites — it's cropped to the figure and set as the portrait`
+          ? `pick any of this character's ${names.length} sprites — it's cropped to the figure and set as the ${slot.title}`
           : 'no sprites generated yet — use the Generate tab first'),
         names.length ? mkEl('div', {
           style: 'display:flex;flex-wrap:wrap;gap:6px;max-height:320px;overflow:auto;padding:6px;'
             + 'background:#0e101a;border:1px solid #232840;border-radius:6px',
         },
           ...names.map((name) => mkEl('div', {
-            title: `${name} — click to set as portrait`,
+            title: `${name} — click to use`,
             style: 'cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:2px',
-            onclick: () => void portraitFromSprite(name),
+            onclick: () => void portraitFromSprite(slot, name),
           },
             spriteThumbEl(name, 64),
             mkEl('span', { class: 'hint', style: 'font-size:9px;max-width:64px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' },
@@ -912,10 +979,18 @@ const renderCharacterTab = (): HTMLElement => {
         ) : null,
       );
     })() : null,
-    mkEl('p', { class: 'hint', style: 'margin-top:8px' },
-      'shown on the character-select screen (square). Drag to recenter; zoom, rotate (90°) and flip to '
-      + 'frame it — the game applies the same transform. Stored as sprites/_select.png + framing in the '
-      + 'bundle; persists on Save. Not a game sprite (never keyed or packed into the atlas).'),
+    mkEl('p', { class: 'hint', style: 'margin-top:8px' }, slot.hint),
+  );
+};
+
+const renderCharacterTab = (): HTMLElement => {
+  const b = stBundle!;
+  const field = (label: string, get: () => number, set: (v: number) => void): HTMLElement =>
+    mkEl('label', { class: 'field' }, label, numInput(get(), set, 70));
+
+  const portraitSection = mkEl('div', {},
+    renderPortraitSlot(SELECT_SLOT),
+    renderPortraitSlot(VS_SLOT),
   );
 
   const grid = mkEl('div', { class: 'grid' },

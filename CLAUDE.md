@@ -52,6 +52,20 @@ Analog frame data from playtests.
 - Atlas packed on every save (browser-side grid of fixed 192px cells) →
   characters/<id>/sprites/atlas.png + atlas.json — the spec §3 ship format.
 - Test tab has a P2 character select for versus matches between bundles.
+- **Portrait SLOTS (Character tab).** Two authored images per character, both
+  driven by the same editor (`renderPortraitSlot`, `PortraitSlot` descriptor):
+  upload / use reference / select-from-sprites (crops to the figure) + zoom,
+  90° rotate, flip, drag-to-recenter. Stored in `meta` and applied identically
+  by the game (`client/atlas.ts drawPortrait(…, slot)`) — the Studio preview is
+  WYSIWYG, so **if you change the fit math, change it in BOTH**.
+  · `meta.selectPortrait` (`_select.png`) + `selectFraming` → square select/HUD
+    portrait, COVER-fit (fills its frame).
+  · `meta.vsPortrait` (`_vs.png`) + `vsFraming` → the pre-fight VS-card pose,
+    CONTAIN-fit into a FIXED frame. That combination is the whole point: every
+    character comes out the same size (reference art is wildly variable) and
+    nothing is clipped. No VS pose → the card falls back to the select portrait
+    (safe, but sizes vary). Neither file is a game sprite: never keyed, never
+    packed into the atlas.
 - **STRIP GENERATION is how costume consistency is achieved (spec §5.1
   stage 2).** Generating each frame as its own image makes the model
   re-invent the outfit every call — the fighter appears to change clothes

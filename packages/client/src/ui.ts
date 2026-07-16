@@ -1598,11 +1598,96 @@ export const drawWallet = (
 };
 
 // ---------------------------------------------------------------- VS card
+/** Deterministic per-index pseudo-random in [0,1) — stable ember layouts. */
+const hash01 = (i: number, salt = 0): number => {
+  const s = Math.sin(i * 127.1 + salt * 311.7) * 43758.5453;
+  return s - Math.floor(s);
+};
+
+/** The VS card's fixed portrait frame — the SAME box for every character. */
+const VS_FRAME_W = 250;
+const VS_FRAME_H = 340;
+const VS_FEET_Y = VH - 52; // frame bottom / nameplate baseline
+const VS_CX: [number, number] = [188, VW - 188];
+
+/**
+ * One fighter on the VS card.
+ *  · Authored VS pose (Studio meta.vsPortrait) → COVER-fit into the fixed
+ *    frame, so every character fills exactly the same box however its source
+ *    art is proportioned. Clipped to a diagonal-cut panel for the classic
+ *    VS-screen slash.
+ *  · No VS pose → contain-fit the select portrait, bottom-anchored so feet are
+ *    never cropped (sizes vary — that's why authoring a VS pose is better).
+ */
+const drawVsFighter = (
+  ctx: CanvasRenderingContext2D, roster: Roster, side: 0 | 1, slide: number, tick: number,
+): void => {
+  const cx = VS_CX[side] + (side === 0 ? -slide : slide);
+  const dir = side === 0 ? 1 : -1;
+  const x = cx - VS_FRAME_W / 2;
+  const y = VS_FEET_Y - VS_FRAME_H;
+
+  if (roster.vsPortrait) {
+    ctx.save();
+    // Diagonal-cut panel: the inner edge rakes toward the center like a slash.
+    const rake = 26;
+    ctx.beginPath();
+    if (side === 0) {
+      ctx.moveTo(x, y); ctx.lineTo(x + VS_FRAME_W + rake, y);
+      ctx.lineTo(x + VS_FRAME_W - rake, y + VS_FRAME_H); ctx.lineTo(x, y + VS_FRAME_H);
+    } else {
+      ctx.moveTo(x - rake, y); ctx.lineTo(x + VS_FRAME_W, y);
+      ctx.lineTo(x + VS_FRAME_W, y + VS_FRAME_H); ctx.lineTo(x + rake, y + VS_FRAME_H);
+    }
+    ctx.closePath();
+    ctx.clip();
+    // Backing wash so a transparent pose still reads against the video.
+    const g = ctx.createLinearGradient(x, y, x, y + VS_FRAME_H);
+    g.addColorStop(0, side === 0 ? '#2a0f14cc' : '#0f1a2acc');
+    g.addColorStop(1, '#06040ccc');
+    ctx.fillStyle = g;
+    ctx.fillRect(x - rake, y, VS_FRAME_W + rake * 2, VS_FRAME_H);
+    // The authored pose, mirrored so both fighters face the center.
+    ctx.save();
+    ctx.translate(cx, 0);
+    ctx.scale(dir, 1);
+    drawPortrait(ctx, roster, -VS_FRAME_W / 2, y, VS_FRAME_W, VS_FRAME_H, 'vs');
+    ctx.restore();
+    // Rim light along the raking edge.
+    ctx.strokeStyle = side === 0 ? 'rgba(255,120,120,0.5)' : 'rgba(120,190,255,0.5)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    if (side === 0) { ctx.moveTo(x + VS_FRAME_W + rake, y); ctx.lineTo(x + VS_FRAME_W - rake, y + VS_FRAME_H); }
+    else { ctx.moveTo(x - rake, y); ctx.lineTo(x + rake, y + VS_FRAME_H); }
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  // Fallback: contain-fit the select portrait, bottom-anchored (never cropped).
+  const img = roster.portrait;
+  if (!img?.naturalWidth || !img.naturalHeight) return;
+  const fit = Math.min(VS_FRAME_H / img.naturalHeight, (VS_FRAME_W + 20) / img.naturalWidth);
+  const w = img.naturalWidth * fit;
+  const h = img.naturalHeight * fit;
+  ctx.save();
+  ctx.translate(cx, VS_FEET_Y + 6 + Math.sin(tick / 40 + side) * 2); // idle bob
+  ctx.scale(dir, 1);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(img, -w / 2, -h, w, h);
+  ctx.restore();
+};
+
 /**
  * Pre-fight stakes card (P0): 2½ seconds of "this is what's on the line" —
- * portraits, names, and the exact credit/XP terms of the match. Doubles as
- * the fight's establishing beat (the 'vs' stinger already plays under it).
- * Pure overlay: the caller decides whether the sim runs beneath it.
+ * fighters, names, and the exact credit/XP terms. Doubles as the fight's
+ * establishing beat (the 'vs' stinger plays under it). Pure overlay: the
+ * caller decides whether the sim runs beneath it.
+ *
+ * All FX are procedural (no assets): the menu background video, a diagonal
+ * red/blue split, converging speed lines, an impact burst behind the VS mark,
+ * drifting embers, scanlines and a vignette. Cheap by construction — a few
+ * dozen strokes per frame, no per-pixel work.
  */
 export const drawVsCard = (
   ctx: CanvasRenderingContext2D,
@@ -1612,44 +1697,173 @@ export const drawVsCard = (
   age: number, // ticks since the card appeared — drives pop-in
 ): void => {
   const inT = easeOutBack(clamp01(age / 14));
-  ctx.fillStyle = `rgba(6,4,12,${0.9 * clamp01(age / 8)})`;
+  const wipe = clamp01(age / 18);
+
+  // ---- backdrop: the menu video, heavily darkened so fighters/text pop.
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, VW, VH); ctx.clip();
+  if (!(bgVideo && drawBgVideoCover(ctx, bgVideo, 0, 0, VW, VH))) {
+    ctx.fillStyle = '#0a0616';
+    ctx.fillRect(0, 0, VW, VH);
+  }
+  ctx.restore();
+  ctx.fillStyle = `rgba(6,4,12,${0.72 * clamp01(age / 6)})`;
   ctx.fillRect(0, 0, VW, VH);
 
-  // Portraits slide in from their edges, facing each other. Portrait images
-  // are VARIABLE-SIZE reference art (not 192px sprite cells), so they must be
-  // contain-fitted and anchored by their BOTTOM edge — a fixed sprite offset
-  // cropped tall art below the canvas (feet cut off, the reported bug).
-  const slide = (1 - inT) * 220;
-  ([0, 1] as const).forEach((i) => {
-    const img = rosters[i].portrait;
-    if (!img || !img.naturalWidth || !img.naturalHeight) return;
-    const fit = Math.min(330 / img.naturalHeight, 270 / img.naturalWidth);
-    const w = img.naturalWidth * fit;
-    const h = img.naturalHeight * fit;
-    ctx.save();
-    ctx.translate(i === 0 ? 185 - slide : VW - 185 + slide, VH - 58);
-    ctx.scale(i === 0 ? 1 : -1, 1); // face each other
-    ctx.imageSmoothingEnabled = true; // hi-res art, not pixel sprites
-    ctx.drawImage(img, -w / 2, -h, w, h); // bottom-anchored: feet always visible
-    ctx.restore();
-    // Nameplate under each fighter.
-    const nx = i === 0 ? 185 : VW - 185;
-    label(ctx, names[i].toUpperCase().slice(0, 20), nx, VH - 38, 15, i === 0 ? '#8fe8a0' : '#ff9d9d');
-  });
-
+  // ---- diagonal split: red side / blue side, wiping in from the seam.
+  const seamTop = VW * 0.545, seamBot = VW * 0.455;
+  const seamX = (t: number): number => seamTop + (seamBot - seamTop) * t; // t: 0 top → 1 bottom
   ctx.save();
-  ctx.translate(VW / 2, 150);
-  ctx.scale(inT, inT);
-  ctx.translate(-VW / 2, -150);
-  display(ctx, 'VS', VW / 2, 165, 92, { glow: 'rgba(255,209,102,0.6)' });
+  ctx.globalAlpha = 0.5 * wipe;
+  ctx.beginPath();
+  ctx.moveTo(0, 0); ctx.lineTo(seamTop, 0); ctx.lineTo(seamBot, VH); ctx.lineTo(0, VH);
+  ctx.closePath();
+  const gl = ctx.createLinearGradient(0, 0, seamTop, VH);
+  gl.addColorStop(0, '#00000000'); gl.addColorStop(1, '#8f1f2e88');
+  ctx.fillStyle = gl; ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(seamTop, 0); ctx.lineTo(VW, 0); ctx.lineTo(VW, VH); ctx.lineTo(seamBot, VH);
+  ctx.closePath();
+  const gr = ctx.createLinearGradient(VW, 0, seamBot, VH);
+  gr.addColorStop(0, '#00000000'); gr.addColorStop(1, '#1f4f8f88');
+  ctx.fillStyle = gr; ctx.fill();
   ctx.restore();
 
-  // The terms — gold, dead center, unmissable.
-  stakes.forEach((s, k) => {
-    label(ctx, s, VW / 2, 235 + k * 26, k === 0 ? 17 : 13, k === 0 ? GOLD_LT : '#ffffff99');
+  // ---- converging speed lines (each side rakes toward the seam).
+  ctx.save();
+  ctx.globalAlpha = 0.22 * wipe;
+  ctx.lineWidth = 2;
+  for (let i = 0; i < 26; i++) {
+    const side = i % 2;
+    const t = hash01(i, 1);
+    const y = t * VH;
+    const len = 60 + hash01(i, 2) * 190;
+    const drift = ((age * 3 + hash01(i, 3) * 400) % 460) - 60;
+    const x0 = side === 0 ? drift : VW - drift;
+    ctx.strokeStyle = side === 0 ? '#ff8a9a' : '#8ac6ff';
+    ctx.beginPath();
+    ctx.moveTo(x0, y);
+    ctx.lineTo(x0 + (side === 0 ? len : -len), y);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // ---- fighters (behind the seam flash + text).
+  const slide = (1 - inT) * 210;
+  drawVsFighter(ctx, rosters[0], 0, slide, age);
+  drawVsFighter(ctx, rosters[1], 1, slide, age);
+
+  // ---- the seam itself: a bright energy slash with a travelling glint.
+  ctx.save();
+  ctx.globalAlpha = wipe;
+  const seamGrad = ctx.createLinearGradient(seamTop, 0, seamBot, VH);
+  seamGrad.addColorStop(0, 'rgba(255,209,102,0)');
+  seamGrad.addColorStop(0.5, 'rgba(255,240,200,0.85)');
+  seamGrad.addColorStop(1, 'rgba(255,209,102,0)');
+  ctx.strokeStyle = seamGrad;
+  ctx.lineWidth = 3;
+  ctx.shadowColor = 'rgba(255,209,102,0.9)';
+  ctx.shadowBlur = 18;
+  ctx.beginPath();
+  ctx.moveTo(seamTop, -10); ctx.lineTo(seamBot, VH + 10);
+  ctx.stroke();
+  // Glint sliding down the slash.
+  const gt = ((age % 90) / 90);
+  ctx.globalAlpha = wipe * (1 - Math.abs(gt - 0.5) * 2) * 0.9;
+  ctx.fillStyle = '#fffbe8';
+  ctx.beginPath();
+  ctx.arc(seamX(gt), gt * VH, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // ---- embers drifting up the frame (stable per-index layout).
+  ctx.save();
+  for (let i = 0; i < 20; i++) {
+    const speed = 0.35 + hash01(i, 4) * 0.5;
+    const ey = (VH + 40 - ((age * speed + hash01(i, 5) * VH) % (VH + 80)));
+    const ex = hash01(i, 6) * VW + Math.sin((age / 30) + i) * 8;
+    const r = 1 + hash01(i, 7) * 2;
+    ctx.globalAlpha = 0.5 * wipe * (0.4 + hash01(i, 8) * 0.6);
+    ctx.fillStyle = ex < seamX(ey / VH) ? '#ffb08a' : '#8ac6ff';
+    ctx.beginPath();
+    ctx.arc(ex, ey, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // ---- impact burst behind the VS mark, once on entry.
+  if (age < 34) {
+    const bt = age / 34;
+    ctx.save();
+    ctx.globalAlpha = (1 - bt) * 0.8;
+    ctx.strokeStyle = '#ffe9a3';
+    ctx.lineWidth = 6 * (1 - bt) + 1;
+    ctx.beginPath();
+    ctx.arc(VW / 2, 152, 20 + bt * 180, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+  // White slam flash on the first frames.
+  if (age < 7) {
+    ctx.fillStyle = `rgba(255,255,255,${(1 - age / 7) * 0.5})`;
+    ctx.fillRect(0, 0, VW, VH);
+  }
+
+  // ---- VS mark: slams in, then breathes.
+  const breathe = 1 + 0.02 * Math.sin(age / 12);
+  ctx.save();
+  ctx.translate(VW / 2, 152);
+  ctx.scale(inT * breathe, inT * breathe);
+  ctx.translate(-VW / 2, -152);
+  display(ctx, 'VS', VW / 2, 168, 96, { glow: 'rgba(255,209,102,0.75)' });
+  ctx.restore();
+
+  // ---- terms band: a dark scrim keeps the stakes readable over the art.
+  if (stakes.length > 0 && age > 8) {
+    const bandA = clamp01((age - 8) / 12);
+    const bandY = 208, bandH = 24 + stakes.length * 24;
+    ctx.save();
+    ctx.globalAlpha = bandA;
+    const bg = ctx.createLinearGradient(0, bandY, 0, bandY + bandH);
+    bg.addColorStop(0, 'rgba(10,7,20,0.0)');
+    bg.addColorStop(0.15, 'rgba(10,7,20,0.85)');
+    bg.addColorStop(0.85, 'rgba(10,7,20,0.85)');
+    bg.addColorStop(1, 'rgba(10,7,20,0.0)');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, bandY, VW, bandH);
+    // Gold hairlines top and bottom, drawn from the center out.
+    const lineW = VW * bandA;
+    ctx.fillStyle = 'rgba(255,209,102,0.55)';
+    ctx.fillRect(VW / 2 - lineW / 2, bandY + 6, lineW, 1);
+    ctx.fillRect(VW / 2 - lineW / 2, bandY + bandH - 6, lineW, 1);
+    stakes.forEach((s, k) => {
+      label(ctx, s, VW / 2, bandY + 30 + k * 24, k === 0 ? 17 : 13, k === 0 ? GOLD_LT : '#ffffffaa');
+    });
+    ctx.restore();
+  }
+
+  // ---- nameplates under each fighter.
+  ([0, 1] as const).forEach((i) => {
+    const nx = VS_CX[i] + (i === 0 ? -slide : slide);
+    ctx.save();
+    ctx.globalAlpha = inT;
+    label(ctx, names[i].toUpperCase().slice(0, 20), nx, VH - 26, 16, i === 0 ? '#8fe8a0' : '#ff9d9d');
+    ctx.restore();
   });
 
+  // ---- scanlines + vignette: cheap CRT-ish polish.
+  ctx.save();
+  ctx.globalAlpha = 0.06;
+  ctx.fillStyle = '#000';
+  for (let y = 0; y < VH; y += 3) ctx.fillRect(0, y, VW, 1);
+  ctx.restore();
+  const vig = ctx.createRadialGradient(VW / 2, VH / 2, VH * 0.35, VW / 2, VH / 2, VH * 0.85);
+  vig.addColorStop(0, 'rgba(0,0,0,0)');
+  vig.addColorStop(1, 'rgba(0,0,0,0.65)');
+  ctx.fillStyle = vig;
+  ctx.fillRect(0, 0, VW, VH);
+
   if (age > 40 && age % 50 < 36) {
-    label(ctx, 'ANY KEY — FIGHT', VW / 2, VH - 16, 12, '#ffffff77');
+    label(ctx, 'ANY KEY — FIGHT', VW / 2, VH - 8, 12, '#ffffff77');
   }
 };

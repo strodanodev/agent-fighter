@@ -3275,7 +3275,8 @@
       "rotate": 0,
       "flipH": true
     },
-    "disabled": true
+    "disabled": true,
+    "vsPortrait": "_vs.png"
   },
-  "versionHash": "3bfb3a53b5ebdd2a"
+  "versionHash": "e3639cef786d59dd"
 }
