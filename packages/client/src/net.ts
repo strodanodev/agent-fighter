@@ -65,6 +65,14 @@ export interface NetAccount {
   wins: number;
   losses: number;
   dailyGranted: boolean;
+  /** This player's shareable dare code (landing /dare/<code>). */
+  refCode?: string;
+  /** Credits granted by THIS snapshot redeeming a referral (0 = none). */
+  referralGranted?: number;
+  /** Friends who ever redeemed this player's dare code (inviter side). */
+  daresAccepted?: number;
+  /** Inviter payouts credited in the rolling week (server caps at 10). */
+  daresPaidWeek?: number;
 }
 
 /** Post-match account progression, server-authoritative (Phase B/C). */
@@ -114,6 +122,7 @@ export class NetSession {
     private authToken?: string,
     private mode: 'wager' | 'solo' = 'wager',
     private email?: string, // AIR-account email — reputation write-back target only
+    private ref?: string, // stashed dare code (?ref=) — redeemed server-side once
   ) {
     this.connect(false);
   }
@@ -123,7 +132,7 @@ export class NetSession {
     const ws = new WebSocket(this.url);
     this.ws = ws;
     ws.onopen = () => {
-      this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email });
+      this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email, ref: this.ref });
       if (resume && this.setup?.resume) {
         this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
       } else {
@@ -204,6 +213,8 @@ export class NetSession {
           wins: Number(msg.wins ?? 0),
           losses: Number(msg.losses ?? 0),
           dailyGranted: Boolean(msg.dailyGranted),
+          refCode: typeof msg.refCode === 'string' ? msg.refCode : undefined,
+          referralGranted: Number(msg.referralGranted ?? 0),
         };
         return;
       }
@@ -423,6 +434,7 @@ export class SoloSession {
     private bundleHash?: string,
     private authToken?: string,
     private email?: string,
+    private ref?: string, // stashed dare code (?ref=) — redeemed server-side once
   ) {
     this.connect(false);
   }
@@ -431,7 +443,7 @@ export class SoloSession {
     const ws = new WebSocket(this.url);
     this.ws = ws;
     ws.onopen = () => {
-      this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email });
+      this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email, ref: this.ref });
       if (resume && this.setup?.resume) {
         this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
       } else {

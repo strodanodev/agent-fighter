@@ -23,12 +23,20 @@
  *    forfeits: the pot goes to the opponent regardless of the sim outcome.
  *    Forfeit (rage-quit) already resolves winner = the non-quitter.
  *  · XP (wager): win 60 / loss 20 / draw 30 — unchanged from Phase B.
+ *  · referral dares (0005): invitee +REFERRAL_CREDITS at first authenticated
+ *    contact carrying a ?ref= code (new accounts only, once ever, never
+ *    self); inviter +REFERRAL_CREDITS once the invitee finishes a first
+ *    decided match (release_referral — capped 10/inviter/rolling week).
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AirIdentity } from './airjwt.js';
 
 export const DAILY_CREDITS = 10;
+/** Both sides of an accepted dare get this (mirrored in 0005_referrals.sql). */
+export const REFERRAL_CREDITS = 25;
+/** Max inviter payouts per rolling 7 days (mirrored in release_referral). */
+export const REFERRAL_WEEKLY_CAP = 10;
 export const SOLO_FEE = 1;
 export const WAGER_FEE = 10;
 /** Solo winner gets the fee back + this profit. */
@@ -63,6 +71,14 @@ export interface Account {
   losses: number;
   /** True when THIS call granted the daily bonus (client shows a toast). */
   dailyGranted: boolean;
+  /** Shareable dare code for landing /dare/<code> ('' until assigned). */
+  refCode: string;
+  /** Credits granted by THIS call redeeming a referral (0 = none). */
+  referralGranted: number;
+  /** Friends who ever redeemed this player's dare code (inviter side). */
+  daresAccepted: number;
+  /** Inviter payouts credited in the rolling week (vs REFERRAL_WEEKLY_CAP). */
+  daresPaidWeek: number;
 }
 
 export interface MatchRecord {
@@ -102,8 +118,12 @@ export class InsufficientCredits extends Error {
 export interface Persistence {
   /** Dev economy (name-keyed identities allowed, nothing durable). */
   dev: boolean;
-  /** Upsert profile, claim the daily bonus if due, return the account. */
-  getAccount: (identity: AirIdentity, name: string, agent: boolean) => Promise<Account>;
+  /**
+   * Upsert profile, claim the daily bonus if due, return the account.
+   * `ref` (a dare code from a shared link) redeems the invitee's referral
+   * bonus when eligible — best-effort, never blocks login.
+   */
+  getAccount: (identity: AirIdentity, name: string, agent: boolean, ref?: string) => Promise<Account>;
   /** Deduct the fee from every AUTHENTICATED side, atomically (all or none). */
   escrowMatch: (matchId: string, subs: [string | null, string | null], fee: number) => Promise<void>;
   /** Settle + award. Idempotent by match id ([] on retry). */
@@ -120,6 +140,12 @@ export interface Persistence {
    * Returns the number of refunds performed. Run at startup + periodically.
    */
   sweepOrphanedEscrow: (olderThanMinutes?: number) => Promise<number>;
+  /**
+   * Pay the inviter of _invitee's referral if it just became due (invitee
+   * finished a first decided match). Idempotent; returns credits granted.
+   * Call AFTER recordMatch settles — the check reads the matches table.
+   */
+  releaseReferral: (inviteeSub: string) => Promise<number>;
   leaderboard: (limit?: number) => Promise<unknown[]>;
 }
 
@@ -186,6 +212,8 @@ export const memoryPersistence = (): Persistence => {
   /** matchId → who was charged what, and when (the sweeper's cutoff clock). */
   const escrows = new Map<string, { subs: Set<string>; fee: number; at: number }>();
   const names = new Map<string, { name: string; agent: boolean }>();
+  /** invitee sub → inviter sub + whether the inviter payout released. */
+  const referrals = new Map<string, { inviter: string; released: boolean }>();
 
   const prof = (sub: string): ProfileRow & { lastDaily: string } => {
     let p = profiles.get(sub);
@@ -196,9 +224,13 @@ export const memoryPersistence = (): Persistence => {
     return p;
   };
 
+  /** Dev codes are derived, stable, and never collide within a session. */
+  const refCodeOf = (sub: string): string =>
+    `${(names.get(sub)?.name ?? 'FIGHTER').replace(/[^A-Za-z0-9]/g, '').slice(0, 10).toUpperCase() || 'FIGHTER'}-${sub.replace(/[^A-Za-z0-9]/g, '').slice(-4).toUpperCase().padStart(4, '0')}`;
+
   return {
     dev: true,
-    getAccount: async (identity, name, agent) => {
+    getAccount: async (identity, name, agent, ref) => {
       const p = prof(identity.sub);
       names.set(identity.sub, { name, agent });
       const today = new Date().toISOString().slice(0, 10);
@@ -207,7 +239,26 @@ export const memoryPersistence = (): Persistence => {
         p.lastDaily = today;
         p.credits += DAILY_CREDITS;
       }
-      return { credits: p.credits, level: p.level, xp: p.xp, wins: p.wins, losses: p.losses, dailyGranted };
+      // Referral redemption — same rules as 0005_referrals.sql get_account.
+      let referralGranted = 0;
+      if (ref) {
+        const code = ref.trim().toUpperCase();
+        const inviter = [...profiles.keys()].find((s) => s !== identity.sub && refCodeOf(s) === code);
+        if (inviter && !referrals.has(identity.sub) && p.wins + p.losses === 0) {
+          referrals.set(identity.sub, { inviter, released: false });
+          p.credits += REFERRAL_CREDITS;
+          referralGranted = REFERRAL_CREDITS;
+        }
+      }
+      // Inviter-side stats: the dev economy has no timestamps, so "released
+      // ever" stands in for the SQL's rolling-week payout window.
+      const mine = [...referrals.values()].filter((r) => r.inviter === identity.sub);
+      return {
+        credits: p.credits, level: p.level, xp: p.xp, wins: p.wins, losses: p.losses,
+        dailyGranted, refCode: refCodeOf(identity.sub), referralGranted,
+        daresAccepted: mine.length,
+        daresPaidWeek: mine.filter((r) => r.released).length,
+      };
     },
     escrowMatch: async (matchId, subs, fee) => {
       const entry = escrows.get(matchId) ?? { subs: new Set<string>(), fee, at: Date.now() };
@@ -251,6 +302,15 @@ export const memoryPersistence = (): Persistence => {
       }
       return refunded;
     },
+    releaseReferral: async (inviteeSub) => {
+      const r = referrals.get(inviteeSub);
+      const p = profiles.get(inviteeSub);
+      // Released only once the invitee has a decided match on record.
+      if (!r || r.released || !p || p.wins + p.losses === 0) return 0;
+      r.released = true;
+      prof(r.inviter).credits += REFERRAL_CREDITS;
+      return REFERRAL_CREDITS;
+    },
     leaderboard: async (limit = 20) =>
       [...profiles.entries()]
         .filter(([, p]) => p.wins + p.losses > 0)
@@ -289,12 +349,13 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
 
   return {
     dev: false,
-    getAccount: async (identity, name, agent) => {
+    getAccount: async (identity, name, agent, ref) => {
       const rows = (await call('/rest/v1/rpc/get_account', {
         method: 'POST',
         body: JSON.stringify({
           _id: identity.sub, _name: name, _agent: agent,
           _address: identity.address ?? null,
+          _ref: ref ?? null,
         }),
       })) as Array<Record<string, unknown>>;
       const row = rows[0] ?? {};
@@ -302,6 +363,10 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         credits: Number(row.credits ?? 0), level: Number(row.level ?? 1),
         xp: Number(row.xp ?? 0), wins: Number(row.wins ?? 0), losses: Number(row.losses ?? 0),
         dailyGranted: Boolean(row.daily_granted),
+        refCode: String(row.ref_code ?? ''),
+        referralGranted: Number(row.referral_granted ?? 0),
+        daresAccepted: Number(row.dares_accepted ?? 0),
+        daresPaidWeek: Number(row.dares_paid_week ?? 0),
       };
     },
     escrowMatch: async (matchId, subs, fee) => {
@@ -344,6 +409,13 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
       const n = (await call('/rest/v1/rpc/sweep_orphaned_escrow', {
         method: 'POST',
         body: JSON.stringify({ _older_than_minutes: olderThanMinutes | 0 }),
+      })) as number;
+      return n | 0;
+    },
+    releaseReferral: async (inviteeSub) => {
+      const n = (await call('/rest/v1/rpc/release_referral', {
+        method: 'POST',
+        body: JSON.stringify({ _invitee: inviteeSub }),
       })) as number;
       return n | 0;
     },

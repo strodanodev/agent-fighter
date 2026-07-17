@@ -229,7 +229,20 @@ export const ROUND_SECONDS = 99;
  * (ADR 0003). Bump on ANY sim-behavior change — the golden replay tests
  * going red is the reminder; bless goldens and bump this in the same commit.
  */
-export const ENGINE_VERSION = 'af-core-1';
+/**
+ * Bump this on ANY change that alters simulated behaviour — including ai.ts.
+ * Ranked solo (protocol v3) is a zero-latency LOCAL simulation: the client runs
+ * the house AI itself from a pinned seed and streams only its own inputs, and
+ * the server re-derives that same AI to verify the result. So a client running
+ * a different ai.ts than the server desyncs and gets flagged as a deviator —
+ * i.e. the player forfeits the match AND the credit fee through no fault of
+ * their own. The version is checked at the `hello` handshake (server.ts), so
+ * bumping turns that silent, costly desync into a clean "reload required".
+ *
+ * af-core-2: AI meter/special usage (supers no longer gated to skill ≥ 65;
+ *            214K wired up) — changes house-bot inputs, hence a new version.
+ */
+export const ENGINE_VERSION = 'af-core-2';
 
 export const TUNING = {
   roundsToWin: 2, // best of 3

@@ -699,28 +699,48 @@ const drawTimer = (ctx: CanvasRenderingContext2D, secs: number, tick: number): v
  * past it, rather than burying the whole badge. Silently omitted if the
  * asset hasn't loaded (fire-and-forget at boot).
  */
-const drawGameLogo = (ctx: CanvasRenderingContext2D, cx: number, topY: number, tick: number): void => {
+const drawGameLogo = (
+  ctx: CanvasRenderingContext2D, cx: number, topY: number, tick: number,
+  charged = false, // ≥1 meter bar → Auto Special can pop the super
+): void => {
   if (!gameLogoImg || gameLogoImg.naturalWidth === 0) return;
   const box = gameLogoBBox ?? { x: 0, y: 0, w: gameLogoImg.naturalWidth, h: gameLogoImg.naturalHeight };
   const BASE_W = 100; // natural badge width before the size adjustments below
   const w = BASE_W * 0.7 * 2.5;
   const h = w * (box.h / box.w);
-  const breathe = fxPulse(tick, 0.045, 0.96, 1.06); // slow "alive" scale
+  // Charged reads as agitated, not just recoloured: it breathes harder and
+  // faster, so the badge catches the eye in peripheral vision mid-fight.
+  const breathe = charged
+    ? fxPulse(tick, 0.11, 0.94, 1.12)
+    : fxPulse(tick, 0.045, 0.96, 1.06);
 
   ctx.save();
   ctx.translate(cx, topY);
   ctx.scale(breathe, breathe);
   ctx.imageSmoothingEnabled = true;
-  // Pulses between near-white and light blue rather than a fixed hue.
-  const glowMix = fxPulse(tick, 0.07); // 0..1
-  const gr = Math.round(210 + 40 * glowMix), gg = Math.round(235 + 15 * glowMix), gb = 255;
-  ctx.shadowColor = `rgba(${gr},${gg},${gb},${0.55 + 0.35 * fxPulse(tick, 0.09)})`;
-  ctx.shadowBlur = 14 + 10 * fxPulse(tick, 0.09);
+  const glowMix = fxPulse(tick, charged ? 0.16 : 0.07); // 0..1
+  if (charged) {
+    // Aggressive red: hot core → deep red, pumping fast.
+    const gr = 255, gg = Math.round(40 + 60 * glowMix), gb = Math.round(30 + 40 * glowMix);
+    ctx.shadowColor = `rgba(${gr},${gg},${gb},${0.75 + 0.25 * fxPulse(tick, 0.19)})`;
+    ctx.shadowBlur = 22 + 20 * fxPulse(tick, 0.19);
+  } else {
+    // Idle: pulses between near-white and light blue rather than a fixed hue.
+    const gr = Math.round(210 + 40 * glowMix), gg = Math.round(235 + 15 * glowMix), gb = 255;
+    ctx.shadowColor = `rgba(${gr},${gg},${gb},${0.55 + 0.35 * fxPulse(tick, 0.09)})`;
+    ctx.shadowBlur = 14 + 10 * fxPulse(tick, 0.09);
+  }
   // Two passes: the shadow builds a real halo around the artwork's own
   // silhouette without a second draw looking like a ghost/double-image.
   ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, -w / 2, 0, w, h);
   ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, -w / 2, 0, w, h);
+  // A third pass while charged deepens the halo into a real red rim.
+  if (charged) ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, -w / 2, 0, w, h);
   ctx.restore();
+
+  // Tap target — generous, and registered from the same geometry that drew the
+  // badge so it tracks the art. Unscaled bounds (the breathe is cosmetic).
+  tapZone(cx - w / 2 - 8, topY - 8, w + 16, h + 16, 'special');
 };
 
 export interface HudFx {
@@ -738,6 +758,7 @@ export const drawHud = (
   rosters: [Roster, Roster],
   fx: HudFx,
   tags?: [string, string], // per-player nameplate suffix (e.g. "AGENT LV 12")
+  autoSpecialCharged = false, // local player has ≥1 bar → logo badge glows red
 ): void => {
   for (const i of [0, 1] as const) {
     const f = g.fighters[i];
@@ -771,7 +792,7 @@ export const drawHud = (
     VW / 2, VH - 8, 11, '#c8c4ba');
 
   // Brand badge over the timer's lower rim (top layer of the persistent HUD).
-  drawGameLogo(ctx, VW / 2, 70, g.tick);
+  drawGameLogo(ctx, VW / 2, 70, g.tick, autoSpecialCharged);
 
   // Center announcement (ROUND n / FIGHT! / K.O.) — drawn ABSOLUTELY LAST so it
   // is the front-most element, over the brand badge and everything else.
@@ -794,6 +815,10 @@ export interface TitleMenuState {
   account?: { credits: number; level: number; wins: number; losses: number } | null;
   /** Animate the "+10 DAILY CREDITS" toast. */
   dailyToast?: boolean;
+  /** Animate the "+25 DARE ACCEPTED" referral-bonus toast. */
+  referralToast?: boolean;
+  /** This player's dare code — enables the DARE A FRIEND row. */
+  refCode?: string;
   /** Remembered fighter (quick match) — shown as "FIGHTING AS …". */
   fighter?: string;
 }
@@ -905,6 +930,13 @@ export const drawTitle = (
     tapZone(cx + 130, hintY + 7, 150, 22, 'signin');
     // The fighter line is the touch path to the select screen.
     if (menu.fighter) tapZone(cx - 260, hintY - 11, 520, 20, 'changefighter');
+    // Referral dare: opens the full invite screen (poster + taunt + link).
+    if (menu.refCode) {
+      const flash = tick % 44 < 36;
+      label(ctx, 'D  DARE A FRIEND  ·  BOTH GET +25 CREDITS', cx, hintY + 38, 12,
+        flash ? '#ffd166' : '#ffe9a3');
+      tapZone(cx - 200, hintY + 27, 400, 22, 'dare');
+    }
   }
 
   // Account/wallet block — upper LEFT, minimal text (M5 spec).
@@ -922,6 +954,13 @@ export const drawTitle = (
     }
   }
 
+  // Referral dare bonus toast — the invitee just cashed in an accepted dare.
+  if (menu.referralToast) {
+    const flash = (tick + 15) % 30 < 22;
+    const y = (menu.address ? 80 : 62) + (menu.dailyToast ? 18 : 0);
+    if (flash) label(ctx, '+25 DARE ACCEPTED — BONUS CREDITS', 16, y, 14, '#8fe8a0', 'left');
+  }
+
   // Daily login bonus toast — under the account block, gold, hard to miss.
   if (menu.dailyToast) {
     const flash = tick % 30 < 22;
@@ -929,6 +968,134 @@ export const drawTitle = (
   }
 
   label(ctx, 'MILESTONE 5 · CREDITS BUILD', cx, VH - 12, 10, '#ffffff55');
+};
+
+// ---------------------------------------------------------------- invite
+/** Hot-red display() treatment for the dare headline / CTA. */
+const DARE_OPTS: DisplayOpts = { from: '#ffe3e3', mid: '#ff5d7e', to: '#93202f', outline: '#2a060f' };
+
+/**
+ * The invite ("dare a friend") screen — the SENDER side of the referral
+ * loop. Everything here frames sharing as an act of aggression, not a
+ * referral chore: the player is putting a bounty on their own head, and the
+ * poster panel previews roughly what lands in the friend's group chat
+ * (the landing /dare/<code> page + OG card render the same name/record/taunt).
+ */
+export interface InviteView {
+  /** Display handle (upper-cased upstream). */
+  name: string;
+  /** Server account snapshot (null = server offline). */
+  account: { credits: number; level: number; wins: number; losses: number } | null;
+  /** Dare code — the screen is only enterable once this exists. */
+  refCode?: string;
+  /** Remembered fighter — poster art + "MAIN" label. */
+  roster?: Roster;
+  /** The active taunt line (preset or the player's own words). */
+  taunt: string;
+  tauntIdx: number;
+  tauntCount: number;
+  /** True when the taunt is player-written (not a preset). */
+  custom: boolean;
+  /** Human-readable link shown under the button (no query noise). */
+  linkLabel: string;
+  /** ≥0 → ticks since the link was copied/shared (flips the button green). */
+  copiedAge: number;
+  /** OS share sheet available → the button SENDS instead of copies. */
+  canShare: boolean;
+  /** Friends who ever redeemed this player's code. */
+  daresAccepted?: number;
+  /** Inviter payouts remaining in the rolling week (server caps at 10). */
+  bountiesLeft?: number;
+}
+
+export const drawInvite = (
+  ctx: CanvasRenderingContext2D, tick: number, v: InviteView,
+): void => {
+  drawMenuBackdrop(ctx);
+  // Same treatment as the landing dare page: the video stays visible, but a
+  // vignette guarantees the type pops against any frame of it.
+  const vig = ctx.createLinearGradient(0, 0, 0, VH);
+  vig.addColorStop(0, '#0a0616cc');
+  vig.addColorStop(0.45, '#0a061677');
+  vig.addColorStop(1, '#0a0616ee');
+  ctx.fillStyle = vig;
+  ctx.fillRect(0, 0, VW, VH);
+  const cx = VW / 2;
+
+  if ((tick + 12) % 44 < 34) {
+    label(ctx, '⚠ PUT A BOUNTY ON YOUR OWN HEAD ⚠', cx, 44, 14, '#ff5d7e');
+  }
+  display(ctx, 'I DARE YOU', cx, 100, 46, {});
+  display(ctx, 'TO BEAT ME', cx, 150, 46, DARE_OPTS);
+
+  // ---- poster panel: the wanted-poster preview of what the friend sees.
+  const pw = 640, ph = 130, px0 = cx - pw / 2, py0 = 176;
+  bevel(ctx, px0, py0, pw, ph, PANEL, GOLD, GOLD_DK, 3);
+  const img = v.roster?.portrait;
+  if (img?.naturalWidth) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(px0 + 3, py0 + 3, 150, ph - 6);
+    ctx.clip();
+    // Slight overscale so the fighter fills the slot like a mugshot.
+    const fit = ((ph - 6) / img.naturalHeight) * 1.35;
+    const w = img.naturalWidth * fit, h = img.naturalHeight * fit;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(img, px0 + 78 - w / 2, py0 + ph - 3 - h, w, h);
+    ctx.restore();
+  }
+  const tx = px0 + 172;
+  label(ctx, 'WANTED: ANYONE WHO CAN TAKE ONE ROUND', tx, py0 + 28, 11, '#ff9db0', 'left');
+  display(ctx, v.name, tx, py0 + 62, 26, { align: 'left' });
+  const a = v.account;
+  label(ctx,
+    a ? `${a.wins}W — ${a.losses}L   ·   LV ${a.level}${v.roster ? `   ·   MAIN  ${v.roster.bundle.name.toUpperCase()}` : ''}`
+      : 'SERVER OFFLINE — STATS UNAVAILABLE',
+    tx, py0 + 88, 13, a ? '#ffd166' : '#ff9d9d', 'left');
+  label(ctx, 'THIS POSTER LANDS IN THEIR CHAT', tx, py0 + 112, 10, '#ffffff66', 'left');
+
+  // ---- taunt row: ◀ ▶ cycles presets, T writes your own (rides the link).
+  const ty = py0 + ph + 28;
+  label(ctx, '◀', cx - 300, ty, 18, GOLD_LT);
+  label(ctx, '▶', cx + 300, ty, 18, GOLD_LT);
+  tapZone(cx - 336, ty - 20, 72, 34, 'taunt:prev');
+  tapZone(cx + 264, ty - 20, 72, 34, 'taunt:next');
+  label(ctx, `“${v.taunt}”`, cx, ty, v.taunt.length > 64 ? 12 : 15, '#ffe9a3');
+  label(ctx, v.custom ? 'YOUR WORDS. NO MERCY.  ·  T  REWRITE'
+    : `TAUNT ${v.tauntIdx + 1}/${v.tauntCount}  ·  T  WRITE YOUR OWN`, cx, ty + 20, 11, '#ffffff77');
+  tapZone(cx - 150, ty + 9, 300, 17, 'taunt:edit');
+
+  // ---- the only button that matters.
+  const bw = 400, bh = 46, bx = cx - bw / 2, by = ty + 40;
+  const armed = v.copiedAge >= 0;
+  if (armed) {
+    bevel(ctx, bx, by, bw, bh, '#0f2a14', '#7ee85a', '#1e4a26', 3);
+    display(ctx, 'DARE ARMED — GO PASTE IT', cx, by + 33, 20,
+      { from: '#eaffea', mid: '#7ee85a', to: '#2f7a1f', outline: '#0e2a08' });
+  } else {
+    const pulse = 1 + 0.03 * Math.sin(tick / 8);
+    bevel(ctx, bx, by, bw, bh, '#3a0e18', '#ff5d7e', '#6e1024', 3);
+    display(ctx, v.canShare ? 'SEND THE DARE' : 'COPY DARE LINK', cx, by + 33, 22,
+      { ...DARE_OPTS, scale: pulse });
+  }
+  tapZone(bx - 20, by - 8, bw + 40, bh + 16, 'copydare');
+  label(ctx, v.refCode ? v.linkLabel : 'CONNECTING TO SERVER…', cx, by + bh + 22, 12, '#8fd0ff');
+
+  // ---- the economics, as scarcity: the 10/week payout cap is an urgency
+  // mechanic, not fine print.
+  let iy = by + bh + 44;
+  label(ctx,
+    `+25 CREDITS EACH WHEN THEY SIGN IN${v.bountiesLeft !== undefined ? `   ·   ${v.bountiesLeft}/10 BOUNTIES LEFT THIS WEEK` : ''}`,
+    cx, iy, 13, v.bountiesLeft === 0 ? '#ff9d9d' : '#ffd166');
+  if ((v.daresAccepted ?? 0) > 0) {
+    iy += 20;
+    label(ctx, `${v.daresAccepted} FIGHTER${v.daresAccepted === 1 ? '' : 'S'} ALREADY TOOK THE BAIT`, cx, iy, 12, '#8fd0ff');
+  }
+
+  label(ctx,
+    `ESC / TAP HERE  BACK      ◀ ▶  TAUNT      T  WRITE YOUR OWN      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`,
+    cx, VH - 14, 12, '#ffffff99');
+  tapZone(24, VH - 40, 170, 34, 'back');
 };
 
 // ---------------------------------------------------------------- select
@@ -1414,6 +1581,7 @@ export const drawResults = (
   age: number, // ticks since the results screen appeared — drives the pop-in
   xp?: XpInfo | null,
   hint?: string, // bottom action line — callers label the rematch with its fee
+  dare?: boolean, // human won + signed in → offer the dare screen (peak ego)
 ): void => {
   ctx.fillStyle = '#0a0616bb';
   ctx.fillRect(0, 0, VW, VH);
@@ -1475,6 +1643,14 @@ export const drawResults = (
   // Rematch fills the screen; the smaller "back" strip sits on the left.
   tapZone(0, 0, VW, VH, 'start');
   tapZone(0, VH - 48, 240, 48, 'back');
+  // The moment after a win is peak ego — the best second to throw a dare.
+  // Registered last so its tap wins over the full-screen rematch zone.
+  if (dare) {
+    const flash = tick % 50 < 38;
+    label(ctx, 'D · TOO EASY? DARE A FRIEND — BOTH GET +25 CR', VW / 2, VH - 54, 13,
+      flash ? '#ffd166' : '#ffe9a3');
+    tapZone(VW / 2 - 240, VH - 70, 480, 24, 'dare');
+  }
 };
 
 // ------------------------------------------------------------- leaderboard

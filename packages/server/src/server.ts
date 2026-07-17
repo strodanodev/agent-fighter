@@ -322,6 +322,17 @@ export const createMatchServer = (opts: {
             });
           }
         }
+        // Referral dares: a settled match may make an invitee's inviter
+        // payout due (their first decided match). AFTER record_match on
+        // purpose — release_referral reads the matches table. Best-effort;
+        // idempotent in Postgres, so a crash-retry can't double-pay.
+        for (const cl of m.clients) {
+          const sub = cl?.identity?.sub;
+          if (!sub) continue;
+          void persistence.releaseReferral(sub).then((paid) => {
+            if (paid > 0) console.log(`[referral] inviter of ${sub} paid +${paid}`);
+          }).catch((e) => console.log(`[referral] release for ${sub} failed: ${String(e)}`));
+        }
       }).catch((e) => console.log(`[match ${m.id}] persist failed: ${String(e)}`));
     }
     if (process.env.AF_DEBUG_LEDGER) {
@@ -480,7 +491,25 @@ export const createMatchServer = (opts: {
     const level = c.account?.level ?? 1;
     return {
       level,
-      skill: Math.max(3, Math.min(100, Math.round((level * 100) / 40))),
+      // Same level→skill ramp as before, but floored at 40 instead of 3.
+      //
+      // Why the floor moved: meter decisions in ai.ts are (deliberately)
+      // skill-gated, because a novice agent that cashes out bars flattens the
+      // difficulty lever the whole CPU system rides on. The side effect was
+      // that LV1 faced skill 3, and a skill-3 agent measurably finishes a
+      // match sitting on 2857/3000 meter having thrown 2 supers — it hoards
+      // three bars and dies with them. 40 is the cheapest skill that actually
+      // spends meter (~20 supers / 14 matches, ~2269 leftover) and it only
+      // moves the bot's win rate against a weak opponent from 47% to ~57%.
+      //
+      // Only the FLOOR changed: level 17+ keeps exactly its old skill, so
+      // mid/high-level difficulty is untouched. Levels 1-16 now share skill 40
+      // (they were 3..40 — all "harmless" tiers, so little progression is lost
+      // and every one of them now uses its meter).
+      //
+      // Server-side only: skill rides in the `solo` setup message and the
+      // client obeys it, so this needs no ENGINE_VERSION bump.
+      skill: Math.max(40, Math.min(100, Math.round((level * 100) / 40))),
       character: characterIds[Math.floor(Math.random() * characterIds.length)]!,
       aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
     };
@@ -518,7 +547,9 @@ export const createMatchServer = (opts: {
           }
           if (c.identity && persistence) {
             try {
-              c.account = await persistence.getAccount(c.identity, c.name, c.agent);
+              // Referral dare code (?ref= link) — redeemed once, best-effort.
+              const ref = typeof msg.ref === 'string' ? msg.ref.slice(0, 40) : undefined;
+              c.account = await persistence.getAccount(c.identity, c.name, c.agent, ref);
               send(c, { t: 'account', ...c.account });
             } catch (e) {
               console.log(`[account] ${c.name}: ${String(e)}`);
@@ -752,7 +783,9 @@ export const createMatchServer = (opts: {
           : null;
         if (!identity) return json(res, 401, { error: 'sign in required' });
         const name = devName || identity.sub.slice(0, 12);
-        return json(res, 200, await persistence.getAccount(identity, name, false));
+        // ?ref=<dare code> — the title screen redeems a stashed referral here.
+        const ref = new URL(req.url ?? '/', 'http://x').searchParams.get('ref')?.slice(0, 40) ?? undefined;
+        return json(res, 200, await persistence.getAccount(identity, name, false, ref));
       })().catch((e) => json(res, 502, { error: String(e) }));
       return;
     }

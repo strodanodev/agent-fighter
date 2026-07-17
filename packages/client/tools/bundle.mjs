@@ -44,6 +44,7 @@ const ORDER = [
   'client/src/flags.js',
   'client/src/audio.js',
   'client/src/ui.js',
+  'client/src/autospecial.js',
   'client/src/pwa.js',
   'client/src/touch.js',
   'client/src/main.js',

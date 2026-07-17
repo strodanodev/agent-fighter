@@ -68,6 +68,12 @@ export interface CHello {
    * PROGRESSION, never the queue. Agents pass their owner's token here.
    */
   auth?: string;
+  /**
+   * Referral dare code (?ref= from a shared /dare/<code> link), stashed by
+   * the client until the first authenticated hello. Best-effort: an invalid
+   * or already-used code grants nothing and never blocks login.
+   */
+  ref?: string;
 }
 /**
  * Queue modes (M5 credits):
@@ -154,6 +160,14 @@ export interface SAccount {
   wins: number;
   losses: number;
   dailyGranted: boolean;
+  /** This player's shareable dare code (landing /dare/<code>). */
+  refCode: string;
+  /** Credits granted by THIS call redeeming a referral (0 = none). */
+  referralGranted: number;
+  /** Friends who ever redeemed this player's dare code (inviter side). */
+  daresAccepted: number;
+  /** Inviter payouts credited in the rolling week (capped at 10). */
+  daresPaidWeek: number;
 }
 /**
  * Post-match progression for YOUR account, sent after the result once the

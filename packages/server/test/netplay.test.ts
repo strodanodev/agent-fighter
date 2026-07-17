@@ -71,10 +71,14 @@ describe('persistence hook (Phase B)', () => {
       // Dev identities so agents can queue without AIR tokens; generous
       // credits so escrow doesn't block the Phase-B recordMatch assertion.
       dev: true,
-      getAccount: async () => ({ credits: 100, level: 1, xp: 0, wins: 0, losses: 0, dailyGranted: false }),
+      getAccount: async () => ({
+        credits: 100, level: 1, xp: 0, wins: 0, losses: 0, dailyGranted: false,
+        refCode: 'TEST-0000', referralGranted: 0, daresAccepted: 0, daresPaidWeek: 0,
+      }),
       escrowMatch: async () => {},
       recordMatch: async (r) => { records.push(r); return []; },
       sweepOrphanedEscrow: async () => 0,
+      releaseReferral: async () => 0,
       leaderboard: async () => [],
     };
     const s2 = await createMatchServer({ port: 0, persistence: mock });

@@ -173,7 +173,20 @@ const ROUND_SECONDS = 99;
  * (ADR 0003). Bump on ANY sim-behavior change — the golden replay tests
  * going red is the reminder; bless goldens and bump this in the same commit.
  */
-const ENGINE_VERSION = 'af-core-1';
+/**
+ * Bump this on ANY change that alters simulated behaviour — including ai.ts.
+ * Ranked solo (protocol v3) is a zero-latency LOCAL simulation: the client runs
+ * the house AI itself from a pinned seed and streams only its own inputs, and
+ * the server re-derives that same AI to verify the result. So a client running
+ * a different ai.ts than the server desyncs and gets flagged as a deviator —
+ * i.e. the player forfeits the match AND the credit fee through no fault of
+ * their own. The version is checked at the `hello` handshake (server.ts), so
+ * bumping turns that silent, costly desync into a clean "reload required".
+ *
+ * af-core-2: AI meter/special usage (supers no longer gated to skill ≥ 65;
+ *            214K wired up) — changes house-bot inputs, hence a new version.
+ */
+const ENGINE_VERSION = 'af-core-2';
 const TUNING = {
     roundsToWin: 2, // best of 3
     preRoundTicks: 60,
@@ -1821,10 +1834,76 @@ const rnd = (ai, n) => {
 const chance = (ai, p) => rnd(ai, 255) < p;
 /** Linear interpolation on the skill lever: value at skill 0 → value at 100. */
 const lerp = (ai, at0, at100) => at0 + Math.trunc(((at100 - at0) * ai.skill) / 100);
+/**
+ * Same, but on a SQUARED skill curve — most of the value arrives at the top.
+ * Integer-safe: skill ≤ 100, so skill² ≤ 10000.
+ */
+const lerpSq = (ai, at0, at100) => at0 + Math.trunc(((at100 - at0) * ai.skill * ai.skill) / 10000);
+/**
+ * Skill on a FLOORED, squared curve: 0 at/below `floor`, 100 at skill 100.
+ *
+ * For decisions worth so much damage that sharing them with weak agents
+ * flattens the difficulty lever. This is measured, not guessed: giving skill-25
+ * agents even a ~10% super rate dropped `skill 85 vs skill 25` from 91% to 74%
+ * over 80 seeds — the lever the entire CPU-difficulty system rides on. A novice
+ * who cashes out supers is not a novice.
+ */
+const skillRamp = (ai, floor) => {
+    if (ai.skill <= floor)
+        return 0;
+    const t = Math.trunc(((ai.skill - floor) * 100) / (100 - floor)); // 0..100
+    return Math.trunc((t * t) / 100); // squared
+};
 const pxDist = (a, b) => Math.abs(fpToPx(a.x - b.x));
 const aiGrounded = (f) => f.y >= fp(460);
 const actionable = (f) => f.action === 0 /* Action.Idle */ || f.action === 1 /* Action.WalkF */
     || f.action === 2 /* Action.WalkB */ || f.action === 3 /* Action.Crouch */;
+// ---------------------------------------------------------------- meter
+/**
+ * Below this skill an agent never cashes a bar out of a CONFIRMED chain or a
+ * whiff punish. Tuned against the bot-vs-bot balance suite: skilled super
+ * usage is worth more than everything else a novice does combined, and
+ * sharing it flattens the difficulty lever the whole CPU system rides on.
+ *
+ * Note this floor deliberately does NOT apply to raw supers — see superOdds.
+ */
+const SUPER_SKILL_FLOOR = 30;
+/** Can the agent afford its super right now? */
+const canSuper = (ai, ch, me) => ai.idxSuper >= 0 && me.meter >= (ch.b.moves[ai.idxSuper]?.meterCost ?? 9999);
+/**
+ * How much does the agent want to spend a bar, 0..255.
+ *
+ * Meter is a resource, not a trophy. The old gate was a flat `skill >= 65`,
+ * which meant every house bot below player level ~26 (skill = level×100/40)
+ * banked three bars and never spent one — free damage left on the table all
+ * match.
+ *
+ * Appetite scales with skill and reads the situation instead.
+ *
+ * EVERY term below — including the situational bonuses — runs through the same
+ * skill ramp. Leaving those bonuses flat looks harmless and is not: it hands
+ * skill-3 agents a ~7% super rate through the back door and drags the
+ * `skill 85 beats skill 25` lever from 91% down to 76% over 80 seeds. Measured
+ * both ways; do not "simplify" the scaling out.
+ */
+const superOdds = (ai, me, op, dist, comboEnder) => {
+    const r = skillRamp(ai, SUPER_SKILL_FLOOR);
+    if (r === 0)
+        return 0; // a novice has no presence of mind for meter
+    // Cashing a bar out of a confirmed chain is worth far more than a raw one.
+    let odds = Math.trunc(((comboEnder ? 195 : 105) * r) / 100);
+    // Close out the round: the opponent is one good hit from dead.
+    const oppMax = characters[ai.side === 0 ? 1 : 0]?.b.maxHealth ?? 10000;
+    if (op.health <= Math.trunc(oppMax / 4))
+        odds += Math.trunc((115 * r) / 100);
+    // Capped meter means every further gain is being thrown away — spend it.
+    if (me.meter >= TUNING.meterMax)
+        odds += Math.trunc((60 * r) / 100);
+    // Don't burn a bar into thin air.
+    if (dist > 300)
+        odds -= 70;
+    return Math.max(0, Math.min(255, odds));
+};
 // ---------------------------------------------------------------- create
 const createAi = (side, skill, seed) => {
     const ai = {
@@ -1846,7 +1925,8 @@ const createAi = (side, skill, seed) => {
         lastHealth: -1,
         airAttackDone: 0,
         bookGround: [], bookLauncher: -1, bookAir: [],
-        idxFireball: -1, idxDp: -1, idxSweep: -1, idxLow: -1, idxSuper: -1,
+        idxFireball: -1, idxDp: -1, idxSweep: -1, idxLow: -1, idxSpecialK: -1, idxSuper: -1,
+        nextSuperAt: 0,
         bookBuilt: 0,
     };
     // Personality: sampled once — this "person" for this match.
@@ -1868,6 +1948,7 @@ const buildBook = (ai, ch) => {
     ai.idxDp = id('623P');
     ai.idxSweep = id('2HK');
     ai.idxLow = id('2LK');
+    ai.idxSpecialK = id('214K');
     ai.idxSuper = ch.superIdx;
     ai.bookBuilt = 1;
 };
@@ -1896,6 +1977,20 @@ const qFireball = (ai, buttons) => {
     else {
         q(ai, { fwd: 1, ticks: 2 });
         q(ai, { fwd: 1, buttons, ticks: 2 });
+    }
+    q(ai, { ticks: 2 });
+};
+/** QCB + K (214K). Mirror of qFireball — same sloppiness model. */
+const q214 = (ai, buttons) => {
+    const sloppy = !chance(ai, lerp(ai, 140, 250));
+    q(ai, { down: 1, ticks: 3 });
+    q(ai, { down: 1, back: 1, ticks: 2 });
+    if (sloppy) {
+        q(ai, { buttons, ticks: 2 });
+    }
+    else {
+        q(ai, { back: 1, ticks: 2 });
+        q(ai, { back: 1, buttons, ticks: 2 });
     }
     q(ai, { ticks: 2 });
 };
@@ -2035,7 +2130,7 @@ const aiPoll = (ai, g) => {
         case 9 /* Action.Attack */: {
             // Hit-confirm: continue the combo book. Blocked → usually stop (safe).
             if (me.attackConnected === 1) {
-                const next = comboNext(ai, ch, me);
+                const next = comboNext(ai, ch, me, op, dist);
                 if (next)
                     return emit(me, null, 0, false); // queued; emitted next tick
             }
@@ -2108,8 +2203,31 @@ const aiPoll = (ai, g) => {
     // Whiff punish: opponent stuck in recovery within reach.
     if (op.action === 9 /* Action.Attack */ && op.attackConnected === 0
         && seen(ai.oppActionAt) && dist < 170 && chance(ai, lerp(ai, 40, 200))) {
+        // A whiffed move is the cleanest super punish in the game — take it before
+        // settling for a normal string.
+        if (canSuper(ai, ch, me) && ai.queue.length === 0 && g.tick >= ai.nextSuperAt
+            && chance(ai, superOdds(ai, me, op, dist, true))) {
+            qFireball(ai, 16 /* Btn.LP */ | 32 /* Btn.MP */);
+            ai.nextSuperAt = g.tick + 90;
+            return emit(me, null, 0, false);
+        }
         ai.intent = 6 /* Intent.Punish */;
         ai.intentUntil = g.tick + 40;
+    }
+    // Raw super: no combo needed. Without this the bar is only ever spent out of
+    // a confirmed chain, so an agent that never opens one dies at three bars.
+    // Rate-limited, in-range, and only when it actually means something —
+    // finishing the round, or meter that would otherwise overflow.
+    if (canSuper(ai, ch, me) && ai.queue.length === 0 && g.tick >= ai.nextSuperAt
+        && dist < 260 && aiGrounded(op)) {
+        const oppMax = characters[ai.side === 0 ? 1 : 0]?.b.maxHealth ?? 10000;
+        const finisher = op.health <= Math.trunc(oppMax / 4);
+        const overflowing = me.meter >= TUNING.meterMax;
+        if ((finisher || overflowing) && chance(ai, superOdds(ai, me, op, dist, false))) {
+            qFireball(ai, 16 /* Btn.LP */ | 32 /* Btn.MP */);
+            ai.nextSuperAt = g.tick + 150;
+            return emit(me, null, 0, false);
+        }
     }
     // ---- intent lifecycle
     if (g.tick >= ai.intentUntil)
@@ -2251,7 +2369,7 @@ const openString = (ai, ch, dist) => {
  * low skill stops at chains, high skill goes launcher → air combo → enders.
  * Every link can be flubbed (dropped/late) — that's the human hand.
  */
-const comboNext = (ai, ch, me) => {
+const comboNext = (ai, ch, me, op, dist) => {
     // Flubbed link: hesitate — the buffer may still save it, sometimes not.
     const flub = !chance(ai, lerp(ai, 150, 246));
     const delay = flub ? 3 + rnd(ai, 5) : 0;
@@ -2263,9 +2381,10 @@ const comboNext = (ai, ch, me) => {
             qTapButton(ai, buttonOfMove(ch, ai.bookGround[gi + 1]));
             return true;
         }
-        // End of ground chain: launcher / special / super, by skill.
-        if (ai.idxSuper >= 0 && me.meter >= (ch.b.moves[ai.idxSuper].meterCost ?? 9999)
-            && ai.skill >= 65 && chance(ai, 120)) {
+        // End of ground chain: super / launcher / special, by skill + situation.
+        // Cashing a bar out of a confirmed chain is the single best thing the
+        // agent can do with meter, so it gets first refusal.
+        if (canSuper(ai, ch, me) && chance(ai, superOdds(ai, me, op, dist, true))) {
             qFireball(ai, 16 /* Btn.LP */ | 32 /* Btn.MP */); // 236 + two punches = super
             return true;
         }
@@ -2277,6 +2396,12 @@ const comboNext = (ai, ch, me) => {
         }
         if (ai.idxFireball >= 0 && chance(ai, ai.p.zoner)) {
             qFireball(ai, 16 /* Btn.LP */);
+            return true;
+        }
+        // 214K: the third special, right there in every character's data and
+        // never once pressed before this. It's a close-range ender.
+        if (ai.idxSpecialK >= 0 && dist < 150 && chance(ai, lerpSq(ai, 20, 150))) {
+            q214(ai, 128 /* Btn.LK */);
             return true;
         }
         return false;
@@ -3071,6 +3196,7 @@ class NetSession {
     authToken;
     mode;
     email;
+    ref;
     status = 'connecting';
     error = '';
     setup = null;
@@ -3095,7 +3221,8 @@ class NetSession {
     intentionalClose = false;
     resumeAttempts = 0;
     retryTimer = null;
-    constructor(url, name, character, bundleHash, authToken, mode = 'wager', email) {
+    constructor(url, name, character, bundleHash, authToken, mode = 'wager', email, // AIR-account email — reputation write-back target only
+    ref) {
         this.url = url;
         this.name = name;
         this.character = character;
@@ -3103,6 +3230,7 @@ class NetSession {
         this.authToken = authToken;
         this.mode = mode;
         this.email = email;
+        this.ref = ref;
         this.connect(false);
     }
     /** Open a socket — either the initial queue or a resume of a live match. */
@@ -3110,7 +3238,7 @@ class NetSession {
         const ws = new WebSocket(this.url);
         this.ws = ws;
         ws.onopen = () => {
-            this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email });
+            this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email, ref: this.ref });
             if (resume && this.setup?.resume) {
                 this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
             }
@@ -3198,6 +3326,8 @@ class NetSession {
                     wins: Number(msg.wins ?? 0),
                     losses: Number(msg.losses ?? 0),
                     dailyGranted: Boolean(msg.dailyGranted),
+                    refCode: typeof msg.refCode === 'string' ? msg.refCode : undefined,
+                    referralGranted: Number(msg.referralGranted ?? 0),
                 };
                 return;
             }
@@ -3386,6 +3516,7 @@ class SoloSession {
     bundleHash;
     authToken;
     email;
+    ref;
     status = 'connecting';
     error = '';
     setup = null;
@@ -3401,20 +3532,21 @@ class SoloSession {
     intentionalClose = false;
     resumeAttempts = 0;
     retryTimer = null;
-    constructor(url, name, character, bundleHash, authToken, email) {
+    constructor(url, name, character, bundleHash, authToken, email, ref) {
         this.url = url;
         this.name = name;
         this.character = character;
         this.bundleHash = bundleHash;
         this.authToken = authToken;
         this.email = email;
+        this.ref = ref;
         this.connect(false);
     }
     connect(resume) {
         const ws = new WebSocket(this.url);
         this.ws = ws;
         ws.onopen = () => {
-            this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email });
+            this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email, ref: this.ref });
             if (resume && this.setup?.resume) {
                 this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
             }
@@ -5173,30 +5305,49 @@ const drawTimer = (ctx, secs, tick) => {
  * past it, rather than burying the whole badge. Silently omitted if the
  * asset hasn't loaded (fire-and-forget at boot).
  */
-const drawGameLogo = (ctx, cx, topY, tick) => {
+const drawGameLogo = (ctx, cx, topY, tick, charged = false) => {
     if (!gameLogoImg || gameLogoImg.naturalWidth === 0)
         return;
     const box = gameLogoBBox ?? { x: 0, y: 0, w: gameLogoImg.naturalWidth, h: gameLogoImg.naturalHeight };
     const BASE_W = 100; // natural badge width before the size adjustments below
     const w = BASE_W * 0.7 * 2.5;
     const h = w * (box.h / box.w);
-    const breathe = fxPulse(tick, 0.045, 0.96, 1.06); // slow "alive" scale
+    // Charged reads as agitated, not just recoloured: it breathes harder and
+    // faster, so the badge catches the eye in peripheral vision mid-fight.
+    const breathe = charged
+        ? fxPulse(tick, 0.11, 0.94, 1.12)
+        : fxPulse(tick, 0.045, 0.96, 1.06);
     ctx.save();
     ctx.translate(cx, topY);
     ctx.scale(breathe, breathe);
     ctx.imageSmoothingEnabled = true;
-    // Pulses between near-white and light blue rather than a fixed hue.
-    const glowMix = fxPulse(tick, 0.07); // 0..1
-    const gr = Math.round(210 + 40 * glowMix), gg = Math.round(235 + 15 * glowMix), gb = 255;
-    ctx.shadowColor = `rgba(${gr},${gg},${gb},${0.55 + 0.35 * fxPulse(tick, 0.09)})`;
-    ctx.shadowBlur = 14 + 10 * fxPulse(tick, 0.09);
+    const glowMix = fxPulse(tick, charged ? 0.16 : 0.07); // 0..1
+    if (charged) {
+        // Aggressive red: hot core → deep red, pumping fast.
+        const gr = 255, gg = Math.round(40 + 60 * glowMix), gb = Math.round(30 + 40 * glowMix);
+        ctx.shadowColor = `rgba(${gr},${gg},${gb},${0.75 + 0.25 * fxPulse(tick, 0.19)})`;
+        ctx.shadowBlur = 22 + 20 * fxPulse(tick, 0.19);
+    }
+    else {
+        // Idle: pulses between near-white and light blue rather than a fixed hue.
+        const gr = Math.round(210 + 40 * glowMix), gg = Math.round(235 + 15 * glowMix), gb = 255;
+        ctx.shadowColor = `rgba(${gr},${gg},${gb},${0.55 + 0.35 * fxPulse(tick, 0.09)})`;
+        ctx.shadowBlur = 14 + 10 * fxPulse(tick, 0.09);
+    }
     // Two passes: the shadow builds a real halo around the artwork's own
     // silhouette without a second draw looking like a ghost/double-image.
     ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, -w / 2, 0, w, h);
     ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, -w / 2, 0, w, h);
+    // A third pass while charged deepens the halo into a real red rim.
+    if (charged)
+        ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, -w / 2, 0, w, h);
     ctx.restore();
+    // Tap target — generous, and registered from the same geometry that drew the
+    // badge so it tracks the art. Unscaled bounds (the breathe is cosmetic).
+    tapZone(cx - w / 2 - 8, topY - 8, w + 16, h + 16, 'special');
 };
-const drawHud = (ctx, g, rosters, fx, tags) => {
+const drawHud = (ctx, g, rosters, fx, tags, // per-player nameplate suffix (e.g. "AGENT LV 12")
+autoSpecialCharged = false) => {
     for (const i of [0, 1]) {
         const f = g.fighters[i];
         const max = rosters[i].ch.b.maxHealth;
@@ -5225,7 +5376,7 @@ const drawHud = (ctx, g, rosters, fx, tags) => {
     ctx.fillRect(0, VH - 24, VW, 1);
     label(ctx, 'P1: WASD · TYU / GHJ        P2: ARROWS · IOP / KL;        B: HITBOXES        ESC: MENU', VW / 2, VH - 8, 11, '#c8c4ba');
     // Brand badge over the timer's lower rim (top layer of the persistent HUD).
-    drawGameLogo(ctx, VW / 2, 70, g.tick);
+    drawGameLogo(ctx, VW / 2, 70, g.tick, autoSpecialCharged);
     // Center announcement (ROUND n / FIGHT! / K.O.) — drawn ABSOLUTELY LAST so it
     // is the front-most element, over the brand badge and everything else.
     if (fx.announce)
@@ -5339,6 +5490,12 @@ const drawTitle = (ctx, rosters, tick, menu) => {
         // The fighter line is the touch path to the select screen.
         if (menu.fighter)
             tapZone(cx - 260, hintY - 11, 520, 20, 'changefighter');
+        // Referral dare: opens the full invite screen (poster + taunt + link).
+        if (menu.refCode) {
+            const flash = tick % 44 < 36;
+            label(ctx, 'D  DARE A FRIEND  ·  BOTH GET +25 CREDITS', cx, hintY + 38, 12, flash ? '#ffd166' : '#ffe9a3');
+            tapZone(cx - 200, hintY + 27, 400, 22, 'dare');
+        }
     }
     // Account/wallet block — upper LEFT, minimal text (M5 spec).
     if (menu.authLabel) {
@@ -5355,6 +5512,13 @@ const drawTitle = (ctx, rosters, tick, menu) => {
             label(ctx, 'SERVER OFFLINE · CREDITS UNAVAILABLE', 16, acctY, 11, '#ff9d9d', 'left');
         }
     }
+    // Referral dare bonus toast — the invitee just cashed in an accepted dare.
+    if (menu.referralToast) {
+        const flash = (tick + 15) % 30 < 22;
+        const y = (menu.address ? 80 : 62) + (menu.dailyToast ? 18 : 0);
+        if (flash)
+            label(ctx, '+25 DARE ACCEPTED — BONUS CREDITS', 16, y, 14, '#8fe8a0', 'left');
+    }
     // Daily login bonus toast — under the account block, gold, hard to miss.
     if (menu.dailyToast) {
         const flash = tick % 30 < 22;
@@ -5362,6 +5526,83 @@ const drawTitle = (ctx, rosters, tick, menu) => {
             label(ctx, `+${10} DAILY LOGIN CREDITS`, 16, menu.address ? 80 : 62, 14, '#ffe9a3', 'left');
     }
     label(ctx, 'MILESTONE 5 · CREDITS BUILD', cx, VH - 12, 10, '#ffffff55');
+};
+// ---------------------------------------------------------------- invite
+/** Hot-red display() treatment for the dare headline / CTA. */
+const DARE_OPTS = { from: '#ffe3e3', mid: '#ff5d7e', to: '#93202f', outline: '#2a060f' };
+const drawInvite = (ctx, tick, v) => {
+    drawMenuBackdrop(ctx);
+    // Same treatment as the landing dare page: the video stays visible, but a
+    // vignette guarantees the type pops against any frame of it.
+    const vig = ctx.createLinearGradient(0, 0, 0, VH);
+    vig.addColorStop(0, '#0a0616cc');
+    vig.addColorStop(0.45, '#0a061677');
+    vig.addColorStop(1, '#0a0616ee');
+    ctx.fillStyle = vig;
+    ctx.fillRect(0, 0, VW, VH);
+    const cx = VW / 2;
+    if ((tick + 12) % 44 < 34) {
+        label(ctx, '⚠ PUT A BOUNTY ON YOUR OWN HEAD ⚠', cx, 44, 14, '#ff5d7e');
+    }
+    display(ctx, 'I DARE YOU', cx, 100, 46, {});
+    display(ctx, 'TO BEAT ME', cx, 150, 46, DARE_OPTS);
+    // ---- poster panel: the wanted-poster preview of what the friend sees.
+    const pw = 640, ph = 130, px0 = cx - pw / 2, py0 = 176;
+    bevel(ctx, px0, py0, pw, ph, PANEL, GOLD, GOLD_DK, 3);
+    const img = v.roster?.portrait;
+    if (img?.naturalWidth) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(px0 + 3, py0 + 3, 150, ph - 6);
+        ctx.clip();
+        // Slight overscale so the fighter fills the slot like a mugshot.
+        const fit = ((ph - 6) / img.naturalHeight) * 1.35;
+        const w = img.naturalWidth * fit, h = img.naturalHeight * fit;
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(img, px0 + 78 - w / 2, py0 + ph - 3 - h, w, h);
+        ctx.restore();
+    }
+    const tx = px0 + 172;
+    label(ctx, 'WANTED: ANYONE WHO CAN TAKE ONE ROUND', tx, py0 + 28, 11, '#ff9db0', 'left');
+    display(ctx, v.name, tx, py0 + 62, 26, { align: 'left' });
+    const a = v.account;
+    label(ctx, a ? `${a.wins}W — ${a.losses}L   ·   LV ${a.level}${v.roster ? `   ·   MAIN  ${v.roster.bundle.name.toUpperCase()}` : ''}`
+        : 'SERVER OFFLINE — STATS UNAVAILABLE', tx, py0 + 88, 13, a ? '#ffd166' : '#ff9d9d', 'left');
+    label(ctx, 'THIS POSTER LANDS IN THEIR CHAT', tx, py0 + 112, 10, '#ffffff66', 'left');
+    // ---- taunt row: ◀ ▶ cycles presets, T writes your own (rides the link).
+    const ty = py0 + ph + 28;
+    label(ctx, '◀', cx - 300, ty, 18, GOLD_LT);
+    label(ctx, '▶', cx + 300, ty, 18, GOLD_LT);
+    tapZone(cx - 336, ty - 20, 72, 34, 'taunt:prev');
+    tapZone(cx + 264, ty - 20, 72, 34, 'taunt:next');
+    label(ctx, `“${v.taunt}”`, cx, ty, v.taunt.length > 64 ? 12 : 15, '#ffe9a3');
+    label(ctx, v.custom ? 'YOUR WORDS. NO MERCY.  ·  T  REWRITE'
+        : `TAUNT ${v.tauntIdx + 1}/${v.tauntCount}  ·  T  WRITE YOUR OWN`, cx, ty + 20, 11, '#ffffff77');
+    tapZone(cx - 150, ty + 9, 300, 17, 'taunt:edit');
+    // ---- the only button that matters.
+    const bw = 400, bh = 46, bx = cx - bw / 2, by = ty + 40;
+    const armed = v.copiedAge >= 0;
+    if (armed) {
+        bevel(ctx, bx, by, bw, bh, '#0f2a14', '#7ee85a', '#1e4a26', 3);
+        display(ctx, 'DARE ARMED — GO PASTE IT', cx, by + 33, 20, { from: '#eaffea', mid: '#7ee85a', to: '#2f7a1f', outline: '#0e2a08' });
+    }
+    else {
+        const pulse = 1 + 0.03 * Math.sin(tick / 8);
+        bevel(ctx, bx, by, bw, bh, '#3a0e18', '#ff5d7e', '#6e1024', 3);
+        display(ctx, v.canShare ? 'SEND THE DARE' : 'COPY DARE LINK', cx, by + 33, 22, { ...DARE_OPTS, scale: pulse });
+    }
+    tapZone(bx - 20, by - 8, bw + 40, bh + 16, 'copydare');
+    label(ctx, v.refCode ? v.linkLabel : 'CONNECTING TO SERVER…', cx, by + bh + 22, 12, '#8fd0ff');
+    // ---- the economics, as scarcity: the 10/week payout cap is an urgency
+    // mechanic, not fine print.
+    let iy = by + bh + 44;
+    label(ctx, `+25 CREDITS EACH WHEN THEY SIGN IN${v.bountiesLeft !== undefined ? `   ·   ${v.bountiesLeft}/10 BOUNTIES LEFT THIS WEEK` : ''}`, cx, iy, 13, v.bountiesLeft === 0 ? '#ff9d9d' : '#ffd166');
+    if ((v.daresAccepted ?? 0) > 0) {
+        iy += 20;
+        label(ctx, `${v.daresAccepted} FIGHTER${v.daresAccepted === 1 ? '' : 'S'} ALREADY TOOK THE BAIT`, cx, iy, 12, '#8fd0ff');
+    }
+    label(ctx, `ESC / TAP HERE  BACK      ◀ ▶  TAUNT      T  WRITE YOUR OWN      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`, cx, VH - 14, 12, '#ffffff99');
+    tapZone(24, VH - 40, 170, 34, 'back');
 };
 /**
  * Peak single-hit damage the character can deal (normals, specials, super,
@@ -5770,7 +6011,8 @@ const drawStageSelect = (ctx, stageIds, cursor, tick) => {
     tapZone(24, VH - 44, 150, 36, 'back');
 };
 const drawResults = (ctx, g, rosters, tick, age, // ticks since the results screen appeared — drives the pop-in
-xp, hint) => {
+xp, hint, // bottom action line — callers label the rematch with its fee
+dare) => {
     ctx.fillStyle = '#0a0616bb';
     ctx.fillRect(0, 0, VW, VH);
     const pop = easeOutBack(clamp01(age / 16));
@@ -5828,6 +6070,13 @@ xp, hint) => {
     // Rematch fills the screen; the smaller "back" strip sits on the left.
     tapZone(0, 0, VW, VH, 'start');
     tapZone(0, VH - 48, 240, 48, 'back');
+    // The moment after a win is peak ego — the best second to throw a dare.
+    // Registered last so its tap wins over the full-screen rematch zone.
+    if (dare) {
+        const flash = tick % 50 < 38;
+        label(ctx, 'D · TOO EASY? DARE A FRIEND — BOTH GET +25 CR', VW / 2, VH - 54, 13, flash ? '#ffd166' : '#ffe9a3');
+        tapZone(VW / 2 - 240, VH - 70, 480, 24, 'dare');
+    }
 };
 const RANK_TABS = ['ALL', 'HUMANS', 'AGENTS'];
 /**
@@ -6231,6 +6480,174 @@ const drawReconnecting = (ctx, tick) => {
     display(ctx, `RECONNECTING${dots}`, VW / 2, boxY + 52, 28, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
     label(ctx, 'CONNECTION HICCUP — YOUR SEAT IS HELD FOR 20 SECONDS', VW / 2, boxY + 84, 13, '#ffffffcc');
     label(ctx, 'ESC — ABANDON (COUNTS AS LEAVING)', VW / 2, boxY + 112, 12, '#ffffff77');
+};
+
+// ---- client/src/autospecial.js ----
+/**
+ * Auto Special Attack — tap the logo badge, get a special.
+ *
+ * THE RULE THAT SHAPES ALL OF THIS: matches are re-simulated by the match
+ * server from the input log to verify the result, and a client whose inputs
+ * don't reproduce its claimed outcome forfeits (ADR 0003 — see the server's
+ * "deviator forfeits the pot" test). So this feature may NOT poke the sim,
+ * start a move, or touch meter. It synthesises exactly the buttons a human
+ * would press — down, down-forward, forward, punch — and feeds them through
+ * the normal InputFrame path. The server then sees an ordinary input stream
+ * and agrees with us.
+ *
+ * That constraint is a gift: this is a pure client feature. @af/core is
+ * untouched, and it works under rollback/online for free.
+ *
+ * The scripts mirror `ai.ts` (qFireball/qDp), which already drives motions
+ * this way for CPU opponents — same mechanism, same parser, proven.
+ *
+ * Randomness here is safe precisely because picking a move is an INPUT
+ * decision, not sim state: the sim never sees our RNG, only the buttons.
+ */
+
+let queue = [];
+let ticksLeft = 0;
+/** Is a macro mid-execution (its inputs own the pad this frame)? */
+const autoSpecialActive = () => queue.length > 0;
+/** Drop any running macro (round reset, leaving the match, got hit). */
+const cancelAutoSpecial = () => { queue = []; ticksLeft = 0; };
+/** Enough meter for the super → the badge glows red. One bar of three. */
+const autoSpecialCharged = (f) => f.meter >= TUNING.meterBar;
+const isGrounded = (f) => f.y >= fp(STAGE.floorYPx);
+const isActionable = (f) => f.action === 0 /* Action.Idle */ || f.action === 1 /* Action.WalkF */
+    || f.action === 2 /* Action.WalkB */ || f.action === 3 /* Action.Crouch */;
+const gapPx = (a, b) => Math.abs(fpToPx(a.x - b.x));
+// ---- motion scripts (facing-relative; mirror ai.ts) ---------------------
+// Each is a few ticks of directions then the button, sized so the pattern
+// lands inside TUNING.motionWindowTicks (14) when the press is buffered.
+const s236 = (buttons) => [
+    { down: 1, ticks: 3 },
+    { down: 1, fwd: 1, ticks: 2 },
+    { fwd: 1, ticks: 2 },
+    { fwd: 1, buttons, ticks: 2 },
+    { ticks: 1 },
+];
+const s623 = (buttons) => [
+    { fwd: 1, ticks: 2 },
+    { down: 1, ticks: 2 },
+    { down: 1, fwd: 1, buttons, ticks: 3 },
+    { ticks: 1 },
+];
+const s214 = (buttons) => [
+    { down: 1, ticks: 3 },
+    { down: 1, back: 1, ticks: 2 },
+    { back: 1, ticks: 2 },
+    { back: 1, buttons, ticks: 2 },
+    { ticks: 1 },
+];
+const scriptFor = (motion, buttons) => (motion === 623 ? s623 : motion === 214 ? s214 : s236)(buttons);
+/**
+ * Score the character's real special list against the current situation, so a
+ * tap throws something sensible instead of a full-screen dragon punch that
+ * hands the opponent a free punish. Still random among the plausible picks —
+ * one tap should feel lucky, not like an aimbot.
+ */
+const optionsFor = (g, side, ch) => {
+    const me = g.fighters[side];
+    const op = g.fighters[side === 0 ? 1 : 0];
+    const d = gapPx(me, op);
+    const oppAir = !isGrounded(op);
+    const out = [];
+    for (const sp of ch.specials) {
+        const move = ch.b.moves[sp.idx];
+        if (move.stance === 'air')
+            continue; // ground-only tap
+        const buttons = sp.kind === 'P' ? 16 /* Btn.LP */ : 128 /* Btn.LK */;
+        let weight = 1;
+        if (sp.motion === 623)
+            weight = oppAir && d < 240 ? 10 : d < 90 ? 3 : 1; // anti-air / reversal
+        else if (sp.motion === 236)
+            weight = d > 260 ? 8 : d > 140 ? 4 : 2; // zoning
+        else if (sp.motion === 214)
+            weight = d < 200 ? 5 : 1; // close range
+        out.push({ motion: sp.motion, buttons, weight, label: move.id });
+    }
+    // The super joins the pool only when it's actually affordable — the same
+    // condition that turns the badge red, so the glow never lies.
+    if (ch.superIdx >= 0) {
+        const sup = ch.b.moves[ch.superIdx];
+        const cost = sup.meterCost ?? 0;
+        if (me.meter >= cost && sup.motion) {
+            // Two punches is what the sim requires for a super (countBits >= 2).
+            out.push({
+                motion: sup.motion,
+                buttons: 16 /* Btn.LP */ | 32 /* Btn.MP */,
+                weight: !oppAir && d < 320 ? 9 : 3,
+                label: sup.id,
+            });
+        }
+    }
+    return out;
+};
+/** Can a tap start right now? Ground-only, and only from a neutral state. */
+const canAutoSpecial = (g, side, ch) => {
+    if (queue.length > 0)
+        return false; // already running — ignore mashing
+    const me = g.fighters[side];
+    return isGrounded(me) && isActionable(me) && optionsFor(g, side, ch).length > 0;
+};
+/**
+ * Begin a macro. `rand01` is injected (Math.random by default) purely so tests
+ * can pin the pick — it never reaches the sim.
+ * Returns the chosen move id, or null if the tap was refused.
+ */
+const startAutoSpecial = (g, side, ch, rand01 = Math.random) => {
+    if (!canAutoSpecial(g, side, ch))
+        return null;
+    const opts = optionsFor(g, side, ch);
+    const total = opts.reduce((t, o) => t + o.weight, 0);
+    let roll = rand01() * total;
+    let pick = opts[opts.length - 1];
+    for (const o of opts) {
+        roll -= o.weight;
+        if (roll <= 0) {
+            pick = o;
+            break;
+        }
+    }
+    queue = scriptFor(pick.motion, pick.buttons);
+    ticksLeft = queue[0].ticks;
+    return pick.label;
+};
+/**
+ * Produce this tick's input and advance the script. Call INSTEAD of the human
+ * pad poll while active — the two must never merge, or the player's own stick
+ * corrupts the motion mid-macro.
+ */
+const pollAutoSpecial = (me) => {
+    // Interrupted (hit, knocked down): abandon the motion rather than finishing
+    // it late into something the player never asked for.
+    if (me.hitstunLeft > 0 || me.action === 10 /* Action.Hitstun */
+        || me.action === 11 /* Action.AirHitstun */ || me.action === 15 /* Action.Knockdown */) {
+        cancelAutoSpecial();
+        return 0;
+    }
+    const step = queue[0];
+    if (!step)
+        return 0;
+    let f = 0;
+    const fwdBit = me.facing === 1 ? 2 /* Btn.Right */ : 1 /* Btn.Left */;
+    const backBit = me.facing === 1 ? 1 /* Btn.Left */ : 2 /* Btn.Right */;
+    if (step.fwd)
+        f |= fwdBit;
+    if (step.back)
+        f |= backBit;
+    if (step.up)
+        f |= 4 /* Btn.Up */;
+    if (step.down)
+        f |= 8 /* Btn.Down */;
+    if (step.buttons)
+        f |= step.buttons;
+    if (--ticksLeft <= 0) {
+        queue.shift();
+        ticksLeft = queue[0]?.ticks ?? 0;
+    }
+    return f;
 };
 
 // ---- client/src/pwa.js ----
@@ -6681,6 +7098,7 @@ const initTouchControls = () => {
 
 
 
+
 const TICK_MS = 1000 / TICKS_PER_SEC;
 // ---------------------------------------------------------------- input
 const keys = new Set();
@@ -6714,6 +7132,14 @@ const pollPad = (map) => {
             f |= bit;
     return f;
 };
+/** Which fighter the human at this keyboard/screen controls (online may be P2). */
+const localSide = () => (net ? net.side : 0);
+/**
+ * Player-0 pad poll, with Auto Special taking the wheel while its macro runs.
+ * The two must NEVER merge — the player's own stick would corrupt the motion
+ * halfway through and turn a fireball into a random normal.
+ */
+const pollLocal = (g) => (autoSpecialActive() ? pollAutoSpecial(g.fighters[localSide()]) : pollPad(P0_MAP));
 /**
  * Menu taps. The draw functions register their tappable rects every frame
  * (ui.ts tapZone), so a pointer press just hit-tests the CURRENT layout and
@@ -6754,6 +7180,63 @@ let practiceFree = false; // offline-fallback match: no fee, no XP, no records
 // The remembered fighter makes the title's ENTER a one-input path to a match.
 const LAST_FIGHTER_KEY = 'af-last-fighter';
 let lastFighter = localStorage.getItem(LAST_FIGHTER_KEY) ?? '';
+// ---- Referral dares ("I dare you to beat me"). A shared landing link
+// (agent-fighter-web.vercel.app/dare/<code>) deep-links here with ?ref=;
+// the code waits in localStorage until the first authenticated contact
+// redeems it server-side (+25 credits each, once ever, new accounts only).
+const REF_CODE_KEY = 'af-ref-code';
+const DARE_LINK_BASE = 'https://agent-fighter-web.vercel.app/dare';
+const storedRef = () => localStorage.getItem(REF_CODE_KEY) ?? undefined;
+let referralToastAge = -1; // ≥0 → the "+25 DARE ACCEPTED" toast is animating
+// ---- Invite screen ("PUT A BOUNTY ON YOUR OWN HEAD") — the sender side of
+// the dare loop. The chosen taunt rides the link as ?t= so the landing page
+// and its OG thumbnail shout it at the invitee; free text is by design.
+/** Mirrors release_referral's rolling-week payout cap (0005_referrals.sql). */
+const REFERRAL_WEEKLY_CAP = 10;
+const TAUNTS = [
+    "MY GRANDMA'S AI HITS HARDER THAN YOU.",
+    "YOU'D BE MY EASIEST WIN YET.",
+    'SAY YOU WERE LAGGING. I DARE YOU.',
+    "I'LL PLAY ONE-HANDED. STILL TAKING YOUR ROUNDS.",
+    "BRING A FRIEND. YOU'LL NEED THE EMOTIONAL SUPPORT.",
+];
+const TAUNT_MAX = 90; // keeps the link sane and the OG card layout intact
+let tauntIdx = 0;
+let customTaunt = '';
+let inviteCopiedAge = -1; // ≥0 → the button reads "DARE ARMED"
+let inviteFrom = 'title'; // where ESC returns to
+const currentTaunt = () => customTaunt || TAUNTS[tauntIdx];
+const dareLink = () => `${DARE_LINK_BASE}/${account?.refCode ?? ''}?t=${encodeURIComponent(currentTaunt())}`;
+/** Coarse pointer ≈ phone/tablet → prefer the OS share sheet over clipboard. */
+const shareViaSheet = () => typeof navigator.share === 'function' && matchMedia('(pointer: coarse)').matches;
+const enterInvite = (from) => {
+    inviteFrom = from;
+    inviteCopiedAge = -1;
+    screen = 'invite';
+};
+const editTaunt = () => {
+    // window.prompt is the only text input a single-canvas game has — same
+    // trade-off the clipboard fallback already makes. Blank → back to presets.
+    const t = window.prompt('WRITE YOUR TAUNT (blank = use the presets):', customTaunt || currentTaunt());
+    if (t === null)
+        return;
+    customTaunt = t.trim().replace(/\s+/g, ' ').slice(0, TAUNT_MAX);
+};
+const shareDare = () => {
+    if (!account?.refCode)
+        return;
+    const link = dareLink();
+    const text = `${currentTaunt()} — I DARE YOU TO BEAT ME. +25 credits if you can take one round.`;
+    const done = () => { inviteCopiedAge = 0; };
+    if (shareViaSheet()) {
+        void navigator.share({ title: 'AGENT FIGHTER', text, url: link }).then(done)
+            .catch(() => { });
+    }
+    else {
+        void navigator.clipboard?.writeText(`${text}\n${link}`).then(done)
+            .catch(() => { window.prompt('COPY YOUR DARE LINK:', link); });
+    }
+};
 /** Ticks the pre-fight stakes card has been showing (-1 = off). */
 let vsCardAge = -1;
 const VS_CARD_TICKS = 150; // ~2.5s; any key skips
@@ -6831,7 +7314,9 @@ const fetchAccount = async () => {
             accountFetch = 'idle';
             return;
         }
-        const res = await fetch(`${matchHttpUrl()}/me`, { headers });
+        // A stashed dare code rides along and redeems exactly once server-side.
+        const ref = storedRef();
+        const res = await fetch(`${matchHttpUrl()}/me${ref ? `?ref=${encodeURIComponent(ref)}` : ''}`, { headers });
         if (!res.ok) {
             accountFetch = 'fail';
             return;
@@ -6839,6 +7324,12 @@ const fetchAccount = async () => {
         account = (await res.json());
         if (account.dailyGranted)
             accountToastAge = 0;
+        if ((account.referralGranted ?? 0) > 0)
+            referralToastAge = 0;
+        // The server has now decided the referral (granted or ineligible) —
+        // either way the code is spent for this account. Stop resending it.
+        if (ref)
+            localStorage.removeItem(REF_CODE_KEY);
         accountFetch = 'done';
     }
     catch {
@@ -6942,6 +7433,12 @@ const applyBootDeepLink = () => {
     const screenQ = (q.get('screen') ?? '').toLowerCase();
     const modeQ = (q.get('mode') ?? '').toLowerCase();
     const charQ = q.get('char');
+    // Dare referral code — stash it before any auth happens so it survives
+    // the AIR dialog round-trip and redeems on the first signed-in contact.
+    const refQ = q.get('ref');
+    if (refQ && /^[A-Za-z0-9-]{3,40}$/.test(refQ)) {
+        localStorage.setItem(REF_CODE_KEY, refQ.toUpperCase());
+    }
     if (modeQ === 'cpu' || modeQ === 'online' || modeQ === '2p') {
         mode = modeQ;
     }
@@ -6981,6 +7478,7 @@ const applyBootDeepLink = () => {
 };
 /** Reset per-match juice/announce state (shared by local + online starts). */
 const resetMatchFx = (g) => {
+    cancelAutoSpecial(); // never carry a half-finished motion into a new round/match
     cam = { x: STAGE.widthPx / 2 - VW / 2 / 1.5, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5 };
     updateCamera(g);
     prevHealth = [g.fighters[0].health, g.fighters[1].health];
@@ -7020,8 +7518,8 @@ const startOnline = (m) => {
         // Solo (v3): pure LOCAL simulation of the pinned house AI — zero added
         // latency; the server re-derives the AI to verify. Wager: rollback PvP.
         net = m === 'solo'
-            ? new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email)
-            : new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email);
+            ? new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef())
+            : new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef());
     });
 };
 /** Match setup arrived — install the pinned characters/stage and begin. */
@@ -7318,7 +7816,7 @@ const renderFight = (g) => {
             `${net.setup.names[0]}${net.setup.agents[0] ? ' · AGENT' : ''}${net.side === 0 ? ' (YOU)' : ''}`,
             `${net.setup.names[1]}${net.setup.agents[1] ? ' · AGENT' : ''}${net.side === 1 ? ' (YOU)' : ''}`,
         ]
-        : cpuAi ? ['', `AGENT LV ${cpuLevelFor(profile, lever)}`] : undefined);
+        : cpuAi ? ['', `AGENT LV ${cpuLevelFor(profile, lever)}`] : undefined, autoSpecialCharged(g.fighters[localSide()]));
     // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
     // sweeps across the whole frame.
     drawFx(ctx, 'screen');
@@ -7475,6 +7973,8 @@ const frame = () => {
         } // signed out
         if (accountToastAge >= 0 && ++accountToastAge > 300)
             accountToastAge = -1;
+        if (referralToastAge >= 0 && ++referralToastAge > 300)
+            referralToastAge = -1;
         drawTitle(ctx, allRosters, uiTick, {
             mode, cpuLevel: cpuLevelFor(profile, lever),
             authLabel: authName() ?? (DEV_GUEST ? `DEV·${DEV_GUEST.toUpperCase()}` : null),
@@ -7486,6 +7986,8 @@ const frame = () => {
                 ? { credits: account.credits, level: account.level, wins: account.wins, losses: account.losses }
                 : null,
             dailyToast: accountToastAge >= 0,
+            referralToast: referralToastAge >= 0,
+            refCode: accountFetch === 'done' ? account?.refCode : undefined,
             fighter: (allRosters.find((r) => r.id === lastFighter && !r.disabled)
                 ?? allRosters.find((r) => !r.disabled))?.bundle.name,
         });
@@ -7533,6 +8035,11 @@ const frame = () => {
             screen = 'ranks';
             fetchRanks();
         }
+        else if (signedIn && account?.refCode && (pressedThisFrame.has('KeyD') || taps.has('dare'))) {
+            // "I DARE YOU TO BEAT ME" — the full invite screen (poster, taunt,
+            // shareable link). Both sides earn +25 credits when a friend accepts.
+            enterInvite('title');
+        }
         else if (!signedIn) {
             // Gated: every other key/tap waits for the sign-in.
         }
@@ -7568,6 +8075,50 @@ const frame = () => {
             fetchRanks();
         if (pressedThisFrame.has('Escape') || taps.has('back'))
             screen = 'title';
+    }
+    else if (screen === 'invite') {
+        if (inviteCopiedAge >= 0 && ++inviteCopiedAge > 240)
+            inviteCopiedAge = -1;
+        drawInvite(ctx, uiTick, {
+            name: (authName() ?? (DEV_GUEST ? `DEV·${DEV_GUEST.toUpperCase()}` : 'FIGHTER')).toUpperCase(),
+            account: account
+                ? { credits: account.credits, level: account.level, wins: account.wins, losses: account.losses }
+                : null,
+            refCode: account?.refCode,
+            roster: allRosters.find((r) => r.id === lastFighter && !r.disabled)
+                ?? allRosters.find((r) => !r.disabled),
+            taunt: currentTaunt(),
+            tauntIdx,
+            tauntCount: TAUNTS.length,
+            custom: !!customTaunt,
+            linkLabel: `${DARE_LINK_BASE.replace(/^https?:\/\//, '')}/${account?.refCode ?? ''}`,
+            copiedAge: inviteCopiedAge,
+            canShare: shareViaSheet(),
+            daresAccepted: account?.daresAccepted,
+            bountiesLeft: account
+                ? Math.max(0, REFERRAL_WEEKLY_CAP - (account.daresPaidWeek ?? 0))
+                : undefined,
+        });
+        if (pressedThisFrame.has('ArrowLeft') || pressedThisFrame.has('KeyA') || taps.has('taunt:prev')) {
+            customTaunt = '';
+            tauntIdx = (tauntIdx + TAUNTS.length - 1) % TAUNTS.length;
+            inviteCopiedAge = -1; // new taunt = new link — re-arm the button
+        }
+        else if (pressedThisFrame.has('ArrowRight') || pressedThisFrame.has('KeyD') || taps.has('taunt:next')) {
+            customTaunt = '';
+            tauntIdx = (tauntIdx + 1) % TAUNTS.length;
+            inviteCopiedAge = -1;
+        }
+        else if (pressedThisFrame.has('KeyT') || taps.has('taunt:edit')) {
+            editTaunt();
+            inviteCopiedAge = -1;
+        }
+        else if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('copydare')) {
+            shareDare();
+        }
+        else if (pressedThisFrame.has('Escape') || taps.has('back')) {
+            screen = inviteFrom;
+        }
     }
     else if (screen === 'select') {
         tickSelect();
@@ -7663,12 +8214,19 @@ const frame = () => {
         const netReconnecting = !!net && net.status === 'reconnecting';
         if (net?.game && net.game !== game)
             game = net.game;
+        // Auto Special: tapping the logo badge queues a real motion + button
+        // script, which then drives the pad for the next few ticks (see
+        // autospecial.ts — inputs only, so the server's re-sim still agrees).
+        if (taps.has('special') && fighters && !holdSim && !netDead) {
+            startAutoSpecial(game, localSide(), fighters[localSide()].ch);
+        }
         if (net && !holdSim && !netDead) {
-            net.frame(pollPad(P0_MAP)); // session owns stepping (rollback or local-sim)
+            net.frame(pollLocal(game)); // session owns stepping (rollback or local-sim)
         }
         else if (!net && !holdSim) {
+            // Offline the human is always P1 (localSide() === 0).
             const p2 = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
-            step(game, [pollPad(P0_MAP), p2]);
+            step(game, [pollLocal(game), p2]);
         }
         updateJuice(game);
         updateCamera(game);
@@ -7735,9 +8293,11 @@ const frame = () => {
             }
         }
         renderFight(game);
+        // Peak-ego entry point: a signed-in winner gets offered the dare screen.
+        const canDare = game.winner === localSide() && !!account?.refCode;
         drawResults(ctx, game, fighters, uiTick, resultsAge, xpBanner, net
             ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : '10 CR'}        ESC: CHANGE FIGHTER`
-            : undefined);
+            : undefined, canDare);
         // Online: the server's verdict is the real result (ADR 0003).
         if (net) {
             ctx.font = 'bold 15px "Courier New", monospace';
@@ -7757,7 +8317,10 @@ const frame = () => {
         }
         drawWalletStrip();
         // 'back' overlaps the full-screen 'start' region, so check it first.
-        if (pressedThisFrame.has('Escape') || taps.has('back')) {
+        if (canDare && (pressedThisFrame.has('KeyD') || taps.has('dare'))) {
+            enterInvite('results'); // ESC on the invite screen returns here
+        }
+        else if (pressedThisFrame.has('Escape') || taps.has('back')) {
             net?.close();
             net = null;
             screen = 'select';

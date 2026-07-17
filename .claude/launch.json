@@ -11,6 +11,15 @@
       "autoPort": false
     },
     {
+      "name": "matchserver",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "src/server.ts"],
+      "cwd": "packages/server",
+      "env": { "PORT": "8477", "AF_ALLOW_DEV_ECONOMY": "1" },
+      "port": 8477,
+      "autoPort": false
+    },
+    {
       "name": "studio",
       "runtimeExecutable": "node",
       "runtimeArgs": ["server.mjs"],

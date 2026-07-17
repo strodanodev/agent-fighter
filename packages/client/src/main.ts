@@ -19,9 +19,10 @@ import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './a
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  currentStageCamLimits, drawHud, drawNetError, drawRanks, drawReconnecting, drawResults,
-  drawSelect, drawStage, drawStageSelect, drawTitle, drawVsCard, drawWallet, resetTaps,
-  setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit, tapHit, tapZone, worldTransform,
+  currentStageCamLimits, drawHud, drawInvite, drawNetError, drawRanks, drawReconnecting,
+  drawResults, drawSelect, drawStage, drawStageSelect, drawTitle, drawVsCard, drawWallet,
+  resetTaps, setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit, tapHit, tapZone,
+  worldTransform,
 } from './ui.js';
 import type { Cam, HudFx, Mode, RankRow, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit } from './chrome.js';
@@ -34,6 +35,9 @@ import {
   auraGlow, drawFx, emitAura, emitBurst, emitRing, fxPulse, updateFx,
 } from './fx.js';
 import { initTouchControls, setTouchScreen } from './touch.js';
+import {
+  autoSpecialActive, autoSpecialCharged, cancelAutoSpecial, pollAutoSpecial, startAutoSpecial,
+} from './autospecial.js';
 import { initPwa } from './pwa.js';
 
 const TICK_MS = 1000 / TICKS_PER_SEC;
@@ -69,6 +73,17 @@ const pollPad = (map: [string, number][]): InputFrame => {
   return f;
 };
 
+/** Which fighter the human at this keyboard/screen controls (online may be P2). */
+const localSide = (): 0 | 1 => (net ? net.side : 0);
+
+/**
+ * Player-0 pad poll, with Auto Special taking the wheel while its macro runs.
+ * The two must NEVER merge — the player's own stick would corrupt the motion
+ * halfway through and turn a fireball into a random normal.
+ */
+const pollLocal = (g: GameState): InputFrame =>
+  (autoSpecialActive() ? pollAutoSpecial(g.fighters[localSide()]) : pollPad(P0_MAP));
+
 /**
  * Menu taps. The draw functions register their tappable rects every frame
  * (ui.ts tapZone), so a pointer press just hit-tests the CURRENT layout and
@@ -90,7 +105,7 @@ const tapAt = (clientX: number, clientY: number): void => {
 };
 
 // ---------------------------------------------------------------- state
-type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'ranks';
+type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'ranks' | 'invite';
 
 let screen: Screen = 'loading';
 let mode: Mode = 'cpu';
@@ -112,6 +127,64 @@ let practiceFree = false; // offline-fallback match: no fee, no XP, no records
 // The remembered fighter makes the title's ENTER a one-input path to a match.
 const LAST_FIGHTER_KEY = 'af-last-fighter';
 let lastFighter = localStorage.getItem(LAST_FIGHTER_KEY) ?? '';
+
+// ---- Referral dares ("I dare you to beat me"). A shared landing link
+// (agent-fighter-web.vercel.app/dare/<code>) deep-links here with ?ref=;
+// the code waits in localStorage until the first authenticated contact
+// redeems it server-side (+25 credits each, once ever, new accounts only).
+const REF_CODE_KEY = 'af-ref-code';
+const DARE_LINK_BASE = 'https://agent-fighter-web.vercel.app/dare';
+const storedRef = (): string | undefined => localStorage.getItem(REF_CODE_KEY) ?? undefined;
+let referralToastAge = -1; // ≥0 → the "+25 DARE ACCEPTED" toast is animating
+
+// ---- Invite screen ("PUT A BOUNTY ON YOUR OWN HEAD") — the sender side of
+// the dare loop. The chosen taunt rides the link as ?t= so the landing page
+// and its OG thumbnail shout it at the invitee; free text is by design.
+/** Mirrors release_referral's rolling-week payout cap (0005_referrals.sql). */
+const REFERRAL_WEEKLY_CAP = 10;
+const TAUNTS = [
+  "MY GRANDMA'S AI HITS HARDER THAN YOU.",
+  "YOU'D BE MY EASIEST WIN YET.",
+  'SAY YOU WERE LAGGING. I DARE YOU.',
+  "I'LL PLAY ONE-HANDED. STILL TAKING YOUR ROUNDS.",
+  "BRING A FRIEND. YOU'LL NEED THE EMOTIONAL SUPPORT.",
+];
+const TAUNT_MAX = 90; // keeps the link sane and the OG card layout intact
+let tauntIdx = 0;
+let customTaunt = '';
+let inviteCopiedAge = -1; // ≥0 → the button reads "DARE ARMED"
+let inviteFrom: 'title' | 'results' = 'title'; // where ESC returns to
+const currentTaunt = (): string => customTaunt || TAUNTS[tauntIdx]!;
+const dareLink = (): string =>
+  `${DARE_LINK_BASE}/${account?.refCode ?? ''}?t=${encodeURIComponent(currentTaunt())}`;
+/** Coarse pointer ≈ phone/tablet → prefer the OS share sheet over clipboard. */
+const shareViaSheet = (): boolean =>
+  typeof navigator.share === 'function' && matchMedia('(pointer: coarse)').matches;
+const enterInvite = (from: 'title' | 'results'): void => {
+  inviteFrom = from;
+  inviteCopiedAge = -1;
+  screen = 'invite';
+};
+const editTaunt = (): void => {
+  // window.prompt is the only text input a single-canvas game has — same
+  // trade-off the clipboard fallback already makes. Blank → back to presets.
+  const t = window.prompt('WRITE YOUR TAUNT (blank = use the presets):', customTaunt || currentTaunt());
+  if (t === null) return;
+  customTaunt = t.trim().replace(/\s+/g, ' ').slice(0, TAUNT_MAX);
+};
+const shareDare = (): void => {
+  if (!account?.refCode) return;
+  const link = dareLink();
+  const text = `${currentTaunt()} — I DARE YOU TO BEAT ME. +25 credits if you can take one round.`;
+  const done = (): void => { inviteCopiedAge = 0; };
+  if (shareViaSheet()) {
+    void navigator.share({ title: 'AGENT FIGHTER', text, url: link }).then(done)
+      .catch(() => { /* user closed the sheet — not a failure */ });
+  } else {
+    void navigator.clipboard?.writeText(`${text}\n${link}`).then(done)
+      .catch(() => { window.prompt('COPY YOUR DARE LINK:', link); });
+  }
+};
 /** Ticks the pre-fight stakes card has been showing (-1 = off). */
 let vsCardAge = -1;
 const VS_CARD_TICKS = 150; // ~2.5s; any key skips
@@ -184,10 +257,16 @@ const fetchAccount = async (): Promise<void> => {
     if (token) headers.Authorization = `Bearer ${token}`;
     else if (DEV_GUEST) headers['X-Dev-Name'] = DEV_GUEST;
     else { accountFetch = 'idle'; return; }
-    const res = await fetch(`${matchHttpUrl()}/me`, { headers });
+    // A stashed dare code rides along and redeems exactly once server-side.
+    const ref = storedRef();
+    const res = await fetch(`${matchHttpUrl()}/me${ref ? `?ref=${encodeURIComponent(ref)}` : ''}`, { headers });
     if (!res.ok) { accountFetch = 'fail'; return; }
     account = (await res.json()) as NetAccount;
     if (account.dailyGranted) accountToastAge = 0;
+    if ((account.referralGranted ?? 0) > 0) referralToastAge = 0;
+    // The server has now decided the referral (granted or ineligible) —
+    // either way the code is spent for this account. Stop resending it.
+    if (ref) localStorage.removeItem(REF_CODE_KEY);
     accountFetch = 'done';
   } catch {
     accountFetch = 'fail'; // server offline — title shows it, local play still fine
@@ -294,6 +373,13 @@ const applyBootDeepLink = (): void => {
   const modeQ = (q.get('mode') ?? '').toLowerCase();
   const charQ = q.get('char');
 
+  // Dare referral code — stash it before any auth happens so it survives
+  // the AIR dialog round-trip and redeems on the first signed-in contact.
+  const refQ = q.get('ref');
+  if (refQ && /^[A-Za-z0-9-]{3,40}$/.test(refQ)) {
+    localStorage.setItem(REF_CODE_KEY, refQ.toUpperCase());
+  }
+
   if (modeQ === 'cpu' || modeQ === 'online' || modeQ === '2p') {
     mode = modeQ;
   }
@@ -334,6 +420,7 @@ const applyBootDeepLink = (): void => {
 
 /** Reset per-match juice/announce state (shared by local + online starts). */
 const resetMatchFx = (g: GameState): void => {
+  cancelAutoSpecial(); // never carry a half-finished motion into a new round/match
   cam = { x: STAGE.widthPx / 2 - VW / 2 / 1.5, y: STAGE.floorYPx - (VH / 1.5) * 0.86, zoom: 1.5 };
   updateCamera(g);
   prevHealth = [g.fighters[0].health, g.fighters[1].health];
@@ -373,8 +460,8 @@ const startOnline = (m: 'solo' | 'wager'): void => {
     // Solo (v3): pure LOCAL simulation of the pinned house AI — zero added
     // latency; the server re-derives the AI to verify. Wager: rollback PvP.
     net = m === 'solo'
-      ? new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email)
-      : new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email);
+      ? new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef())
+      : new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef());
   });
 };
 
@@ -677,7 +764,8 @@ const renderFight = (g: GameState): void => {
         `${net.setup.names[0]}${net.setup.agents[0] ? ' · AGENT' : ''}${net.side === 0 ? ' (YOU)' : ''}`,
         `${net.setup.names[1]}${net.setup.agents[1] ? ' · AGENT' : ''}${net.side === 1 ? ' (YOU)' : ''}`,
       ]
-      : cpuAi ? ['', `AGENT LV ${cpuLevelFor(profile, lever)}`] : undefined);
+      : cpuAi ? ['', `AGENT LV ${cpuLevelFor(profile, lever)}`] : undefined,
+    autoSpecialCharged(g.fighters[localSide()]));
 
   // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
   // sweeps across the whole frame.
@@ -798,6 +886,7 @@ const frame = (): void => {
     if (signedIn && accountFetch === 'idle') void fetchAccount();
     if (!signedIn && account) { account = null; accountFetch = 'idle'; } // signed out
     if (accountToastAge >= 0 && ++accountToastAge > 300) accountToastAge = -1;
+    if (referralToastAge >= 0 && ++referralToastAge > 300) referralToastAge = -1;
     drawTitle(ctx, allRosters, uiTick, {
       mode, cpuLevel: cpuLevelFor(profile, lever),
       authLabel: authName() ?? (DEV_GUEST ? `DEV·${DEV_GUEST.toUpperCase()}` : null),
@@ -809,6 +898,8 @@ const frame = (): void => {
         ? { credits: account.credits, level: account.level, wins: account.wins, losses: account.losses }
         : null,
       dailyToast: accountToastAge >= 0,
+      referralToast: referralToastAge >= 0,
+      refCode: accountFetch === 'done' ? account?.refCode : undefined,
       fighter: (allRosters.find((r) => r.id === lastFighter && !r.disabled)
         ?? allRosters.find((r) => !r.disabled))?.bundle.name,
     });
@@ -851,6 +942,10 @@ const frame = (): void => {
       // Standings are public — viewable even from the sign-in gate.
       screen = 'ranks';
       fetchRanks();
+    } else if (signedIn && account?.refCode && (pressedThisFrame.has('KeyD') || taps.has('dare'))) {
+      // "I DARE YOU TO BEAT ME" — the full invite screen (poster, taunt,
+      // shareable link). Both sides earn +25 credits when a friend accepts.
+      enterInvite('title');
     } else if (!signedIn) {
       // Gated: every other key/tap waits for the sign-in.
     } else if (tappedMode) {
@@ -877,6 +972,44 @@ const frame = (): void => {
     for (let i = 0; i < RANK_TABS.length; i++) if (taps.has(`ranktab:${i}`)) ranksTab = i;
     if (pressedThisFrame.has('KeyR')) fetchRanks();
     if (pressedThisFrame.has('Escape') || taps.has('back')) screen = 'title';
+  } else if (screen === 'invite') {
+    if (inviteCopiedAge >= 0 && ++inviteCopiedAge > 240) inviteCopiedAge = -1;
+    drawInvite(ctx, uiTick, {
+      name: (authName() ?? (DEV_GUEST ? `DEV·${DEV_GUEST.toUpperCase()}` : 'FIGHTER')).toUpperCase(),
+      account: account
+        ? { credits: account.credits, level: account.level, wins: account.wins, losses: account.losses }
+        : null,
+      refCode: account?.refCode,
+      roster: allRosters.find((r) => r.id === lastFighter && !r.disabled)
+        ?? allRosters.find((r) => !r.disabled),
+      taunt: currentTaunt(),
+      tauntIdx,
+      tauntCount: TAUNTS.length,
+      custom: !!customTaunt,
+      linkLabel: `${DARE_LINK_BASE.replace(/^https?:\/\//, '')}/${account?.refCode ?? ''}`,
+      copiedAge: inviteCopiedAge,
+      canShare: shareViaSheet(),
+      daresAccepted: account?.daresAccepted,
+      bountiesLeft: account
+        ? Math.max(0, REFERRAL_WEEKLY_CAP - (account.daresPaidWeek ?? 0))
+        : undefined,
+    });
+    if (pressedThisFrame.has('ArrowLeft') || pressedThisFrame.has('KeyA') || taps.has('taunt:prev')) {
+      customTaunt = '';
+      tauntIdx = (tauntIdx + TAUNTS.length - 1) % TAUNTS.length;
+      inviteCopiedAge = -1; // new taunt = new link — re-arm the button
+    } else if (pressedThisFrame.has('ArrowRight') || pressedThisFrame.has('KeyD') || taps.has('taunt:next')) {
+      customTaunt = '';
+      tauntIdx = (tauntIdx + 1) % TAUNTS.length;
+      inviteCopiedAge = -1;
+    } else if (pressedThisFrame.has('KeyT') || taps.has('taunt:edit')) {
+      editTaunt();
+      inviteCopiedAge = -1;
+    } else if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('copydare')) {
+      shareDare();
+    } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
+      screen = inviteFrom;
+    }
   } else if (screen === 'select') {
     tickSelect();
     drawSelect(ctx, allRosters, picks, locked, uiTick,
@@ -963,11 +1096,18 @@ const frame = (): void => {
     // renderer keeps drawing the pre-drop snapshot forever.
     const netReconnecting = !!net && net.status === 'reconnecting';
     if (net?.game && net.game !== game) game = net.game;
+    // Auto Special: tapping the logo badge queues a real motion + button
+    // script, which then drives the pad for the next few ticks (see
+    // autospecial.ts — inputs only, so the server's re-sim still agrees).
+    if (taps.has('special') && fighters && !holdSim && !netDead) {
+      startAutoSpecial(game, localSide(), fighters[localSide()].ch);
+    }
     if (net && !holdSim && !netDead) {
-      net.frame(pollPad(P0_MAP)); // session owns stepping (rollback or local-sim)
+      net.frame(pollLocal(game)); // session owns stepping (rollback or local-sim)
     } else if (!net && !holdSim) {
+      // Offline the human is always P1 (localSide() === 0).
       const p2: InputFrame = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
-      step(game, [pollPad(P0_MAP), p2]);
+      step(game, [pollLocal(game), p2]);
     }
     updateJuice(game);
     updateCamera(game);
@@ -1034,10 +1174,13 @@ const frame = (): void => {
       }
     }
     renderFight(game);
+    // Peak-ego entry point: a signed-in winner gets offered the dare screen.
+    const canDare = game.winner === localSide() && !!account?.refCode;
     drawResults(ctx, game, fighters!, uiTick, resultsAge, xpBanner,
       net
         ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : '10 CR'}        ESC: CHANGE FIGHTER`
-        : undefined);
+        : undefined,
+      canDare);
     // Online: the server's verdict is the real result (ADR 0003).
     if (net) {
       ctx.font = 'bold 15px "Courier New", monospace';
@@ -1058,7 +1201,9 @@ const frame = (): void => {
     }
     drawWalletStrip();
     // 'back' overlaps the full-screen 'start' region, so check it first.
-    if (pressedThisFrame.has('Escape') || taps.has('back')) {
+    if (canDare && (pressedThisFrame.has('KeyD') || taps.has('dare'))) {
+      enterInvite('results'); // ESC on the invite screen returns here
+    } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
       net?.close();
       net = null;
       screen = 'select'; locked = [false, false];

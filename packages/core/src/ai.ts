@@ -1,6 +1,7 @@
 import { Btn } from './input.js';
 import type { InputFrame } from './input.js';
 import { fp, fpToPx, nextRand } from './fp.js';
+import { TUNING } from './data.js';
 import type { LoadedCharacter } from './data.js';
 import { Action, Phase, characters } from './state.js';
 import type { FighterState, GameState } from './state.js';
@@ -104,7 +105,10 @@ export interface AiState {
   idxDp: number;
   idxSweep: number;
   idxLow: number;
+  idxSpecialK: number; // 214K — the third special
   idxSuper: number;
+  /** Earliest tick a RAW (non-combo) super may fire again — stops per-tick spam. */
+  nextSuperAt: number;
   bookBuilt: number;
 }
 
@@ -121,6 +125,28 @@ const chance = (ai: AiState, p: number): boolean => rnd(ai, 255) < p;
 const lerp = (ai: AiState, at0: number, at100: number): number =>
   at0 + Math.trunc(((at100 - at0) * ai.skill) / 100);
 
+/**
+ * Same, but on a SQUARED skill curve — most of the value arrives at the top.
+ * Integer-safe: skill ≤ 100, so skill² ≤ 10000.
+ */
+const lerpSq = (ai: AiState, at0: number, at100: number): number =>
+  at0 + Math.trunc(((at100 - at0) * ai.skill * ai.skill) / 10000);
+
+/**
+ * Skill on a FLOORED, squared curve: 0 at/below `floor`, 100 at skill 100.
+ *
+ * For decisions worth so much damage that sharing them with weak agents
+ * flattens the difficulty lever. This is measured, not guessed: giving skill-25
+ * agents even a ~10% super rate dropped `skill 85 vs skill 25` from 91% to 74%
+ * over 80 seeds — the lever the entire CPU-difficulty system rides on. A novice
+ * who cashes out supers is not a novice.
+ */
+const skillRamp = (ai: AiState, floor: number): number => {
+  if (ai.skill <= floor) return 0;
+  const t = Math.trunc(((ai.skill - floor) * 100) / (100 - floor)); // 0..100
+  return Math.trunc((t * t) / 100); // squared
+};
+
 const pxDist = (a: FighterState, b: FighterState): number =>
   Math.abs(fpToPx(a.x - b.x));
 
@@ -129,6 +155,54 @@ const aiGrounded = (f: FighterState): boolean => f.y >= fp(460);
 const actionable = (f: FighterState): boolean =>
   f.action === Action.Idle || f.action === Action.WalkF
   || f.action === Action.WalkB || f.action === Action.Crouch;
+
+// ---------------------------------------------------------------- meter
+/**
+ * Below this skill an agent never cashes a bar out of a CONFIRMED chain or a
+ * whiff punish. Tuned against the bot-vs-bot balance suite: skilled super
+ * usage is worth more than everything else a novice does combined, and
+ * sharing it flattens the difficulty lever the whole CPU system rides on.
+ *
+ * Note this floor deliberately does NOT apply to raw supers — see superOdds.
+ */
+const SUPER_SKILL_FLOOR = 30;
+
+/** Can the agent afford its super right now? */
+const canSuper = (ai: AiState, ch: LoadedCharacter, me: FighterState): boolean =>
+  ai.idxSuper >= 0 && me.meter >= (ch.b.moves[ai.idxSuper]?.meterCost ?? 9999);
+
+/**
+ * How much does the agent want to spend a bar, 0..255.
+ *
+ * Meter is a resource, not a trophy. The old gate was a flat `skill >= 65`,
+ * which meant every house bot below player level ~26 (skill = level×100/40)
+ * banked three bars and never spent one — free damage left on the table all
+ * match.
+ *
+ * Appetite scales with skill and reads the situation instead.
+ *
+ * EVERY term below — including the situational bonuses — runs through the same
+ * skill ramp. Leaving those bonuses flat looks harmless and is not: it hands
+ * skill-3 agents a ~7% super rate through the back door and drags the
+ * `skill 85 beats skill 25` lever from 91% down to 76% over 80 seeds. Measured
+ * both ways; do not "simplify" the scaling out.
+ */
+const superOdds = (
+  ai: AiState, me: FighterState, op: FighterState, dist: number, comboEnder: boolean,
+): number => {
+  const r = skillRamp(ai, SUPER_SKILL_FLOOR);
+  if (r === 0) return 0; // a novice has no presence of mind for meter
+  // Cashing a bar out of a confirmed chain is worth far more than a raw one.
+  let odds = Math.trunc(((comboEnder ? 195 : 105) * r) / 100);
+  // Close out the round: the opponent is one good hit from dead.
+  const oppMax = characters[ai.side === 0 ? 1 : 0]?.b.maxHealth ?? 10000;
+  if (op.health <= Math.trunc(oppMax / 4)) odds += Math.trunc((115 * r) / 100);
+  // Capped meter means every further gain is being thrown away — spend it.
+  if (me.meter >= TUNING.meterMax) odds += Math.trunc((60 * r) / 100);
+  // Don't burn a bar into thin air.
+  if (dist > 300) odds -= 70;
+  return Math.max(0, Math.min(255, odds));
+};
 
 // ---------------------------------------------------------------- create
 export const createAi = (side: 0 | 1, skill: number, seed: number): AiState => {
@@ -151,7 +225,8 @@ export const createAi = (side: 0 | 1, skill: number, seed: number): AiState => {
     lastHealth: -1,
     airAttackDone: 0,
     bookGround: [], bookLauncher: -1, bookAir: [],
-    idxFireball: -1, idxDp: -1, idxSweep: -1, idxLow: -1, idxSuper: -1,
+    idxFireball: -1, idxDp: -1, idxSweep: -1, idxLow: -1, idxSpecialK: -1, idxSuper: -1,
+    nextSuperAt: 0,
     bookBuilt: 0,
   };
   // Personality: sampled once — this "person" for this match.
@@ -174,6 +249,7 @@ const buildBook = (ai: AiState, ch: LoadedCharacter): void => {
   ai.idxDp = id('623P');
   ai.idxSweep = id('2HK');
   ai.idxLow = id('2LK');
+  ai.idxSpecialK = id('214K');
   ai.idxSuper = ch.superIdx;
   ai.bookBuilt = 1;
 };
@@ -206,6 +282,20 @@ const qFireball = (ai: AiState, buttons: number): void => {
   } else {
     q(ai, { fwd: 1, ticks: 2 });
     q(ai, { fwd: 1, buttons, ticks: 2 });
+  }
+  q(ai, { ticks: 2 });
+};
+
+/** QCB + K (214K). Mirror of qFireball — same sloppiness model. */
+const q214 = (ai: AiState, buttons: number): void => {
+  const sloppy = !chance(ai, lerp(ai, 140, 250));
+  q(ai, { down: 1, ticks: 3 });
+  q(ai, { down: 1, back: 1, ticks: 2 });
+  if (sloppy) {
+    q(ai, { buttons, ticks: 2 });
+  } else {
+    q(ai, { back: 1, ticks: 2 });
+    q(ai, { back: 1, buttons, ticks: 2 });
   }
   q(ai, { ticks: 2 });
 };
@@ -342,7 +432,7 @@ export const aiPoll = (ai: AiState, g: GameState): InputFrame => {
     case Action.Attack: {
       // Hit-confirm: continue the combo book. Blocked → usually stop (safe).
       if (me.attackConnected === 1) {
-        const next = comboNext(ai, ch, me);
+        const next = comboNext(ai, ch, me, op, dist);
         if (next) return emit(me, null, 0, false); // queued; emitted next tick
       } else if (me.attackConnected === 2 && chance(ai, lerp(ai, 90, 30))) {
         // Low skill mashes one more into block sometimes — very human.
@@ -410,8 +500,32 @@ export const aiPoll = (ai: AiState, g: GameState): InputFrame => {
   // Whiff punish: opponent stuck in recovery within reach.
   if (op.action === Action.Attack && op.attackConnected === 0
     && seen(ai.oppActionAt) && dist < 170 && chance(ai, lerp(ai, 40, 200))) {
+    // A whiffed move is the cleanest super punish in the game — take it before
+    // settling for a normal string.
+    if (canSuper(ai, ch, me) && ai.queue.length === 0 && g.tick >= ai.nextSuperAt
+      && chance(ai, superOdds(ai, me, op, dist, true))) {
+      qFireball(ai, Btn.LP | Btn.MP);
+      ai.nextSuperAt = g.tick + 90;
+      return emit(me, null, 0, false);
+    }
     ai.intent = Intent.Punish;
     ai.intentUntil = g.tick + 40;
+  }
+
+  // Raw super: no combo needed. Without this the bar is only ever spent out of
+  // a confirmed chain, so an agent that never opens one dies at three bars.
+  // Rate-limited, in-range, and only when it actually means something —
+  // finishing the round, or meter that would otherwise overflow.
+  if (canSuper(ai, ch, me) && ai.queue.length === 0 && g.tick >= ai.nextSuperAt
+    && dist < 260 && aiGrounded(op)) {
+    const oppMax = characters[ai.side === 0 ? 1 : 0]?.b.maxHealth ?? 10000;
+    const finisher = op.health <= Math.trunc(oppMax / 4);
+    const overflowing = me.meter >= TUNING.meterMax;
+    if ((finisher || overflowing) && chance(ai, superOdds(ai, me, op, dist, false))) {
+      qFireball(ai, Btn.LP | Btn.MP);
+      ai.nextSuperAt = g.tick + 150;
+      return emit(me, null, 0, false);
+    }
   }
 
   // ---- intent lifecycle
@@ -550,7 +664,9 @@ const openString = (ai: AiState, ch: LoadedCharacter, dist: number): void => {
  * low skill stops at chains, high skill goes launcher → air combo → enders.
  * Every link can be flubbed (dropped/late) — that's the human hand.
  */
-const comboNext = (ai: AiState, ch: LoadedCharacter, me: FighterState): boolean => {
+const comboNext = (
+  ai: AiState, ch: LoadedCharacter, me: FighterState, op: FighterState, dist: number,
+): boolean => {
   // Flubbed link: hesitate — the buffer may still save it, sometimes not.
   const flub = !chance(ai, lerp(ai, 150, 246));
   const delay = flub ? 3 + rnd(ai, 5) : 0;
@@ -562,9 +678,10 @@ const comboNext = (ai: AiState, ch: LoadedCharacter, me: FighterState): boolean 
       qTapButton(ai, buttonOfMove(ch, ai.bookGround[gi + 1]!));
       return true;
     }
-    // End of ground chain: launcher / special / super, by skill.
-    if (ai.idxSuper >= 0 && me.meter >= (ch.b.moves[ai.idxSuper]!.meterCost ?? 9999)
-      && ai.skill >= 65 && chance(ai, 120)) {
+    // End of ground chain: super / launcher / special, by skill + situation.
+    // Cashing a bar out of a confirmed chain is the single best thing the
+    // agent can do with meter, so it gets first refusal.
+    if (canSuper(ai, ch, me) && chance(ai, superOdds(ai, me, op, dist, true))) {
       qFireball(ai, Btn.LP | Btn.MP); // 236 + two punches = super
       return true;
     }
@@ -575,6 +692,12 @@ const comboNext = (ai: AiState, ch: LoadedCharacter, me: FighterState): boolean 
     }
     if (ai.idxFireball >= 0 && chance(ai, ai.p.zoner)) {
       qFireball(ai, Btn.LP);
+      return true;
+    }
+    // 214K: the third special, right there in every character's data and
+    // never once pressed before this. It's a close-range ender.
+    if (ai.idxSpecialK >= 0 && dist < 150 && chance(ai, lerpSq(ai, 20, 150))) {
+      q214(ai, Btn.LK);
       return true;
     }
     return false;
