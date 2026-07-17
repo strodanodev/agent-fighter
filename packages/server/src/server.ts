@@ -604,6 +604,20 @@ export const createMatchServer = (opts: {
    * credits, which is griefing (or a lag switch). Silence past
    * IDLE_FORFEIT_MS settles the match exactly like a disconnect.
    */
+  // Orphaned-escrow sweep (ADR 0005): refund fees stranded by a crash between
+  // escrow and settlement. Once at startup — deploys ARE restarts, so every
+  // deploy mid-match would otherwise strand a pot — then hourly for belt and
+  // braces. Failures only log; the next pass retries.
+  const sweepEscrow = (): void => {
+    if (!persistence) return;
+    void persistence.sweepOrphanedEscrow()
+      .then((n) => { if (n > 0) console.log(`[sweep] refunded ${n} orphaned escrow fee(s)`); })
+      .catch((e) => console.log(`[sweep] failed: ${String((e as Error).message ?? e)}`));
+  };
+  sweepEscrow();
+  const escrowSweep = setInterval(sweepEscrow, 60 * 60 * 1000);
+  escrowSweep.unref?.();
+
   const idleSweep = setInterval(() => {
     const now = Date.now();
     for (const c of clients) {
@@ -701,7 +715,7 @@ export const createMatchServer = (opts: {
       const port = typeof address === 'object' && address ? address.port : DEFAULT_PORT;
       resolve({
         port,
-        close: () => { clearInterval(idleSweep); wss.close(); http.close(); },
+        close: () => { clearInterval(idleSweep); clearInterval(escrowSweep); wss.close(); http.close(); },
       });
     });
   });

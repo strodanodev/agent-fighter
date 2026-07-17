@@ -211,3 +211,46 @@ test('LIVE wager: pot settles winner +10 / loser −10; broke player is refused'
     )).credits, 0);
   }
 });
+
+// ------------------------------------------------------------ escrow sweeper
+test('sweeper: refunds fees stranded by a crash; settled + young escrows untouched', async () => {
+  const p = memoryPersistence();
+  await p.getAccount(id('crashA'), 'CA', false); // 10
+  await p.getAccount(id('crashB'), 'CB', false); // 10
+  await p.getAccount(id('winner'), 'W', false);  // 10
+
+  // A wager whose settlement never ran (the "server died" ghost)…
+  await p.escrowMatch('ghost', ['crashA', 'crashB'], WAGER_FEE);
+  // …a match that settled normally…
+  await p.escrowMatch('done', ['winner', null], SOLO_FEE);
+  await p.recordMatch(baseRecord({
+    matchId: 'done', mode: 'solo', fee: SOLO_FEE, identities: [id('winner'), null], winner: 0,
+  }));
+  // …and a fee young enough to belong to a match still in progress.
+  await p.escrowMatch('inflight', ['winner', null], SOLO_FEE);
+
+  const swept = await p.sweepOrphanedEscrow(0); // cutoff 0 → ghost qualifies…
+  // …but 'inflight' also has age 0 — so use the count to prove ONLY unsettled
+  // matches were touched: ghost (2 fees) + inflight (1 fee) = 3, 'done' = 0.
+  assert.equal(swept, 3, 'both unsettled matches swept; the settled one untouched');
+  assert.equal((await p.getAccount(id('crashA'), 'CA', false)).credits, DAILY_CREDITS);
+  assert.equal((await p.getAccount(id('crashB'), 'CB', false)).credits, DAILY_CREDITS);
+
+  // Idempotent: a second sweep refunds nothing.
+  assert.equal(await p.sweepOrphanedEscrow(0), 0);
+
+  // THE double-spend guard: a late settlement of a swept match awards NOTHING.
+  const late = await p.recordMatch(baseRecord({
+    matchId: 'ghost', identities: [id('crashA'), id('crashB')], winner: 0,
+  }));
+  assert.deepEqual(late, []);
+  assert.equal((await p.getAccount(id('crashA'), 'CA', false)).credits, DAILY_CREDITS);
+});
+
+test('sweeper: a young orphan is left alone until the cutoff passes', async () => {
+  const p = memoryPersistence();
+  await p.getAccount(id('u9'), 'U9', false);
+  await p.escrowMatch('young', ['u9', null], SOLO_FEE);
+  assert.equal(await p.sweepOrphanedEscrow(30), 0, '30-min cutoff spares a fresh escrow');
+  assert.equal((await p.getAccount(id('u9'), 'U9', false)).credits, DAILY_CREDITS - SOLO_FEE);
+});

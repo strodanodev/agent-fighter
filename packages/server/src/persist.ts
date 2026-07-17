@@ -108,6 +108,18 @@ export interface Persistence {
   escrowMatch: (matchId: string, subs: [string | null, string | null], fee: number) => Promise<void>;
   /** Settle + award. Idempotent by match id ([] on retry). */
   recordMatch: (r: MatchRecord) => Promise<XpAward[]>;
+  /**
+   * Refund fees whose match NEVER settled — the server died between escrow
+   * and record_match, stranding real credits (ADR 0005's known gap). Only
+   * fees older than the cutoff are touched (younger ones may belong to a
+   * match still in progress; no legitimate match outlives 30 minutes — the
+   * idle forfeit caps silence at 30s and the pace guard caps solo at ~3×
+   * real time). A swept match is SETTLED as a no-contest (it gets a matches
+   * row), so a late record_match finds the id taken and awards nothing —
+   * refund-then-payout double-spends are structurally impossible.
+   * Returns the number of refunds performed. Run at startup + periodically.
+   */
+  sweepOrphanedEscrow: (olderThanMinutes?: number) => Promise<number>;
   leaderboard: (limit?: number) => Promise<unknown[]>;
 }
 
@@ -171,7 +183,8 @@ const settleSide = (
 export const memoryPersistence = (): Persistence => {
   const profiles = new Map<string, ProfileRow & { lastDaily: string }>();
   const settled = new Set<string>(); // match ids
-  const escrows = new Map<string, Set<string>>(); // matchId → subs charged
+  /** matchId → who was charged what, and when (the sweeper's cutoff clock). */
+  const escrows = new Map<string, { subs: Set<string>; fee: number; at: number }>();
   const names = new Map<string, { name: string; agent: boolean }>();
 
   const prof = (sub: string): ProfileRow & { lastDaily: string } => {
@@ -197,13 +210,13 @@ export const memoryPersistence = (): Persistence => {
       return { credits: p.credits, level: p.level, xp: p.xp, wins: p.wins, losses: p.losses, dailyGranted };
     },
     escrowMatch: async (matchId, subs, fee) => {
-      const charged = escrows.get(matchId) ?? new Set<string>();
-      escrows.set(matchId, charged);
-      const due = ([0, 1] as const).filter((s) => subs[s] && !charged.has(subs[s]!));
+      const entry = escrows.get(matchId) ?? { subs: new Set<string>(), fee, at: Date.now() };
+      escrows.set(matchId, entry);
+      const due = ([0, 1] as const).filter((s) => subs[s] && !entry.subs.has(subs[s]!));
       for (const s of due) if (prof(subs[s]!).credits < fee) throw new InsufficientCredits(s);
       for (const s of due) {
         prof(subs[s]!).credits -= fee;
-        charged.add(subs[s]!);
+        entry.subs.add(subs[s]!);
       }
     },
     recordMatch: async (r) => {
@@ -222,6 +235,21 @@ export const memoryPersistence = (): Persistence => {
         });
       }
       return out;
+    },
+    sweepOrphanedEscrow: async (olderThanMinutes = 30) => {
+      const cutoff = Date.now() - olderThanMinutes * 60_000;
+      let refunded = 0;
+      for (const [matchId, e] of escrows) {
+        if (settled.has(matchId) || e.at > cutoff) continue;
+        // Settle the ghost as a no-contest FIRST — a late recordMatch then
+        // finds the id taken and awards nothing (no refund-then-payout).
+        settled.add(matchId);
+        for (const sub of e.subs) {
+          prof(sub).credits += e.fee;
+          refunded++;
+        }
+      }
+      return refunded;
     },
     leaderboard: async (limit = 20) =>
       [...profiles.entries()]
@@ -312,19 +340,40 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         credits: row.credits! | 0,
       }));
     },
+    sweepOrphanedEscrow: async (olderThanMinutes = 30) => {
+      const n = (await call('/rest/v1/rpc/sweep_orphaned_escrow', {
+        method: 'POST',
+        body: JSON.stringify({ _older_than_minutes: olderThanMinutes | 0 }),
+      })) as number;
+      return n | 0;
+    },
     leaderboard: async (limit = 20) =>
       (await call(`/rest/v1/leaderboard?select=*&limit=${limit | 0}`, { method: 'GET' })) as unknown[],
   };
 };
 
 /**
- * Production Supabase when configured; otherwise the dev in-memory economy
- * (full feature set, nothing durable, name-keyed identities allowed).
+ * Production Supabase when configured; otherwise the dev in-memory economy —
+ * but only when asked for BY NAME (AF_ALLOW_DEV_ECONOMY=1).
+ *
+ * Fail closed: memoryPersistence is `dev: true`, and that flag makes the
+ * server mint a name-keyed identity for any client that asks (server.ts
+ * `hello`) and lets /me authenticate on a plain X-Dev-Name header. Harmless
+ * on a laptop, catastrophic on a public host — anyone could wear anyone's
+ * account and mint credits. A missing env var must never be the difference.
  */
 export const createPersistence = (): Persistence => {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_KEY;
   if (url && key) return supabasePersistence(url, key);
-  console.log('[persist] SUPABASE_URL/SUPABASE_SERVICE_KEY unset → DEV in-memory economy (not durable)');
+  if (process.env.AF_ALLOW_DEV_ECONOMY !== '1') {
+    throw new Error(
+      'SUPABASE_URL / SUPABASE_SERVICE_KEY are unset, so the only economy '
+      + 'available is the in-memory dev one — which accepts any identity a '
+      + 'client claims. Refusing to start. Set both vars (production), or set '
+      + 'AF_ALLOW_DEV_ECONOMY=1 to opt into a throwaway local economy.',
+    );
+  }
+  console.log('[persist] DEV in-memory economy (AF_ALLOW_DEV_ECONOMY=1) — identities are UNVERIFIED, nothing is durable');
   return memoryPersistence();
 };

@@ -74,6 +74,7 @@ describe('persistence hook (Phase B)', () => {
       getAccount: async () => ({ credits: 100, level: 1, xp: 0, wins: 0, losses: 0, dailyGranted: false }),
       escrowMatch: async () => {},
       recordMatch: async (r) => { records.push(r); return []; },
+      sweepOrphanedEscrow: async () => 0,
       leaderboard: async () => [],
     };
     const s2 = await createMatchServer({ port: 0, persistence: mock });
