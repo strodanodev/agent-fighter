@@ -1904,8 +1904,24 @@ const superOdds = (ai, me, op, dist, comboEnder) => {
         odds -= 70;
     return Math.max(0, Math.min(255, odds));
 };
+/**
+ * The exact bounds personality sampling draws from (min = base, max = base +
+ * range in createAi). Coached personalities (ADR 0006) are clamped to these
+ * same bounds server-side AND here — a trained agent can play differently,
+ * never outside what a randomly-rolled opponent could be. Keeping the clamp
+ * in core means every consumer (server verify, client solo sim, headless
+ * agents) agrees bit-for-bit on the effective values.
+ */
+const AI_PERSONALITY_RANGES = {
+    aggression: [90, 220],
+    jumpiness: [40, 190],
+    zoner: [40, 210],
+    throwHappy: [30, 150],
+    pushblocker: [60, 220],
+    patience: [60, 200],
+};
 // ---------------------------------------------------------------- create
-const createAi = (side, skill, seed) => {
+const createAi = (side, skill, seed, personality) => {
     const ai = {
         side,
         skill: Math.max(0, Math.min(100, skill)),
@@ -1929,13 +1945,24 @@ const createAi = (side, skill, seed) => {
         nextSuperAt: 0,
         bookBuilt: 0,
     };
-    // Personality: sampled once — this "person" for this match.
+    // Personality: sampled once — this "person" for this match. ALWAYS sampled
+    // (even when overridden) so the rng stream downstream of creation is
+    // identical with and without a coached personality.
     ai.p.aggression = 90 + rnd(ai, 130);
     ai.p.jumpiness = 40 + rnd(ai, 150);
     ai.p.zoner = 40 + rnd(ai, 170);
     ai.p.throwHappy = 30 + rnd(ai, 120);
     ai.p.pushblocker = 60 + rnd(ai, 160);
     ai.p.patience = 60 + rnd(ai, 140);
+    if (personality) {
+        for (const k of Object.keys(AI_PERSONALITY_RANGES)) {
+            const v = personality[k];
+            if (typeof v !== 'number' || !Number.isFinite(v))
+                continue;
+            const [lo, hi] = AI_PERSONALITY_RANGES[k];
+            ai.p[k] = Math.max(lo, Math.min(hi, v | 0));
+        }
+    }
     return ai;
 };
 /** Combo routes come from the character's own data — cancel graph included. */
@@ -3180,7 +3207,7 @@ Object.assign(globalThis, {
  * (the classic GGPO throttle) rather than drift.
  */
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 3;
+const NET_PROTOCOL = 4;
 const MAX_AHEAD = 10;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -3517,6 +3544,7 @@ class SoloSession {
     authToken;
     email;
     ref;
+    arcadeQueue;
     status = 'connecting';
     error = '';
     setup = null;
@@ -3532,7 +3560,13 @@ class SoloSession {
     intentionalClose = false;
     resumeAttempts = 0;
     retryTimer = null;
-    constructor(url, name, character, bundleHash, authToken, email, ref) {
+    constructor(url, name, character, bundleHash, authToken, email, ref, // stashed dare code (?ref=) — redeemed server-side once
+    /**
+     * AGENT ARCADE (v4): queue the ranked gauntlet instead of a single solo
+     * match. `runToken` (from the previous battle's setup.arcade.token)
+     * continues an existing run; omitted = start a new run (entry fee).
+     */
+    arcadeQueue) {
         this.url = url;
         this.name = name;
         this.character = character;
@@ -3540,6 +3574,7 @@ class SoloSession {
         this.authToken = authToken;
         this.email = email;
         this.ref = ref;
+        this.arcadeQueue = arcadeQueue;
         this.connect(false);
     }
     connect(resume) {
@@ -3551,7 +3586,11 @@ class SoloSession {
                 this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
             }
             else {
-                this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: 'solo' });
+                this.send({
+                    t: 'queue', character: this.character, bundleHash: this.bundleHash,
+                    mode: this.arcadeQueue ? 'arcade' : 'solo',
+                    runToken: this.arcadeQueue?.runToken || undefined,
+                });
                 this.status = 'queued';
             }
         };
@@ -5430,10 +5469,10 @@ const drawTitle = (ctx, rosters, tick, menu) => {
     }
     // Bottom menu: laid out at a fixed offset from the bottom edge rather than
     // guessed from where the art's elements happen to land — robust even if
-    // the logo file gets swapped for different art later. No opaque panel
-    // behind it (by design): the key art / video backdrop shows through, and
-    // display()/label() already carry their own outline+glow for contrast.
-    const barH = 178, barY = VH - barH;
+    // the logo file gets swapped for different art later. Rows are drawn as
+    // translucent button plates (finger-sized tap targets) so the key art /
+    // video backdrop still shows through them.
+    const barH = 200, barY = VH - barH;
     const menuY0 = barY + 30;
     if (menu.gate) {
         // M5: signing in is REQUIRED — the AIR account is the wallet the whole
@@ -5457,45 +5496,66 @@ const drawTitle = (ctx, rosters, tick, menu) => {
     }
     else {
         // 2-player local is disabled (single-controller / mobile focus) — omitted.
+        // Mode rows are big button plates (≥44px tall — a real finger target on a
+        // phone), each with a one-line subtitle explaining the stakes.
         const rows = [
-            ['cpu', 'VS AGENT  ·  RANKED  ·  1 CREDIT'],
-            ['online', 'ONLINE WAGER  ·  10 CREDITS  ·  WINNER TAKES POT'],
+            ['cpu', 'AGENT ARCADE', 'RANKED · 1 CREDIT PER RUN · BEAT EVERY AGENT'],
+            ['online', 'ONLINE WAGER', '10 CREDITS ENTRY · WINNER TAKES THE POT'],
         ];
-        rows.forEach(([m, txt], k) => {
-            const y = menuY0 + k * 34;
+        const btnW = Math.min(560, VW - 48), btnH = 46, btnGap = 10;
+        const btnX = cx - btnW / 2;
+        rows.forEach(([m, txt, sub], k) => {
+            const y = barY + 12 + k * (btnH + btnGap);
             const on = menu.mode === m;
-            tapZone(cx - 260, y - 17, 520, 34, `mode:${m}`);
+            tapZone(btnX, y, btnW, btnH, `mode:${m}`);
+            ctx.fillStyle = on ? 'rgba(24,16,44,0.82)' : 'rgba(10,6,22,0.55)';
+            ctx.fillRect(btnX, y, btnW, btnH);
+            ctx.strokeStyle = on ? GOLD : 'rgba(255,255,255,0.22)';
+            ctx.lineWidth = on ? 2.5 : 1.5;
+            ctx.strokeRect(btnX + 0.5, y + 0.5, btnW - 1, btnH - 1);
             if (on) {
-                const pulse = 1 + 0.035 * Math.sin(tick / 10);
-                display(ctx, txt, cx, y, 22, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+                const pulse = 1 + 0.03 * Math.sin(tick / 10);
                 // A small bouncing arrow marker to the left, arcade-menu style.
                 const bounce = 3 * Math.sin(tick / 9);
-                label(ctx, '▶', cx - 236 + bounce, y, 18, GOLD_LT);
+                label(ctx, '▶', btnX + 22 + bounce, y + btnH / 2 + 6, 18, GOLD_LT);
+                display(ctx, txt, cx, y + 22, 20, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+                label(ctx, sub, cx, y + 39, 10, '#ffd166cc');
             }
             else {
-                label(ctx, txt, cx, y, 16, '#ffffff70');
+                label(ctx, txt, cx, y + 22, 17, '#ffffff99');
+                label(ctx, sub, cx, y + 39, 10, '#ffffff55');
             }
         });
-        const hintY = menuY0 + rows.length * 34 + 6;
-        // Quick match (P0): ENTER launches with the remembered fighter — the
-        // select screen is the C detour, not a toll booth on every match.
+        ctx.lineWidth = 1;
+        // The fighter line is the touch path to the select screen (online quick
+        // match uses it; ARCADE always re-selects on entry).
+        const fy = barY + 12 + rows.length * (btnH + btnGap) + 4;
         if (menu.fighter) {
-            label(ctx, `FIGHTING AS  ${menu.fighter.toUpperCase()}   ·   C  CHANGE FIGHTER`, cx, hintY, 12, '#8fd0ff');
+            label(ctx, `FIGHTING AS  ${menu.fighter.toUpperCase()}   ·   TAP / C  CHANGE`, cx, fy + 12, 12, '#8fd0ff');
+            tapZone(btnX, fy, btnW, 22, 'changefighter');
         }
-        label(ctx, 'TAP / ENTER  QUICK MATCH       R  RANKINGS       L  SIGN OUT', cx, hintY + 18, 13, '#ffffffaa');
-        // Split the hint line into two halves so RANKINGS and SIGN OUT are each
-        // reachable by touch (no keyboard on a phone).
-        tapZone(cx - 20, hintY + 7, 150, 22, 'ranks');
-        tapZone(cx + 130, hintY + 7, 150, 22, 'signin');
-        // The fighter line is the touch path to the select screen.
-        if (menu.fighter)
-            tapZone(cx - 260, hintY - 11, 520, 20, 'changefighter');
-        // Referral dare: opens the full invite screen (poster + taunt + link).
-        if (menu.refCode) {
-            const flash = tick % 44 < 36;
-            label(ctx, 'D  DARE A FRIEND  ·  BOTH GET +25 CREDITS', cx, hintY + 38, 12, flash ? '#ffd166' : '#ffe9a3');
-            tapZone(cx - 200, hintY + 27, 400, 22, 'dare');
-        }
+        // Bottom action pills: every keyboard shortcut gets a real button — no
+        // keyboard on a phone. Registered as generous ≥30px-tall tap targets.
+        const pills = [
+            ['R · RANKINGS', 'ranks', '#ffffffcc'],
+            ['L · SIGN OUT', 'signin', '#ffffff99'],
+        ];
+        if (menu.refCode)
+            pills.push(['D · DARE +25', 'dare', tick % 44 < 36 ? '#ffd166' : '#ffe9a3']);
+        const pillW = 158, pillH = 30, pillGap = 12;
+        const rowW = pills.length * pillW + (pills.length - 1) * pillGap;
+        const py = fy + 24;
+        pills.forEach(([txt, act, col], k) => {
+            const x = cx - rowW / 2 + k * (pillW + pillGap);
+            tapZone(x, py, pillW, pillH, act);
+            ctx.fillStyle = 'rgba(10,6,22,0.55)';
+            ctx.fillRect(x, py, pillW, pillH);
+            ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(x + 0.5, py + 0.5, pillW - 1, pillH - 1);
+            label(ctx, txt, x + pillW / 2, py + pillH / 2 + 4, 12, col);
+        });
+        ctx.lineWidth = 1;
     }
     // Account/wallet block — upper LEFT, minimal text (M5 spec).
     if (menu.authLabel) {
@@ -5525,7 +5585,7 @@ const drawTitle = (ctx, rosters, tick, menu) => {
         if (flash)
             label(ctx, `+${10} DAILY LOGIN CREDITS`, 16, menu.address ? 80 : 62, 14, '#ffe9a3', 'left');
     }
-    label(ctx, 'MILESTONE 5 · CREDITS BUILD', cx, VH - 12, 10, '#ffffff55');
+    label(ctx, 'MILESTONE 5 · CREDITS BUILD', cx, VH - 4, 9, '#ffffff55');
 };
 // ---------------------------------------------------------------- invite
 /** Hot-red display() treatment for the dare headline / CTA. */
@@ -5547,30 +5607,68 @@ const drawInvite = (ctx, tick, v) => {
     display(ctx, 'I DARE YOU', cx, 100, 46, {});
     display(ctx, 'TO BEAT ME', cx, 150, 46, DARE_OPTS);
     // ---- poster panel: the wanted-poster preview of what the friend sees.
-    const pw = 640, ph = 130, px0 = cx - pw / 2, py0 = 176;
+    // Left = full-body mugshot (contain-fit, never cropped); middle = the
+    // callout + this player's live record; right = the fighter's stat profile,
+    // which is what fills the card instead of the old dead space.
+    const pw = 664, ph = 150, px0 = cx - pw / 2, py0 = 170;
     bevel(ctx, px0, py0, pw, ph, PANEL, GOLD, GOLD_DK, 3);
+    // Mugshot cell — dark panel + red footlight; the whole fighter contain-fit
+    // and bottom-anchored so no head/limb is ever clipped (sprite aspect ratios
+    // run ~0.5–1.0 across the roster, which the old overscale-crop mangled).
+    const cellX = px0 + 8, cellY = py0 + 8, cellW = 128, cellH = ph - 16;
+    ctx.save();
+    rrect(ctx, cellX, cellY, cellW, cellH, 6);
+    ctx.clip();
+    const foot = ctx.createRadialGradient(cellX + cellW / 2, cellY + cellH, 8, cellX + cellW / 2, cellY + cellH, cellH);
+    foot.addColorStop(0, 'rgba(255,61,110,0.24)');
+    foot.addColorStop(1, 'rgba(6,4,12,0.92)');
+    ctx.fillStyle = foot;
+    ctx.fillRect(cellX, cellY, cellW, cellH);
     const img = v.roster?.portrait;
     if (img?.naturalWidth) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(px0 + 3, py0 + 3, 150, ph - 6);
-        ctx.clip();
-        // Slight overscale so the fighter fills the slot like a mugshot.
-        const fit = ((ph - 6) / img.naturalHeight) * 1.35;
+        const fit = Math.min((cellW - 14) / img.naturalWidth, (cellH - 10) / img.naturalHeight);
         const w = img.naturalWidth * fit, h = img.naturalHeight * fit;
         ctx.imageSmoothingEnabled = false;
-        ctx.drawImage(img, px0 + 78 - w / 2, py0 + ph - 3 - h, w, h);
-        ctx.restore();
+        ctx.drawImage(img, cellX + cellW / 2 - w / 2, cellY + cellH - 5 - h, w, h);
     }
-    const tx = px0 + 172;
-    label(ctx, 'WANTED: ANYONE WHO CAN TAKE ONE ROUND', tx, py0 + 28, 11, '#ff9db0', 'left');
-    display(ctx, v.name, tx, py0 + 62, 26, { align: 'left' });
+    else {
+        label(ctx, '?', cellX + cellW / 2, cellY + cellH / 2 + 14, 40, '#ffffff33');
+    }
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(255,61,110,0.55)';
+    ctx.lineWidth = 1.5;
+    rrect(ctx, cellX, cellY, cellW, cellH, 6);
+    ctx.stroke();
+    // Middle column: the callout + this player's live record.
+    const tx = px0 + 152;
+    label(ctx, '⚠ WANTED: ANYONE WHO CAN TAKE ONE ROUND', tx, py0 + 26, 11, '#ff9db0', 'left');
+    const nameSize = v.name.length > 13 ? 18 : v.name.length > 10 ? 21 : 26;
+    display(ctx, v.name, tx, py0 + 60, nameSize, { align: 'left' });
     const a = v.account;
-    label(ctx, a ? `${a.wins}W — ${a.losses}L   ·   LV ${a.level}${v.roster ? `   ·   MAIN  ${v.roster.bundle.name.toUpperCase()}` : ''}`
-        : 'SERVER OFFLINE — STATS UNAVAILABLE', tx, py0 + 88, 13, a ? '#ffd166' : '#ff9d9d', 'left');
-    label(ctx, 'THIS POSTER LANDS IN THEIR CHAT', tx, py0 + 112, 10, '#ffffff66', 'left');
+    label(ctx, a ? `${a.wins}W — ${a.losses}L    ·    LV ${a.level}${v.roster ? `    ·    MAIN ${v.roster.bundle.name.toUpperCase()}` : ''}`
+        : 'SERVER OFFLINE — STATS UNAVAILABLE', tx, py0 + 86, 13, a ? '#ffd166' : '#ff9d9d', 'left');
+    if (a)
+        label(ctx, `⛁ ${a.credits} CR IN THE BANK`, tx, py0 + 108, 11, '#8fd0ff', 'left');
+    label(ctx, 'THIS IS THE POSTER THAT LANDS IN THEIR CHAT', tx, py0 + ph - 14, 10, '#ffffff59', 'left');
+    // Right column: the fighter's stat profile — the very same bars the select
+    // screen derives from the bundle, which is the "player/character stats"
+    // that fill the card. computeRosterStats is memoized on the array ref, so
+    // passing allRosters here is a cache hit against the select screen.
+    let stats = null;
+    if (v.roster && v.rosters) {
+        const idx = v.rosters.indexOf(v.roster);
+        if (idx >= 0)
+            stats = computeRosterStats(v.rosters)[idx] ?? null;
+    }
+    if (stats) {
+        ctx.fillStyle = 'rgba(217,164,65,0.22)';
+        ctx.fillRect(px0 + 408, py0 + 14, 1, ph - 28);
+        const sx = px0 + 424, sw = pw - 424 - 14;
+        label(ctx, 'FIGHTER PROFILE', sx, py0 + 22, 10, '#c8b98a', 'left', false);
+        stats.bars.forEach((s, i) => drawStatBar(ctx, sx, py0 + 36 + i * 21, sw, s, '#e8a24a', tick));
+    }
     // ---- taunt row: ◀ ▶ cycles presets, T writes your own (rides the link).
-    const ty = py0 + ph + 28;
+    const ty = py0 + ph + 26;
     label(ctx, '◀', cx - 300, ty, 18, GOLD_LT);
     label(ctx, '▶', cx + 300, ty, 18, GOLD_LT);
     tapZone(cx - 336, ty - 20, 72, 34, 'taunt:prev');
@@ -5579,30 +5677,50 @@ const drawInvite = (ctx, tick, v) => {
     label(ctx, v.custom ? 'YOUR WORDS. NO MERCY.  ·  T  REWRITE'
         : `TAUNT ${v.tauntIdx + 1}/${v.tauntCount}  ·  T  WRITE YOUR OWN`, cx, ty + 20, 11, '#ffffff77');
     tapZone(cx - 150, ty + 9, 300, 17, 'taunt:edit');
-    // ---- the only button that matters.
-    const bw = 400, bh = 46, bx = cx - bw / 2, by = ty + 40;
+    // ---- the one button that matters. On copy the plate greys out (disabled),
+    // a green ring pops out (success animation), and the line under it turns
+    // into a "now go send it" instruction — the copy already happened, the job
+    // now is to paste it into a chat app.
+    const bw = 420, bh = 46, bx = cx - bw / 2, by = ty + 36;
     const armed = v.copiedAge >= 0;
     if (armed) {
-        bevel(ctx, bx, by, bw, bh, '#0f2a14', '#7ee85a', '#1e4a26', 3);
-        display(ctx, 'DARE ARMED — GO PASTE IT', cx, by + 33, 20, { from: '#eaffea', mid: '#7ee85a', to: '#2f7a1f', outline: '#0e2a08' });
+        bevel(ctx, bx, by, bw, bh, '#191a20', '#3f414c', '#101116', 3);
+        const pop = easeOutBack(clamp01(v.copiedAge / 12));
+        display(ctx, '✓ INVITE LINK COPIED', cx, by + 31, 19, { from: '#eafff0', mid: '#8fe8a0', to: '#3f7a4f', outline: '#0e2a12', scale: pop });
+        if (v.copiedAge < 28) {
+            const t = v.copiedAge / 28;
+            ctx.save();
+            ctx.globalAlpha = (1 - t) * 0.85;
+            ctx.strokeStyle = '#7ee85a';
+            ctx.lineWidth = 3;
+            rrect(ctx, bx - t * 16, by - t * 12, bw + t * 32, bh + t * 24, 7);
+            ctx.stroke();
+            ctx.restore();
+        }
     }
     else {
         const pulse = 1 + 0.03 * Math.sin(tick / 8);
         bevel(ctx, bx, by, bw, bh, '#3a0e18', '#ff5d7e', '#6e1024', 3);
-        display(ctx, v.canShare ? 'SEND THE DARE' : 'COPY DARE LINK', cx, by + 33, 22, { ...DARE_OPTS, scale: pulse });
+        display(ctx, v.canShare ? 'SEND INVITE LINK' : 'COPY INVITE LINK', cx, by + 31, 22, { ...DARE_OPTS, scale: pulse });
     }
     tapZone(bx - 20, by - 8, bw + 40, bh + 16, 'copydare');
-    label(ctx, v.refCode ? v.linkLabel : 'CONNECTING TO SERVER…', cx, by + bh + 22, 12, '#8fd0ff');
-    // ---- the economics, as scarcity: the 10/week payout cap is an urgency
-    // mechanic, not fine print.
-    let iy = by + bh + 44;
+    // Under the button: the link when idle, the send-it instruction when copied.
+    if (armed) {
+        label(ctx, v.canShare ? 'SENT — NOW GO CALL THEM OUT'
+            : 'NOW SEND IT TO A FRIEND  ·  WHATSAPP · DISCORD · IMESSAGE · ANYWHERE', cx, by + bh + 20, 12, '#8fe8a0');
+    }
+    else {
+        label(ctx, v.refCode ? v.linkLabel : 'CONNECTING TO SERVER…', cx, by + bh + 20, 12, '#8fd0ff');
+    }
+    // ---- the economics, as scarcity: the 10/week payout cap is urgency.
+    let iy = by + bh + 42;
     label(ctx, `+25 CREDITS EACH WHEN THEY SIGN IN${v.bountiesLeft !== undefined ? `   ·   ${v.bountiesLeft}/10 BOUNTIES LEFT THIS WEEK` : ''}`, cx, iy, 13, v.bountiesLeft === 0 ? '#ff9d9d' : '#ffd166');
     if ((v.daresAccepted ?? 0) > 0) {
-        iy += 20;
+        iy += 19;
         label(ctx, `${v.daresAccepted} FIGHTER${v.daresAccepted === 1 ? '' : 'S'} ALREADY TOOK THE BAIT`, cx, iy, 12, '#8fd0ff');
     }
-    label(ctx, `ESC / TAP HERE  BACK      ◀ ▶  TAUNT      T  WRITE YOUR OWN      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`, cx, VH - 14, 12, '#ffffff99');
-    tapZone(24, VH - 40, 170, 34, 'back');
+    label(ctx, `ESC  BACK      ◀ ▶  TAUNT      T  WRITE YOUR OWN      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`, cx, VH - 12, 12, '#ffffff99');
+    tapZone(24, VH - 38, 150, 32, 'back');
 };
 /**
  * Peak single-hit damage the character can deal (normals, specials, super,
@@ -5879,14 +5997,26 @@ const drawFighterCard = (ctx, x, y, w, h, r, stats, accent, header, locked, tick
         by += 20;
     }
 };
-const drawSelect = (ctx, rosters, cursors, locked, tick, cpuInfo) => {
+const drawSelect = (ctx, rosters, cursors, locked, tick, cpuInfo, 
+/** Set = AGENT ARCADE entry: gauntlet size; swaps the P2 card for the rules panel. */
+arcadeTotal) => {
     drawMenuBackdrop(ctx);
     ctx.fillStyle = '#0a0616d9';
     ctx.fillRect(0, 0, VW, VH);
     const stats = computeRosterStats(rosters);
-    display(ctx, 'SELECT YOUR FIGHTER', VW / 2, 46, 26);
+    display(ctx, arcadeTotal ? 'AGENT ARCADE — CHOOSE YOUR FIGHTER' : 'SELECT YOUR FIGHTER', VW / 2, 46, 24);
     if (cpuInfo)
         drawCpuBadge(ctx, cpuInfo, tick);
+    // Escape hatch back to the title — phones have no ESC key.
+    const backW = 110, backH = 34;
+    tapZone(VW - 16 - backW, 12, backW, backH, 'back');
+    ctx.fillStyle = 'rgba(10,6,22,0.6)';
+    ctx.fillRect(VW - 16 - backW, 12, backW, backH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(VW - 16 - backW + 0.5, 12.5, backW - 1, backH - 1);
+    ctx.lineWidth = 1;
+    label(ctx, '‹ TITLE', VW - 16 - backW / 2, 12 + backH / 2 + 4, 12, '#ffffffcc');
     // Portrait grid — a single row (wraps past 6). Compact so the bottom band
     // is free for the two fighter cards.
     const cols = Math.min(rosters.length, 6);
@@ -5918,6 +6048,8 @@ const drawSelect = (ctx, rosters, cursors, locked, tick, cpuInfo) => {
         // Selection cursors: smooth pulsing glow instead of a hard blink.
         // (Disabled fighters are skipped by the cursor, so none render here.)
         for (const i of [0, 1]) {
+            if (i === 1 && arcadeTotal)
+                break; // arcade: only the player's cursor exists
             if (cursors[i] !== k)
                 continue;
             const pulse = locked[i] ? 1 : 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(tick / 8));
@@ -5956,14 +6088,34 @@ const drawSelect = (ctx, rosters, cursors, locked, tick, cpuInfo) => {
     const p2Header = cpuInfo ? `AGENT · LV ${cpuInfo.cpuLevel}` : 'PLAYER 2';
     const cardHeaders = ['PLAYER 1', p2Header];
     for (const i of [0, 1]) {
+        if (i === 1 && arcadeTotal)
+            break; // arcade: the rules panel takes P2's slot
         const r = rosters[cursors[i]];
         if (!r)
             continue;
         const cx = i === 0 ? 16 : VW - 16 - cardW;
         drawFighterCard(ctx, cx, cardY, cardW, cardH, r, stats[cursors[i]], P_COLORS[i], cardHeaders[i], locked[i], tick);
     }
+    // AGENT ARCADE rules panel — what the player is signing up for, where the
+    // opponent card would normally sit.
+    if (arcadeTotal) {
+        const rx = VW - 16 - cardW;
+        bevel(ctx, rx, cardY, cardW, cardH, PANEL, GOLD, GOLD_DK, 3);
+        display(ctx, 'THE GAUNTLET', rx + cardW / 2, cardY + 34, 20);
+        const lines = [
+            [`${arcadeTotal} AGENTS STAND IN YOUR WAY`, '#ffd166'],
+            ['RANKED · 1 CREDIT PER RUN · XP EVERY BATTLE', '#8fd0ff'],
+            ['CREDIT BONUSES AT MILESTONES + FULL CLEAR', '#ffffffcc'],
+            ['LOSE ONCE — GAME OVER', '#ff9d9d'],
+            ['NO CHARACTER SWITCHING MID-RUN', '#ffffff99'],
+        ];
+        lines.forEach(([txt, col], k) => label(ctx, txt, rx + cardW / 2, cardY + 62 + k * 22, 12, col));
+    }
     const bothLocked = locked[0] && locked[1];
-    if (bothLocked) {
+    if (arcadeTotal) {
+        label(ctx, 'TAP TWICE / F  LOCK IN — YOUR FIGHTER RIDES THE WHOLE RUN', VW / 2, VH - 8, 12, '#ffffffaa');
+    }
+    else if (bothLocked) {
         const pulse = 1 + 0.04 * Math.sin(tick / 9);
         display(ctx, 'PRESS START TO FIGHT', VW / 2, VH - 8, 20, { scale: pulse, glow: 'rgba(255,209,102,0.5)' });
     }
@@ -6077,6 +6229,37 @@ dare) => {
         label(ctx, 'D · TOO EASY? DARE A FRIEND — BOTH GET +25 CR', VW / 2, VH - 54, 13, flash ? '#ffd166' : '#ffe9a3');
         tapZone(VW / 2 - 240, VH - 70, 480, 24, 'dare');
     }
+};
+// ---------------------------------------------------------------- game over
+/** Hot-red treatment for the GAME OVER headline. */
+const GAMEOVER_OPTS = {
+    from: '#ffe3e3', mid: '#ff5d7e', to: '#93202f', outline: '#2a060f', glow: 'rgba(255,45,74,0.5)',
+};
+/**
+ * AGENT ARCADE run-ender: one loss anywhere in the gauntlet lands here, over
+ * the frozen final frame of the fight. Any tap/key — or the countdown running
+ * out — returns to the title (the caller owns that transition).
+ */
+const drawGameOver = (ctx, tick, age, // ticks since the screen appeared — drives pop-in + countdown
+info) => {
+    ctx.fillStyle = '#12040acc';
+    ctx.fillRect(0, 0, VW, VH);
+    const pop = easeOutBack(clamp01(age / 20));
+    ctx.save();
+    ctx.translate(VW / 2, VH / 2 - 30);
+    ctx.scale(pop, pop);
+    ctx.translate(-VW / 2, -(VH / 2 - 30));
+    display(ctx, 'GAME OVER', VW / 2, VH / 2 - 30, 72, GAMEOVER_OPTS);
+    ctx.restore();
+    if (age > 14) {
+        label(ctx, `DEFEATED BY ${info.by.toUpperCase()}  ·  BATTLE ${info.stage} OF ${info.total}`, VW / 2, VH / 2 + 24, 16, '#ffd7d7');
+        label(ctx, 'THE GAUNTLET RESETS — ENTER AGAIN FROM THE TITLE', VW / 2, VH / 2 + 50, 12, '#ffffff88');
+    }
+    const secs = Math.max(0, 10 - Math.trunc(age / 60));
+    if (tick % 60 < 42) {
+        label(ctx, `TAP / ENTER — TITLE SCREEN (${secs})`, VW / 2, VH - 30, 15, '#ffffffcc');
+    }
+    tapZone(0, 0, VW, VH, 'start');
 };
 const RANK_TABS = ['ALL', 'HUMANS', 'AGENTS'];
 /**
@@ -7316,7 +7499,16 @@ const fetchAccount = async () => {
         }
         // A stashed dare code rides along and redeems exactly once server-side.
         const ref = storedRef();
-        const res = await fetch(`${matchHttpUrl()}/me${ref ? `?ref=${encodeURIComponent(ref)}` : ''}`, { headers });
+        const q = new URLSearchParams();
+        // Same display name as the ws hello — without it get_account upserts a
+        // UUID-prefix fallback over the real fighter name (leaderboard bug).
+        const name = authName();
+        if (name)
+            q.set('name', name.toUpperCase());
+        if (ref)
+            q.set('ref', ref);
+        const qs = q.toString();
+        const res = await fetch(`${matchHttpUrl()}/me${qs ? `?${qs}` : ''}`, { headers });
         if (!res.ok) {
             accountFetch = 'fail';
             return;
@@ -7340,6 +7532,8 @@ let uiTick = 0;
 let allRosters = [];
 let picks = [0, 0];
 let locked = [false, false];
+let arcade = null;
+let gameOverAge = 0; // ticks on the GAME OVER screen — drives its countdown
 // Progression + the CPU difficulty lever.
 const profile = loadProfile();
 let lever = loadLever();
@@ -7497,10 +7691,12 @@ const resetMatchFx = (g) => {
 };
 /**
  * Queue for a server match (ADR 0003 + M5 credits).
- * 'wager' = PvP, 10-credit entrance each, winner takes the pot.
- * 'solo'  = ranked vs the HOUSE agent at your level, 1 credit.
+ * 'wager'  = PvP, 10-credit entrance each, winner takes the pot.
+ * 'solo'   = a single match vs the HOUSE agent at your level, 1 credit.
+ * 'arcade' = AGENT ARCADE, the ranked gauntlet — 1 credit per RUN.
+ *   `runToken` continues an existing run (the next battle); omitted = new run.
  */
-const startOnline = (m) => {
+const startOnline = (m, runToken) => {
     const roster = allRosters[picks[0]];
     lastFighter = roster.id;
     localStorage.setItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
@@ -7515,11 +7711,12 @@ const startOnline = (m) => {
         if (screen !== 'online' || net)
             return; // player backed out while fetching
         const email = auth.email || undefined; // AIR write-back target (ADR 0004)
-        // Solo (v3): pure LOCAL simulation of the pinned house AI — zero added
-        // latency; the server re-derives the AI to verify. Wager: rollback PvP.
-        net = m === 'solo'
-            ? new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef())
-            : new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef());
+        // Solo/arcade (v3/v4): pure LOCAL simulation of the pinned house AI —
+        // zero added latency; the server re-derives the AI to verify. Wager:
+        // rollback PvP.
+        net = m === 'wager'
+            ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef())
+            : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(), m === 'arcade' ? { runToken } : undefined);
     });
 };
 /** Match setup arrived — install the pinned characters/stage and begin. */
@@ -7546,12 +7743,28 @@ const installOnlineMatch = () => {
     resetMatchFx(game);
     netInstalled = true;
     screen = 'fight';
+    // AGENT ARCADE: adopt the SERVER's run position — it owns the sequencing.
+    if (s.mode === 'arcade' && s.arcade) {
+        arcade = {
+            practice: false,
+            stage: s.arcade.battle,
+            total: s.arcade.total,
+            opponents: [],
+            runToken: s.arcade.token,
+        };
+    }
     // Stakes card (P0): what this match costs and pays, up front.
     vsCardAge = 0;
-    vsStakes = s.mode === 'solo'
-        ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP', 'RANKED · SERVER-VERIFIED']
-        : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
-    void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
+    vsStakes = s.mode === 'arcade'
+        ? [
+            `BATTLE ${(s.arcade?.battle ?? 0) + 1} OF ${s.arcade?.total ?? 0}${(s.fee ?? 0) > 0 ? `      ENTRY −${s.fee} CR` : ''}`,
+            "RANKED GAUNTLET · SERVER-VERIFIED · LOSE ONCE AND IT'S GAME OVER",
+        ]
+        : s.mode === 'solo'
+            ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP', 'RANKED · SERVER-VERIFIED']
+            : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
+    const newChallenger = s.mode === 'arcade' && (s.arcade?.battle ?? 0) > 0;
+    void audio.playStinger(newChallenger ? 'here_comes_a_new_challenger' : 'vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
 const startFight = () => {
     fighters = [allRosters[picks[0]], allRosters[picks[1]]];
@@ -7571,6 +7784,75 @@ const startFight = () => {
         ? ['LOCAL VERSUS', '']
         : ['FREE PRACTICE      NO FEE · NO XP · NO RECORDS', ''];
     void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
+};
+// ---------------------------------------------------------------- arcade
+/**
+ * AI skill ramp across the gauntlet: the first battle is winnable by a
+ * newcomer, the last one plays at near-max skill. (The 0-100 lever is
+ * @af/core's createAi knob.)
+ */
+const ARCADE_SKILL_MIN = 35, ARCADE_SKILL_MAX = 95;
+const arcadeSkill = (stage, total) => Math.round(ARCADE_SKILL_MIN
+    + (ARCADE_SKILL_MAX - ARCADE_SKILL_MIN) * (total <= 1 ? 1 : stage / (total - 1)));
+/**
+ * PRACTICE gauntlet — the offline fallback when the match server is
+ * unreachable. Same run structure as ranked arcade, fully local: no fee,
+ * no XP, no records.
+ */
+const startArcadePractice = () => {
+    const me = picks[0];
+    const roster = allRosters[me];
+    lastFighter = roster.id;
+    localStorage.setItem(LAST_FIGHTER_KEY, lastFighter);
+    // Every enabled agent except the player's own — shuffled so each run has a
+    // fresh order. A roster of one still works: it becomes a mirror match.
+    const opponents = allRosters
+        .map((r, i) => (!r.disabled && i !== me ? i : -1))
+        .filter((i) => i >= 0);
+    for (let i = opponents.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1)); // client-only — the sim gets its own seeds
+        [opponents[i], opponents[j]] = [opponents[j], opponents[i]];
+    }
+    if (opponents.length === 0)
+        opponents.push(me);
+    arcade = { practice: true, opponents, stage: 0, total: opponents.length };
+    startArcadeFight();
+};
+/** Begin the current PRACTICE stage — a fully local fight vs the next agent. */
+const startArcadeFight = () => {
+    const run = arcade;
+    const opp = run.opponents[run.stage];
+    picks[1] = opp;
+    fighters = [allRosters[picks[0]], allRosters[opp]];
+    setCharacters(fighters[0].ch, fighters[1].ch);
+    // Rotate the stage art each battle so the run tours the whole game.
+    if (stageAssets.length > 0) {
+        stageCursor = (seed + run.stage) % stageAssets.length;
+        setStageAsset(stageAssets[stageCursor] ?? null);
+    }
+    game = createGameState(seed++);
+    cpuAi = createAi(1, arcadeSkill(run.stage, run.total), seed * 31 + 7);
+    statDmg = 0;
+    statBestCombo = 0;
+    xpBanner = null;
+    net = null;
+    resetMatchFx(game);
+    screen = 'fight';
+    vsCardAge = 0;
+    vsStakes = [
+        `BATTLE ${run.stage + 1} OF ${run.total}`,
+        'PRACTICE GAUNTLET · NO FEE · NO XP · NO RECORDS',
+    ];
+    void audio.playStinger(run.stage === 0 ? 'vs' : 'here_comes_a_new_challenger', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
+};
+/** Leave the gauntlet (quit, GAME OVER, or full clear) → back to the title. */
+const endArcade = () => {
+    net?.close(); // ranked: leaving mid-battle is a forfeit; post-result no-op
+    net = null;
+    arcade = null;
+    cpuAi = null;
+    screen = 'title';
+    void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
 };
 /**
  * World px a fighter's body occupies. Sprites are authored supersampled (2x)
@@ -7814,9 +8096,17 @@ const renderFight = (g) => {
     drawHud(ctx, g, fighters, fx, net?.setup
         ? [
             `${net.setup.names[0]}${net.setup.agents[0] ? ' · AGENT' : ''}${net.side === 0 ? ' (YOU)' : ''}`,
-            `${net.setup.names[1]}${net.setup.agents[1] ? ' · AGENT' : ''}${net.side === 1 ? ' (YOU)' : ''}`,
+            // Arcade: the HUD prefixes the character name itself, so the server
+            // name ("ELON · 1/8") would double it — show just the run position.
+            `${arcade && !arcade.practice
+                ? `BATTLE ${arcade.stage + 1}/${arcade.total}`
+                : net.setup.names[1]}${net.setup.agents[1] ? ' · AGENT' : ''}${net.side === 1 ? ' (YOU)' : ''}`,
         ]
-        : cpuAi ? ['', `AGENT LV ${cpuLevelFor(profile, lever)}`] : undefined, autoSpecialCharged(g.fighters[localSide()]));
+        : cpuAi
+            ? ['', arcade
+                    ? `BATTLE ${arcade.stage + 1}/${arcade.total}`
+                    : `AGENT LV ${cpuLevelFor(profile, lever)}`]
+            : undefined, autoSpecialCharged(g.fighters[localSide()]));
     // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
     // sweeps across the whole frame.
     drawFx(ctx, 'screen');
@@ -7826,6 +8116,17 @@ const tickSelect = () => {
     const n = allRosters.length;
     const enabled = (i) => !allRosters[i]?.disabled;
     const anyEnabled = allRosters.some((_r, i) => enabled(i));
+    // ESC / the ‹ TITLE button: unlock a locked pick first; otherwise leave.
+    if (pressedThisFrame.has('Escape') || taps.has('back')) {
+        if (locked[0] || locked[1]) {
+            locked = [false, false];
+        }
+        else {
+            screen = 'title';
+            void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
+            return;
+        }
+    }
     const move = (i, d) => {
         if (locked[i] || !anyEnabled)
             return;
@@ -7879,11 +8180,12 @@ const tickSelect = () => {
     if (enabled(picks[0]) && (tapConfirm || CONFIRM[0].some((k) => pressedThisFrame.has(k))))
         locked[0] = true;
     if (mode === 'online' || mode === 'cpu') {
-        // Server modes (M5): your pick is the queue ticket. Wager matchmakes a
-        // PvP opponent; ranked VS AGENT gets a house bot at your level — the
-        // server picks its character (and charges the entrance fee).
+        // Locking IS the launch. ONLINE: the pick is the wager-queue ticket
+        // (the server matchmakes and charges the fee). ARCADE: the pick is
+        // sealed for the whole gauntlet — no switching until the run ends —
+        // and queues the RANKED run (1 credit, server-verified).
         if (locked[0])
-            startOnline(mode === 'cpu' ? 'solo' : 'wager');
+            startOnline(mode === 'cpu' ? 'arcade' : 'wager');
         return;
     }
     if (mode === '2p') {
@@ -7900,8 +8202,6 @@ const tickSelect = () => {
         locked[1] = true;
         void audio.playStinger('here_comes_a_new_challenger');
     }
-    if (pressedThisFrame.has('Escape'))
-        locked = [false, false];
     if (locked[0] && locked[1] && (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space'))) {
         if (stageIds.length > 0)
             screen = 'stageSelect';
@@ -8007,15 +8307,21 @@ const frame = () => {
             void audio.playBgm('player_select', { fadeInSec: 0.5 });
         };
         /**
-         * QUICK MATCH (P0): title → queue in ONE input, with the remembered
-         * fighter. The select screen becomes an opt-in detour (C), not a toll.
+         * Launch the selected mode. ONLINE keeps the P0 quick-match promise
+         * (one input → queue with the remembered fighter). AGENT ARCADE always
+         * routes through the select screen first: you pick your fighter INSIDE
+         * the mode, and that pick is then locked for the whole run.
          */
-        const quickPlay = () => {
+        const launchMode = () => {
+            if (mode === 'cpu') {
+                enterSelect();
+                return;
+            }
             let idx = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
             if (idx < 0)
                 idx = Math.max(0, allRosters.findIndex((r) => !r.disabled));
             picks[0] = idx;
-            startOnline(mode === 'cpu' ? 'solo' : 'wager');
+            startOnline('wager');
         };
         // A tapped mode row picks the mode AND launches — one tap to a match.
         const tappedMode = MODES.find((m) => taps.has(`mode:${m}`));
@@ -8045,7 +8351,7 @@ const frame = () => {
         }
         else if (tappedMode) {
             mode = tappedMode;
-            quickPlay();
+            launchMode();
         }
         else if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')) {
             mode = MODES[(MODES.indexOf(mode) + MODES.length - 1) % MODES.length];
@@ -8057,7 +8363,7 @@ const frame = () => {
             enterSelect();
         }
         else if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('start')) {
-            quickPlay();
+            launchMode();
         }
     }
     else if (screen === 'ranks') {
@@ -8087,6 +8393,7 @@ const frame = () => {
             refCode: account?.refCode,
             roster: allRosters.find((r) => r.id === lastFighter && !r.disabled)
                 ?? allRosters.find((r) => !r.disabled),
+            rosters: allRosters,
             taunt: currentTaunt(),
             tauntIdx,
             tauntCount: TAUNTS.length,
@@ -8122,7 +8429,9 @@ const frame = () => {
     }
     else if (screen === 'select') {
         tickSelect();
-        drawSelect(ctx, allRosters, picks, locked, uiTick, mode === 'cpu' ? { cpuLevel: cpuLevelFor(profile, lever), lever } : undefined);
+        // ARCADE select: no CPU-level badge (difficulty ramps per stage instead);
+        // the gauntlet rules panel tells the player what they're entering.
+        drawSelect(ctx, allRosters, picks, locked, uiTick, undefined, mode === 'cpu' ? Math.max(1, allRosters.filter((r) => !r.disabled).length - 1) : undefined);
         drawWalletStrip();
     }
     else if (screen === 'stageSelect') {
@@ -8135,11 +8444,14 @@ const frame = () => {
         ctx.fillRect(0, 0, VW, VH);
         const dots = '.'.repeat(1 + (Math.trunc(uiTick / 20) % 3));
         const solo = queuedMode === 'solo';
+        const arcadeQ = queuedMode === 'arcade';
         const failed = net?.status === 'error';
         const msg = !net ? `CONNECTING${dots}` // token fetch in flight
             : failed ? `OFFLINE: ${net.error}`
                 : net.setup ? 'OPPONENT FOUND — STARTING'
-                    : net.status === 'queued' ? (solo ? `CALLING THE HOUSE AGENT${dots}` : `SEARCHING FOR OPPONENT${dots}`)
+                    : net.status === 'queued'
+                        ? (arcadeQ ? `ENTERING AGENT ARCADE${dots}`
+                            : solo ? `CALLING THE HOUSE AGENT${dots}` : `SEARCHING FOR OPPONENT${dots}`)
                         : `CONNECTING${dots}`;
         ctx.font = 'bold 22px "Courier New", monospace';
         ctx.textAlign = 'center';
@@ -8147,19 +8459,22 @@ const frame = () => {
         ctx.fillText(msg, VW / 2, VH / 2 - 34);
         ctx.font = 'bold 14px "Courier New", monospace';
         ctx.fillStyle = '#ffd166';
-        ctx.fillText(solo
-            ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
-            : 'WAGER · 10 CREDITS ENTRY EACH · WINNER TAKES THE 20 POT', VW / 2, VH / 2 - 4);
+        ctx.fillText(arcadeQ
+            ? 'RANKED GAUNTLET · 1 CREDIT PER RUN · BEAT EVERY AGENT'
+            : solo
+                ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
+                : 'WAGER · 10 CREDITS ENTRY EACH · WINNER TAKES THE 20 POT', VW / 2, VH / 2 - 4);
         ctx.font = '13px "Courier New", monospace';
         ctx.fillStyle = '#ffffff88';
         ctx.fillText(failed
-            ? (solo ? 'TAP / ENTER: FREE PRACTICE (no fee · no XP · no records)'
-                : 'is the match server running?  npm run server')
+            ? (arcadeQ ? 'TAP / ENTER: PRACTICE GAUNTLET (no fee · no XP · no records)'
+                : solo ? 'TAP / ENTER: FREE PRACTICE (no fee · no XP · no records)'
+                    : 'is the match server running?  npm run server')
             : 'humans and agents share this queue  ·  ESC: cancel', VW / 2, VH / 2 + 24);
         if (failed) {
             ctx.fillText('TAP BACK / ESC: leave', VW / 2, VH / 2 + 46);
             // Phones have no Enter/Esc — without these zones iOS is stuck on OFFLINE.
-            if (solo)
+            if (solo || arcadeQ)
                 tapZone(VW / 2 - 280, VH / 2 - 70, 560, 100, 'practice');
             tapZone(24, VH - 52, 200, 40, 'back');
             ctx.font = 'bold 14px "Courier New", monospace';
@@ -8169,7 +8484,14 @@ const frame = () => {
         drawWalletStrip();
         if (net?.setup && !netInstalled)
             installOnlineMatch();
-        if (failed && solo && (pressedThisFrame.has('Enter') || taps.has('practice') || taps.has('start'))) {
+        if (failed && arcadeQ && (pressedThisFrame.has('Enter') || taps.has('practice') || taps.has('start'))) {
+            // Server unreachable → the same gauntlet fully local, reward-free.
+            practiceFree = true;
+            net?.close();
+            net = null;
+            startArcadePractice();
+        }
+        else if (failed && solo && (pressedThisFrame.has('Enter') || taps.has('practice') || taps.has('start'))) {
             // Server unreachable → the old local match, explicitly reward-free.
             practiceFree = true;
             net?.close();
@@ -8181,19 +8503,33 @@ const frame = () => {
         else if (pressedThisFrame.has('Escape') || taps.has('back')) {
             net?.close();
             net = null;
-            screen = 'select';
-            locked = [false, false];
+            if (arcadeQ && arcade) {
+                // Backing out MID-RUN (between battles): the run is abandoned — the
+                // title, never the select screen (no fighter switching mid-run).
+                endArcade();
+            }
+            else {
+                screen = 'select';
+                locked = [false, false];
+            }
         }
     }
     else if (screen === 'fight' && game) {
         if (pressedThisFrame.has('KeyB'))
             showBoxes = !showBoxes;
         if (pressedThisFrame.has('Escape')) {
-            net?.close(); // online: leaving is a forfeit (ADR 0003)
-            net = null;
-            screen = 'select';
-            locked = [false, false];
-            void audio.playBgm('player_select', { fadeInSec: 0.5 });
+            if (arcade) {
+                // Quitting mid-gauntlet abandons the run — back to the title, never
+                // to the select screen (no fighter switching once the run began).
+                endArcade();
+            }
+            else {
+                net?.close(); // online: leaving is a forfeit (ADR 0003)
+                net = null;
+                screen = 'select';
+                locked = [false, false];
+                void audio.playBgm('player_select', { fadeInSec: 0.5 });
+            }
         }
         // Stakes card: shown for the first ~2.5s; any key skips. Solo and local
         // matches HOLD the sim under it (nothing is waiting on us); wager keeps
@@ -8232,7 +8568,10 @@ const frame = () => {
         updateCamera(game);
         renderFight(game);
         if (cardUp && fighters && !netDead) {
-            drawVsCard(ctx, fighters, net?.setup ? net.setup.names : [fighters[0].bundle.name, cpuAi ? `AGENT LV ${cpuLevelFor(profile, lever)}` : fighters[1].bundle.name], vsStakes.filter((s) => s), vsCardAge);
+            drawVsCard(ctx, fighters, net?.setup
+                ? net.setup.names
+                : [fighters[0].bundle.name,
+                    cpuAi && !arcade ? `AGENT LV ${cpuLevelFor(profile, lever)}` : fighters[1].bundle.name], vsStakes.filter((s) => s), vsCardAge);
             vsCardAge++;
         }
         else if (vsCardAge >= 0 && !netDead) {
@@ -8244,33 +8583,79 @@ const frame = () => {
         if (netDead) {
             drawNetError(ctx, net.error, queuedMode, uiTick);
             if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('back')) {
-                net.close();
-                net = null;
                 vsCardAge = -1;
-                screen = 'select';
-                locked = [false, false];
-                void audio.playBgm('player_select', { fadeInSec: 0.5 });
+                if (arcade) {
+                    endArcade(); // ranked run dies with the connection → title
+                }
+                else {
+                    net.close();
+                    net = null;
+                    screen = 'select';
+                    locked = [false, false];
+                    void audio.playBgm('player_select', { fadeInSec: 0.5 });
+                }
             }
         }
         if (game.phase === 1 /* Phase.Fighting */ && !hurryPlayed && game.timerTicks <= HURRY_UP_TICKS) {
             hurryPlayed = true;
             void audio.playStinger('hurry_up', { duck: false }); // layers over the stage loop, like the arcade original
         }
-        if (game.phase === 3 /* Phase.MatchOver */) {
-            // Progression is SERVER-AWARDED (M5): ranked/wager XP + credits arrive
-            // in the post-result xp message. Free practice pays nothing by design.
-            // Stale fight-screen state (a lingering "K.O." banner, a frozen combo
-            // counter) must not bleed into the results screen's own layout.
+        // The server settled this match UNDER a live fight (idle forfeit while
+        // the tab was throttled/locked, or a mid-match verdict): the local sim
+        // can no longer decide anything — surface the verdict instead of
+        // freezing on a dead session forever.
+        if (net?.result && net.status === 'done' && game.phase !== 3 /* Phase.MatchOver */) {
             fx.announce = '';
             fx.comboOwner = -1;
             resultsAge = 0;
-            screen = 'results';
-            // CPU beat the human → arcade "Game Over"; anything else (human win,
-            // 2P vs 2P, a draw) gets the victory jingle.
-            const lostToCpu = Boolean(cpuAi) && game.winner === 1;
-            void audio.playStinger(lostToCpu ? 'game_over' : 'win', {
-                onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
-            });
+            const lostIt = net.result.winner === 1 - localSide() || net.result.winner === -1;
+            if (arcade) {
+                // Whatever ended it, the run is over server-side → GAME OVER card.
+                gameOverAge = 0;
+                screen = 'gameover';
+                void audio.playStinger('game_over');
+            }
+            else {
+                screen = 'results';
+                void audio.playStinger(lostIt ? 'game_over' : 'win', {
+                    onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
+                });
+            }
+        }
+        if (game.phase === 3 /* Phase.MatchOver */) {
+            // Stale fight-screen state (a lingering "K.O." banner, a frozen combo
+            // counter) must not bleed into the next screen's own layout.
+            fx.announce = '';
+            fx.comboOwner = -1;
+            resultsAge = 0;
+            if (arcade) {
+                // AGENT ARCADE: only a clean win advances the run. A loss OR a draw
+                // ends it — the gauntlet demands the win. Progression is SERVER-
+                // AWARDED for ranked runs (the post-result xp message → banner);
+                // practice runs pay nothing by design.
+                if (game.winner === 0) {
+                    screen = 'results';
+                    void audio.playStinger('win', {
+                        onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
+                    });
+                }
+                else {
+                    gameOverAge = 0;
+                    screen = 'gameover';
+                    void audio.playStinger('game_over');
+                }
+            }
+            else {
+                // Progression is SERVER-AWARDED (M5): ranked/wager XP + credits
+                // arrive in the post-result xp message. Free practice pays nothing.
+                screen = 'results';
+                // CPU beat the human → arcade "Game Over" stinger; anything else
+                // (human win, 2P vs 2P, a draw) gets the victory jingle.
+                const lostToCpu = Boolean(cpuAi) && game.winner === 1;
+                void audio.playStinger(lostToCpu ? 'game_over' : 'win', {
+                    onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
+                });
+            }
         }
     }
     else if (screen === 'results' && game) {
@@ -8295,9 +8680,17 @@ const frame = () => {
         renderFight(game);
         // Peak-ego entry point: a signed-in winner gets offered the dare screen.
         const canDare = game.winner === localSide() && !!account?.refCode;
-        drawResults(ctx, game, fighters, uiTick, resultsAge, xpBanner, net
-            ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : '10 CR'}        ESC: CHANGE FIGHTER`
-            : undefined, canDare);
+        // Arcade: this screen is the between-battles interstitial. The run only
+        // moves FORWARD (next challenger) or ENDS (quit to title) — there is no
+        // path back to the select screen mid-run.
+        const arcadeDone = arcade ? arcade.stage + 1 >= arcade.total : false;
+        drawResults(ctx, game, fighters, uiTick, resultsAge, xpBanner, arcade
+            ? (arcadeDone
+                ? `ARCADE COMPLETE — ALL ${arcade.total} AGENTS DOWN!        TAP / ENTER: TITLE`
+                : `BATTLE ${arcade.stage + 1} OF ${arcade.total} CLEARED        TAP / ENTER: NEXT CHALLENGER        ESC: QUIT`)
+            : net
+                ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : '10 CR'}        ESC: CHANGE FIGHTER`
+                : undefined, canDare);
         // Online: the server's verdict is the real result (ADR 0003).
         if (net) {
             ctx.font = 'bold 15px "Courier New", monospace';
@@ -8321,16 +8714,39 @@ const frame = () => {
             enterInvite('results'); // ESC on the invite screen returns here
         }
         else if (pressedThisFrame.has('Escape') || taps.has('back')) {
-            net?.close();
-            net = null;
-            screen = 'select';
-            locked = [false, false];
-            void audio.playBgm('player_select', { fadeInSec: 0.5 });
+            if (arcade) {
+                endArcade(); // quitting the gauntlet → title, never the select screen
+            }
+            else {
+                net?.close();
+                net = null;
+                screen = 'select';
+                locked = [false, false];
+                void audio.playBgm('player_select', { fadeInSec: 0.5 });
+            }
         }
         else if (pressedThisFrame.has('Enter') || taps.has('start')) {
-            // INSTANT REMATCH (P0): one input → straight back into the queue with
-            // the same fighter and mode. No select detour, no re-confirm.
-            if (net) {
+            if (arcade) {
+                // Forward through the gauntlet — same fighter, next challenger.
+                if (arcadeDone) {
+                    endArcade();
+                }
+                else if (arcade.practice) {
+                    arcade.stage++;
+                    startArcadeFight();
+                }
+                else {
+                    // RANKED: re-queue with the run token — the server owns the next
+                    // battle (opponent, skill, position) and re-validates the token.
+                    const token = arcade.runToken;
+                    net?.close();
+                    net = null;
+                    startOnline('arcade', token);
+                }
+            }
+            else if (net) {
+                // INSTANT REMATCH (P0): one input → straight back into the queue
+                // with the same fighter and mode. No select detour, no re-confirm.
                 const again = queuedMode;
                 net.close();
                 net = null;
@@ -8340,6 +8756,45 @@ const frame = () => {
                 startFight();
             }
         }
+    }
+    else if (screen === 'gameover' && game) {
+        // AGENT ARCADE run-ender: the frozen final frame under a GAME OVER card.
+        // Any input — or the 10s countdown — returns to the title screen.
+        gameOverAge++;
+        // Ranked: fold the settlement into the title wallet chip (same sync the
+        // results screen does) so the balance is honest the moment we return.
+        if (net?.xp && account) {
+            account = {
+                ...account, credits: net.xp.credits, level: net.xp.level,
+                xp: net.xp.xp, wins: net.xp.wins, losses: net.xp.losses,
+            };
+        }
+        renderFight(game);
+        drawGameOver(ctx, uiTick, gameOverAge, {
+            by: fighters?.[1]?.bundle.name ?? 'THE HOUSE',
+            stage: (arcade?.stage ?? 0) + 1,
+            total: arcade?.total ?? 1,
+        });
+        // Ranked run: the server's verdict (and the XP burn) land moments after
+        // the KO — surface them on the card so the loss reads as settled.
+        if (net) {
+            ctx.font = 'bold 13px "Courier New", monospace';
+            ctx.textAlign = 'center';
+            if (net.result) {
+                const ok = net.result.reason === 'verified';
+                ctx.fillStyle = ok ? '#7ee85a' : '#ffd166';
+                const burn = net.xp ? `   ·   ${net.xp.gained} XP · ${net.xp.creditsDelta} CR` : '';
+                ctx.fillText(`${ok ? '✓ SERVER-VERIFIED' : `RESULT: ${net.result.reason.toUpperCase()}`}${burn}`, VW / 2, VH - 60);
+            }
+            else {
+                ctx.fillStyle = '#ffffff88';
+                ctx.fillText('VERIFYING WITH SERVER…', VW / 2, VH - 60);
+            }
+        }
+        const dismiss = pressedThisFrame.has('Enter') || pressedThisFrame.has('Space')
+            || pressedThisFrame.has('Escape') || taps.has('start');
+        if (gameOverAge > 600 || (dismiss && gameOverAge > 30))
+            endArcade();
     }
     // The arcade overlay belongs to the match only — push the screen this frame
     // ended on, so it appears/disappears in lockstep with what was just drawn.

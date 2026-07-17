@@ -19,7 +19,7 @@ import type { AiState, GameState, InputFrame } from '@af/core';
  */
 
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 3;
+const NET_PROTOCOL = 4;
 const MAX_AHEAD = 10;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -33,10 +33,15 @@ export interface NetSetup {
   chars: [{ id: string; hash?: string }, { id: string; hash?: string }];
   names: [string, string];
   agents: [boolean, boolean];
-  mode?: 'wager' | 'solo';
+  mode?: 'wager' | 'solo' | 'arcade';
   fee?: number;
   /** v3 local-sim solo: the deterministic house AI this client simulates. */
   solo?: { skill: number; aiSeed: number };
+  /**
+   * AGENT ARCADE (v4): run position + the bearer token that re-queues the
+   * run for the next battle after a verified win.
+   */
+  arcade?: { battle: number; total: number; token: string };
   /** This side's resume token — lets a dropped socket rejoin (ADR 0005). */
   resume?: string;
 }
@@ -435,6 +440,12 @@ export class SoloSession {
     private authToken?: string,
     private email?: string,
     private ref?: string, // stashed dare code (?ref=) — redeemed server-side once
+    /**
+     * AGENT ARCADE (v4): queue the ranked gauntlet instead of a single solo
+     * match. `runToken` (from the previous battle's setup.arcade.token)
+     * continues an existing run; omitted = start a new run (entry fee).
+     */
+    private arcadeQueue?: { runToken?: string },
   ) {
     this.connect(false);
   }
@@ -447,7 +458,11 @@ export class SoloSession {
       if (resume && this.setup?.resume) {
         this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
       } else {
-        this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: 'solo' });
+        this.send({
+          t: 'queue', character: this.character, bundleHash: this.bundleHash,
+          mode: this.arcadeQueue ? 'arcade' : 'solo',
+          runToken: this.arcadeQueue?.runToken || undefined,
+        });
         this.status = 'queued';
       }
     };

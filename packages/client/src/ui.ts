@@ -874,10 +874,10 @@ export const drawTitle = (
 
   // Bottom menu: laid out at a fixed offset from the bottom edge rather than
   // guessed from where the art's elements happen to land — robust even if
-  // the logo file gets swapped for different art later. No opaque panel
-  // behind it (by design): the key art / video backdrop shows through, and
-  // display()/label() already carry their own outline+glow for contrast.
-  const barH = 178, barY = VH - barH;
+  // the logo file gets swapped for different art later. Rows are drawn as
+  // translucent button plates (finger-sized tap targets) so the key art /
+  // video backdrop still shows through them.
+  const barH = 200, barY = VH - barH;
 
   const menuY0 = barY + 30;
   if (menu.gate) {
@@ -899,44 +899,64 @@ export const drawTitle = (
     if (menu.authError) label(ctx, `⚠ ${menu.authError.slice(0, 64)}`, cx, menuY0 + 92, 12, '#ff9d9d');
   } else {
     // 2-player local is disabled (single-controller / mobile focus) — omitted.
-    const rows: [Mode, string][] = [
-      ['cpu', 'VS AGENT  ·  RANKED  ·  1 CREDIT'],
-      ['online', 'ONLINE WAGER  ·  10 CREDITS  ·  WINNER TAKES POT'],
+    // Mode rows are big button plates (≥44px tall — a real finger target on a
+    // phone), each with a one-line subtitle explaining the stakes.
+    const rows: [Mode, string, string][] = [
+      ['cpu', 'AGENT ARCADE', 'RANKED · 1 CREDIT PER RUN · BEAT EVERY AGENT'],
+      ['online', 'ONLINE WAGER', '10 CREDITS ENTRY · WINNER TAKES THE POT'],
     ];
-    rows.forEach(([m, txt], k) => {
-      const y = menuY0 + k * 34;
+    const btnW = Math.min(560, VW - 48), btnH = 46, btnGap = 10;
+    const btnX = cx - btnW / 2;
+    rows.forEach(([m, txt, sub], k) => {
+      const y = barY + 12 + k * (btnH + btnGap);
       const on = menu.mode === m;
-      tapZone(cx - 260, y - 17, 520, 34, `mode:${m}`);
+      tapZone(btnX, y, btnW, btnH, `mode:${m}`);
+      ctx.fillStyle = on ? 'rgba(24,16,44,0.82)' : 'rgba(10,6,22,0.55)';
+      ctx.fillRect(btnX, y, btnW, btnH);
+      ctx.strokeStyle = on ? GOLD : 'rgba(255,255,255,0.22)';
+      ctx.lineWidth = on ? 2.5 : 1.5;
+      ctx.strokeRect(btnX + 0.5, y + 0.5, btnW - 1, btnH - 1);
       if (on) {
-        const pulse = 1 + 0.035 * Math.sin(tick / 10);
-        display(ctx, txt, cx, y, 22, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+        const pulse = 1 + 0.03 * Math.sin(tick / 10);
         // A small bouncing arrow marker to the left, arcade-menu style.
         const bounce = 3 * Math.sin(tick / 9);
-        label(ctx, '▶', cx - 236 + bounce, y, 18, GOLD_LT);
+        label(ctx, '▶', btnX + 22 + bounce, y + btnH / 2 + 6, 18, GOLD_LT);
+        display(ctx, txt, cx, y + 22, 20, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+        label(ctx, sub, cx, y + 39, 10, '#ffd166cc');
       } else {
-        label(ctx, txt, cx, y, 16, '#ffffff70');
+        label(ctx, txt, cx, y + 22, 17, '#ffffff99');
+        label(ctx, sub, cx, y + 39, 10, '#ffffff55');
       }
     });
-    const hintY = menuY0 + rows.length * 34 + 6;
-    // Quick match (P0): ENTER launches with the remembered fighter — the
-    // select screen is the C detour, not a toll booth on every match.
+    ctx.lineWidth = 1;
+    // The fighter line is the touch path to the select screen (online quick
+    // match uses it; ARCADE always re-selects on entry).
+    const fy = barY + 12 + rows.length * (btnH + btnGap) + 4;
     if (menu.fighter) {
-      label(ctx, `FIGHTING AS  ${menu.fighter.toUpperCase()}   ·   C  CHANGE FIGHTER`, cx, hintY, 12, '#8fd0ff');
+      label(ctx, `FIGHTING AS  ${menu.fighter.toUpperCase()}   ·   TAP / C  CHANGE`, cx, fy + 12, 12, '#8fd0ff');
+      tapZone(btnX, fy, btnW, 22, 'changefighter');
     }
-    label(ctx, 'TAP / ENTER  QUICK MATCH       R  RANKINGS       L  SIGN OUT', cx, hintY + 18, 13, '#ffffffaa');
-    // Split the hint line into two halves so RANKINGS and SIGN OUT are each
-    // reachable by touch (no keyboard on a phone).
-    tapZone(cx - 20, hintY + 7, 150, 22, 'ranks');
-    tapZone(cx + 130, hintY + 7, 150, 22, 'signin');
-    // The fighter line is the touch path to the select screen.
-    if (menu.fighter) tapZone(cx - 260, hintY - 11, 520, 20, 'changefighter');
-    // Referral dare: opens the full invite screen (poster + taunt + link).
-    if (menu.refCode) {
-      const flash = tick % 44 < 36;
-      label(ctx, 'D  DARE A FRIEND  ·  BOTH GET +25 CREDITS', cx, hintY + 38, 12,
-        flash ? '#ffd166' : '#ffe9a3');
-      tapZone(cx - 200, hintY + 27, 400, 22, 'dare');
-    }
+    // Bottom action pills: every keyboard shortcut gets a real button — no
+    // keyboard on a phone. Registered as generous ≥30px-tall tap targets.
+    const pills: [string, string, string][] = [
+      ['R · RANKINGS', 'ranks', '#ffffffcc'],
+      ['L · SIGN OUT', 'signin', '#ffffff99'],
+    ];
+    if (menu.refCode) pills.push(['D · DARE +25', 'dare', tick % 44 < 36 ? '#ffd166' : '#ffe9a3']);
+    const pillW = 158, pillH = 30, pillGap = 12;
+    const rowW = pills.length * pillW + (pills.length - 1) * pillGap;
+    const py = fy + 24;
+    pills.forEach(([txt, act, col], k) => {
+      const x = cx - rowW / 2 + k * (pillW + pillGap);
+      tapZone(x, py, pillW, pillH, act);
+      ctx.fillStyle = 'rgba(10,6,22,0.55)';
+      ctx.fillRect(x, py, pillW, pillH);
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(x + 0.5, py + 0.5, pillW - 1, pillH - 1);
+      label(ctx, txt, x + pillW / 2, py + pillH / 2 + 4, 12, col);
+    });
+    ctx.lineWidth = 1;
   }
 
   // Account/wallet block — upper LEFT, minimal text (M5 spec).
@@ -967,7 +987,7 @@ export const drawTitle = (
     if (flash) label(ctx, `+${10} DAILY LOGIN CREDITS`, 16, menu.address ? 80 : 62, 14, '#ffe9a3', 'left');
   }
 
-  label(ctx, 'MILESTONE 5 · CREDITS BUILD', cx, VH - 12, 10, '#ffffff55');
+  label(ctx, 'MILESTONE 5 · CREDITS BUILD', cx, VH - 4, 9, '#ffffff55');
 };
 
 // ---------------------------------------------------------------- invite
@@ -990,6 +1010,8 @@ export interface InviteView {
   refCode?: string;
   /** Remembered fighter — poster art + "MAIN" label. */
   roster?: Roster;
+  /** Full roster (same array the select screen uses) — for the stat profile. */
+  rosters?: Roster[];
   /** The active taunt line (preset or the player's own words). */
   taunt: string;
   tauntIdx: number;
@@ -1029,33 +1051,72 @@ export const drawInvite = (
   display(ctx, 'TO BEAT ME', cx, 150, 46, DARE_OPTS);
 
   // ---- poster panel: the wanted-poster preview of what the friend sees.
-  const pw = 640, ph = 130, px0 = cx - pw / 2, py0 = 176;
+  // Left = full-body mugshot (contain-fit, never cropped); middle = the
+  // callout + this player's live record; right = the fighter's stat profile,
+  // which is what fills the card instead of the old dead space.
+  const pw = 664, ph = 150, px0 = cx - pw / 2, py0 = 170;
   bevel(ctx, px0, py0, pw, ph, PANEL, GOLD, GOLD_DK, 3);
+
+  // Mugshot cell — dark panel + red footlight; the whole fighter contain-fit
+  // and bottom-anchored so no head/limb is ever clipped (sprite aspect ratios
+  // run ~0.5–1.0 across the roster, which the old overscale-crop mangled).
+  const cellX = px0 + 8, cellY = py0 + 8, cellW = 128, cellH = ph - 16;
+  ctx.save();
+  rrect(ctx, cellX, cellY, cellW, cellH, 6);
+  ctx.clip();
+  const foot = ctx.createRadialGradient(
+    cellX + cellW / 2, cellY + cellH, 8, cellX + cellW / 2, cellY + cellH, cellH);
+  foot.addColorStop(0, 'rgba(255,61,110,0.24)');
+  foot.addColorStop(1, 'rgba(6,4,12,0.92)');
+  ctx.fillStyle = foot;
+  ctx.fillRect(cellX, cellY, cellW, cellH);
   const img = v.roster?.portrait;
   if (img?.naturalWidth) {
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(px0 + 3, py0 + 3, 150, ph - 6);
-    ctx.clip();
-    // Slight overscale so the fighter fills the slot like a mugshot.
-    const fit = ((ph - 6) / img.naturalHeight) * 1.35;
+    const fit = Math.min((cellW - 14) / img.naturalWidth, (cellH - 10) / img.naturalHeight);
     const w = img.naturalWidth * fit, h = img.naturalHeight * fit;
     ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(img, px0 + 78 - w / 2, py0 + ph - 3 - h, w, h);
-    ctx.restore();
+    ctx.drawImage(img, cellX + cellW / 2 - w / 2, cellY + cellH - 5 - h, w, h);
+  } else {
+    label(ctx, '?', cellX + cellW / 2, cellY + cellH / 2 + 14, 40, '#ffffff33');
   }
-  const tx = px0 + 172;
-  label(ctx, 'WANTED: ANYONE WHO CAN TAKE ONE ROUND', tx, py0 + 28, 11, '#ff9db0', 'left');
-  display(ctx, v.name, tx, py0 + 62, 26, { align: 'left' });
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(255,61,110,0.55)';
+  ctx.lineWidth = 1.5;
+  rrect(ctx, cellX, cellY, cellW, cellH, 6);
+  ctx.stroke();
+
+  // Middle column: the callout + this player's live record.
+  const tx = px0 + 152;
+  label(ctx, '⚠ WANTED: ANYONE WHO CAN TAKE ONE ROUND', tx, py0 + 26, 11, '#ff9db0', 'left');
+  const nameSize = v.name.length > 13 ? 18 : v.name.length > 10 ? 21 : 26;
+  display(ctx, v.name, tx, py0 + 60, nameSize, { align: 'left' });
   const a = v.account;
   label(ctx,
-    a ? `${a.wins}W — ${a.losses}L   ·   LV ${a.level}${v.roster ? `   ·   MAIN  ${v.roster.bundle.name.toUpperCase()}` : ''}`
+    a ? `${a.wins}W — ${a.losses}L    ·    LV ${a.level}${v.roster ? `    ·    MAIN ${v.roster.bundle.name.toUpperCase()}` : ''}`
       : 'SERVER OFFLINE — STATS UNAVAILABLE',
-    tx, py0 + 88, 13, a ? '#ffd166' : '#ff9d9d', 'left');
-  label(ctx, 'THIS POSTER LANDS IN THEIR CHAT', tx, py0 + 112, 10, '#ffffff66', 'left');
+    tx, py0 + 86, 13, a ? '#ffd166' : '#ff9d9d', 'left');
+  if (a) label(ctx, `⛁ ${a.credits} CR IN THE BANK`, tx, py0 + 108, 11, '#8fd0ff', 'left');
+  label(ctx, 'THIS IS THE POSTER THAT LANDS IN THEIR CHAT', tx, py0 + ph - 14, 10, '#ffffff59', 'left');
+
+  // Right column: the fighter's stat profile — the very same bars the select
+  // screen derives from the bundle, which is the "player/character stats"
+  // that fill the card. computeRosterStats is memoized on the array ref, so
+  // passing allRosters here is a cache hit against the select screen.
+  let stats: CharStats | null = null;
+  if (v.roster && v.rosters) {
+    const idx = v.rosters.indexOf(v.roster);
+    if (idx >= 0) stats = computeRosterStats(v.rosters)[idx] ?? null;
+  }
+  if (stats) {
+    ctx.fillStyle = 'rgba(217,164,65,0.22)';
+    ctx.fillRect(px0 + 408, py0 + 14, 1, ph - 28);
+    const sx = px0 + 424, sw = pw - 424 - 14;
+    label(ctx, 'FIGHTER PROFILE', sx, py0 + 22, 10, '#c8b98a', 'left', false);
+    stats.bars.forEach((s, i) => drawStatBar(ctx, sx, py0 + 36 + i * 21, sw, s, '#e8a24a', tick));
+  }
 
   // ---- taunt row: ◀ ▶ cycles presets, T writes your own (rides the link).
-  const ty = py0 + ph + 28;
+  const ty = py0 + ph + 26;
   label(ctx, '◀', cx - 300, ty, 18, GOLD_LT);
   label(ctx, '▶', cx + 300, ty, 18, GOLD_LT);
   tapZone(cx - 336, ty - 20, 72, 34, 'taunt:prev');
@@ -1065,37 +1126,59 @@ export const drawInvite = (
     : `TAUNT ${v.tauntIdx + 1}/${v.tauntCount}  ·  T  WRITE YOUR OWN`, cx, ty + 20, 11, '#ffffff77');
   tapZone(cx - 150, ty + 9, 300, 17, 'taunt:edit');
 
-  // ---- the only button that matters.
-  const bw = 400, bh = 46, bx = cx - bw / 2, by = ty + 40;
+  // ---- the one button that matters. On copy the plate greys out (disabled),
+  // a green ring pops out (success animation), and the line under it turns
+  // into a "now go send it" instruction — the copy already happened, the job
+  // now is to paste it into a chat app.
+  const bw = 420, bh = 46, bx = cx - bw / 2, by = ty + 36;
   const armed = v.copiedAge >= 0;
   if (armed) {
-    bevel(ctx, bx, by, bw, bh, '#0f2a14', '#7ee85a', '#1e4a26', 3);
-    display(ctx, 'DARE ARMED — GO PASTE IT', cx, by + 33, 20,
-      { from: '#eaffea', mid: '#7ee85a', to: '#2f7a1f', outline: '#0e2a08' });
+    bevel(ctx, bx, by, bw, bh, '#191a20', '#3f414c', '#101116', 3);
+    const pop = easeOutBack(clamp01(v.copiedAge / 12));
+    display(ctx, '✓ INVITE LINK COPIED', cx, by + 31, 19,
+      { from: '#eafff0', mid: '#8fe8a0', to: '#3f7a4f', outline: '#0e2a12', scale: pop });
+    if (v.copiedAge < 28) {
+      const t = v.copiedAge / 28;
+      ctx.save();
+      ctx.globalAlpha = (1 - t) * 0.85;
+      ctx.strokeStyle = '#7ee85a';
+      ctx.lineWidth = 3;
+      rrect(ctx, bx - t * 16, by - t * 12, bw + t * 32, bh + t * 24, 7);
+      ctx.stroke();
+      ctx.restore();
+    }
   } else {
     const pulse = 1 + 0.03 * Math.sin(tick / 8);
     bevel(ctx, bx, by, bw, bh, '#3a0e18', '#ff5d7e', '#6e1024', 3);
-    display(ctx, v.canShare ? 'SEND THE DARE' : 'COPY DARE LINK', cx, by + 33, 22,
+    display(ctx, v.canShare ? 'SEND INVITE LINK' : 'COPY INVITE LINK', cx, by + 31, 22,
       { ...DARE_OPTS, scale: pulse });
   }
   tapZone(bx - 20, by - 8, bw + 40, bh + 16, 'copydare');
-  label(ctx, v.refCode ? v.linkLabel : 'CONNECTING TO SERVER…', cx, by + bh + 22, 12, '#8fd0ff');
 
-  // ---- the economics, as scarcity: the 10/week payout cap is an urgency
-  // mechanic, not fine print.
-  let iy = by + bh + 44;
+  // Under the button: the link when idle, the send-it instruction when copied.
+  if (armed) {
+    label(ctx,
+      v.canShare ? 'SENT — NOW GO CALL THEM OUT'
+        : 'NOW SEND IT TO A FRIEND  ·  WHATSAPP · DISCORD · IMESSAGE · ANYWHERE',
+      cx, by + bh + 20, 12, '#8fe8a0');
+  } else {
+    label(ctx, v.refCode ? v.linkLabel : 'CONNECTING TO SERVER…', cx, by + bh + 20, 12, '#8fd0ff');
+  }
+
+  // ---- the economics, as scarcity: the 10/week payout cap is urgency.
+  let iy = by + bh + 42;
   label(ctx,
     `+25 CREDITS EACH WHEN THEY SIGN IN${v.bountiesLeft !== undefined ? `   ·   ${v.bountiesLeft}/10 BOUNTIES LEFT THIS WEEK` : ''}`,
     cx, iy, 13, v.bountiesLeft === 0 ? '#ff9d9d' : '#ffd166');
   if ((v.daresAccepted ?? 0) > 0) {
-    iy += 20;
+    iy += 19;
     label(ctx, `${v.daresAccepted} FIGHTER${v.daresAccepted === 1 ? '' : 'S'} ALREADY TOOK THE BAIT`, cx, iy, 12, '#8fd0ff');
   }
 
   label(ctx,
-    `ESC / TAP HERE  BACK      ◀ ▶  TAUNT      T  WRITE YOUR OWN      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`,
-    cx, VH - 14, 12, '#ffffff99');
-  tapZone(24, VH - 40, 170, 34, 'back');
+    `ESC  BACK      ◀ ▶  TAUNT      T  WRITE YOUR OWN      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`,
+    cx, VH - 12, 12, '#ffffff99');
+  tapZone(24, VH - 38, 150, 32, 'back');
 };
 
 // ---------------------------------------------------------------- select
@@ -1414,14 +1497,26 @@ export const drawSelect = (
   locked: [boolean, boolean],
   tick: number,
   cpuInfo?: CpuBadgeInfo,
+  /** Set = AGENT ARCADE entry: gauntlet size; swaps the P2 card for the rules panel. */
+  arcadeTotal?: number,
 ): void => {
   drawMenuBackdrop(ctx);
   ctx.fillStyle = '#0a0616d9';
   ctx.fillRect(0, 0, VW, VH);
 
   const stats = computeRosterStats(rosters);
-  display(ctx, 'SELECT YOUR FIGHTER', VW / 2, 46, 26);
+  display(ctx, arcadeTotal ? 'AGENT ARCADE — CHOOSE YOUR FIGHTER' : 'SELECT YOUR FIGHTER', VW / 2, 46, 24);
   if (cpuInfo) drawCpuBadge(ctx, cpuInfo, tick);
+  // Escape hatch back to the title — phones have no ESC key.
+  const backW = 110, backH = 34;
+  tapZone(VW - 16 - backW, 12, backW, backH, 'back');
+  ctx.fillStyle = 'rgba(10,6,22,0.6)';
+  ctx.fillRect(VW - 16 - backW, 12, backW, backH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(VW - 16 - backW + 0.5, 12.5, backW - 1, backH - 1);
+  ctx.lineWidth = 1;
+  label(ctx, '‹ TITLE', VW - 16 - backW / 2, 12 + backH / 2 + 4, 12, '#ffffffcc');
 
   // Portrait grid — a single row (wraps past 6). Compact so the bottom band
   // is free for the two fighter cards.
@@ -1454,6 +1549,7 @@ export const drawSelect = (
     // Selection cursors: smooth pulsing glow instead of a hard blink.
     // (Disabled fighters are skipped by the cursor, so none render here.)
     for (const i of [0, 1] as const) {
+      if (i === 1 && arcadeTotal) break; // arcade: only the player's cursor exists
       if (cursors[i] !== k) continue;
       const pulse = locked[i] ? 1 : 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(tick / 8));
       const o = i === 0 ? 0 : 4; // offset so both cursors are visible on the same cell
@@ -1492,6 +1588,7 @@ export const drawSelect = (
   const p2Header = cpuInfo ? `AGENT · LV ${cpuInfo.cpuLevel}` : 'PLAYER 2';
   const cardHeaders: [string, string] = ['PLAYER 1', p2Header];
   for (const i of [0, 1] as const) {
+    if (i === 1 && arcadeTotal) break; // arcade: the rules panel takes P2's slot
     const r = rosters[cursors[i]];
     if (!r) continue;
     const cx = i === 0 ? 16 : VW - 16 - cardW;
@@ -1499,8 +1596,27 @@ export const drawSelect = (
       P_COLORS[i], cardHeaders[i], locked[i], tick);
   }
 
+  // AGENT ARCADE rules panel — what the player is signing up for, where the
+  // opponent card would normally sit.
+  if (arcadeTotal) {
+    const rx = VW - 16 - cardW;
+    bevel(ctx, rx, cardY, cardW, cardH, PANEL, GOLD, GOLD_DK, 3);
+    display(ctx, 'THE GAUNTLET', rx + cardW / 2, cardY + 34, 20);
+    const lines: [string, string][] = [
+      [`${arcadeTotal} AGENTS STAND IN YOUR WAY`, '#ffd166'],
+      ['RANKED · 1 CREDIT PER RUN · XP EVERY BATTLE', '#8fd0ff'],
+      ['CREDIT BONUSES AT MILESTONES + FULL CLEAR', '#ffffffcc'],
+      ['LOSE ONCE — GAME OVER', '#ff9d9d'],
+      ['NO CHARACTER SWITCHING MID-RUN', '#ffffff99'],
+    ];
+    lines.forEach(([txt, col], k) => label(ctx, txt, rx + cardW / 2, cardY + 62 + k * 22, 12, col));
+  }
+
   const bothLocked = locked[0] && locked[1];
-  if (bothLocked) {
+  if (arcadeTotal) {
+    label(ctx, 'TAP TWICE / F  LOCK IN — YOUR FIGHTER RIDES THE WHOLE RUN',
+      VW / 2, VH - 8, 12, '#ffffffaa');
+  } else if (bothLocked) {
     const pulse = 1 + 0.04 * Math.sin(tick / 9);
     display(ctx, 'PRESS START TO FIGHT', VW / 2, VH - 8, 20, { scale: pulse, glow: 'rgba(255,209,102,0.5)' });
   } else {
@@ -1651,6 +1767,46 @@ export const drawResults = (
       flash ? '#ffd166' : '#ffe9a3');
     tapZone(VW / 2 - 240, VH - 70, 480, 24, 'dare');
   }
+};
+
+// ---------------------------------------------------------------- game over
+/** Hot-red treatment for the GAME OVER headline. */
+const GAMEOVER_OPTS: DisplayOpts = {
+  from: '#ffe3e3', mid: '#ff5d7e', to: '#93202f', outline: '#2a060f', glow: 'rgba(255,45,74,0.5)',
+};
+
+/**
+ * AGENT ARCADE run-ender: one loss anywhere in the gauntlet lands here, over
+ * the frozen final frame of the fight. Any tap/key — or the countdown running
+ * out — returns to the title (the caller owns that transition).
+ */
+export const drawGameOver = (
+  ctx: CanvasRenderingContext2D,
+  tick: number,
+  age: number, // ticks since the screen appeared — drives pop-in + countdown
+  info: { by: string; stage: number; total: number },
+): void => {
+  ctx.fillStyle = '#12040acc';
+  ctx.fillRect(0, 0, VW, VH);
+
+  const pop = easeOutBack(clamp01(age / 20));
+  ctx.save();
+  ctx.translate(VW / 2, VH / 2 - 30);
+  ctx.scale(pop, pop);
+  ctx.translate(-VW / 2, -(VH / 2 - 30));
+  display(ctx, 'GAME OVER', VW / 2, VH / 2 - 30, 72, GAMEOVER_OPTS);
+  ctx.restore();
+
+  if (age > 14) {
+    label(ctx, `DEFEATED BY ${info.by.toUpperCase()}  ·  BATTLE ${info.stage} OF ${info.total}`,
+      VW / 2, VH / 2 + 24, 16, '#ffd7d7');
+    label(ctx, 'THE GAUNTLET RESETS — ENTER AGAIN FROM THE TITLE', VW / 2, VH / 2 + 50, 12, '#ffffff88');
+  }
+  const secs = Math.max(0, 10 - Math.trunc(age / 60));
+  if (tick % 60 < 42) {
+    label(ctx, `TAP / ENTER — TITLE SCREEN (${secs})`, VW / 2, VH - 30, 15, '#ffffffcc');
+  }
+  tapZone(0, 0, VW, VH, 'start');
 };
 
 // ------------------------------------------------------------- leaderboard
@@ -2054,7 +2210,7 @@ export const drawVsCard = (
 export const drawNetError = (
   ctx: CanvasRenderingContext2D,
   error: string,
-  mode: 'solo' | 'wager',
+  mode: 'solo' | 'wager' | 'arcade',
   tick: number,
 ): void => {
   ctx.fillStyle = 'rgba(6,4,12,0.82)';
