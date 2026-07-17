@@ -3207,7 +3207,7 @@ Object.assign(globalThis, {
  * (the classic GGPO throttle) rather than drift.
  */
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 4;
+const NET_PROTOCOL = 5;
 const MAX_AHEAD = 10;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -3224,6 +3224,7 @@ class NetSession {
     mode;
     email;
     ref;
+    room;
     status = 'connecting';
     error = '';
     setup = null;
@@ -3249,7 +3250,8 @@ class NetSession {
     resumeAttempts = 0;
     retryTimer = null;
     constructor(url, name, character, bundleHash, authToken, mode = 'wager', email, // AIR-account email — reputation write-back target only
-    ref) {
+    ref, // stashed dare code (?ref=) — redeemed server-side once
+    room) {
         this.url = url;
         this.name = name;
         this.character = character;
@@ -3258,6 +3260,7 @@ class NetSession {
         this.mode = mode;
         this.email = email;
         this.ref = ref;
+        this.room = room;
         this.connect(false);
     }
     /** Open a socket — either the initial queue or a resume of a live match. */
@@ -3270,7 +3273,7 @@ class NetSession {
                 this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
             }
             else {
-                this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode });
+                this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode, room: this.room });
                 this.status = 'queued';
             }
         };
@@ -3411,7 +3414,12 @@ class NetSession {
             this.myInputs[k] = 0;
             this.send({ t: 'i', k, v: 0 });
         }
-        this.status = 'playing';
+        // A throttled tab can receive setup AND the result before its first frame
+        // runs begin() (e.g. queue, lock the phone, opponent forfeits). 'done' is
+        // terminal — resurrecting 'playing' here left the client in a dead fight
+        // the results transition (which keys on 'done') could never leave.
+        if (this.status !== 'done')
+            this.status = 'playing';
     }
     /**
      * Successful resume: rebuild the ENTIRE sim from the server's ledger —
@@ -3703,7 +3711,10 @@ class SoloSession {
         const s = this.setup;
         this.game = createGameState(s.seed);
         this.houseAi = createAi(1, s.solo.skill, s.solo.aiSeed);
-        this.status = 'playing';
+        // Same throttled-tab race as NetSession.begin(): a result that landed
+        // before the first frame must keep its terminal status.
+        if (this.status !== 'done')
+            this.status = 'playing';
     }
     /** Advance one tick — pure local sim; always succeeds while playing. */
     frame(pad) {
@@ -5483,6 +5494,11 @@ const drawTitle = (ctx, rosters, tick, menu) => {
             label(ctx, 'complete the AIR dialog to continue', cx, menuY0 + 48, 13, '#ffffffaa');
         }
         else {
+            // A live challenge rode in on ?room= — tell them WHY they're signing
+            // in; the title auto-joins the room the moment the gate clears.
+            if (menu.challenge && tick % 40 < 30) {
+                label(ctx, '⚔ YOUR OPPONENT IS WAITING — SIGN IN TO FIGHT ⚔', cx, menuY0 - 6, 13, '#ff5d7e');
+            }
             display(ctx, 'SIGN IN TO ENTER', cx, menuY0 + 18, 28, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
             label(ctx, 'TAP / PRESS  L  ·  AIR ACCOUNT (GOOGLE / EMAIL / WALLET)', cx, menuY0 + 48, 14, '#ffd166');
             label(ctx, '10 FREE CREDITS EVERY DAY YOU LOG IN   ·   R: RANKINGS', cx, menuY0 + 70, 12, '#ffffff88');
@@ -5712,14 +5728,22 @@ const drawInvite = (ctx, tick, v) => {
     else {
         label(ctx, v.refCode ? v.linkLabel : 'CONNECTING TO SERVER…', cx, by + bh + 20, 12, '#8fd0ff');
     }
+    // ---- CHALLENGE LIVE (protocol v5): the "right now" sibling of the async
+    // dare — parks you in a room keyed by your code and copies a ?room= link
+    // that drops the friend straight in. Free and unranked, so no fine print.
+    if (v.refCode) {
+        const flash = (tick + 20) % 44 < 36;
+        label(ctx, '⚔  C  CHALLENGE LIVE — FIGHT THEM RIGHT NOW · FREE', cx, by + bh + 40, 13, flash ? '#8fd0ff' : '#bfe4ff');
+        tapZone(cx - 260, by + bh + 27, 520, 24, 'challenge');
+    }
     // ---- the economics, as scarcity: the 10/week payout cap is urgency.
-    let iy = by + bh + 42;
+    let iy = by + bh + 62;
     label(ctx, `+25 CREDITS EACH WHEN THEY SIGN IN${v.bountiesLeft !== undefined ? `   ·   ${v.bountiesLeft}/10 BOUNTIES LEFT THIS WEEK` : ''}`, cx, iy, 13, v.bountiesLeft === 0 ? '#ff9d9d' : '#ffd166');
     if ((v.daresAccepted ?? 0) > 0) {
         iy += 19;
         label(ctx, `${v.daresAccepted} FIGHTER${v.daresAccepted === 1 ? '' : 'S'} ALREADY TOOK THE BAIT`, cx, iy, 12, '#8fd0ff');
     }
-    label(ctx, `ESC  BACK      ◀ ▶  TAUNT      T  WRITE YOUR OWN      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`, cx, VH - 12, 12, '#ffffff99');
+    label(ctx, `ESC  BACK      ◀ ▶  TAUNT      T  WRITE YOUR OWN      C  CHALLENGE      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`, cx, VH - 12, 12, '#ffffff99');
     tapZone(24, VH - 38, 150, 32, 'back');
 };
 /**
@@ -6164,7 +6188,13 @@ const drawStageSelect = (ctx, stageIds, cursor, tick) => {
 };
 const drawResults = (ctx, g, rosters, tick, age, // ticks since the results screen appeared — drives the pop-in
 xp, hint, // bottom action line — callers label the rematch with its fee
-dare) => {
+dare, // human won + signed in → offer the dare screen (peak ego)
+/**
+ * The SERVER's verdict, for matches the local sim never finished (opponent
+ * forfeit / mid-match settlement): g.winner is still -1 then, and indexing
+ * rosters[-1] crashed this screen before this fallback existed.
+ */
+serverWinner) => {
     ctx.fillStyle = '#0a0616bb';
     ctx.fillRect(0, 0, VW, VH);
     const pop = easeOutBack(clamp01(age / 16));
@@ -6175,8 +6205,10 @@ dare) => {
     ctx.scale(pop, pop);
     ctx.translate(-VW / 2, -(VH / 2 - 20));
     bevel(ctx, boxX, boxY, boxW, boxH, PANEL, GOLD, GOLD_DK, 3);
-    const w = g.winner;
-    const title = w === 2 ? 'DRAW GAME' : `${rosters[w].bundle.name.toUpperCase()} WINS`;
+    const w = g.winner >= 0 ? g.winner : serverWinner ?? -1;
+    const title = w === 2 ? 'DRAW GAME'
+        : w < 0 ? 'NO CONTEST'
+            : `${rosters[w].bundle.name.toUpperCase()} WINS`;
     display(ctx, title, VW / 2, VH / 2 - 20, 44, w === 2 ? COOL_OPTS : {});
     label(ctx, `${g.roundsWon0} — ${g.roundsWon1}`, VW / 2, VH / 2 + 22, 24, '#fff');
     ctx.restore();
@@ -6639,9 +6671,11 @@ const drawNetError = (ctx, error, mode, tick) => {
     }
     // What happens to the money — the first thing a player wants to know.
     label(ctx, 'THE SERVER SETTLES THIS MATCH FROM ITS OWN RECORD.', VW / 2, boxY + 108, 13, '#ffffffcc');
-    label(ctx, mode === 'wager'
-        ? 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE THE POT IS REFUNDED'
-        : 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE YOUR CREDIT IS REFUNDED', VW / 2, boxY + 128, 11, '#ffd166');
+    label(ctx, mode === 'friendly'
+        ? 'FRIENDLY MATCH — NOTHING WAS STAKED, NOTHING IS LOST'
+        : mode === 'wager'
+            ? 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE THE POT IS REFUNDED'
+            : 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE YOUR CREDIT IS REFUNDED', VW / 2, boxY + 128, 11, '#ffd166');
     if (tick % 60 < 44) {
         label(ctx, 'ENTER / ESC — BACK TO MENU', VW / 2, boxY + 162, 14, GOLD_LT);
     }
@@ -7388,6 +7422,11 @@ let tauntIdx = 0;
 let customTaunt = '';
 let inviteCopiedAge = -1; // ≥0 → the button reads "DARE ARMED"
 let inviteFrom = 'title'; // where ESC returns to
+// ---- Friendly challenge rooms (protocol v5): FREE, UNRANKED, paired by a
+// shared room code (the inviter's ref code). ?room= deep links a challenged
+// friend straight into the inviter's room — after the AIR sign-in gate.
+let friendlyRoom = ''; // the room the current/last friendly queued into
+let pendingRoom = ''; // ?room= from a challenge link, waiting on sign-in
 const currentTaunt = () => customTaunt || TAUNTS[tauntIdx];
 const dareLink = () => `${DARE_LINK_BASE}/${account?.refCode ?? ''}?t=${encodeURIComponent(currentTaunt())}`;
 /** Coarse pointer ≈ phone/tablet → prefer the OS share sheet over clipboard. */
@@ -7633,6 +7672,14 @@ const applyBootDeepLink = () => {
     if (refQ && /^[A-Za-z0-9-]{3,40}$/.test(refQ)) {
         localStorage.setItem(REF_CODE_KEY, refQ.toUpperCase());
     }
+    // Live challenge (?room=): remember it in-memory only — it's a "fight me
+    // RIGHT NOW" invitation, not a durable coupon. The title branch auto-joins
+    // the room once the player is signed in (AIR login is an in-page dialog,
+    // so no reload loses this).
+    const roomQ = q.get('room');
+    if (roomQ && /^[A-Za-z0-9-]{3,40}$/.test(roomQ)) {
+        pendingRoom = roomQ.toUpperCase();
+    }
     if (modeQ === 'cpu' || modeQ === 'online' || modeQ === '2p') {
         mode = modeQ;
     }
@@ -7691,10 +7738,12 @@ const resetMatchFx = (g) => {
 };
 /**
  * Queue for a server match (ADR 0003 + M5 credits).
- * 'wager'  = PvP, 10-credit entrance each, winner takes the pot.
- * 'solo'   = a single match vs the HOUSE agent at your level, 1 credit.
- * 'arcade' = AGENT ARCADE, the ranked gauntlet — 1 credit per RUN.
+ * 'wager'    = PvP, 10-credit entrance each, winner takes the pot.
+ * 'solo'     = a single match vs the HOUSE agent at your level, 1 credit.
+ * 'arcade'   = AGENT ARCADE, the ranked gauntlet — 1 credit per RUN.
  *   `runToken` continues an existing run (the next battle); omitted = new run.
+ * 'friendly' = private challenge (v5): PvP paired by `friendlyRoom` instead
+ *   of the public queue. FREE and UNRANKED — verified winner, nothing else.
  */
 const startOnline = (m, runToken) => {
     const roster = allRosters[picks[0]];
@@ -7712,12 +7761,25 @@ const startOnline = (m, runToken) => {
             return; // player backed out while fetching
         const email = auth.email || undefined; // AIR write-back target (ADR 0004)
         // Solo/arcade (v3/v4): pure LOCAL simulation of the pinned house AI —
-        // zero added latency; the server re-derives the AI to verify. Wager:
-        // rollback PvP.
-        net = m === 'wager'
-            ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef())
+        // zero added latency; the server re-derives the AI to verify. Wager and
+        // friendly: rollback PvP over the relay.
+        net = m === 'wager' || m === 'friendly'
+            ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(), m === 'friendly' ? friendlyRoom : undefined)
             : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(), m === 'arcade' ? { runToken } : undefined);
     });
+};
+/**
+ * Enter a friendly challenge room with the remembered fighter (same pick
+ * logic as quick play — the invite screen and ?room= links skip the select
+ * detour; C on the select screen is still available first if they care).
+ */
+const startFriendly = (room) => {
+    let idx = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
+    if (idx < 0)
+        idx = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+    picks[0] = idx;
+    friendlyRoom = room.toUpperCase();
+    startOnline('friendly');
 };
 /** Match setup arrived — install the pinned characters/stage and begin. */
 const installOnlineMatch = () => {
@@ -7762,7 +7824,9 @@ const installOnlineMatch = () => {
         ]
         : s.mode === 'solo'
             ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP', 'RANKED · SERVER-VERIFIED']
-            : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
+            : s.mode === 'friendly'
+                ? ['FRIENDLY CHALLENGE      NO FEE · NO POT · NO RECORDS', 'BRAGGING RIGHTS ONLY · SERVER-VERIFIED']
+                : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
     const newChallenger = s.mode === 'arcade' && (s.arcade?.battle ?? 0) > 0;
     void audio.playStinger(newChallenger ? 'here_comes_a_new_challenger' : 'vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
@@ -8275,6 +8339,14 @@ const frame = () => {
             accountToastAge = -1;
         if (referralToastAge >= 0 && ++referralToastAge > 300)
             referralToastAge = -1;
+        // A challenge link (?room=) auto-joins the friend's room the moment the
+        // sign-in gate clears — clicking the link WAS the consent. One last
+        // title frame draws beneath; the lobby takes over next frame.
+        if (signedIn && accountFetch === 'done' && pendingRoom) {
+            const room = pendingRoom;
+            pendingRoom = '';
+            startFriendly(room);
+        }
         drawTitle(ctx, allRosters, uiTick, {
             mode, cpuLevel: cpuLevelFor(profile, lever),
             authLabel: authName() ?? (DEV_GUEST ? `DEV·${DEV_GUEST.toUpperCase()}` : null),
@@ -8288,6 +8360,7 @@ const frame = () => {
             dailyToast: accountToastAge >= 0,
             referralToast: referralToastAge >= 0,
             refCode: accountFetch === 'done' ? account?.refCode : undefined,
+            challenge: !!pendingRoom,
             fighter: (allRosters.find((r) => r.id === lastFighter && !r.disabled)
                 ?? allRosters.find((r) => !r.disabled))?.bundle.name,
         });
@@ -8420,6 +8493,16 @@ const frame = () => {
             editTaunt();
             inviteCopiedAge = -1;
         }
+        else if (account?.refCode && (pressedThisFrame.has('KeyC') || taps.has('challenge'))) {
+            // CHALLENGE LIVE: park in a room keyed by MY code and copy the live
+            // link (?room= + ?ref= — a brand-new friend still redeems the dare
+            // bonus by signing up). The lobby explains the waiting state.
+            const code = account.refCode;
+            void navigator.clipboard
+                ?.writeText(`${location.origin}/?room=${encodeURIComponent(code)}&ref=${encodeURIComponent(code)}`)
+                .catch(() => { });
+            startFriendly(code);
+        }
         else if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('copydare')) {
             shareDare();
         }
@@ -8445,13 +8528,15 @@ const frame = () => {
         const dots = '.'.repeat(1 + (Math.trunc(uiTick / 20) % 3));
         const solo = queuedMode === 'solo';
         const arcadeQ = queuedMode === 'arcade';
+        const friendlyQ = queuedMode === 'friendly';
         const failed = net?.status === 'error';
         const msg = !net ? `CONNECTING${dots}` // token fetch in flight
             : failed ? `OFFLINE: ${net.error}`
                 : net.setup ? 'OPPONENT FOUND — STARTING'
                     : net.status === 'queued'
                         ? (arcadeQ ? `ENTERING AGENT ARCADE${dots}`
-                            : solo ? `CALLING THE HOUSE AGENT${dots}` : `SEARCHING FOR OPPONENT${dots}`)
+                            : friendlyQ ? `WAITING FOR YOUR CHALLENGER${dots}`
+                                : solo ? `CALLING THE HOUSE AGENT${dots}` : `SEARCHING FOR OPPONENT${dots}`)
                         : `CONNECTING${dots}`;
         ctx.font = 'bold 22px "Courier New", monospace';
         ctx.textAlign = 'center';
@@ -8461,16 +8546,20 @@ const frame = () => {
         ctx.fillStyle = '#ffd166';
         ctx.fillText(arcadeQ
             ? 'RANKED GAUNTLET · 1 CREDIT PER RUN · BEAT EVERY AGENT'
-            : solo
-                ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
-                : 'WAGER · 10 CREDITS ENTRY EACH · WINNER TAKES THE 20 POT', VW / 2, VH / 2 - 4);
+            : friendlyQ
+                ? `FRIENDLY · FREE · NO POT · ROOM ${friendlyRoom}`
+                : solo
+                    ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
+                    : 'WAGER · 10 CREDITS ENTRY EACH · WINNER TAKES THE 20 POT', VW / 2, VH / 2 - 4);
         ctx.font = '13px "Courier New", monospace';
         ctx.fillStyle = '#ffffff88';
         ctx.fillText(failed
             ? (arcadeQ ? 'TAP / ENTER: PRACTICE GAUNTLET (no fee · no XP · no records)'
                 : solo ? 'TAP / ENTER: FREE PRACTICE (no fee · no XP · no records)'
                     : 'is the match server running?  npm run server')
-            : 'humans and agents share this queue  ·  ESC: cancel', VW / 2, VH / 2 + 24);
+            : friendlyQ
+                ? 'challenge link copied — paste it to your friend, they must join while you wait  ·  ESC: cancel'
+                : 'humans and agents share this queue  ·  ESC: cancel', VW / 2, VH / 2 + 24);
         if (failed) {
             ctx.fillText('TAP BACK / ESC: leave', VW / 2, VH / 2 + 46);
             // Phones have no Enter/Esc — without these zones iOS is stuck on OFFLINE.
@@ -8507,6 +8596,11 @@ const frame = () => {
                 // Backing out MID-RUN (between battles): the run is abandoned — the
                 // title, never the select screen (no fighter switching mid-run).
                 endArcade();
+            }
+            else if (friendlyQ) {
+                // Canceling a challenge → the invite screen (both the inviter who
+                // came from it and a deep-linked friend, who lands on their own).
+                screen = 'invite';
             }
             else {
                 screen = 'select';
@@ -8678,8 +8772,12 @@ const frame = () => {
             }
         }
         renderFight(game);
+        // The effective winner: the local sim's, or the SERVER's verdict when the
+        // sim never finished (opponent forfeit / mid-match settlement) — without
+        // it this screen indexed rosters[-1] and crashed on every ragequit win.
+        const effWinner = game.winner >= 0 ? game.winner : net?.result?.winner ?? -1;
         // Peak-ego entry point: a signed-in winner gets offered the dare screen.
-        const canDare = game.winner === localSide() && !!account?.refCode;
+        const canDare = effWinner === localSide() && !!account?.refCode;
         // Arcade: this screen is the between-battles interstitial. The run only
         // moves FORWARD (next challenger) or ENDS (quit to title) — there is no
         // path back to the select screen mid-run.
@@ -8689,8 +8787,8 @@ const frame = () => {
                 ? `ARCADE COMPLETE — ALL ${arcade.total} AGENTS DOWN!        TAP / ENTER: TITLE`
                 : `BATTLE ${arcade.stage + 1} OF ${arcade.total} CLEARED        TAP / ENTER: NEXT CHALLENGER        ESC: QUIT`)
             : net
-                ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : '10 CR'}        ESC: CHANGE FIGHTER`
-                : undefined, canDare);
+                ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : queuedMode === 'friendly' ? 'FREE' : '10 CR'}        ESC: CHANGE FIGHTER`
+                : undefined, canDare, net?.result?.winner);
         // Online: the server's verdict is the real result (ADR 0003).
         if (net) {
             ctx.font = 'bold 15px "Courier New", monospace';

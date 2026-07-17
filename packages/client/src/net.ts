@@ -19,7 +19,7 @@ import type { AiState, GameState, InputFrame } from '@af/core';
  */
 
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 4;
+const NET_PROTOCOL = 5;
 const MAX_AHEAD = 10;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -33,7 +33,7 @@ export interface NetSetup {
   chars: [{ id: string; hash?: string }, { id: string; hash?: string }];
   names: [string, string];
   agents: [boolean, boolean];
-  mode?: 'wager' | 'solo' | 'arcade';
+  mode?: 'wager' | 'solo' | 'arcade' | 'friendly';
   fee?: number;
   /** v3 local-sim solo: the deterministic house AI this client simulates. */
   solo?: { skill: number; aiSeed: number };
@@ -125,9 +125,10 @@ export class NetSession {
     private character: string,
     private bundleHash?: string,
     private authToken?: string,
-    private mode: 'wager' | 'solo' = 'wager',
+    private mode: 'wager' | 'friendly' = 'wager',
     private email?: string, // AIR-account email — reputation write-back target only
     private ref?: string, // stashed dare code (?ref=) — redeemed server-side once
+    private room?: string, // friendly rendezvous code (mode 'friendly' only)
   ) {
     this.connect(false);
   }
@@ -141,7 +142,7 @@ export class NetSession {
       if (resume && this.setup?.resume) {
         this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
       } else {
-        this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode });
+        this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode, room: this.room });
         this.status = 'queued';
       }
     };
@@ -276,7 +277,11 @@ export class NetSession {
       this.myInputs[k] = 0;
       this.send({ t: 'i', k, v: 0 });
     }
-    this.status = 'playing';
+    // A throttled tab can receive setup AND the result before its first frame
+    // runs begin() (e.g. queue, lock the phone, opponent forfeits). 'done' is
+    // terminal — resurrecting 'playing' here left the client in a dead fight
+    // the results transition (which keys on 'done') could never leave.
+    if (this.status !== 'done') this.status = 'playing';
   }
 
   /**
@@ -571,7 +576,9 @@ export class SoloSession {
     const s = this.setup!;
     this.game = createGameState(s.seed);
     this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed);
-    this.status = 'playing';
+    // Same throttled-tab race as NetSession.begin(): a result that landed
+    // before the first frame must keep its terminal status.
+    if (this.status !== 'done') this.status = 'playing';
   }
 
   /** Advance one tick — pure local sim; always succeeds while playing. */

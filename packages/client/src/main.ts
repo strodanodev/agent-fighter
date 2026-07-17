@@ -120,7 +120,7 @@ const DEV_GUEST = new URLSearchParams(location.search).get('dev');
 let account: NetAccount | null = null;
 let accountFetch: 'idle' | 'busy' | 'done' | 'fail' = 'idle';
 let accountToastAge = -1; // ≥0 → the "+10 DAILY CREDITS" toast is animating
-let queuedMode: 'solo' | 'wager' | 'arcade' = 'wager';
+let queuedMode: 'solo' | 'wager' | 'arcade' | 'friendly' = 'wager';
 let practiceFree = false; // offline-fallback match: no fee, no XP, no records
 
 // ---- P0 loop redesign: quick play, VS card, wallet strip.
@@ -154,6 +154,11 @@ let tauntIdx = 0;
 let customTaunt = '';
 let inviteCopiedAge = -1; // ≥0 → the button reads "DARE ARMED"
 let inviteFrom: 'title' | 'results' = 'title'; // where ESC returns to
+// ---- Friendly challenge rooms (protocol v5): FREE, UNRANKED, paired by a
+// shared room code (the inviter's ref code). ?room= deep links a challenged
+// friend straight into the inviter's room — after the AIR sign-in gate.
+let friendlyRoom = ''; // the room the current/last friendly queued into
+let pendingRoom = ''; // ?room= from a challenge link, waiting on sign-in
 const currentTaunt = (): string => customTaunt || TAUNTS[tauntIdx]!;
 const dareLink = (): string =>
   `${DARE_LINK_BASE}/${account?.refCode ?? ''}?t=${encodeURIComponent(currentTaunt())}`;
@@ -411,6 +416,15 @@ const applyBootDeepLink = (): void => {
     localStorage.setItem(REF_CODE_KEY, refQ.toUpperCase());
   }
 
+  // Live challenge (?room=): remember it in-memory only — it's a "fight me
+  // RIGHT NOW" invitation, not a durable coupon. The title branch auto-joins
+  // the room once the player is signed in (AIR login is an in-page dialog,
+  // so no reload loses this).
+  const roomQ = q.get('room');
+  if (roomQ && /^[A-Za-z0-9-]{3,40}$/.test(roomQ)) {
+    pendingRoom = roomQ.toUpperCase();
+  }
+
   if (modeQ === 'cpu' || modeQ === 'online' || modeQ === '2p') {
     mode = modeQ;
   }
@@ -471,12 +485,14 @@ const resetMatchFx = (g: GameState): void => {
 
 /**
  * Queue for a server match (ADR 0003 + M5 credits).
- * 'wager'  = PvP, 10-credit entrance each, winner takes the pot.
- * 'solo'   = a single match vs the HOUSE agent at your level, 1 credit.
- * 'arcade' = AGENT ARCADE, the ranked gauntlet — 1 credit per RUN.
+ * 'wager'    = PvP, 10-credit entrance each, winner takes the pot.
+ * 'solo'     = a single match vs the HOUSE agent at your level, 1 credit.
+ * 'arcade'   = AGENT ARCADE, the ranked gauntlet — 1 credit per RUN.
  *   `runToken` continues an existing run (the next battle); omitted = new run.
+ * 'friendly' = private challenge (v5): PvP paired by `friendlyRoom` instead
+ *   of the public queue. FREE and UNRANKED — verified winner, nothing else.
  */
-const startOnline = (m: 'solo' | 'wager' | 'arcade', runToken?: string): void => {
+const startOnline = (m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: string): void => {
   const roster = allRosters[picks[0]]!;
   lastFighter = roster.id;
   localStorage.setItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
@@ -491,13 +507,27 @@ const startOnline = (m: 'solo' | 'wager' | 'arcade', runToken?: string): void =>
     if (screen !== 'online' || net) return; // player backed out while fetching
     const email = auth.email || undefined; // AIR write-back target (ADR 0004)
     // Solo/arcade (v3/v4): pure LOCAL simulation of the pinned house AI —
-    // zero added latency; the server re-derives the AI to verify. Wager:
-    // rollback PvP.
-    net = m === 'wager'
-      ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef())
+    // zero added latency; the server re-derives the AI to verify. Wager and
+    // friendly: rollback PvP over the relay.
+    net = m === 'wager' || m === 'friendly'
+      ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(),
+        m === 'friendly' ? friendlyRoom : undefined)
       : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(),
         m === 'arcade' ? { runToken } : undefined);
   });
+};
+
+/**
+ * Enter a friendly challenge room with the remembered fighter (same pick
+ * logic as quick play — the invite screen and ?room= links skip the select
+ * detour; C on the select screen is still available first if they care).
+ */
+const startFriendly = (room: string): void => {
+  let idx = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
+  if (idx < 0) idx = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+  picks[0] = idx;
+  friendlyRoom = room.toUpperCase();
+  startOnline('friendly');
 };
 
 /** Match setup arrived — install the pinned characters/stage and begin. */
@@ -542,7 +572,9 @@ const installOnlineMatch = (): void => {
     ]
     : s.mode === 'solo'
       ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP', 'RANKED · SERVER-VERIFIED']
-      : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
+      : s.mode === 'friendly'
+        ? ['FRIENDLY CHALLENGE      NO FEE · NO POT · NO RECORDS', 'BRAGGING RIGHTS ONLY · SERVER-VERIFIED']
+        : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
   const newChallenger = s.mode === 'arcade' && (s.arcade?.battle ?? 0) > 0;
   void audio.playStinger(newChallenger ? 'here_comes_a_new_challenger' : 'vs',
     { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
@@ -1031,6 +1063,14 @@ const frame = (): void => {
     if (!signedIn && account) { account = null; accountFetch = 'idle'; } // signed out
     if (accountToastAge >= 0 && ++accountToastAge > 300) accountToastAge = -1;
     if (referralToastAge >= 0 && ++referralToastAge > 300) referralToastAge = -1;
+    // A challenge link (?room=) auto-joins the friend's room the moment the
+    // sign-in gate clears — clicking the link WAS the consent. One last
+    // title frame draws beneath; the lobby takes over next frame.
+    if (signedIn && accountFetch === 'done' && pendingRoom) {
+      const room = pendingRoom;
+      pendingRoom = '';
+      startFriendly(room);
+    }
     drawTitle(ctx, allRosters, uiTick, {
       mode, cpuLevel: cpuLevelFor(profile, lever),
       authLabel: authName() ?? (DEV_GUEST ? `DEV·${DEV_GUEST.toUpperCase()}` : null),
@@ -1044,6 +1084,7 @@ const frame = (): void => {
       dailyToast: accountToastAge >= 0,
       referralToast: referralToastAge >= 0,
       refCode: accountFetch === 'done' ? account?.refCode : undefined,
+      challenge: !!pendingRoom,
       fighter: (allRosters.find((r) => r.id === lastFighter && !r.disabled)
         ?? allRosters.find((r) => !r.disabled))?.bundle.name,
     });
@@ -1153,6 +1194,15 @@ const frame = (): void => {
     } else if (pressedThisFrame.has('KeyT') || taps.has('taunt:edit')) {
       editTaunt();
       inviteCopiedAge = -1;
+    } else if (account?.refCode && (pressedThisFrame.has('KeyC') || taps.has('challenge'))) {
+      // CHALLENGE LIVE: park in a room keyed by MY code and copy the live
+      // link (?room= + ?ref= — a brand-new friend still redeems the dare
+      // bonus by signing up). The lobby explains the waiting state.
+      const code = account.refCode;
+      void navigator.clipboard
+        ?.writeText(`${location.origin}/?room=${encodeURIComponent(code)}&ref=${encodeURIComponent(code)}`)
+        .catch(() => { /* lobby shows the room code as fallback */ });
+      startFriendly(code);
     } else if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('copydare')) {
       shareDare();
     } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
@@ -1175,12 +1225,14 @@ const frame = (): void => {
     const dots = '.'.repeat(1 + (Math.trunc(uiTick / 20) % 3));
     const solo = queuedMode === 'solo';
     const arcadeQ = queuedMode === 'arcade';
+    const friendlyQ = queuedMode === 'friendly';
     const failed = net?.status === 'error';
     const msg = !net ? `CONNECTING${dots}` // token fetch in flight
       : failed ? `OFFLINE: ${net.error}`
       : net.setup ? 'OPPONENT FOUND — STARTING'
       : net.status === 'queued'
         ? (arcadeQ ? `ENTERING AGENT ARCADE${dots}`
+          : friendlyQ ? `WAITING FOR YOUR CHALLENGER${dots}`
           : solo ? `CALLING THE HOUSE AGENT${dots}` : `SEARCHING FOR OPPONENT${dots}`)
       : `CONNECTING${dots}`;
     ctx.font = 'bold 22px "Courier New", monospace';
@@ -1191,16 +1243,20 @@ const frame = (): void => {
     ctx.fillStyle = '#ffd166';
     ctx.fillText(arcadeQ
       ? 'RANKED GAUNTLET · 1 CREDIT PER RUN · BEAT EVERY AGENT'
-      : solo
-        ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
-        : 'WAGER · 10 CREDITS ENTRY EACH · WINNER TAKES THE 20 POT', VW / 2, VH / 2 - 4);
+      : friendlyQ
+        ? `FRIENDLY · FREE · NO POT · ROOM ${friendlyRoom}`
+        : solo
+          ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
+          : 'WAGER · 10 CREDITS ENTRY EACH · WINNER TAKES THE 20 POT', VW / 2, VH / 2 - 4);
     ctx.font = '13px "Courier New", monospace';
     ctx.fillStyle = '#ffffff88';
     ctx.fillText(failed
       ? (arcadeQ ? 'TAP / ENTER: PRACTICE GAUNTLET (no fee · no XP · no records)'
         : solo ? 'TAP / ENTER: FREE PRACTICE (no fee · no XP · no records)'
         : 'is the match server running?  npm run server')
-      : 'humans and agents share this queue  ·  ESC: cancel', VW / 2, VH / 2 + 24);
+      : friendlyQ
+        ? 'challenge link copied — paste it to your friend, they must join while you wait  ·  ESC: cancel'
+        : 'humans and agents share this queue  ·  ESC: cancel', VW / 2, VH / 2 + 24);
     if (failed) {
       ctx.fillText('TAP BACK / ESC: leave', VW / 2, VH / 2 + 46);
       // Phones have no Enter/Esc — without these zones iOS is stuck on OFFLINE.
@@ -1233,6 +1289,10 @@ const frame = (): void => {
         // Backing out MID-RUN (between battles): the run is abandoned — the
         // title, never the select screen (no fighter switching mid-run).
         endArcade();
+      } else if (friendlyQ) {
+        // Canceling a challenge → the invite screen (both the inviter who
+        // came from it and a deep-linked friend, who lands on their own).
+        screen = 'invite';
       } else {
         screen = 'select';
         locked = [false, false];
@@ -1393,8 +1453,12 @@ const frame = (): void => {
       }
     }
     renderFight(game);
+    // The effective winner: the local sim's, or the SERVER's verdict when the
+    // sim never finished (opponent forfeit / mid-match settlement) — without
+    // it this screen indexed rosters[-1] and crashed on every ragequit win.
+    const effWinner = game.winner >= 0 ? game.winner : net?.result?.winner ?? -1;
     // Peak-ego entry point: a signed-in winner gets offered the dare screen.
-    const canDare = game.winner === localSide() && !!account?.refCode;
+    const canDare = effWinner === localSide() && !!account?.refCode;
     // Arcade: this screen is the between-battles interstitial. The run only
     // moves FORWARD (next challenger) or ENDS (quit to title) — there is no
     // path back to the select screen mid-run.
@@ -1405,9 +1469,9 @@ const frame = (): void => {
           ? `ARCADE COMPLETE — ALL ${arcade.total} AGENTS DOWN!        TAP / ENTER: TITLE`
           : `BATTLE ${arcade.stage + 1} OF ${arcade.total} CLEARED        TAP / ENTER: NEXT CHALLENGER        ESC: QUIT`)
         : net
-          ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : '10 CR'}        ESC: CHANGE FIGHTER`
+          ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : queuedMode === 'friendly' ? 'FREE' : '10 CR'}        ESC: CHANGE FIGHTER`
           : undefined,
-      canDare);
+      canDare, net?.result?.winner);
     // Online: the server's verdict is the real result (ADR 0003).
     if (net) {
       ctx.font = 'bold 15px "Courier New", monospace';

@@ -79,7 +79,13 @@ interface Client {
 
 interface Match {
   id: string;
-  mode: MatchMode;
+  /**
+   * 'friendly' (v5) lives OUTSIDE MatchMode on purpose: persistence never
+   * sees it — settlement skips recordMatch entirely (no fee, no XP, no W-L,
+   * no referral release), so the SQL layer needs no new mode. Everything
+   * else (relay, ledger, verify, forfeit ladder, resume) is mode-agnostic.
+   */
+  mode: MatchMode | 'friendly';
   fee: number;
   /** Solo (v3): clients[1] is null — the opponent is the pinned AI below. */
   clients: [Client, Client | null];
@@ -270,6 +276,13 @@ export const createMatchServer = (opts: {
 
   const clients = new Set<Client>();
   const queue: Client[] = [];
+  /**
+   * Friendly rendezvous (v5): room code → the player parked in it, waiting.
+   * Symmetric by design — the server pairs ANY two sockets presenting the
+   * same code and never cares whose ref_code it happens to be. No fee is
+   * escrowed, so a waiter who never gets a challenger strands nothing.
+   */
+  const rooms = new Map<string, Client>();
   /** In-flight matches by id — the CResume lookup. */
   const liveMatches = new Map<string, Match>();
   /** AGENT ARCADE runs by token (v4). */
@@ -387,7 +400,12 @@ export const createMatchServer = (opts: {
     // Persist + award XP AFTER the result is out — progression is async and
     // must never delay or gate the verdict. record_match is idempotent by
     // match id, so a crash-retry can't double-award.
-    if (persistence) {
+    //
+    // FRIENDLY matches skip this block ENTIRELY (the anti-collusion stance):
+    // nothing was escrowed, so nothing settles — no XP, no W-L, no credit
+    // movement, no referral release. The verified result above is the whole
+    // payout (bragging rights). Persistence never learns the match happened.
+    if (persistence && m.mode !== 'friendly') {
       void persistence.recordMatch({
         matchId: m.id, mode: m.mode, fee: m.fee, payout: arcadePayout,
         identities: [m.clients[0].identity, m.clients[1]?.identity ?? null],
@@ -472,7 +490,7 @@ export const createMatchServer = (opts: {
   };
 
   const startMatch = (
-    c0: Client, c1: Client | null, mode: MatchMode, fee: number, id?: string,
+    c0: Client, c1: Client | null, mode: MatchMode | 'friendly', fee: number, id?: string,
     solo?: { skill: number; aiSeed: number; character: string; level: number },
     arcadeRun?: ArcadeRun,
   ): void => {
@@ -730,13 +748,38 @@ export const createMatchServer = (opts: {
         }
         c.character = msg.character;
 
-        const mode: MatchMode = msg.mode === 'solo' ? 'solo' : msg.mode === 'arcade' ? 'arcade' : 'wager';
+        const mode: MatchMode | 'friendly' = msg.mode === 'solo' ? 'solo'
+          : msg.mode === 'arcade' ? 'arcade'
+          : msg.mode === 'friendly' ? 'friendly'
+          : 'wager';
         const runToken = typeof msg.runToken === 'string' ? msg.runToken : '';
         void (async () => {
           await c.identityReady;
           if (c.state !== 'lobby' || c.ws.readyState !== WebSocket.OPEN) return;
           if (persistence && !c.identity) {
-            return send(c, { t: 'error', code: 'auth', msg: 'sign in to play ranked/wager matches' });
+            return send(c, { t: 'error', code: 'auth', msg: 'sign in to play online matches' });
+          }
+          if (mode === 'friendly') {
+            // Private challenge (v5): symmetric rendezvous by room code —
+            // first arrival parks, second pairs. FREE and UNRANKED (see
+            // protocol.ts CQueue); no escrow, no credit pre-check. Same
+            // room string, same shape rules as dare codes.
+            const room = String(msg.room ?? '').trim().toUpperCase();
+            if (!/^[A-Z0-9-]{3,40}$/.test(room)) {
+              return send(c, { t: 'error', msg: 'friendly challenge needs a room code' });
+            }
+            const waiter = rooms.get(room);
+            if (waiter && waiter !== c && waiter.ws.readyState === WebSocket.OPEN && waiter.state === 'queued') {
+              rooms.delete(room);
+              c.state = 'queued';
+              send(c, { t: 'queued' });
+              return startMatch(waiter, c, 'friendly', 0);
+            }
+            // Empty room (or a stale/dead waiter) → this client becomes the
+            // waiter. Overwriting a dead entry is the cleanup path.
+            rooms.set(room, c);
+            c.state = 'queued';
+            return send(c, { t: 'queued' });
           }
           if (mode === 'arcade') {
             // AGENT ARCADE continuation: a valid run token re-enters the run
@@ -893,6 +936,8 @@ export const createMatchServer = (opts: {
     clients.delete(c);
     const qi = queue.indexOf(c);
     if (qi >= 0) queue.splice(qi, 1);
+    // A friendly waiter leaving empties their room (nothing was escrowed).
+    for (const [code, waiter] of rooms) if (waiter === c) rooms.delete(code);
     const m = c.match;
     if (!m || m.finished) return;
     m.gone[c.side] = true;

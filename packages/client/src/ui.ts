@@ -819,6 +819,8 @@ export interface TitleMenuState {
   referralToast?: boolean;
   /** This player's dare code — enables the DARE A FRIEND row. */
   refCode?: string;
+  /** A ?room= challenge link is waiting on sign-in — say so on the gate. */
+  challenge?: boolean;
   /** Remembered fighter (quick match) — shown as "FIGHTING AS …". */
   fighter?: string;
 }
@@ -888,6 +890,11 @@ export const drawTitle = (
       display(ctx, 'SIGNING IN…', cx, menuY0 + 18, 26, { glow: 'rgba(143,184,255,0.55)' });
       label(ctx, 'complete the AIR dialog to continue', cx, menuY0 + 48, 13, '#ffffffaa');
     } else {
+      // A live challenge rode in on ?room= — tell them WHY they're signing
+      // in; the title auto-joins the room the moment the gate clears.
+      if (menu.challenge && tick % 40 < 30) {
+        label(ctx, '⚔ YOUR OPPONENT IS WAITING — SIGN IN TO FIGHT ⚔', cx, menuY0 - 6, 13, '#ff5d7e');
+      }
       display(ctx, 'SIGN IN TO ENTER', cx, menuY0 + 18, 28, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
       label(ctx, 'TAP / PRESS  L  ·  AIR ACCOUNT (GOOGLE / EMAIL / WALLET)', cx, menuY0 + 48, 14, '#ffd166');
       label(ctx, '10 FREE CREDITS EVERY DAY YOU LOG IN   ·   R: RANKINGS', cx, menuY0 + 70, 12, '#ffffff88');
@@ -1165,8 +1172,18 @@ export const drawInvite = (
     label(ctx, v.refCode ? v.linkLabel : 'CONNECTING TO SERVER…', cx, by + bh + 20, 12, '#8fd0ff');
   }
 
+  // ---- CHALLENGE LIVE (protocol v5): the "right now" sibling of the async
+  // dare — parks you in a room keyed by your code and copies a ?room= link
+  // that drops the friend straight in. Free and unranked, so no fine print.
+  if (v.refCode) {
+    const flash = (tick + 20) % 44 < 36;
+    label(ctx, '⚔  C  CHALLENGE LIVE — FIGHT THEM RIGHT NOW · FREE', cx, by + bh + 40,
+      13, flash ? '#8fd0ff' : '#bfe4ff');
+    tapZone(cx - 260, by + bh + 27, 520, 24, 'challenge');
+  }
+
   // ---- the economics, as scarcity: the 10/week payout cap is urgency.
-  let iy = by + bh + 42;
+  let iy = by + bh + 62;
   label(ctx,
     `+25 CREDITS EACH WHEN THEY SIGN IN${v.bountiesLeft !== undefined ? `   ·   ${v.bountiesLeft}/10 BOUNTIES LEFT THIS WEEK` : ''}`,
     cx, iy, 13, v.bountiesLeft === 0 ? '#ff9d9d' : '#ffd166');
@@ -1176,7 +1193,7 @@ export const drawInvite = (
   }
 
   label(ctx,
-    `ESC  BACK      ◀ ▶  TAUNT      T  WRITE YOUR OWN      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`,
+    `ESC  BACK      ◀ ▶  TAUNT      T  WRITE YOUR OWN      C  CHALLENGE      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`,
     cx, VH - 12, 12, '#ffffff99');
   tapZone(24, VH - 38, 150, 32, 'back');
 };
@@ -1698,6 +1715,12 @@ export const drawResults = (
   xp?: XpInfo | null,
   hint?: string, // bottom action line — callers label the rematch with its fee
   dare?: boolean, // human won + signed in → offer the dare screen (peak ego)
+  /**
+   * The SERVER's verdict, for matches the local sim never finished (opponent
+   * forfeit / mid-match settlement): g.winner is still -1 then, and indexing
+   * rosters[-1] crashed this screen before this fallback existed.
+   */
+  serverWinner?: number,
 ): void => {
   ctx.fillStyle = '#0a0616bb';
   ctx.fillRect(0, 0, VW, VH);
@@ -1711,8 +1734,10 @@ export const drawResults = (
   ctx.scale(pop, pop);
   ctx.translate(-VW / 2, -(VH / 2 - 20));
   bevel(ctx, boxX, boxY, boxW, boxH, PANEL, GOLD, GOLD_DK, 3);
-  const w = g.winner;
-  const title = w === 2 ? 'DRAW GAME' : `${rosters[w as 0 | 1].bundle.name.toUpperCase()} WINS`;
+  const w = g.winner >= 0 ? g.winner : serverWinner ?? -1;
+  const title = w === 2 ? 'DRAW GAME'
+    : w < 0 ? 'NO CONTEST'
+    : `${rosters[w as 0 | 1].bundle.name.toUpperCase()} WINS`;
   display(ctx, title, VW / 2, VH / 2 - 20, 44, w === 2 ? COOL_OPTS : {});
   label(ctx, `${g.roundsWon0} — ${g.roundsWon1}`, VW / 2, VH / 2 + 22, 24, '#fff');
   ctx.restore();
@@ -2210,7 +2235,7 @@ export const drawVsCard = (
 export const drawNetError = (
   ctx: CanvasRenderingContext2D,
   error: string,
-  mode: 'solo' | 'wager' | 'arcade',
+  mode: 'solo' | 'wager' | 'arcade' | 'friendly',
   tick: number,
 ): void => {
   ctx.fillStyle = 'rgba(6,4,12,0.82)';
@@ -2232,9 +2257,11 @@ export const drawNetError = (
 
   // What happens to the money — the first thing a player wants to know.
   label(ctx, 'THE SERVER SETTLES THIS MATCH FROM ITS OWN RECORD.', VW / 2, boxY + 108, 13, '#ffffffcc');
-  label(ctx, mode === 'wager'
-    ? 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE THE POT IS REFUNDED'
-    : 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE YOUR CREDIT IS REFUNDED',
+  label(ctx, mode === 'friendly'
+    ? 'FRIENDLY MATCH — NOTHING WAS STAKED, NOTHING IS LOST'
+    : mode === 'wager'
+      ? 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE THE POT IS REFUNDED'
+      : 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE YOUR CREDIT IS REFUNDED',
   VW / 2, boxY + 128, 11, '#ffd166');
 
   if (tick % 60 < 44) {

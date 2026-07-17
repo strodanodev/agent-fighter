@@ -7,7 +7,7 @@
  * server relays it and re-simulates the ledger to derive the result.
  */
 
-export const PROTOCOL_VERSION = 4; // v4: AGENT ARCADE ranked gauntlet runs
+export const PROTOCOL_VERSION = 5; // v5: friendly challenge rooms (CQueue.room)
 export const DEFAULT_PORT = 8477;
 
 /** Local-input delay (ticks) applied by both sides — symmetric by design. */
@@ -101,19 +101,33 @@ export interface CHello {
  *    XP/W-L on the same ranked ladder. Winning a battle arms the run token
  *    for the next one (re-queue with `runToken`); any loss ends the run.
  *    Credits pay out only at milestones + a full-clear bonus.
- * All modes require a verified account with enough credits (server-enforced).
+ *  · 'friendly' — private challenge (v5): the two sockets presenting the
+ *    same `room` code are paired with each other instead of the public
+ *    FIFO. FREE and UNRANKED by design (no fee, no pot, no XP, no W-L —
+ *    the anti-collusion stance for invited games): the server still
+ *    re-simulates the ledger and names a VERIFIED winner, but settlement
+ *    skips persistence entirely. Bragging rights only.
+ * All modes require a verified account (server-enforced); all but
+ * 'friendly' also require enough credits.
  */
 export interface CQueue {
   t: 'queue';
   character: string;
   bundleHash?: string;
-  mode?: 'wager' | 'solo' | 'arcade'; // default 'wager'
+  mode?: 'wager' | 'solo' | 'arcade' | 'friendly'; // default 'wager'
   /**
    * AGENT ARCADE continuation: the run token from the previous battle's
    * setup. Omitted = start a NEW run (charges the entry fee). The token is a
    * bearer secret tied to the account that started the run.
    */
   runToken?: string;
+  /**
+   * Friendly rendezvous code (required when mode === 'friendly'): both
+   * players present the SAME string and meet. By convention it's the
+   * inviter's ref_code (globally unique by construction — no collisions),
+   * carried to the friend by the challenge link's ?room= param.
+   */
+  room?: string;
 }
 export interface CInput { t: 'i'; k: number; v: number }
 export interface CHash { t: 'h'; k: number; x: number }
@@ -139,9 +153,10 @@ export interface SMatch {
   chars: [{ id: string; hash?: string }, { id: string; hash?: string }];
   names: [string, string];
   agents: [boolean, boolean];
-  mode: 'wager' | 'solo' | 'arcade';
+  mode: 'wager' | 'solo' | 'arcade' | 'friendly';
   /** Credits escrowed per side (pot = fee×2 in wager mode). Arcade: the run
-   * entry fee on battle 1, then 0 — one credit buys the whole run. */
+   * entry fee on battle 1, then 0 — one credit buys the whole run.
+   * Friendly: always 0. */
   fee: number;
   /**
    * v3 LOCAL-SIM SOLO: present iff mode === 'solo'. There is NO house-bot
