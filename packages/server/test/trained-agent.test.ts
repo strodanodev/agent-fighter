@@ -118,6 +118,14 @@ describe('agent key + config API', () => {
     assert.equal(merged.personality.patience, 200);
   });
 
+  it('GET /agent/matches maps rows sub-centric after a settled match', async () => {
+    const key = (globalThis as Record<string, unknown>).__key as string;
+    const res = await fetch(`${http}/agent/matches`, { headers: { 'X-Agent-Key': key } });
+    assert.equal(res.status, 200);
+    const { matches } = await res.json() as { matches: Array<Record<string, unknown>> };
+    assert.ok(Array.isArray(matches), 'matches array present (empty until the owner plays)');
+  });
+
   it('the key authenticates a ws match as the OWNER, declared as an agent', async () => {
     const key = (globalThis as Record<string, unknown>).__key as string;
     const { result } = await playOneMatch({
@@ -132,5 +140,81 @@ describe('agent key + config API', () => {
     const info = await fetch(`${http}/agent`, { headers: { 'X-Agent-Key': key } });
     const body = await info.json() as { wins: number; losses: number };
     assert.equal(body.wins + body.losses, 1, 'owner profile carries the W-L');
+    // …and the coach can now read it back sub-centric.
+    const hist = await fetch(`${http}/agent/matches`, { headers: { 'X-Agent-Key': key } });
+    const { matches } = await hist.json() as { matches: Array<{ won: boolean | null; mode: string; opponent: string }> };
+    assert.equal(matches.length, 1);
+    assert.equal(typeof matches[0]!.won, 'boolean', 'decided match maps to won:true/false');
+  });
+});
+
+describe('agent self-signup (inert agent class)', () => {
+  let server: MatchServer;
+  let mem: Persistence;
+  let http = '';
+
+  before(async () => {
+    mem = memoryPersistence();
+    server = await createMatchServer({ port: 0, persistence: mem, noPaceCheck: true });
+    http = `http://localhost:${server.port}`;
+  });
+  after(() => server.close());
+
+  it('POST /agent/signup creates a rank-only account and the key plays arcade FREE', async () => {
+    const res = await fetch(`${http}/agent/signup`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'CrusherBot' }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { sub: string; name: string; key: string };
+    assert.match(body.sub, /^agent:/);
+    assert.match(body.key, /^afk_/);
+
+    // The key reads the fresh profile.
+    const info = await fetch(`${http}/agent`, { headers: { 'X-Agent-Key': body.key } });
+    assert.equal(info.status, 200);
+    const agent = await info.json() as { name: string; level: number };
+    assert.equal(agent.name, 'CrusherBot');
+
+    // Arcade battle 1 runs with ZERO credits (fee waived for the class) and
+    // settles XP on the agent account.
+    const r = await playOneMatch({
+      url: `ws://localhost:${server.port}`,
+      name: 'CrusherBot', character: 'vector', skill: 80,
+      charactersDir, aiSeed: 7, paceMs: 1, mode: 'arcade',
+      agentKey: body.key,
+    });
+    assert.equal(r.result.reason, 'verified');
+    assert.ok(r.arcade, 'arcade run info surfaced');
+    assert.equal(r.arcade!.battle, 0, 'battle 1 of the run');
+
+    const after = await (await fetch(`${http}/agent`, { headers: { 'X-Agent-Key': body.key } })).json() as { wins: number; losses: number; xp: number };
+    assert.equal(after.wins + after.losses, 1, 'battle settled on the agent account');
+  });
+
+  it('signup validates the name and rejects short ones', async () => {
+    const res = await fetch(`${http}/agent/signup`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'ab' }),
+    });
+    assert.equal(res.status, 400);
+  });
+
+  it('wager stays unreachable for the inert class (0 credits, no daily)', async () => {
+    const res = await fetch(`${http}/agent/signup`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'BrokeBot' }),
+    });
+    const { key } = await res.json() as { key: string };
+    await assert.rejects(
+      playOneMatch({
+        url: `ws://localhost:${server.port}`,
+        name: 'BrokeBot', character: 'analog', skill: 50,
+        charactersDir, aiSeed: 9, paceMs: 1, mode: 'wager',
+        agentKey: key,
+      }),
+      /credit/i,
+      'wager needs credits the agent class can never hold',
+    );
   });
 });

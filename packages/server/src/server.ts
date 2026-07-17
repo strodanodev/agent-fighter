@@ -34,12 +34,40 @@ import {
 import type { Account, MatchMode, Persistence } from './persist.js';
 import { createAirIssuer, loadIssuerConfig } from './air-issuer.js';
 import type { AirIssuer } from './air-issuer.js';
+import { connectPageHtml } from './connect-page.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(here, '..', '..', '..');
 
 /** Durable agent keys (ADR 0006): only the sha256 of a key is ever stored. */
 const sha256Hex = (s: string): string => createHash('sha256').update(s).digest('hex');
+
+/**
+ * AGENT-CLASS accounts (self-signup, Minds obj. 1): sub `agent:<uuid>`.
+ * Economically inert — fee 0, payout 0, no daily grant, wager unreachable
+ * (it needs credits they can never hold). XP/rank only. This prefix check
+ * is the single switch the whole policy hangs on.
+ */
+const isAgentClassSub = (sub: string | undefined | null): boolean => !!sub && sub.startsWith('agent:');
+
+/** Abuse valves for the free agent class — plain in-memory day counters.
+ *  (Reset on restart: acceptable — they bound COMPUTE, not money.) */
+const dayCounter = (): { bump: (key: string, max: number) => boolean } => {
+  const m = new Map<string, { day: string; n: number }>();
+  return {
+    /** True = under the cap (and counted); false = cap hit. */
+    bump: (key, max) => {
+      const day = new Date().toISOString().slice(0, 10);
+      const e = m.get(key);
+      if (!e || e.day !== day) { m.set(key, { day, n: 1 }); return true; }
+      if (e.n >= max) return false;
+      e.n++;
+      return true;
+    },
+  };
+};
+const SIGNUPS_PER_IP_PER_DAY = 5;
+const AGENT_BATTLES_PER_DAY = 20;
 
 /**
  * Clamp a coached personality to the exact bounds random sampling uses
@@ -287,6 +315,12 @@ export const createMatchServer = (opts: {
   const liveMatches = new Map<string, Match>();
   /** AGENT ARCADE runs by token (v4). */
   const arcadeRuns = new Map<string, ArcadeRun>();
+  // Free-tier abuse valves (agent class): per-sub battles, per-IP signups.
+  const agentBattleCap = dayCounter();
+  const signupCap = dayCounter();
+  // Coach-write throttle: keys carry the hour, so the day-counter acts hourly.
+  const putCap = dayCounter();
+  const PUTS_PER_HOUR = 30;
   let nextId = 1;
   let nextMatch = 1;
   let matchSeed = (Date.now() % 100_000) | 0; // server-side is allowed wall clock
@@ -372,7 +406,9 @@ export const createMatchServer = (opts: {
         && result.deviator !== 0;
       if (wonBattle) {
         run.battle++;
-        arcadePayout = arcadeMilestonePayout(run.battle, run.opponents.length);
+        // Agent-class runs never pay credits — the rank IS the prize.
+        arcadePayout = isAgentClassSub(run.sub) ? 0
+          : arcadeMilestonePayout(run.battle, run.opponents.length);
         if (run.battle >= run.opponents.length) {
           arcadeRuns.delete(run.token); // FULL CLEAR — the run is complete
           console.log(`[arcade] ${m.clients[0].name} CLEARED the gauntlet (${run.opponents.length} battles)`);
@@ -653,7 +689,8 @@ export const createMatchServer = (opts: {
    * the fee, the opponent sequencing, and the payouts differ.
    */
   const startArcadeBattle = async (c: Client, run: ArcadeRun): Promise<void> => {
-    const fee = run.battle === 0 && persistence ? ARCADE_FEE : 0;
+    // Agent-class runs are FREE (inert economy — XP/rank only).
+    const fee = run.battle === 0 && persistence && !isAgentClassSub(run.sub) ? ARCADE_FEE : 0;
     const matchId = `m${nextMatch++}`;
     if (fee > 0) {
       try {
@@ -725,10 +762,24 @@ export const createMatchServer = (opts: {
           }
           if (c.identity && persistence) {
             try {
-              // Referral dare code (?ref= link) — redeemed once, best-effort.
-              const ref = typeof msg.ref === 'string' ? msg.ref.slice(0, 40) : undefined;
-              c.account = await persistence.getAccount(c.identity, c.name, c.agent, ref);
-              send(c, { t: 'account', ...c.account });
+              if (isAgentClassSub(c.identity.sub)) {
+                // Inert agent class: NEVER route through getAccount (it
+                // grants the daily). Snapshot from the profile, credits 0.
+                const info = await persistence.getAgent(c.identity.sub);
+                c.account = {
+                  credits: 0, level: info?.level ?? 1, xp: info?.xp ?? 0,
+                  wins: info?.wins ?? 0, losses: info?.losses ?? 0,
+                  dailyGranted: false, refCode: '', referralGranted: 0,
+                  daresAccepted: 0, daresPaidWeek: 0,
+                };
+                if (info) c.name = info.name; // signup name wins over hello
+                send(c, { t: 'account', ...c.account });
+              } else {
+                // Referral dare code (?ref= link) — redeemed once, best-effort.
+                const ref = typeof msg.ref === 'string' ? msg.ref.slice(0, 40) : undefined;
+                c.account = await persistence.getAccount(c.identity, c.name, c.agent, ref);
+                send(c, { t: 'account', ...c.account });
+              }
             } catch (e) {
               console.log(`[account] ${c.name}: ${String(e)}`);
             }
@@ -799,13 +850,22 @@ export const createMatchServer = (opts: {
               if (run.charId !== c.character) {
                 return send(c, { t: 'error', msg: 'your fighter is locked for the whole arcade run' });
               }
+              if (isAgentClassSub(c.identity?.sub)
+                && !agentBattleCap.bump(c.identity!.sub, AGENT_BATTLES_PER_DAY)) {
+                return send(c, { t: 'error', msg: `agent accounts get ${AGENT_BATTLES_PER_DAY} arcade battles/day — the run resumes tomorrow` });
+              }
               c.state = 'queued';
               send(c, { t: 'queued' });
               return startArcadeBattle(c, run);
             }
-            // New run: 1 credit buys the whole gauntlet. Opponents are every
-            // ENABLED agent except the player's own, shuffled server-side.
-            if (persistence && (c.account?.credits ?? 0) < ARCADE_FEE) {
+            // New run: 1 credit buys the whole gauntlet — except for the
+            // inert AGENT CLASS, which plays FREE (XP/rank only) under a
+            // per-day battle cap (compute is the resource being protected).
+            const agentClass = isAgentClassSub(c.identity?.sub);
+            if (agentClass && !agentBattleCap.bump(c.identity!.sub, AGENT_BATTLES_PER_DAY)) {
+              return send(c, { t: 'error', msg: `agent accounts get ${AGENT_BATTLES_PER_DAY} arcade battles/day — come back tomorrow` });
+            }
+            if (!agentClass && persistence && (c.account?.credits ?? 0) < ARCADE_FEE) {
               return send(c, { t: 'error', code: 'credits', msg: `AGENT ARCADE needs ${ARCADE_FEE} credit` });
             }
             const opponents = enabledCharacterIds.filter((id) => id !== c.character);
@@ -1077,6 +1137,48 @@ export const createMatchServer = (opts: {
       })().catch((e) => json(res, 502, { error: String(e) }));
       return;
     }
+    // ---- Self-serve key mint (Minds MVP): a tiny standalone page — AIR
+    // sign-in → POST /agent/key → key shown once + Minds hand-off steps.
+    if (path === '/connect') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...CORS });
+      return res.end(connectPageHtml());
+    }
+    // ---- AGENT SELF-SIGNUP (Minds obj. 1): no auth — the whole point is
+    // that an agent can onboard itself. Safe because the account class it
+    // creates is economically inert (fee 0 / payout 0 / no daily), so the
+    // only thing being rationed is compute: per-IP signups + per-sub battles.
+    if (path === '/agent/signup') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'POST {name} to sign up' });
+      if (!persistence) return json(res, 503, { error: 'persistence not configured' });
+      const ip = (String(req.headers['x-forwarded-for'] ?? '').split(',')[0] ?? '').trim()
+        || req.socket.remoteAddress || 'unknown';
+      if (!signupCap.bump(`ip:${ip}`, SIGNUPS_PER_IP_PER_DAY)) {
+        return json(res, 429, { error: `signup limit: ${SIGNUPS_PER_IP_PER_DAY}/day per IP` });
+      }
+      void (async () => {
+        let body = '';
+        for await (const chunk of req) body += chunk;
+        let name = '';
+        try { name = String((JSON.parse(body || '{}') as Record<string, unknown>).name ?? ''); }
+        catch { return json(res, 400, { error: 'bad json' }); }
+        name = name.trim().slice(0, 24);
+        if (name.length < 3) return json(res, 400, { error: 'name: 3-24 characters' });
+        const sub = `agent:${randomUUID()}`;
+        const key = `afk_${randomBytes(24).toString('hex')}`;
+        if (!(await persistence.createAgentAccount(sub, name, sha256Hex(key)))) {
+          return json(res, 500, { error: 'could not create account — try again' });
+        }
+        console.log(`[signup] agent account ${name} = ${sub} (${ip})`);
+        // The key is shown ONCE. Rank-only account: no credits, ever.
+        return json(res, 200, {
+          sub, name, key,
+          note: 'store the key now — it is never shown again',
+          account: 'agent-class: free arcade/rank play, no credits, wager unavailable',
+          play: 'ws hello { agentKey } → queue { mode: "arcade" }',
+        });
+      })().catch((e) => json(res, 502, { error: String(e) }));
+      return;
+    }
     // ---- TRAIN MY AGENT (ADR 0006). Auth for all /agent routes:
     //   · Bearer AIR JWT (the owner, e.g. from the game UI), or
     //   · X-Agent-Key (the durable key — how a Minds coach connects), or
@@ -1114,6 +1216,11 @@ export const createMatchServer = (opts: {
         }
 
         if (path === '/agent' && req.method === 'PUT') {
+          // Hourly write throttle — a chatty coach can nudge, not thrash.
+          const hour = new Date().toISOString().slice(0, 13);
+          if (!putCap.bump(`put:${sub}:${hour}`, PUTS_PER_HOUR)) {
+            return json(res, 429, { error: `coaching limit: ${PUTS_PER_HOUR} changes/hour` });
+          }
           let body = '';
           for await (const chunk of req) body += chunk;
           let parsed: Record<string, unknown>;
@@ -1149,7 +1256,27 @@ export const createMatchServer = (opts: {
           });
         }
 
-        return json(res, 501, { error: 'match history endpoint lands with the next migration' });
+        // GET /agent/matches — recent settled matches, sub-centric ("did I
+        // win", "who was it") so the coach never has to reason about sides.
+        const limit = Math.min(50, Math.max(1, Number(new URL(req.url ?? '/', 'http://x').searchParams.get('limit')) || 20));
+        const rows = await persistence.recentMatches(sub, limit);
+        return json(res, 200, {
+          matches: rows.map((r) => {
+            const mySide = r.p0 === sub ? 0 : 1;
+            return {
+              id: r.id, when: r.created_at, mode: r.mode,
+              character: mySide === 0 ? r.p0_char : r.p1_char,
+              opponent: mySide === 0 ? r.p1_name : r.p0_name,
+              opponentCharacter: mySide === 0 ? r.p1_char : r.p0_char,
+              opponentIsAgent: mySide === 0 ? r.p1_agent : r.p0_agent,
+              won: r.winner === mySide ? true : r.winner === 1 - mySide ? false : null,
+              draw: r.winner === 2,
+              reason: r.reason,
+              rounds: mySide === 0 ? [r.rounds0, r.rounds1] : [r.rounds1, r.rounds0],
+              seconds: Math.round(r.end_tick / 60),
+            };
+          }),
+        });
       })().catch((e) => json(res, 502, { error: String(e) }));
       return;
     }

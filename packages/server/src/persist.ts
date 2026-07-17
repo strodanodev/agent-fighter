@@ -216,6 +216,35 @@ export interface Persistence {
   setAgentKey: (sub: string, keyHash: string | null) => Promise<boolean>;
   /** Resolve a presented key hash to its owner. */
   findByAgentKey: (keyHash: string) => Promise<{ sub: string; name: string } | null>;
+  /**
+   * Self-signup for AGENT-CLASS accounts (sub `agent:<uuid>`, Minds obj. 1):
+   * economically INERT — created with 0 credits, never granted the daily,
+   * never paid out (server enforces fee 0 / payout 0 by the sub prefix), so
+   * a bot farm has nothing to extract. They compete for XP/rank on the
+   * AGENTS leaderboard tab. Creates the profile AND stores the key hash in
+   * one shot. False = the id already existed (retry with a fresh uuid).
+   */
+  createAgentAccount: (sub: string, name: string, keyHash: string) => Promise<boolean>;
+  /**
+   * Recent settled matches involving `sub`, newest first (coach food —
+   * GET /agent/matches). Raw rows; the endpoint maps them sub-centric.
+   */
+  recentMatches: (sub: string, limit: number) => Promise<MatchRow[]>;
+}
+
+/** One settled match as stored (subset of the matches table the coach needs). */
+export interface MatchRow {
+  id: string;
+  mode: string;
+  p0: string | null; p1: string | null;
+  p0_name: string; p1_name: string;
+  p0_agent: boolean; p1_agent: boolean;
+  p0_char: string; p1_char: string;
+  winner: number;
+  reason: string;
+  rounds0: number; rounds1: number;
+  end_tick: number;
+  created_at: string;
 }
 
 // ---------------------------------------------------------------- shared math
@@ -292,6 +321,8 @@ export const memoryPersistence = (): Persistence => {
   const referrals = new Map<string, { inviter: string; released: boolean }>();
   /** sub → trained agent config + key (ADR 0006). */
   const agents = new Map<string, { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null }>();
+  /** Newest-first ring of settled matches (GET /agent/matches food). */
+  const matchRows: MatchRow[] = [];
   const agentOf = (sub: string): { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null } => {
     let a = agents.get(sub);
     if (!a) { a = { config: null, keyHash: null, keyCreatedAt: null }; agents.set(sub, a); }
@@ -369,6 +400,16 @@ export const memoryPersistence = (): Persistence => {
     recordMatch: async (r) => {
       if (settled.has(r.matchId)) return [];
       settled.add(r.matchId);
+      matchRows.unshift({
+        id: r.matchId, mode: r.mode, created_at: new Date().toISOString(),
+        p0: r.identities[0]?.sub ?? null, p1: r.identities[1]?.sub ?? null,
+        p0_name: r.names[0], p1_name: r.names[1],
+        p0_agent: r.agents[0], p1_agent: r.agents[1],
+        p0_char: r.chars[0], p1_char: r.chars[1],
+        winner: r.winner, reason: r.reason,
+        rounds0: r.rounds[0], rounds1: r.rounds[1], end_tick: r.endTick,
+      });
+      if (matchRows.length > 500) matchRows.pop();
       const out: XpAward[] = [];
       for (const side of [0, 1] as const) {
         const sub = r.identities[side]?.sub;
@@ -449,6 +490,19 @@ export const memoryPersistence = (): Persistence => {
         }
       }
       return null;
+    },
+    recentMatches: async (sub, limit) =>
+      matchRows.filter((m) => m.p0 === sub || m.p1 === sub).slice(0, limit),
+    createAgentAccount: async (sub, name, keyHash) => {
+      if (profiles.has(sub)) return false;
+      // Same shape as prof(), but lastDaily is pre-stamped FOREVER: agent-
+      // class accounts never claim the daily grant (economically inert).
+      profiles.set(sub, { credits: 0, level: 1, xp: 0, wins: 0, losses: 0, lastDaily: '9999-12-31' });
+      names.set(sub, { name, agent: true });
+      const a = agentOf(sub);
+      a.keyHash = keyHash;
+      a.keyCreatedAt = new Date().toISOString();
+      return true;
     },
   };
 };
@@ -604,6 +658,20 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
       })) as Array<Record<string, unknown>>;
       const row = rows?.[0];
       return row ? { sub: String(row.id), name: String(row.name ?? 'anon') } : null;
+    },
+    createAgentAccount: async (sub, name, keyHash) =>
+      Boolean(await call('/rest/v1/rpc/create_agent_account', {
+        method: 'POST', body: JSON.stringify({ _id: sub, _name: name, _hash: keyHash }),
+      })),
+    recentMatches: async (sub, limit) => {
+      // Straight PostgREST read — matches is public-read anyway; the service
+      // key just skips the anon path. Indexes matches_p0/p1_idx cover this.
+      const cols = 'id,mode,p0,p1,p0_name,p1_name,p0_agent,p1_agent,p0_char,p1_char,winner,reason,rounds0,rounds1,end_tick,created_at';
+      const s = encodeURIComponent(sub);
+      return (await call(
+        `/rest/v1/matches?select=${cols}&or=(p0.eq.${s},p1.eq.${s})&order=created_at.desc&limit=${limit | 0}`,
+        { method: 'GET' },
+      )) as MatchRow[];
     },
   };
 };

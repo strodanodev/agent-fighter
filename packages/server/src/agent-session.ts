@@ -54,12 +54,16 @@ export interface AgentOptions {
    */
   personality?: Record<string, number>;
   /**
-   * Queue mode — 'wager' (default, PvP pot) or 'solo' (vs the house AI).
-   * Solo is LOCAL-SIM (protocol v3): the server pins a deterministic house
-   * AI in the match setup; this session simulates it locally and streams
+   * Queue mode — 'wager' (default, PvP pot), 'solo' (one match vs the house
+   * AI), or 'arcade' (one BATTLE of the ranked gauntlet — chain battles by
+   * passing the returned run token back via `runToken`). Solo and arcade
+   * battles are LOCAL-SIM (protocol v3/v4): the server pins a deterministic
+   * house AI in the setup; this session simulates it locally and streams
    * only its own inputs. No opponent packets exist at all.
    */
-  mode?: 'wager' | 'solo';
+  mode?: 'wager' | 'solo' | 'arcade';
+  /** Arcade continuation: the run token from the previous battle's result. */
+  runToken?: string;
   /** Owner's AIR email — target for the reputation write-back (ADR 0004). */
   email?: string;
 }
@@ -68,6 +72,8 @@ export interface AgentResult {
   result: SResult;
   localHash: number; // my sim's final hash — must equal result.hash
   localTicks: number;
+  /** Arcade battles: run position + the token that queues the NEXT battle. */
+  arcade?: { battle: number; total: number; token: string };
 }
 
 /** Play exactly one online match. Resolves with the server-verified result. */
@@ -138,6 +144,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
         character: opts.character,
         bundleHash: bundleOf(opts.character).versionHash,
         mode: opts.mode ?? 'wager',
+        runToken: opts.runToken,
       });
     });
 
@@ -222,7 +229,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
             } catch { /* debug only */ }
           }
           ws.close();
-          return resolve({ result: msg, localHash, localTicks: simTick });
+          return resolve({ result: msg, localHash, localTicks: simTick, arcade: setup?.arcade });
         }
         default:
           return;

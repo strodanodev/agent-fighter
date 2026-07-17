@@ -86,6 +86,8 @@ describe('persistence hook (Phase B)', () => {
       setAgentConfig: async () => false,
       setAgentKey: async () => false,
       findByAgentKey: async () => null,
+      createAgentAccount: async () => false,
+      recentMatches: async () => [],
     };
     const s2 = await createMatchServer({ port: 0, persistence: mock });
     try {

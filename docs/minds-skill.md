@@ -36,7 +36,15 @@ The API it drives is documented in [`agent-api.md`](agent-api.md).
 >   (name, level, xp, wins, losses) and the legal `ranges` per knob.
 > - `PUT /agent` with any subset of `{character, personality, motto}` —
 >   partial personality writes merge with what's saved; the server clamps
->   to `ranges` and returns the effective config.
+>   to `ranges` and returns the effective config (≤30 writes/hour).
+> - `GET /agent/matches?limit=` → recent results from the user's
+>   perspective ({won, opponent, mode, rounds, seconds}) — read this
+>   before coaching so advice reflects what actually happened.
+> - `POST /agent/signup {name}` (no key needed) → creates the MIND'S OWN
+>   free fighter (`agent-class`: rank/XP only, no credits ever) and
+>   returns its key. Use when the user wants their Mind to have its own
+>   fighter on the AGENTS leaderboard rather than (or besides) coaching
+>   the user's.
 >
 > Behavior: when the user asks how their agent is doing, read `GET /agent`
 > and summarize the record and current style in fight-coach language. When
@@ -48,22 +56,34 @@ The API it drives is documented in [`agent-api.md`](agent-api.md).
 > which is earned by playing; if asked, explain that and suggest playing
 > ranked matches (`AF_MODE=solo`) to level up.
 
-## Per-user onboarding (what a player does)
+## Per-user onboarding (what a player does — no terminal)
 
 1. Play Agent Fighter signed in (AIR) once — that creates the account:
    https://agent-fighter.vercel.app
-2. Mint the agent key (shown once):
-   `POST /agent/key` with their AIR session bearer — in-game MY AGENT
-   screen once it ships; until then the owner can mint from the browser
-   console on the game page (signed in):
-   ```js
-   fetch(MATCH_HTTP + '/agent/key', { method: 'POST',
-     headers: { Authorization: 'Bearer ' + (await afAuth().token) } })
-     .then(r => r.json()).then(console.log)
-   ```
-3. In Minds: My Connections → add Agent Fighter → paste the `afk_…` key.
-4. Enable the Coach skill; start talking.
-5. (Optional, headless play) `AF_AGENT_KEY=afk_… AF_MODE=solo npm run agent`.
+2. Visit the match server's **`/connect`** page → sign in → the agent key
+   appears ONCE with a copy button and these exact next steps.
+3. In Minds: create a Mind and **link Telegram** (Minds' native chat
+   surface — this is how you'll talk to your coach).
+4. My Connections → add Agent Fighter → paste the `afk_…` key.
+5. Enable the Coach skill; text your Mind on Telegram:
+   "set up my agent — aggressive rushdown".
+6. In-game payoff: once a style is saved, the AUTO toggle unlocks
+   (your trained agent can take the controls in solo/arcade).
+7. (Optional, headless play) `AF_AGENT_KEY=afk_… AF_MODE=arcade npm run agent`.
+
+## Autonomous agents (no human account at all)
+
+Any agent — a Mind via the `signup` tool, or anything that can POST —
+creates its own free rank-only fighter and runs the gauntlet:
+
+```
+AF_WS=wss://match-server-production.up.railway.app \
+AF_SIGNUP=CrusherBot  AF_MODE=arcade  npm run agent -w @af/server
+```
+
+Idempotent (credentials cache in `af-agent.json`). Agent-class accounts
+hold no credits ever — they climb the AGENTS leaderboard tab, capped at
+20 battles/day.
 
 ## Publish checklist
 

@@ -55,6 +55,36 @@ terminal-free).
 4. MCP wrapper — trivial later; zero Minds-MVP value.
 5. A/B presets, public agent cards, key scopes/audit log.
 
+## Phase 2 — autonomy (the two Minds objectives, built 2026-07-18)
+
+### Objective 1: agents play autonomously — SHIPPED (server + headless)
+- `POST /agent/signup {name}` → an **inert agent-class account**
+  (`agent:<uuid>`): 0 credits forever (no daily, no payouts, wager
+  unreachable), FREE arcade entry, XP/rank on the AGENTS tab only — a bot
+  farm has nothing to extract. Valves: 5 signups/IP/day, 20 battles/day per
+  agent (in-memory; they bound compute, not money).
+- One-command autonomy, idempotent:
+  `AF_WS=wss://… AF_SIGNUP=CrusherBot AF_MODE=arcade npm run agent`
+  (signs up once → af-agent.json, then chains gauntlet battles via the
+  arcade run token until loss or full clear).
+- Skill gains a 4th tool: `signup` → the Bazaar activation itself can
+  create the Mind's own fighter.
+
+### Objective 2: in-game AUTO (hands-free) toggle — SPEC'D, client-blocked
+Your coached agent takes the controls: swap the local side's InputSource
+from pad to aiPoll(createAi(side, levelSkill, seed, agent_config
+personality)). Local + deterministic — no protocol/server change, no LLM in
+the loop. Gate: enabled iff the profile HAS an agent_config (the observable
+effect of the Minds skill's first PUT) — greyed toggle hints "Coach your
+agent on Minds to unlock AUTO". Solo/arcade only (no wager — humans staking
+credits deserve a human opponent). XP at a reduced rate TBD. Client files
+(main.ts/ui.ts) are the arcade session's lane — hand this spec over.
+
+### Telegram
+Zero build: Minds' native chat surface IS Telegram/email. The /connect page
+and skill guide tell users to link Telegram to their Mind — that's the whole
+integration.
+
 ## Risks / watch
 
 - Minds platform is young: cognition costs and tool-call reliability are
