@@ -3207,7 +3207,7 @@ Object.assign(globalThis, {
  * (the classic GGPO throttle) rather than drift.
  */
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 5;
+const NET_PROTOCOL = 6;
 const MAX_AHEAD = 10;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -3236,6 +3236,13 @@ class NetSession {
     game = null;
     /** Ticks currently stalled waiting on the opponent (UI: "connection…"). */
     stalled = 0;
+    /**
+     * Wall-clock deadline (Date.now() ms) the opponent must reconnect by, set
+     * from the server's `oppgone` heads-up (v6); null when the peer is present.
+     * Drives the "OPPONENT DISCONNECTED — reconnecting… Ns" countdown. Cleared
+     * by `oppback` or the final `result`.
+     */
+    oppGoneUntil = null;
     ws;
     myInputs = [];
     oppInputs = [];
@@ -3382,9 +3389,20 @@ class NetSession {
                 }
                 return;
             }
+            case 'oppgone': {
+                // Opponent's socket dropped (v6) — start the reconnect countdown so
+                // the fight screen explains the stall instead of freezing silently.
+                this.oppGoneUntil = Date.now() + Number(msg.graceMs ?? 0);
+                return;
+            }
+            case 'oppback': {
+                this.oppGoneUntil = null; // opponent reconnected within grace
+                return;
+            }
             case 'result': {
                 this.result = msg;
                 this.status = 'done';
+                this.oppGoneUntil = null;
                 return;
             }
             case 'xp': {
@@ -3561,6 +3579,7 @@ class SoloSession {
     xp = null;
     game = null;
     stalled = 0; // never stalls — kept for the shared interface
+    oppGoneUntil = null; // no peer socket — kept for the shared interface
     ws;
     houseAi = null;
     tick = 0;
@@ -4941,6 +4960,32 @@ const display = (ctx, s, x, y, size, opts = {}) => {
 const DANGER_OPTS = { from: '#ffe3e6', mid: '#ff6b81', to: '#8f1626', outline: '#2a0810' };
 const COOL_OPTS = { from: '#eaf6ff', mid: '#7fd0ff', to: '#1a5f8f', outline: '#0a1a2a' };
 /**
+ * Emphasized CREDITS readout — a big, glowing gold "⛁ N CR". The whole
+ * economy runs on credits, so they get the loudest treatment on the home and
+ * select screens. Left-anchored; returns the drawn width so a small stats line
+ * can sit beside it. `y` is the baseline.
+ */
+const drawCredits = (ctx, x, y, credits, size) => {
+    const txt = `⛁ ${credits.toLocaleString()} CR`;
+    ctx.save();
+    ctx.font = `${size}px ${DISPLAY_FONT_STACK}`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    // Gold bloom pass, then a crisp fill on top.
+    ctx.shadowColor = 'rgba(255,190,60,0.75)';
+    ctx.shadowBlur = size * 0.7;
+    ctx.fillStyle = '#ffe28c';
+    ctx.fillText(txt, x, y);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#000000aa';
+    ctx.fillText(txt, x + 1.5, y + 1.5);
+    ctx.fillStyle = '#ffd23a';
+    ctx.fillText(txt, x, y);
+    const w = ctx.measureText(txt).width;
+    ctx.restore();
+    return w;
+};
+/**
  * Center announcement (ROUND n / FIGHT! / K.O. / DOUBLE KO) — the marquee
  * moment of each round. Drawn as the FRONT-MOST HUD element (called dead last
  * in drawHud, after the brand badge) so nothing occludes it.
@@ -5396,8 +5441,32 @@ const drawGameLogo = (ctx, cx, topY, tick, charged = false) => {
     // badge so it tracks the art. Unscaled bounds (the breathe is cosmetic).
     tapZone(cx - w / 2 - 8, topY - 8, w + 16, h + 16, 'special');
 };
+/** The identity strip below one player's HUD block (under the meter). */
+const drawPlayerId = (ctx, i, id) => {
+    const align = i === 0 ? 'left' : 'right';
+    const ax = i === 0 ? HUD.edge : VW - HUD.edge;
+    const y = HUD.meterY + HUD.meterSegH + 9; // just under the charge bar
+    if (id.wallet)
+        label(ctx, id.wallet, ax, y, 10, '#8fb6d8', align, true);
+    const parts = [];
+    const gold = id.credits !== undefined;
+    if (gold)
+        parts.push(`⛁ ${id.credits.toLocaleString()} CR`);
+    if (id.level)
+        parts.push(`LV ${id.level}`);
+    if ((id.wins ?? 0) + (id.losses ?? 0) > 0)
+        parts.push(`${id.wins ?? 0}W ${id.losses ?? 0}L`);
+    if (id.streak)
+        parts.push(`W${id.streak} STREAK`);
+    if (id.minds)
+        parts.push('◇ MINDS™');
+    if (parts.length) {
+        label(ctx, parts.join('  ·  '), ax, y + 13, 11, gold ? '#ffd23a' : '#cfe0ef', align, true);
+    }
+};
 const drawHud = (ctx, g, rosters, fx, tags, // per-player nameplate suffix (e.g. "AGENT LV 12")
-autoSpecialCharged = false) => {
+autoSpecialCharged = false, // local player has ≥1 bar → logo badge glows red
+ids) => {
     for (const i of [0, 1]) {
         const f = g.fighters[i];
         const max = rosters[i].ch.b.maxHealth;
@@ -5407,6 +5476,8 @@ autoSpecialCharged = false) => {
         drawNameplate(ctx, i, rosters[i].bundle.name + (tags?.[i] ? ` · ${tags[i]}` : ''));
         drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
         drawMeter(ctx, i, f.meter, g.tick);
+        if (ids?.[i])
+            drawPlayerId(ctx, i, ids[i]);
     }
     drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
     // Combo counter: punches in on each new hit (re-triggered via comboAge
@@ -5543,8 +5614,9 @@ const drawTitle = (ctx, rosters, tick, menu) => {
             }
         });
         ctx.lineWidth = 1;
-        // The fighter line is the touch path to the select screen (online quick
-        // match uses it; ARCADE always re-selects on entry).
+        // The fighter line shows where the select cursor will start; both modes
+        // route through the select screen now, so tapping it (or a mode row) all
+        // land on select — this is just the shortcut label.
         const fy = barY + 12 + rows.length * (btnH + btnGap) + 4;
         if (menu.fighter) {
             label(ctx, `FIGHTING AS  ${menu.fighter.toUpperCase()}   ·   TAP / C  CHANGE`, cx, fy + 12, 12, '#8fd0ff');
@@ -5582,7 +5654,9 @@ const drawTitle = (ctx, rosters, tick, menu) => {
         const acctY = menu.address ? 58 : 40;
         if (menu.account) {
             const a = menu.account;
-            label(ctx, `⛁ ${a.credits} CR   ·   LV ${a.level}   ·   ${a.wins}W ${a.losses}L`, 16, acctY, 12, '#ffd166', 'left');
+            // CREDITS emphasized (big, glowing gold); level + record small alongside.
+            const cw = drawCredits(ctx, 16, acctY + 6, a.credits, 19);
+            label(ctx, `LV ${a.level}   ·   ${a.wins}W ${a.losses}L`, 16 + cw + 14, acctY + 4, 11, '#dcd6c8', 'left');
         }
         else {
             label(ctx, 'SERVER OFFLINE · CREDITS UNAVAILABLE', 16, acctY, 11, '#ff9d9d', 'left');
@@ -5689,38 +5763,48 @@ const drawInvite = (ctx, tick, v) => {
     label(ctx, '▶', cx + 300, ty, 18, GOLD_LT);
     tapZone(cx - 336, ty - 20, 72, 34, 'taunt:prev');
     tapZone(cx + 264, ty - 20, 72, 34, 'taunt:next');
-    label(ctx, `“${v.taunt}”`, cx, ty, v.taunt.length > 64 ? 12 : 15, '#ffe9a3');
-    label(ctx, v.custom ? 'YOUR WORDS. NO MERCY.  ·  T  REWRITE'
-        : `TAUNT ${v.tauntIdx + 1}/${v.tauntCount}  ·  T  WRITE YOUR OWN`, cx, ty + 20, 11, '#ffffff77');
-    tapZone(cx - 150, ty + 9, 300, 17, 'taunt:edit');
-    // ---- the one button that matters. On copy the plate greys out (disabled),
-    // a green ring pops out (success animation), and the line under it turns
-    // into a "now go send it" instruction — the copy already happened, the job
-    // now is to paste it into a chat app.
-    const bw = 420, bh = 46, bx = cx - bw / 2, by = ty + 36;
+    label(ctx, `“${v.taunt}”`, cx, ty, v.taunt.length > 52 ? 12 : 15, '#ffe9a3');
+    label(ctx, `TAUNT ${v.tauntIdx + 1}/${v.tauntCount}  ·  ◀ ▶  TO CHANGE`, cx, ty + 20, 11, '#ffffff77');
+    // ---- two CTAs side by side: async dare (copy/send link) + live challenge
+    // (park in a room keyed by your code). On copy the left plate greys out
+    // with a green ring; challenge stays armed — fight them right now.
+    const gap = 14, bh = 46, by = ty + 36;
+    const copyW = v.refCode ? 360 : 420;
+    const chalW = 220;
+    const rowW = v.refCode ? copyW + gap + chalW : copyW;
+    const rowX = cx - rowW / 2;
+    const bx = rowX;
     const armed = v.copiedAge >= 0;
     if (armed) {
-        bevel(ctx, bx, by, bw, bh, '#191a20', '#3f414c', '#101116', 3);
+        bevel(ctx, bx, by, copyW, bh, '#191a20', '#3f414c', '#101116', 3);
         const pop = easeOutBack(clamp01(v.copiedAge / 12));
-        display(ctx, '✓ INVITE LINK COPIED', cx, by + 31, 19, { from: '#eafff0', mid: '#8fe8a0', to: '#3f7a4f', outline: '#0e2a12', scale: pop });
+        display(ctx, '✓ INVITE LINK COPIED', bx + copyW / 2, by + 31, 17, { from: '#eafff0', mid: '#8fe8a0', to: '#3f7a4f', outline: '#0e2a12', scale: pop });
         if (v.copiedAge < 28) {
             const t = v.copiedAge / 28;
             ctx.save();
             ctx.globalAlpha = (1 - t) * 0.85;
             ctx.strokeStyle = '#7ee85a';
             ctx.lineWidth = 3;
-            rrect(ctx, bx - t * 16, by - t * 12, bw + t * 32, bh + t * 24, 7);
+            rrect(ctx, bx - t * 12, by - t * 10, copyW + t * 24, bh + t * 20, 7);
             ctx.stroke();
             ctx.restore();
         }
     }
     else {
         const pulse = 1 + 0.03 * Math.sin(tick / 8);
-        bevel(ctx, bx, by, bw, bh, '#3a0e18', '#ff5d7e', '#6e1024', 3);
-        display(ctx, v.canShare ? 'SEND INVITE LINK' : 'COPY INVITE LINK', cx, by + 31, 22, { ...DARE_OPTS, scale: pulse });
+        bevel(ctx, bx, by, copyW, bh, '#3a0e18', '#ff5d7e', '#6e1024', 3);
+        display(ctx, v.canShare ? 'SEND INVITE LINK' : 'COPY INVITE LINK', bx + copyW / 2, by + 31, 18, { ...DARE_OPTS, scale: pulse });
     }
-    tapZone(bx - 20, by - 8, bw + 40, bh + 16, 'copydare');
-    // Under the button: the link when idle, the send-it instruction when copied.
+    tapZone(bx - 8, by - 8, copyW + 16, bh + 16, 'copydare');
+    // CHALLENGE LIVE (protocol v5): free unranked room keyed by your code.
+    if (v.refCode) {
+        const cxBtn = rowX + copyW + gap;
+        const pulse = 1 + 0.03 * Math.sin(tick / 8 + 1.2);
+        bevel(ctx, cxBtn, by, chalW, bh, '#0e2438', '#5db8ff', '#163a5a', 3);
+        display(ctx, '⚔ CHALLENGE', cxBtn + chalW / 2, by + 31, 18, { from: '#eaf6ff', mid: '#8fd0ff', to: '#3a7ab0', outline: '#0a1a2a', scale: pulse });
+        tapZone(cxBtn - 8, by - 8, chalW + 16, bh + 16, 'challenge');
+    }
+    // Under the buttons: the link when idle, the send-it instruction when copied.
     if (armed) {
         label(ctx, v.canShare ? 'SENT — NOW GO CALL THEM OUT'
             : 'NOW SEND IT TO A FRIEND  ·  WHATSAPP · DISCORD · IMESSAGE · ANYWHERE', cx, by + bh + 20, 12, '#8fe8a0');
@@ -5728,22 +5812,14 @@ const drawInvite = (ctx, tick, v) => {
     else {
         label(ctx, v.refCode ? v.linkLabel : 'CONNECTING TO SERVER…', cx, by + bh + 20, 12, '#8fd0ff');
     }
-    // ---- CHALLENGE LIVE (protocol v5): the "right now" sibling of the async
-    // dare — parks you in a room keyed by your code and copies a ?room= link
-    // that drops the friend straight in. Free and unranked, so no fine print.
-    if (v.refCode) {
-        const flash = (tick + 20) % 44 < 36;
-        label(ctx, '⚔  C  CHALLENGE LIVE — FIGHT THEM RIGHT NOW · FREE', cx, by + bh + 40, 13, flash ? '#8fd0ff' : '#bfe4ff');
-        tapZone(cx - 260, by + bh + 27, 520, 24, 'challenge');
-    }
     // ---- the economics, as scarcity: the 10/week payout cap is urgency.
-    let iy = by + bh + 62;
+    let iy = by + bh + 42;
     label(ctx, `+25 CREDITS EACH WHEN THEY SIGN IN${v.bountiesLeft !== undefined ? `   ·   ${v.bountiesLeft}/10 BOUNTIES LEFT THIS WEEK` : ''}`, cx, iy, 13, v.bountiesLeft === 0 ? '#ff9d9d' : '#ffd166');
     if ((v.daresAccepted ?? 0) > 0) {
         iy += 19;
         label(ctx, `${v.daresAccepted} FIGHTER${v.daresAccepted === 1 ? '' : 'S'} ALREADY TOOK THE BAIT`, cx, iy, 12, '#8fd0ff');
     }
-    label(ctx, `ESC  BACK      ◀ ▶  TAUNT      T  WRITE YOUR OWN      C  CHALLENGE      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`, cx, VH - 12, 12, '#ffffff99');
+    label(ctx, `ESC  BACK      ◀ ▶  TAUNT      C  CHALLENGE      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`, cx, VH - 12, 12, '#ffffff99');
     tapZone(24, VH - 38, 150, 32, 'back');
 };
 /**
@@ -5819,21 +5895,75 @@ const computeRosterStats = (rosters) => {
     statsCacheKey = rosters;
     return statsCache;
 };
+const AGENT_ACCENT = '#4ea8de'; // opponent (P2) blue
+/**
+ * Upper-right AGENT OPPONENT card: who you're about to fight. Shows the
+ * agent's name, LEVEL (still lever-adjustable), win/loss record, current win
+ * streak and shortened wallet — real data for a live agent, the house agent's
+ * live aggregate otherwise. A "Connected to Minds™" ribbon marks the house /
+ * simulated-agent case; a "LIVE AGENT" tag marks a real one.
+ */
 const drawCpuBadge = (ctx, info, tick) => {
-    const w = 168, h = 60;
-    const x = VW - 16 - w, y = 12;
-    const glow = 0.5 + 0.5 * Math.sin(tick / 14);
+    const opp = info.opp;
+    const w = 244, h = 68;
+    const x = VW - 10 - w, y = 6;
+    const pulse = fxPulse(tick, 0.09);
+    const accent = AGENT_ACCENT;
+    const delta = info.lever === 0 ? '' : info.lever > 0 ? `+${info.lever}` : `${info.lever}`;
+    // Panel: rounded, gradient fill, glowing accent outline.
     ctx.save();
-    ctx.shadowColor = `rgba(217,164,65,${0.25 + 0.2 * glow})`;
-    ctx.shadowBlur = 10;
-    bevel(ctx, x, y, w, h, PANEL, GOLD, GOLD_DK, 2);
+    ctx.shadowColor = accent + 'aa';
+    ctx.shadowBlur = 10 + 6 * pulse;
+    const gp = ctx.createLinearGradient(0, y, 0, y + h);
+    gp.addColorStop(0, '#161a28f4');
+    gp.addColorStop(1, '#0b0d16f4');
+    rrect(ctx, x, y, w, h, 10);
+    ctx.fillStyle = gp;
+    ctx.fill();
     ctx.restore();
-    label(ctx, 'AGENT LEVEL', x + w / 2, y + 15, 10, '#c8b98a');
-    const delta = info.lever === 0 ? '' : info.lever > 0 ? ` (+${info.lever})` : ` (${info.lever})`;
-    display(ctx, `LV ${info.cpuLevel}`, x + w / 2, y + 42, 22, { scale: 1 });
+    ctx.save();
+    rrect(ctx, x + 1.5, y + 1.5, w - 3, h - 3, 9);
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 1.5;
+    ctx.shadowColor = accent;
+    ctx.shadowBlur = 5 + 5 * pulse;
+    ctx.stroke();
+    ctx.restore();
+    // Header strip: "AGENT OPPONENT" + LIVE / Minds ribbon.
+    ctx.save();
+    rrect(ctx, x, y, w, h, 10);
+    ctx.clip();
+    const gh = ctx.createLinearGradient(x, 0, x + w, 0);
+    gh.addColorStop(0, tintHex(accent, -8));
+    gh.addColorStop(1, tintHex(accent, -52));
+    ctx.fillStyle = gh;
+    ctx.fillRect(x, y, w, 15);
+    ctx.restore();
+    label(ctx, 'AGENT OPPONENT', x + 8, y + 12, 9, '#ffffff', 'left', true);
+    const live = opp?.kind === 'live';
+    const ribbon = live ? '◆ LIVE AGENT' : '◇ CONNECTED · MINDS™';
+    label(ctx, ribbon, x + w - 8, y + 12, 9, live ? '#8fe8a0' : '#bfe0ff', 'right', true);
+    if (!opp) {
+        // Fallback: bare calibrated level (server unreachable, identity pending).
+        display(ctx, `LV ${info.cpuLevel}`, x + w / 2, y + 46, 24, { align: 'center' });
+        if (delta)
+            label(ctx, `(${delta})`, x + w / 2 + 52, y + 46, 11, '#7ee85a', 'left', false);
+        label(ctx, '[  /  ]  ADJUST LEVEL', x + w / 2, y + h - 5, 9, '#c8c4ba99');
+        return;
+    }
+    // Name + level.
+    display(ctx, opp.name.toUpperCase().slice(0, 16), x + 10, y + 36, 17, {
+        align: 'left', glow: accent + 'aa', glowBlur: 10,
+    });
+    display(ctx, `LV ${opp.level}`, x + w - 10, y + 36, 18, { align: 'right' });
     if (delta)
-        label(ctx, delta, x + w / 2 + 46, y + 42, 11, '#7ee85a');
-    label(ctx, '[  /  ]  ADJUST', x + w / 2, y + h - 4, 9, '#c8c4ba99');
+        label(ctx, delta, x + w - 10, y + 47, 9, '#7ee85a', 'right', false);
+    // Record · streak (left) and wallet (right).
+    const streakStr = opp.streak > 0 ? `  ·  W${opp.streak} STREAK` : '';
+    label(ctx, `${opp.wins}W  ${opp.losses}L${streakStr}`, x + 10, y + 55, 10, '#ffd99b', 'left', true);
+    if (opp.wallet)
+        label(ctx, opp.wallet, x + 10, y + 65, 9, '#8fb6d8', 'left', false);
+    label(ctx, '[ / ] LV', x + w - 10, y + 64, 8, '#c8c4ba88', 'right', false);
 };
 /** Rounded-rectangle path (no fill/stroke — caller decides). */
 const rrect = (ctx, x, y, w, h, r) => {
@@ -6023,24 +6153,32 @@ const drawFighterCard = (ctx, x, y, w, h, r, stats, accent, header, locked, tick
 };
 const drawSelect = (ctx, rosters, cursors, locked, tick, cpuInfo, 
 /** Set = AGENT ARCADE entry: gauntlet size; swaps the P2 card for the rules panel. */
-arcadeTotal) => {
+arcadeTotal, 
+/** Set = friendly challenge entry: retitles the screen (free, no stakes). */
+friendly) => {
     drawMenuBackdrop(ctx);
     ctx.fillStyle = '#0a0616d9';
     ctx.fillRect(0, 0, VW, VH);
     const stats = computeRosterStats(rosters);
-    display(ctx, arcadeTotal ? 'AGENT ARCADE — CHOOSE YOUR FIGHTER' : 'SELECT YOUR FIGHTER', VW / 2, 46, 24);
-    if (cpuInfo)
-        drawCpuBadge(ctx, cpuInfo, tick);
-    // Escape hatch back to the title — phones have no ESC key.
-    const backW = 110, backH = 34;
-    tapZone(VW - 16 - backW, 12, backW, backH, 'back');
+    const heading = arcadeTotal ? 'AGENT ARCADE — CHOOSE YOUR FIGHTER'
+        : friendly ? 'FRIENDLY CHALLENGE — CHOOSE YOUR FIGHTER'
+            : 'SELECT YOUR FIGHTER';
+    display(ctx, heading, VW / 2, 46, 24);
+    // Escape hatch back to the title — phones have no ESC key. Top-LEFT, tucked
+    // just under the wallet strip (which owns the very top line), so the
+    // top-right corner is free for the AGENT OPPONENT card (drawn last, on top).
+    const backW = 100, backH = 28;
+    const backX = 12, backY = 34;
+    tapZone(backX, backY, backW, backH, 'back');
     ctx.fillStyle = 'rgba(10,6,22,0.6)';
-    ctx.fillRect(VW - 16 - backW, 12, backW, backH);
+    ctx.fillRect(backX, backY, backW, backH);
     ctx.strokeStyle = 'rgba(255,255,255,0.22)';
     ctx.lineWidth = 1.5;
-    ctx.strokeRect(VW - 16 - backW + 0.5, 12.5, backW - 1, backH - 1);
+    ctx.strokeRect(backX + 0.5, backY + 0.5, backW - 1, backH - 1);
     ctx.lineWidth = 1;
-    label(ctx, '‹ TITLE', VW - 16 - backW / 2, 12 + backH / 2 + 4, 12, '#ffffffcc');
+    label(ctx, '‹ TITLE', backX + backW / 2, backY + backH / 2 + 4, 12, '#ffffffcc');
+    if (cpuInfo)
+        drawCpuBadge(ctx, cpuInfo, tick);
     // Portrait grid — a single row (wraps past 6). Compact so the bottom band
     // is free for the two fighter cards.
     const cols = Math.min(rosters.length, 6);
@@ -6305,6 +6443,18 @@ tab, error, tick, you) => {
     ctx.fillStyle = '#0a0616cc';
     ctx.fillRect(0, 0, VW, VH);
     display(ctx, 'LEADERBOARD', VW / 2, 64, 40, { glow: 'rgba(255,209,102,0.5)' });
+    // Escape hatch back to the title — phones have no ESC key.
+    // (Previously an invisible bottom-left zone; the footer said "TAP HERE"
+    // at center so taps missed. Match the select screen's ‹ TITLE button.)
+    const backW = 110, backH = 34;
+    tapZone(VW - 16 - backW, 12, backW, backH, 'back');
+    ctx.fillStyle = 'rgba(10,6,22,0.6)';
+    ctx.fillRect(VW - 16 - backW, 12, backW, backH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(VW - 16 - backW + 0.5, 12.5, backW - 1, backH - 1);
+    ctx.lineWidth = 1;
+    label(ctx, '‹ TITLE', VW - 16 - backW / 2, 12 + backH / 2 + 4, 12, '#ffffffcc');
     // Tabs — ◄ ► cycles, arcade style.
     const tabY = 104;
     RANK_TABS.forEach((t, i) => {
@@ -6359,19 +6509,20 @@ tab, error, tick, you) => {
             label(ctx, `${r.wins} — ${r.losses}`, boxX + cols.wl, y, 14, '#ffffffdd');
         });
     }
-    label(ctx, 'TAP  TAB       R  REFRESH       ESC / TAP HERE  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
-    tapZone(24, VH - 44, 170, 36, 'back');
+    label(ctx, 'TAP  TAB       R  REFRESH       ESC / ‹ TITLE  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
 };
 const drawWallet = (ctx, w, delta) => {
     if (!w)
         return;
-    label(ctx, `⛁ ${w.credits} CR   ·   LV ${w.level}   ·   ${w.wins}W ${w.losses}L`, 16, 22, 12, '#ffd166', 'left');
+    // CREDITS emphasized (big, glowing gold); level + record small alongside.
+    const cw = drawCredits(ctx, 16, 27, w.credits, 21);
+    label(ctx, `LV ${w.level}   ·   ${w.wins}W ${w.losses}L`, 16 + cw + 16, 25, 12, '#dcd6c8', 'left');
     if (delta && delta.age < 120 && delta.amt !== 0) {
         const t = delta.age / 120;
         ctx.save();
         ctx.globalAlpha = 1 - t * t;
         const up = delta.age * 0.22;
-        label(ctx, `${delta.amt > 0 ? '+' : '−'}${Math.abs(delta.amt)} CR`, 16, 42 - up, 15, delta.amt > 0 ? '#7ee85a' : '#ff6b6b', 'left');
+        label(ctx, `${delta.amt > 0 ? '+' : '−'}${Math.abs(delta.amt)} CR`, 16, 46 - up, 16, delta.amt > 0 ? '#7ee85a' : '#ff6b6b', 'left');
         ctx.restore();
     }
 };
@@ -6697,6 +6848,34 @@ const drawReconnecting = (ctx, tick) => {
     display(ctx, `RECONNECTING${dots}`, VW / 2, boxY + 52, 28, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
     label(ctx, 'CONNECTION HICCUP — YOUR SEAT IS HELD FOR 20 SECONDS', VW / 2, boxY + 84, 13, '#ffffffcc');
     label(ctx, 'ESC — ABANDON (COUNTS AS LEAVING)', VW / 2, boxY + 112, 12, '#ffffff77');
+};
+/**
+ * The OPPONENT dropped and the server is holding their seat (v6). Distinct
+ * from drawReconnecting (which is about OUR socket) — here our connection is
+ * fine, the peer's isn't, and the rollback sim has frozen on its last known
+ * frame. Without this the freeze reads as a crash; with it, it reads as
+ * "they bailed, you're about to win." `secsLeft` is the live grace countdown;
+ * `friendly` swaps the stakes line (a friendly forfeit costs the quitter
+ * nothing but the round).
+ */
+const drawOpponentGone = (ctx, secsLeft, friendly, tick) => {
+    ctx.fillStyle = 'rgba(6,4,12,0.72)';
+    ctx.fillRect(0, 0, VW, VH);
+    const boxW = 600, boxH = 160;
+    const boxX = VW / 2 - boxW / 2, boxY = VH / 2 - boxH / 2;
+    bevel(ctx, boxX, boxY, boxW, boxH, PANEL, GOLD, GOLD_DK, 3);
+    const dots = '.'.repeat(1 + (Math.trunc(tick / 20) % 3));
+    const pulse = 1 + 0.03 * Math.sin(tick / 10);
+    display(ctx, 'OPPONENT DISCONNECTED', VW / 2, boxY + 48, 26, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+    label(ctx, `WAITING FOR THEM TO RECONNECT${dots}`, VW / 2, boxY + 80, 14, '#ffffffcc');
+    // The countdown IS the reassurance — a number ticking down beats a frozen frame.
+    const s = Math.max(0, Math.ceil(secsLeft));
+    display(ctx, `${s}`, VW / 2, boxY + 122, 30, {
+        from: '#ffe9a3', mid: '#ffd166', to: '#a5711a', outline: '#2a1c04',
+    });
+    label(ctx, friendly
+        ? "IF THEY DON'T RETURN, THE ROUND IS YOURS — NOTHING WAS STAKED"
+        : "IF THEY DON'T RETURN, YOU WIN BY FORFEIT", VW / 2, boxY + 146, 11, '#ffd166');
 };
 
 // ---- client/src/autospecial.js ----
@@ -7410,16 +7589,27 @@ let referralToastAge = -1; // ≥0 → the "+25 DARE ACCEPTED" toast is animatin
 // and its OG thumbnail shout it at the invitee; free text is by design.
 /** Mirrors release_referral's rolling-week payout cap (0005_referrals.sql). */
 const REFERRAL_WEEKLY_CAP = 10;
+// Curated taunts only — the ◀ ▶ picker cycles these (no free-text input, so
+// nothing forgeable ever rides the shared ?t= link). Keep each ≤ ~64 chars so
+// the OG card and the in-game line never overflow.
 const TAUNTS = [
     "MY GRANDMA'S AI HITS HARDER THAN YOU.",
     "YOU'D BE MY EASIEST WIN YET.",
     'SAY YOU WERE LAGGING. I DARE YOU.',
     "I'LL PLAY ONE-HANDED. STILL TAKING YOUR ROUNDS.",
     "BRING A FRIEND. YOU'LL NEED THE EMOTIONAL SUPPORT.",
+    "I'VE SEEN YOU PLAY. THIS WON'T TAKE LONG.",
+    'ONE ROUND. THAT’S ALL I’M ASKING. YOU CAN’T EVEN GIVE ME ONE.',
+    'YOUR MAIN? CUTE. BRING IT ANYWAY.',
+    'BLOCK BUTTON’S RIGHT THERE. YOU’LL FIND OUT WHY.',
+    'AFRAID? YOU SHOULD BE.',
+    'I ALREADY KNOW HOW THIS ENDS. DO YOU?',
+    'FREE CREDITS FOR LOSING TO ME. GENEROUS, RIGHT?',
+    'TAP ACCEPT. GET FLATTENED. COLLECT YOUR PARTICIPATION TROPHY.',
+    'NO JOHNS. NO LAG. JUST YOU LOSING.',
+    'PROVE ME WRONG. YOU WON’T, BUT PROVE ME WRONG.',
 ];
-const TAUNT_MAX = 90; // keeps the link sane and the OG card layout intact
 let tauntIdx = 0;
-let customTaunt = '';
 let inviteCopiedAge = -1; // ≥0 → the button reads "DARE ARMED"
 let inviteFrom = 'title'; // where ESC returns to
 // ---- Friendly challenge rooms (protocol v5): FREE, UNRANKED, paired by a
@@ -7427,7 +7617,11 @@ let inviteFrom = 'title'; // where ESC returns to
 // friend straight into the inviter's room — after the AIR sign-in gate.
 let friendlyRoom = ''; // the room the current/last friendly queued into
 let pendingRoom = ''; // ?room= from a challenge link, waiting on sign-in
-const currentTaunt = () => customTaunt || TAUNTS[tauntIdx];
+// The select screen is shared by wager and friendly (both PvP, one fighter to
+// pick). This flag tells its lock handler which to queue — set true only for
+// the friendly path, reset false on every normal (wager/cpu) select entry.
+let selectingFriendly = false;
+const currentTaunt = () => TAUNTS[tauntIdx];
 const dareLink = () => `${DARE_LINK_BASE}/${account?.refCode ?? ''}?t=${encodeURIComponent(currentTaunt())}`;
 /** Coarse pointer ≈ phone/tablet → prefer the OS share sheet over clipboard. */
 const shareViaSheet = () => typeof navigator.share === 'function' && matchMedia('(pointer: coarse)').matches;
@@ -7435,14 +7629,6 @@ const enterInvite = (from) => {
     inviteFrom = from;
     inviteCopiedAge = -1;
     screen = 'invite';
-};
-const editTaunt = () => {
-    // window.prompt is the only text input a single-canvas game has — same
-    // trade-off the clipboard fallback already makes. Blank → back to presets.
-    const t = window.prompt('WRITE YOUR TAUNT (blank = use the presets):', customTaunt || currentTaunt());
-    if (t === null)
-        return;
-    customTaunt = t.trim().replace(/\s+/g, ' ').slice(0, TAUNT_MAX);
 };
 const shareDare = () => {
     if (!account?.refCode)
@@ -7518,6 +7704,75 @@ const fetchRanks = () => {
     })
         .catch((e) => { ranksErr = e.message || 'unreachable'; })
         .finally(() => { ranksBusy = false; });
+};
+let agentRoster = null;
+let agentRosterFetched = false;
+/** Stable branded house smart-account handle (the house has no AIR wallet). */
+const HOUSE_WALLET = '0xA6E7…13C9';
+const shortAddr = (a) => a && a.length >= 10 ? `${a.slice(0, 6)}…${a.slice(-4)}` : (a ?? '');
+const fetchAgentRoster = () => {
+    agentRosterFetched = true;
+    void fetch(`${matchHttpUrl()}/agents/roster`)
+        .then(async (r) => { if (r.ok)
+        agentRoster = (await r.json()); })
+        .catch(() => { });
+};
+/**
+ * The two HUD identity strips (wallet + on-chain stats) drawn under each
+ * fighter's portrait/health/meter. The signed-in player's row shows credits;
+ * the opponent's shows its record — the agent opponent for solo/arcade, the
+ * live peer for online, a guest for local 2P.
+ */
+const hudIds = () => {
+    const ls = localSide();
+    const me = {
+        wallet: shortAddr(auth.address),
+        credits: account?.credits,
+        level: account?.level ?? profile.level,
+        wins: account?.wins ?? profile.wins,
+        losses: account?.losses ?? profile.losses,
+    };
+    let opp;
+    if (cpuAi) {
+        const o = resolveAgentOpp();
+        opp = { wallet: o.wallet, level: o.level, wins: o.wins, losses: o.losses, streak: o.streak, minds: o.minds };
+    }
+    else if (net?.setup) {
+        const os = (1 - net.side);
+        opp = { wallet: '', minds: net.setup.agents[os] }; // live peer: name is on the nameplate; record unknown here
+    }
+    else {
+        opp = { wallet: '' }; // local 2P guest
+    }
+    const out = [null, null];
+    out[ls] = me;
+    out[(1 - ls)] = opp;
+    return out;
+};
+/** Resolve the current AI-agent opponent for the select-screen badge. */
+const resolveAgentOpp = () => {
+    const target = cpuLevelFor(profile, lever);
+    const agents = agentRoster?.agents ?? [];
+    if (agents.length > 0) {
+        const a = [...agents].sort((p, q) => Math.abs(p.level - target) - Math.abs(q.level - target))[0];
+        return {
+            kind: 'live', name: a.name, level: a.level, wins: a.wins, losses: a.losses,
+            streak: a.streak, wallet: shortAddr(a.address), minds: false,
+        };
+    }
+    // House agent: calibrated level; the REAL aggregate record once it has match
+    // history (it visibly grows as players fight it — the "learning" signal),
+    // else a seeded "connected account" so a fresh deployment still reads as an
+    // established rival.
+    const h = agentRoster?.house;
+    const live = h && h.battles > 0;
+    return {
+        kind: 'house', name: 'HOUSE AGENT', level: target,
+        wins: live ? h.wins : (12 + (profile.wins % 40)),
+        losses: live ? h.losses : (2 + (profile.losses % 6)),
+        streak: live ? h.streak : Math.max(0, (profile.wins % 5)),
+        wallet: HOUSE_WALLET, minds: true,
+    };
 };
 /**
  * Pull the account snapshot from the match server (also claims the daily
@@ -7769,17 +8024,23 @@ const startOnline = (m, runToken) => {
     });
 };
 /**
- * Enter a friendly challenge room with the remembered fighter (same pick
- * logic as quick play — the invite screen and ?room= links skip the select
- * detour; C on the select screen is still available first if they care).
+ * Enter a friendly challenge → the CHARACTER SELECT screen first (both the
+ * inviter hitting CHALLENGE LIVE and a ?room= friend pick their fighter
+ * before queuing). Locking on select queues 'friendly' into `friendlyRoom`.
  */
 const startFriendly = (room) => {
-    let idx = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
-    if (idx < 0)
-        idx = Math.max(0, allRosters.findIndex((r) => !r.disabled));
-    picks[0] = idx;
     friendlyRoom = room.toUpperCase();
-    startOnline('friendly');
+    selectingFriendly = true;
+    mode = 'online'; // render the one-fighter online select (not cpu/2p)
+    screen = 'select';
+    locked = [false, false];
+    // Cursor starts on the remembered fighter — one confirm away, but they CAN
+    // move it now (the whole point of this screen).
+    let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
+    if (fe < 0)
+        fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+    picks = [fe, fe];
+    void audio.playBgm('player_select', { fadeInSec: 0.5 });
 };
 /** Match setup arrived — install the pinned characters/stage and begin. */
 const installOnlineMatch = () => {
@@ -8170,7 +8431,7 @@ const renderFight = (g) => {
             ? ['', arcade
                     ? `BATTLE ${arcade.stage + 1}/${arcade.total}`
                     : `AGENT LV ${cpuLevelFor(profile, lever)}`]
-            : undefined, autoSpecialCharged(g.fighters[localSide()]));
+            : undefined, autoSpecialCharged(g.fighters[localSide()]), hudIds());
     // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
     // sweeps across the whole frame.
     drawFx(ctx, 'screen');
@@ -8184,6 +8445,13 @@ const tickSelect = () => {
     if (pressedThisFrame.has('Escape') || taps.has('back')) {
         if (locked[0] || locked[1]) {
             locked = [false, false];
+        }
+        else if (selectingFriendly) {
+            // Backing out of a challenge pick → the invite screen it came from
+            // (no one is waiting yet — the room isn't queued until lock).
+            selectingFriendly = false;
+            screen = 'invite';
+            return;
         }
         else {
             screen = 'title';
@@ -8244,12 +8512,12 @@ const tickSelect = () => {
     if (enabled(picks[0]) && (tapConfirm || CONFIRM[0].some((k) => pressedThisFrame.has(k))))
         locked[0] = true;
     if (mode === 'online' || mode === 'cpu') {
-        // Locking IS the launch. ONLINE: the pick is the wager-queue ticket
-        // (the server matchmakes and charges the fee). ARCADE: the pick is
-        // sealed for the whole gauntlet — no switching until the run ends —
-        // and queues the RANKED run (1 credit, server-verified).
+        // Locking IS the launch. FRIENDLY: queue the private challenge room.
+        // ONLINE: the pick is the wager-queue ticket (server matchmakes + charges
+        // the fee). ARCADE: the pick is sealed for the whole gauntlet — no
+        // switching until the run ends — and queues the RANKED run (1 credit).
         if (locked[0])
-            startOnline(mode === 'cpu' ? 'arcade' : 'wager');
+            startOnline(selectingFriendly ? 'friendly' : mode === 'cpu' ? 'arcade' : 'wager');
         return;
     }
     if (mode === '2p') {
@@ -8368,10 +8636,11 @@ const frame = () => {
         // focus). The '2p' Mode value + its handling stay in the codebase, just no
         // longer offered on the menu.
         const MODES = ['cpu', 'online'];
-        /** Leave the title for the fighter select (C — "change fighter"). */
+        /** Leave the title for the fighter select. */
         const enterSelect = () => {
             screen = 'select';
             locked = [false, false];
+            selectingFriendly = false; // a title select is always wager (online) or arcade (cpu)
             // Cursor starts on the REMEMBERED fighter so select is one confirm away.
             let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
             if (fe < 0)
@@ -8380,22 +8649,12 @@ const frame = () => {
             void audio.playBgm('player_select', { fadeInSec: 0.5 });
         };
         /**
-         * Launch the selected mode. ONLINE keeps the P0 quick-match promise
-         * (one input → queue with the remembered fighter). AGENT ARCADE always
-         * routes through the select screen first: you pick your fighter INSIDE
-         * the mode, and that pick is then locked for the whole run.
+         * Both modes now route through the select screen first — you pick your
+         * fighter before entering the match (ONLINE WAGER stakes credits, so a
+         * blind quick-queue was a footgun; AGENT ARCADE locks the pick for the
+         * whole run). Select's lock handler does the actual queue.
          */
-        const launchMode = () => {
-            if (mode === 'cpu') {
-                enterSelect();
-                return;
-            }
-            let idx = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
-            if (idx < 0)
-                idx = Math.max(0, allRosters.findIndex((r) => !r.disabled));
-            picks[0] = idx;
-            startOnline('wager');
-        };
+        const launchMode = () => { enterSelect(); };
         // A tapped mode row picks the mode AND launches — one tap to a match.
         const tappedMode = MODES.find((m) => taps.has(`mode:${m}`));
         if (pressedThisFrame.has('KeyL') || taps.has('signin')) {
@@ -8470,7 +8729,6 @@ const frame = () => {
             taunt: currentTaunt(),
             tauntIdx,
             tauntCount: TAUNTS.length,
-            custom: !!customTaunt,
             linkLabel: `${DARE_LINK_BASE.replace(/^https?:\/\//, '')}/${account?.refCode ?? ''}`,
             copiedAge: inviteCopiedAge,
             canShare: shareViaSheet(),
@@ -8480,17 +8738,11 @@ const frame = () => {
                 : undefined,
         });
         if (pressedThisFrame.has('ArrowLeft') || pressedThisFrame.has('KeyA') || taps.has('taunt:prev')) {
-            customTaunt = '';
             tauntIdx = (tauntIdx + TAUNTS.length - 1) % TAUNTS.length;
             inviteCopiedAge = -1; // new taunt = new link — re-arm the button
         }
         else if (pressedThisFrame.has('ArrowRight') || pressedThisFrame.has('KeyD') || taps.has('taunt:next')) {
-            customTaunt = '';
             tauntIdx = (tauntIdx + 1) % TAUNTS.length;
-            inviteCopiedAge = -1;
-        }
-        else if (pressedThisFrame.has('KeyT') || taps.has('taunt:edit')) {
-            editTaunt();
             inviteCopiedAge = -1;
         }
         else if (account?.refCode && (pressedThisFrame.has('KeyC') || taps.has('challenge'))) {
@@ -8512,9 +8764,15 @@ const frame = () => {
     }
     else if (screen === 'select') {
         tickSelect();
-        // ARCADE select: no CPU-level badge (difficulty ramps per stage instead);
-        // the gauntlet rules panel tells the player what they're entering.
-        drawSelect(ctx, allRosters, picks, locked, uiTick, undefined, mode === 'cpu' ? Math.max(1, allRosters.filter((r) => !r.disabled).length - 1) : undefined);
+        if (!agentRosterFetched)
+            fetchAgentRoster();
+        // The upper-right AGENT OPPONENT card: who you're about to fight (level,
+        // W-L, streak, wallet) — a live agent when one exists, else the house
+        // agent. Shown for the AI-agent gauntlet; PvP-friendly select has no CPU.
+        const badge = !selectingFriendly
+            ? { cpuLevel: cpuLevelFor(profile, lever), lever, opp: resolveAgentOpp() }
+            : undefined;
+        drawSelect(ctx, allRosters, picks, locked, uiTick, badge, mode === 'cpu' ? Math.max(1, allRosters.filter((r) => !r.disabled).length - 1) : undefined, selectingFriendly);
         drawWalletStrip();
     }
     else if (screen === 'stageSelect') {
@@ -8674,6 +8932,14 @@ const frame = () => {
         if (netReconnecting) {
             drawReconnecting(ctx, uiTick); // ESC falls through to the branch's exit
         }
+        // OUR link is fine but the OPPONENT's dropped (v6): the rollback sim has
+        // frozen waiting on their inputs. Explain it + count down the server's
+        // grace, so the freeze reads as "they bailed" not "it crashed". Yields to
+        // our own reconnect/dead overlays (those are the more urgent story).
+        const oppGoneUntil = net?.oppGoneUntil ?? null;
+        if (oppGoneUntil !== null && !netReconnecting && !netDead && !net?.result) {
+            drawOpponentGone(ctx, (oppGoneUntil - Date.now()) / 1000, net?.setup?.mode === 'friendly', uiTick);
+        }
         if (netDead) {
             drawNetError(ctx, net.error, queuedMode, uiTick);
             if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('back')) {
@@ -8814,6 +9080,14 @@ const frame = () => {
         else if (pressedThisFrame.has('Escape') || taps.has('back')) {
             if (arcade) {
                 endArcade(); // quitting the gauntlet → title, never the select screen
+            }
+            else if (queuedMode === 'friendly') {
+                // Friendly done → back to the invite screen (a wager-mode select here
+                // would be an accidental 10-credit queue). Rematch is still ENTER.
+                net?.close();
+                net = null;
+                selectingFriendly = false;
+                screen = 'invite';
             }
             else {
                 net?.close();
@@ -8968,7 +9242,7 @@ Object.assign(globalThis, {
     afSetLever: (v) => { lever = Math.max(-10, Math.min(10, v | 0)); saveLever(lever); },
     afNet: () => (net ? {
         status: net.status, error: net.error, setup: net.setup, result: net.result,
-        stalled: net.stalled, side: net.side,
+        stalled: net.stalled, side: net.side, oppGoneUntil: net.oppGoneUntil,
     } : null),
     // Sever the live socket WITHOUT the leave-intent flag — simulates a wifi
     // blip so the reconnect path can be tested from the console/automation.

@@ -125,6 +125,26 @@ test('NO CONTEST: both sides gone on an undecided wager refunds both (never an a
   assert.equal(accA.wins + accA.losses + accB.wins + accB.losses, 0, 'nobody is charged a loss');
 });
 
+test('HEADS-UP: when the opponent drops, the survivor is told immediately (v6 oppgone)', async (t) => {
+  const server = await createMatchServer({ port: 0, persistence: memoryPersistence(), noPaceCheck: true });
+  t.after(() => server.close());
+  const url = `ws://127.0.0.1:${server.port}`;
+
+  const quitter = rawClient(url, 'Dropper', 'wager');
+  const stayer = rawClient(url, 'Survivor', 'wager');
+  await Promise.all([quitter.ready, stayer.ready]);
+  await Promise.all([quitter.until('match'), stayer.until('match')]);
+  for (let k = 0; k < 20; k++) { quitter.send({ t: 'i', k, v: 0 }); stayer.send({ t: 'i', k, v: 0 }); }
+  await new Promise((r) => setTimeout(r, 150));
+  quitter.close();
+
+  // The notice must land WITHOUT waiting out the 20s forfeit grace — that's
+  // the whole point (no more silent freeze). It carries the grace to count down.
+  const gone = await stayer.until<Extract<ServerMsg, { t: 'oppgone' }>>('oppgone', 4_000);
+  assert.ok(gone.graceMs > 0, 'the survivor gets a grace window to render as a countdown');
+  stayer.close();
+});
+
 test('the honest path still settles: a normal solo match pays out', async (t) => {
   const persistence = memoryPersistence();
   const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true });

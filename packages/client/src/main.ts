@@ -19,12 +19,12 @@ import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './a
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  currentStageCamLimits, drawGameOver, drawHud, drawInvite, drawNetError, drawRanks, drawReconnecting,
-  drawResults, drawSelect, drawStage, drawStageSelect, drawTitle, drawVsCard, drawWallet,
-  resetTaps, setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit, tapHit, tapZone,
-  worldTransform,
+  currentStageCamLimits, drawGameOver, drawHud, drawInvite, drawNetError, drawOpponentGone,
+  drawRanks, drawReconnecting, drawResults, drawSelect, drawStage, drawStageSelect, drawTitle,
+  drawVsCard, drawWallet, resetTaps, setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit,
+  tapHit, tapZone, worldTransform,
 } from './ui.js';
-import type { Cam, HudFx, Mode, RankRow, XpInfo } from './ui.js';
+import type { AgentOpponent, Cam, HudFx, HudId, Mode, RankRow, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit } from './chrome.js';
 import type { StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
@@ -142,16 +142,27 @@ let referralToastAge = -1; // ≥0 → the "+25 DARE ACCEPTED" toast is animatin
 // and its OG thumbnail shout it at the invitee; free text is by design.
 /** Mirrors release_referral's rolling-week payout cap (0005_referrals.sql). */
 const REFERRAL_WEEKLY_CAP = 10;
+// Curated taunts only — the ◀ ▶ picker cycles these (no free-text input, so
+// nothing forgeable ever rides the shared ?t= link). Keep each ≤ ~64 chars so
+// the OG card and the in-game line never overflow.
 const TAUNTS = [
   "MY GRANDMA'S AI HITS HARDER THAN YOU.",
   "YOU'D BE MY EASIEST WIN YET.",
   'SAY YOU WERE LAGGING. I DARE YOU.',
   "I'LL PLAY ONE-HANDED. STILL TAKING YOUR ROUNDS.",
   "BRING A FRIEND. YOU'LL NEED THE EMOTIONAL SUPPORT.",
+  "I'VE SEEN YOU PLAY. THIS WON'T TAKE LONG.",
+  'ONE ROUND. THAT’S ALL I’M ASKING. YOU CAN’T EVEN GIVE ME ONE.',
+  'YOUR MAIN? CUTE. BRING IT ANYWAY.',
+  'BLOCK BUTTON’S RIGHT THERE. YOU’LL FIND OUT WHY.',
+  'AFRAID? YOU SHOULD BE.',
+  'I ALREADY KNOW HOW THIS ENDS. DO YOU?',
+  'FREE CREDITS FOR LOSING TO ME. GENEROUS, RIGHT?',
+  'TAP ACCEPT. GET FLATTENED. COLLECT YOUR PARTICIPATION TROPHY.',
+  'NO JOHNS. NO LAG. JUST YOU LOSING.',
+  'PROVE ME WRONG. YOU WON’T, BUT PROVE ME WRONG.',
 ];
-const TAUNT_MAX = 90; // keeps the link sane and the OG card layout intact
 let tauntIdx = 0;
-let customTaunt = '';
 let inviteCopiedAge = -1; // ≥0 → the button reads "DARE ARMED"
 let inviteFrom: 'title' | 'results' = 'title'; // where ESC returns to
 // ---- Friendly challenge rooms (protocol v5): FREE, UNRANKED, paired by a
@@ -159,7 +170,11 @@ let inviteFrom: 'title' | 'results' = 'title'; // where ESC returns to
 // friend straight into the inviter's room — after the AIR sign-in gate.
 let friendlyRoom = ''; // the room the current/last friendly queued into
 let pendingRoom = ''; // ?room= from a challenge link, waiting on sign-in
-const currentTaunt = (): string => customTaunt || TAUNTS[tauntIdx]!;
+// The select screen is shared by wager and friendly (both PvP, one fighter to
+// pick). This flag tells its lock handler which to queue — set true only for
+// the friendly path, reset false on every normal (wager/cpu) select entry.
+let selectingFriendly = false;
+const currentTaunt = (): string => TAUNTS[tauntIdx]!;
 const dareLink = (): string =>
   `${DARE_LINK_BASE}/${account?.refCode ?? ''}?t=${encodeURIComponent(currentTaunt())}`;
 /** Coarse pointer ≈ phone/tablet → prefer the OS share sheet over clipboard. */
@@ -169,13 +184,6 @@ const enterInvite = (from: 'title' | 'results'): void => {
   inviteFrom = from;
   inviteCopiedAge = -1;
   screen = 'invite';
-};
-const editTaunt = (): void => {
-  // window.prompt is the only text input a single-canvas game has — same
-  // trade-off the clipboard fallback already makes. Blank → back to presets.
-  const t = window.prompt('WRITE YOUR TAUNT (blank = use the presets):', customTaunt || currentTaunt());
-  if (t === null) return;
-  customTaunt = t.trim().replace(/\s+/g, ' ').slice(0, TAUNT_MAX);
 };
 const shareDare = (): void => {
   if (!account?.refCode) return;
@@ -248,6 +256,91 @@ const fetchRanks = (): void => {
     })
     .catch((e) => { ranksErr = (e as Error).message || 'unreachable'; })
     .finally(() => { ranksBusy = false; });
+};
+
+// ---- AGENT OPPONENT identity (select-screen badge) ------------------------
+// The match server's /agents/roster returns real LIVE agents plus the house
+// agent's live aggregate record. The badge shows a live agent near the
+// player's calibrated level when one exists, else the house agent (real W-L +
+// streak, per-player level, "Connected to Minds™").
+interface RosterAgent {
+  id: string; name: string; address: string | null;
+  level: number; xp: number; wins: number; losses: number; streak: number;
+}
+interface RosterResp {
+  agents: RosterAgent[];
+  house: { wins: number; losses: number; streak: number; battles: number };
+}
+let agentRoster: RosterResp | null = null;
+let agentRosterFetched = false;
+/** Stable branded house smart-account handle (the house has no AIR wallet). */
+const HOUSE_WALLET = '0xA6E7…13C9';
+
+const shortAddr = (a?: string | null): string =>
+  a && a.length >= 10 ? `${a.slice(0, 6)}…${a.slice(-4)}` : (a ?? '');
+
+const fetchAgentRoster = (): void => {
+  agentRosterFetched = true;
+  void fetch(`${matchHttpUrl()}/agents/roster`)
+    .then(async (r) => { if (r.ok) agentRoster = (await r.json()) as RosterResp; })
+    .catch(() => { /* offline — the house agent is synthesized in resolveAgentOpp */ });
+};
+
+/**
+ * The two HUD identity strips (wallet + on-chain stats) drawn under each
+ * fighter's portrait/health/meter. The signed-in player's row shows credits;
+ * the opponent's shows its record — the agent opponent for solo/arcade, the
+ * live peer for online, a guest for local 2P.
+ */
+const hudIds = (): [HudId | null, HudId | null] => {
+  const ls = localSide();
+  const me: HudId = {
+    wallet: shortAddr(auth.address),
+    credits: account?.credits,
+    level: account?.level ?? profile.level,
+    wins: account?.wins ?? profile.wins,
+    losses: account?.losses ?? profile.losses,
+  };
+  let opp: HudId | null;
+  if (cpuAi) {
+    const o = resolveAgentOpp();
+    opp = { wallet: o.wallet, level: o.level, wins: o.wins, losses: o.losses, streak: o.streak, minds: o.minds };
+  } else if (net?.setup) {
+    const os = (1 - net.side) as 0 | 1;
+    opp = { wallet: '', minds: net.setup.agents[os] }; // live peer: name is on the nameplate; record unknown here
+  } else {
+    opp = { wallet: '' }; // local 2P guest
+  }
+  const out: [HudId | null, HudId | null] = [null, null];
+  out[ls] = me;
+  out[(1 - ls) as 0 | 1] = opp;
+  return out;
+};
+
+/** Resolve the current AI-agent opponent for the select-screen badge. */
+const resolveAgentOpp = (): AgentOpponent => {
+  const target = cpuLevelFor(profile, lever);
+  const agents = agentRoster?.agents ?? [];
+  if (agents.length > 0) {
+    const a = [...agents].sort((p, q) => Math.abs(p.level - target) - Math.abs(q.level - target))[0]!;
+    return {
+      kind: 'live', name: a.name, level: a.level, wins: a.wins, losses: a.losses,
+      streak: a.streak, wallet: shortAddr(a.address), minds: false,
+    };
+  }
+  // House agent: calibrated level; the REAL aggregate record once it has match
+  // history (it visibly grows as players fight it — the "learning" signal),
+  // else a seeded "connected account" so a fresh deployment still reads as an
+  // established rival.
+  const h = agentRoster?.house;
+  const live = h && h.battles > 0;
+  return {
+    kind: 'house', name: 'HOUSE AGENT', level: target,
+    wins: live ? h!.wins : (12 + (profile.wins % 40)),
+    losses: live ? h!.losses : (2 + (profile.losses % 6)),
+    streak: live ? h!.streak : Math.max(0, (profile.wins % 5)),
+    wallet: HOUSE_WALLET, minds: true,
+  };
 };
 
 /**
@@ -518,16 +611,22 @@ const startOnline = (m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: str
 };
 
 /**
- * Enter a friendly challenge room with the remembered fighter (same pick
- * logic as quick play — the invite screen and ?room= links skip the select
- * detour; C on the select screen is still available first if they care).
+ * Enter a friendly challenge → the CHARACTER SELECT screen first (both the
+ * inviter hitting CHALLENGE LIVE and a ?room= friend pick their fighter
+ * before queuing). Locking on select queues 'friendly' into `friendlyRoom`.
  */
 const startFriendly = (room: string): void => {
-  let idx = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
-  if (idx < 0) idx = Math.max(0, allRosters.findIndex((r) => !r.disabled));
-  picks[0] = idx;
   friendlyRoom = room.toUpperCase();
-  startOnline('friendly');
+  selectingFriendly = true;
+  mode = 'online'; // render the one-fighter online select (not cpu/2p)
+  screen = 'select';
+  locked = [false, false];
+  // Cursor starts on the remembered fighter — one confirm away, but they CAN
+  // move it now (the whole point of this screen).
+  let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
+  if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+  picks = [fe, fe];
+  void audio.playBgm('player_select', { fadeInSec: 0.5 });
 };
 
 /** Match setup arrived — install the pinned characters/stage and begin. */
@@ -931,7 +1030,8 @@ const renderFight = (g: GameState): void => {
           ? `BATTLE ${arcade.stage + 1}/${arcade.total}`
           : `AGENT LV ${cpuLevelFor(profile, lever)}`]
         : undefined,
-    autoSpecialCharged(g.fighters[localSide()]));
+    autoSpecialCharged(g.fighters[localSide()]),
+    hudIds());
 
   // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
   // sweeps across the whole frame.
@@ -947,6 +1047,12 @@ const tickSelect = (): void => {
   if (pressedThisFrame.has('Escape') || taps.has('back')) {
     if (locked[0] || locked[1]) {
       locked = [false, false];
+    } else if (selectingFriendly) {
+      // Backing out of a challenge pick → the invite screen it came from
+      // (no one is waiting yet — the room isn't queued until lock).
+      selectingFriendly = false;
+      screen = 'invite';
+      return;
     } else {
       screen = 'title';
       void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
@@ -989,11 +1095,11 @@ const tickSelect = (): void => {
   // A disabled fighter under the cursor cannot be confirmed.
   if (enabled(picks[0]) && (tapConfirm || CONFIRM[0]!.some((k) => pressedThisFrame.has(k)))) locked[0] = true;
   if (mode === 'online' || mode === 'cpu') {
-    // Locking IS the launch. ONLINE: the pick is the wager-queue ticket
-    // (the server matchmakes and charges the fee). ARCADE: the pick is
-    // sealed for the whole gauntlet — no switching until the run ends —
-    // and queues the RANKED run (1 credit, server-verified).
-    if (locked[0]) startOnline(mode === 'cpu' ? 'arcade' : 'wager');
+    // Locking IS the launch. FRIENDLY: queue the private challenge room.
+    // ONLINE: the pick is the wager-queue ticket (server matchmakes + charges
+    // the fee). ARCADE: the pick is sealed for the whole gauntlet — no
+    // switching until the run ends — and queues the RANKED run (1 credit).
+    if (locked[0]) startOnline(selectingFriendly ? 'friendly' : mode === 'cpu' ? 'arcade' : 'wager');
     return;
   }
   if (mode === '2p') {
@@ -1092,10 +1198,11 @@ const frame = (): void => {
     // focus). The '2p' Mode value + its handling stay in the codebase, just no
     // longer offered on the menu.
     const MODES: Mode[] = ['cpu', 'online'];
-    /** Leave the title for the fighter select (C — "change fighter"). */
+    /** Leave the title for the fighter select. */
     const enterSelect = (): void => {
       screen = 'select';
       locked = [false, false];
+      selectingFriendly = false; // a title select is always wager (online) or arcade (cpu)
       // Cursor starts on the REMEMBERED fighter so select is one confirm away.
       let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
       if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
@@ -1103,18 +1210,12 @@ const frame = (): void => {
       void audio.playBgm('player_select', { fadeInSec: 0.5 });
     };
     /**
-     * Launch the selected mode. ONLINE keeps the P0 quick-match promise
-     * (one input → queue with the remembered fighter). AGENT ARCADE always
-     * routes through the select screen first: you pick your fighter INSIDE
-     * the mode, and that pick is then locked for the whole run.
+     * Both modes now route through the select screen first — you pick your
+     * fighter before entering the match (ONLINE WAGER stakes credits, so a
+     * blind quick-queue was a footgun; AGENT ARCADE locks the pick for the
+     * whole run). Select's lock handler does the actual queue.
      */
-    const launchMode = (): void => {
-      if (mode === 'cpu') { enterSelect(); return; }
-      let idx = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
-      if (idx < 0) idx = Math.max(0, allRosters.findIndex((r) => !r.disabled));
-      picks[0] = idx;
-      startOnline('wager');
-    };
+    const launchMode = (): void => { enterSelect(); };
     // A tapped mode row picks the mode AND launches — one tap to a match.
     const tappedMode = MODES.find((m) => taps.has(`mode:${m}`));
     if (pressedThisFrame.has('KeyL') || taps.has('signin')) {
@@ -1174,7 +1275,6 @@ const frame = (): void => {
       taunt: currentTaunt(),
       tauntIdx,
       tauntCount: TAUNTS.length,
-      custom: !!customTaunt,
       linkLabel: `${DARE_LINK_BASE.replace(/^https?:\/\//, '')}/${account?.refCode ?? ''}`,
       copiedAge: inviteCopiedAge,
       canShare: shareViaSheet(),
@@ -1184,15 +1284,10 @@ const frame = (): void => {
         : undefined,
     });
     if (pressedThisFrame.has('ArrowLeft') || pressedThisFrame.has('KeyA') || taps.has('taunt:prev')) {
-      customTaunt = '';
       tauntIdx = (tauntIdx + TAUNTS.length - 1) % TAUNTS.length;
       inviteCopiedAge = -1; // new taunt = new link — re-arm the button
     } else if (pressedThisFrame.has('ArrowRight') || pressedThisFrame.has('KeyD') || taps.has('taunt:next')) {
-      customTaunt = '';
       tauntIdx = (tauntIdx + 1) % TAUNTS.length;
-      inviteCopiedAge = -1;
-    } else if (pressedThisFrame.has('KeyT') || taps.has('taunt:edit')) {
-      editTaunt();
       inviteCopiedAge = -1;
     } else if (account?.refCode && (pressedThisFrame.has('KeyC') || taps.has('challenge'))) {
       // CHALLENGE LIVE: park in a room keyed by MY code and copy the live
@@ -1210,10 +1305,16 @@ const frame = (): void => {
     }
   } else if (screen === 'select') {
     tickSelect();
-    // ARCADE select: no CPU-level badge (difficulty ramps per stage instead);
-    // the gauntlet rules panel tells the player what they're entering.
-    drawSelect(ctx, allRosters, picks, locked, uiTick, undefined,
-      mode === 'cpu' ? Math.max(1, allRosters.filter((r) => !r.disabled).length - 1) : undefined);
+    if (!agentRosterFetched) fetchAgentRoster();
+    // The upper-right AGENT OPPONENT card: who you're about to fight (level,
+    // W-L, streak, wallet) — a live agent when one exists, else the house
+    // agent. Shown for the AI-agent gauntlet; PvP-friendly select has no CPU.
+    const badge = !selectingFriendly
+      ? { cpuLevel: cpuLevelFor(profile, lever), lever, opp: resolveAgentOpp() }
+      : undefined;
+    drawSelect(ctx, allRosters, picks, locked, uiTick, badge,
+      mode === 'cpu' ? Math.max(1, allRosters.filter((r) => !r.disabled).length - 1) : undefined,
+      selectingFriendly);
     drawWalletStrip();
   } else if (screen === 'stageSelect') {
     tickStageSelect();
@@ -1360,6 +1461,15 @@ const frame = (): void => {
     if (netReconnecting) {
       drawReconnecting(ctx, uiTick); // ESC falls through to the branch's exit
     }
+    // OUR link is fine but the OPPONENT's dropped (v6): the rollback sim has
+    // frozen waiting on their inputs. Explain it + count down the server's
+    // grace, so the freeze reads as "they bailed" not "it crashed". Yields to
+    // our own reconnect/dead overlays (those are the more urgent story).
+    const oppGoneUntil = net?.oppGoneUntil ?? null;
+    if (oppGoneUntil !== null && !netReconnecting && !netDead && !net?.result) {
+      drawOpponentGone(ctx, (oppGoneUntil - Date.now()) / 1000,
+        net?.setup?.mode === 'friendly', uiTick);
+    }
     if (netDead) {
       drawNetError(ctx, net!.error, queuedMode, uiTick);
       if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('back')) {
@@ -1497,6 +1607,13 @@ const frame = (): void => {
     } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
       if (arcade) {
         endArcade(); // quitting the gauntlet → title, never the select screen
+      } else if (queuedMode === 'friendly') {
+        // Friendly done → back to the invite screen (a wager-mode select here
+        // would be an accidental 10-credit queue). Rematch is still ENTER.
+        net?.close();
+        net = null;
+        selectingFriendly = false;
+        screen = 'invite';
       } else {
         net?.close();
         net = null;
@@ -1643,7 +1760,7 @@ Object.assign(globalThis, {
   afSetLever: (v: number) => { lever = Math.max(-10, Math.min(10, v | 0)); saveLever(lever); },
   afNet: () => (net ? {
     status: net.status, error: net.error, setup: net.setup, result: net.result,
-    stalled: net.stalled, side: net.side,
+    stalled: net.stalled, side: net.side, oppGoneUntil: net.oppGoneUntil,
   } : null),
   // Sever the live socket WITHOUT the leave-intent flag — simulates a wifi
   // blip so the reconnect path can be tested from the console/automation.

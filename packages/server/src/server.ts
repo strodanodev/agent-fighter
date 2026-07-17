@@ -896,6 +896,12 @@ export const createMatchServer = (opts: {
           resume: m.resumeTokens[side],
           inputs: [toNullable(m.inputs[0]), toNullable(m.inputs[1])],
         });
+        // Clear the survivor's "opponent disconnected" notice (v6) — their
+        // peer is back and inputs will resume flowing.
+        const peer = m.clients[1 - side];
+        if (peer && peer !== c && peer.ws.readyState === WebSocket.OPEN) {
+          send(peer, { t: 'oppback' });
+        }
         console.log(`[match ${m.id}] side ${side} (${c.name}) resumed`);
         return;
       }
@@ -941,6 +947,14 @@ export const createMatchServer = (opts: {
     const m = c.match;
     if (!m || m.finished) return;
     m.gone[c.side] = true;
+    // Tell the SURVIVOR their opponent vanished (v6) — the instant it happens,
+    // so their client explains the freeze + counts down the grace instead of
+    // sitting on a dead-looking frame. PvP only: a solo/arcade opponent has no
+    // socket, so clients[1-side] is null and nothing is sent.
+    const survivor = m.clients[1 - c.side];
+    if (survivor && survivor.ws.readyState === WebSocket.OPEN) {
+      send(survivor, { t: 'oppgone', graceMs: FORFEIT_GRACE_MS });
+    }
     // Grace, then settle (ADR 0003 disconnect policy). Whoever is still here
     // when it fires is the survivor; if NOBODY is, it's a no-contest, not an
     // arbitrary loss for whichever socket happened to close first.
@@ -1030,6 +1044,16 @@ export const createMatchServer = (opts: {
         .catch((e) => json(res, 502, { error: String(e) }));
       return;
     }
+    // Opponent identity for the AGENT ARCADE / VS-AGENT select-screen badge:
+    // the live agent roster (real trained agents) + the house agent's aggregate
+    // record. The client picks a live agent near its level, else the house.
+    if (path === '/agents/roster') {
+      if (!persistence) return json(res, 503, { error: 'persistence not configured' });
+      void Promise.all([persistence.agentRoster(), persistence.houseStats()])
+        .then(([agents, house]) => json(res, 200, { agents, house }))
+        .catch((e) => json(res, 502, { error: String(e) }));
+      return;
+    }
     // Account snapshot for the title screen (also claims the daily bonus —
     // "logging in" = first authenticated contact of the day, whichever
     // surface it lands on). Auth: AIR session JWT; in the DEV economy an
@@ -1044,10 +1068,9 @@ export const createMatchServer = (opts: {
           : null;
         if (!identity) return json(res, 401, { error: 'sign in required' });
         const q = new URL(req.url ?? '/', 'http://x').searchParams;
-        // ?name= — the client's display name. Without it, get_account upserts
-        // the sub-prefix fallback over the real fighter name (leaderboard
-        // showed a raw UUID until the next ws hello repaired it).
-        const name = devName || (q.get('name') ?? '').slice(0, 24) || identity.sub.slice(0, 12);
+        // ?name= — client display name. Empty string lets get_account KEEP the
+        // existing profile name (never clobber with a UUID-prefix stub).
+        const name = (devName || (q.get('name') ?? '')).slice(0, 24);
         // ?ref=<dare code> — the title screen redeems a stashed referral here.
         const ref = q.get('ref')?.slice(0, 40) ?? undefined;
         return json(res, 200, await persistence.getAccount(identity, name, false, ref));

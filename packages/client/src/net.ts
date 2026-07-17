@@ -19,7 +19,7 @@ import type { AiState, GameState, InputFrame } from '@af/core';
  */
 
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 5;
+const NET_PROTOCOL = 6;
 const MAX_AHEAD = 10;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -104,6 +104,13 @@ export class NetSession {
   game: GameState | null = null;
   /** Ticks currently stalled waiting on the opponent (UI: "connection…"). */
   stalled = 0;
+  /**
+   * Wall-clock deadline (Date.now() ms) the opponent must reconnect by, set
+   * from the server's `oppgone` heads-up (v6); null when the peer is present.
+   * Drives the "OPPONENT DISCONNECTED — reconnecting… Ns" countdown. Cleared
+   * by `oppback` or the final `result`.
+   */
+  oppGoneUntil: number | null = null;
 
   private ws!: WebSocket;
   private myInputs: number[] = [];
@@ -244,9 +251,20 @@ export class NetSession {
         }
         return;
       }
+      case 'oppgone': {
+        // Opponent's socket dropped (v6) — start the reconnect countdown so
+        // the fight screen explains the stall instead of freezing silently.
+        this.oppGoneUntil = Date.now() + Number(msg.graceMs ?? 0);
+        return;
+      }
+      case 'oppback': {
+        this.oppGoneUntil = null; // opponent reconnected within grace
+        return;
+      }
       case 'result': {
         this.result = msg as unknown as NetResult;
         this.status = 'done';
+        this.oppGoneUntil = null;
         return;
       }
       case 'xp': {
@@ -428,6 +446,7 @@ export class SoloSession {
   xp: NetXp | null = null;
   game: GameState | null = null;
   stalled = 0; // never stalls — kept for the shared interface
+  oppGoneUntil: number | null = null; // no peer socket — kept for the shared interface
 
   private ws!: WebSocket;
   private houseAi: AiState | null = null;

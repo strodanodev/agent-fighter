@@ -154,6 +154,24 @@ export interface AgentInfo {
   level: number; xp: number; wins: number; losses: number;
 }
 
+/**
+ * A LIVE agent (a real player's trained agent) as an opponent identity — the
+ * select-screen badge card (0010 `agent_roster` view). `address` is the AIR
+ * smart-account wallet; `streak` is the current consecutive-win count.
+ */
+export interface AgentRosterRow {
+  id: string;
+  name: string;
+  address: string | null;
+  level: number; xp: number; wins: number; losses: number;
+  streak: number;
+}
+
+/** The house agent's live aggregate record (0010 `house_agent_stats`). */
+export interface HouseStats {
+  wins: number; losses: number; streak: number; battles: number;
+}
+
 export interface Persistence {
   /** Dev economy (name-keyed identities allowed, nothing durable). */
   dev: boolean;
@@ -186,6 +204,10 @@ export interface Persistence {
    */
   releaseReferral: (inviteeSub: string) => Promise<number>;
   leaderboard: (limit?: number) => Promise<unknown[]>;
+  /** LIVE agents (real trained agents) as opponent-card identities. */
+  agentRoster: () => Promise<AgentRosterRow[]>;
+  /** The house agent's live aggregate record (grows as players fight it). */
+  houseStats: () => Promise<HouseStats>;
   /** Trained agent (ADR 0006). Null = profile does not exist. */
   getAgent: (sub: string) => Promise<AgentInfo | null>;
   /** Caller has ALREADY clamped/validated the config (server.ts is the authority). */
@@ -293,7 +315,20 @@ export const memoryPersistence = (): Persistence => {
     dev: true,
     getAccount: async (identity, name, agent, ref) => {
       const p = prof(identity.sub);
-      names.set(identity.sub, { name, agent });
+      const trimmed = name.trim();
+      const stub =
+        !trimmed ||
+        trimmed === identity.sub.slice(0, 12) ||
+        /^[0-9a-f]{8}-[0-9a-f]{0,4}$/i.test(trimmed);
+      const prev = names.get(identity.sub);
+      if (!stub || !prev) {
+        names.set(identity.sub, {
+          name: stub ? identity.sub.slice(0, 12) : trimmed,
+          agent,
+        });
+      } else {
+        names.set(identity.sub, { name: prev.name, agent });
+      }
       const today = new Date().toISOString().slice(0, 10);
       const dailyGranted = p.lastDaily !== today;
       if (dailyGranted) {
@@ -381,6 +416,10 @@ export const memoryPersistence = (): Persistence => {
           id, name: names.get(id)?.name ?? 'anon', is_agent: names.get(id)?.agent ?? false,
           level: p.level, xp: p.xp, wins: p.wins, losses: p.losses, rank: i + 1,
         })),
+    // Dev economy has no durable match history; the client falls back to a
+    // client-simulated house agent when these come back empty/zero.
+    agentRoster: async () => [],
+    houseStats: async () => ({ wins: 0, losses: 0, streak: 0, battles: 0 }),
     getAgent: async (sub) => {
       if (!profiles.has(sub)) return null;
       const p = prof(sub);
@@ -441,10 +480,25 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
   return {
     dev: false,
     getAccount: async (identity, name, agent, ref) => {
+      // Never let an empty / UUID-prefix stub clobber a real fighter name
+      // (leaderboard bug — see migration 0009_leaderboard_names.sql).
+      let safeName = name.trim();
+      const stub =
+        !safeName ||
+        safeName === identity.sub.slice(0, 12) ||
+        /^[0-9a-f]{8}-[0-9a-f]{0,4}$/i.test(safeName);
+      if (stub) {
+        const existing = (await call(
+          `/rest/v1/profiles?id=eq.${encodeURIComponent(identity.sub)}&select=name&limit=1`,
+          { method: 'GET' },
+        )) as Array<{ name?: string }>;
+        const kept = existing[0]?.name?.trim();
+        safeName = kept && kept.length > 0 ? kept : identity.sub.slice(0, 12);
+      }
       const rows = (await call('/rest/v1/rpc/get_account', {
         method: 'POST',
         body: JSON.stringify({
-          _id: identity.sub, _name: name, _agent: agent,
+          _id: identity.sub, _name: safeName, _agent: agent,
           _address: identity.address ?? null,
           _ref: ref ?? null,
         }),
@@ -513,6 +567,15 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
     },
     leaderboard: async (limit = 20) =>
       (await call(`/rest/v1/leaderboard?select=*&limit=${limit | 0}`, { method: 'GET' })) as unknown[],
+    agentRoster: async () =>
+      (await call('/rest/v1/agent_roster?select=*&order=level.desc,wins.desc&limit=50', { method: 'GET' })) as AgentRosterRow[],
+    houseStats: async () => {
+      const rows = (await call('/rest/v1/rpc/house_agent_stats', {
+        method: 'POST', body: JSON.stringify({}),
+      })) as Array<Record<string, number>>;
+      const r = rows?.[0] ?? { wins: 0, losses: 0, streak: 0, battles: 0 };
+      return { wins: r.wins! | 0, losses: r.losses! | 0, streak: r.streak! | 0, battles: r.battles! | 0 };
+    },
     getAgent: async (sub) => {
       const rows = (await call('/rest/v1/rpc/get_agent', {
         method: 'POST', body: JSON.stringify({ _id: sub }),

@@ -7,7 +7,7 @@
  * server relays it and re-simulates the ledger to derive the result.
  */
 
-export const PROTOCOL_VERSION = 5; // v5: friendly challenge rooms (CQueue.room)
+export const PROTOCOL_VERSION = 6; // v6: opponent-disconnect heads-up (oppgone/oppback)
 export const DEFAULT_PORT = 8477;
 
 /** Local-input delay (ticks) applied by both sides — symmetric by design. */
@@ -199,6 +199,19 @@ export interface SResult {
 }
 export interface SError { t: 'error'; msg: string; code?: 'credits' | 'auth' }
 /**
+ * PvP heads-up (v6): the OPPONENT's socket just dropped. Sent to the SURVIVOR
+ * the instant it happens so the client can show "OPPONENT DISCONNECTED —
+ * reconnecting… Ns" instead of silently freezing (its rollback sim stalls
+ * once it runs out of the vanished peer's inputs). `graceMs` is the window
+ * the server will hold before forfeiting the missing side (FORFEIT_GRACE_MS)
+ * — the countdown the client renders. Solo/arcade never send this (no peer
+ * socket). Purely informational: the authoritative verdict is still the
+ * later `result`.
+ */
+export interface SOppGone { t: 'oppgone'; graceMs: number }
+/** The dropped opponent rejoined within grace (v6) — clear the notice. */
+export interface SOppBack { t: 'oppback' }
+/**
  * Your account snapshot — sent once the hello token verifies (and again on
  * demand). `dailyGranted` = THIS connection claimed today's login bonus.
  */
@@ -237,4 +250,4 @@ export interface SXp {
   creditsDelta: number;
   credits: number;
 }
-export type ServerMsg = SWelcome | SQueued | SMatch | SResumed | SInput | SResult | SError | SAccount | SXp;
+export type ServerMsg = SWelcome | SQueued | SMatch | SResumed | SInput | SResult | SError | SAccount | SXp | SOppGone | SOppBack;
