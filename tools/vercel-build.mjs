@@ -29,16 +29,19 @@ const DEMO = join(ROOT, 'packages', 'client', 'demo');
 rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
 
-// Landing page.
+// EVERYTHING bundle.mjs emitted, tree and all: the demo html, vendor/
+// airkit.umd.js, sw.js + manifest.webmanifest (the worker must sit at the
+// site root so its scope covers the app), .well-known/jwks.json.
+//
+// Copy the tree rather than naming files. A hardcoded list silently drifts
+// from what the bundler emits and 404s in production — that is exactly how
+// vendor/airkit.umd.js went missing and took AIR sign-in down with it.
+cpSync(DEMO, OUT, { recursive: true });
+
+// The demo is the landing page; keep /m1 as a short alias for the M1 build.
 cpSync(join(DEMO, 'agent-fighter.html'), join(OUT, 'index.html'));
 if (existsSync(join(DEMO, 'agent-fighter-m1.html'))) {
   cpSync(join(DEMO, 'agent-fighter-m1.html'), join(OUT, 'm1.html'));
-}
-
-// PWA root files (bundle.mjs copies them next to the demo). The service worker
-// must sit at the site root so its scope covers the whole app.
-for (const f of ['manifest.webmanifest', 'sw.js']) {
-  if (existsSync(join(DEMO, f))) cpSync(join(DEMO, f), join(OUT, f));
 }
 
 // Static trees. frames-raw is authoring scratch — never ship it.
