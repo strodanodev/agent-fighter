@@ -6,6 +6,9 @@
   "workspaces": [
     "packages/*"
   ],
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "test": "npm run test -w @af/core",
     "typecheck": "npm run typecheck -w @af/core && npm run typecheck -w @af/client && npm run typecheck -w @af/studio && npm run typecheck -w @af/server",

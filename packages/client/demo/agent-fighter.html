@@ -2350,17 +2350,15 @@ const loadRoster = async (id) => {
     // Atlases ship as WebP (a fraction of the bytes); `image` names the file.
     // Older atlases predate the field and are always atlas.png.
     const sheetFile = atlas?.image ?? 'atlas.png';
-    // Dedicated character-select portrait, authored in Studio (meta.selectPortrait
-    // → _select.png). Only honored when the bundle still references it — "remove"
-    // in Studio clears the field but leaves the file, and we must respect that.
     const meta = bundle.meta;
-    const portraitFile = meta?.selectPortrait;
-    const safePortrait = portraitFile && /^[\w.-]+\.(png|webp|jpe?g)$/.test(portraitFile)
-        ? portraitFile : null;
-    const [sheet, refPortrait, selectPortrait] = await Promise.all([
+    const safeName = (f) => f && /^[\w.-]+\.(png|webp|jpe?g)$/.test(f) ? f : null;
+    const safePortrait = safeName(meta?.selectPortrait);
+    const safeVs = safeName(meta?.vsPortrait);
+    const [sheet, refPortrait, selectPortrait, vsPortrait] = await Promise.all([
         loadImage(`/characters/${id}/sprites/${sheetFile}`),
         loadImage(`/characters/${id}/sprites/_reference.png`),
         safePortrait ? loadImage(`/characters/${id}/sprites/${safePortrait}`) : Promise.resolve(null),
+        safeVs ? loadImage(`/characters/${id}/sprites/${safeVs}`) : Promise.resolve(null),
     ]);
     const dedicated = !!selectPortrait;
     const portrait = selectPortrait ?? refPortrait;
@@ -2371,6 +2369,8 @@ const loadRoster = async (id) => {
         // A composed portrait fills its frame (cover-fit); only the sprite fallback
         // needs alpha bounds to crop away the empty cell.
         portraitBox: !dedicated && portrait ? alphaBounds(portrait) : null,
+        vsPortrait,
+        vsFraming: vsPortrait ? (meta?.vsFraming ?? null) : null,
         disabled: !!meta?.disabled,
     };
 };
@@ -2434,16 +2434,12 @@ const drawFighter = (ctx, roster, f, tick, x, y, fallback, opts) => {
     ctx.fillRect(-26, -108, 52, 108);
     ctx.restore();
 };
-/**
- * Draw a character portrait into (x, y, w, h).
- *  - Dedicated portrait (_select.png): composed art → cover-fit (fill the frame,
- *    center-crop the overflow), no alpha cropping.
- *  - Reference-sprite fallback: a square crop centered on the head and chest of
- *    the figure (the reference cell is mostly empty space), scaled to fill.
- */
-const drawPortrait = (ctx, roster, x, y, w, h) => {
-    const img = roster.portrait;
-    if (!img || (!roster.portraitDedicated && !roster.portraitBox)) {
+const drawPortrait = (ctx, roster, x, y, w, h, slot = 'select') => {
+    const useVs = slot === 'vs' && !!roster.vsPortrait;
+    const img = useVs ? roster.vsPortrait : roster.portrait;
+    const dedicated = useVs || roster.portraitDedicated;
+    const framing = useVs ? roster.vsFraming : roster.portraitFraming;
+    if (!img || (!dedicated && !roster.portraitBox)) {
         ctx.fillStyle = '#1b1e30';
         ctx.fillRect(x, y, w, h);
         return;
@@ -2452,23 +2448,28 @@ const drawPortrait = (ctx, roster, x, y, w, h) => {
     ctx.beginPath();
     ctx.rect(x, y, w, h);
     ctx.clip();
-    ctx.imageSmoothingEnabled = roster.portraitDedicated ? true : (roster.atlas?.smooth ?? false);
+    ctx.imageSmoothingEnabled = dedicated ? true : (roster.atlas?.smooth ?? false);
     if (ctx.imageSmoothingEnabled)
         ctx.imageSmoothingQuality = 'high';
-    if (roster.portraitDedicated) {
-        // Cover-fit scaled by zoom, then rotated (90° steps), flipped, and panned.
-        // Must match the Studio preview math (studio main.ts framedPreview).
-        const fr = roster.portraitFraming;
+    if (dedicated) {
+        // Fitted by zoom, then rotated (90° steps), flipped, and panned. Must match
+        // the Studio preview math (studio main.ts framedPreview).
+        //  · select → COVER: a square portrait should fill its frame edge to edge.
+        //  · vs → CONTAIN: the whole pose stays visible (never clipped) while the
+        //    fixed frame keeps every character the same size. zoom > 1 pushes in.
+        const fr = framing;
         const iw = img.naturalWidth, ih = img.naturalHeight;
         const zoom = Math.max(1, fr?.zoom ?? 1);
         const rot = ((((fr?.rotate ?? 0) % 360) + 360) % 360);
         const swap = rot === 90 || rot === 270;
         const bw = swap ? ih : iw, bh = swap ? iw : ih;
-        const scale = Math.max(w / bw, h / bh) * zoom;
+        const fitScale = useVs ? Math.min(w / bw, h / bh) : Math.max(w / bw, h / bh);
+        const scale = fitScale * zoom;
         const sw = bw * scale, sh = bh * scale;
         const panX = Math.max(-1, Math.min(1, fr?.panX ?? 0));
         const panY = Math.max(-1, Math.min(1, fr?.panY ?? 0));
-        ctx.translate(x + w / 2 + panX * (sw - w) / 2, y + h / 2 + panY * (sh - h) / 2);
+        // Only pan across real overflow — a contained image has none to slide.
+        ctx.translate(x + w / 2 + panX * Math.max(0, sw - w) / 2, y + h / 2 + panY * Math.max(0, sh - h) / 2);
         ctx.rotate(rot * Math.PI / 180);
         if (fr?.flipH)
             ctx.scale(-1, 1);
@@ -3058,7 +3059,18 @@ const NET_PROTOCOL = 3;
 const MAX_AHEAD = 10;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
+/** Resume retry policy: a handful of quick attempts inside the server's
+ * FORFEIT_GRACE window (20s) — 6 × ~1.6s covers a router blip with room. */
+const RESUME_ATTEMPTS = 6;
+const RESUME_RETRY_MS = 1_600;
 class NetSession {
+    url;
+    name;
+    character;
+    bundleHash;
+    authToken;
+    mode;
+    email;
     status = 'connecting';
     error = '';
     setup = null;
@@ -3080,28 +3092,88 @@ class NetSession {
     resimFrom = -1;
     overSent = false;
     nextHashTick = 0; // last CONFIRMED checkpoint reported to the server
+    intentionalClose = false;
+    resumeAttempts = 0;
+    retryTimer = null;
     constructor(url, name, character, bundleHash, authToken, mode = 'wager', email) {
-        this.ws = new WebSocket(url);
-        this.ws.onopen = () => {
-            this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION, auth: authToken, email });
-            this.send({ t: 'queue', character, bundleHash, mode });
-            this.status = 'queued';
+        this.url = url;
+        this.name = name;
+        this.character = character;
+        this.bundleHash = bundleHash;
+        this.authToken = authToken;
+        this.mode = mode;
+        this.email = email;
+        this.connect(false);
+    }
+    /** Open a socket — either the initial queue or a resume of a live match. */
+    connect(resume) {
+        const ws = new WebSocket(this.url);
+        this.ws = ws;
+        ws.onopen = () => {
+            this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email });
+            if (resume && this.setup?.resume) {
+                this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
+            }
+            else {
+                this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode });
+                this.status = 'queued';
+            }
         };
-        this.ws.onerror = () => {
-            if (this.status !== 'done') {
+        // A failed pre-match connection is fatal; mid-resume failures fall
+        // through to onclose, which schedules the next attempt.
+        ws.onerror = () => {
+            if (this.status !== 'done' && this.status !== 'reconnecting') {
                 this.status = 'error';
                 this.error = 'connection failed';
             }
         };
-        this.ws.onclose = () => {
-            if (this.status !== 'done' && this.status !== 'error') {
-                this.status = 'error';
-                this.error = 'connection lost';
+        ws.onclose = () => this.onSocketClose();
+        ws.onmessage = (ev) => this.onMessage(String(ev.data));
+    }
+    /**
+     * The reconnect state machine (ADR 0005): a socket dropping MID-MATCH is
+     * not the end — the server holds our seat for FORFEIT_GRACE_MS and the
+     * resume token gets us back in. Only an intentional close (the player
+     * leaving) or exhausted retries settle into 'error'.
+     */
+    onSocketClose() {
+        if (this.intentionalClose || this.status === 'done' || this.status === 'error')
+            return;
+        const canResume = !!this.setup?.resume && !this.result;
+        if ((this.status === 'playing' && canResume) || this.status === 'reconnecting') {
+            if (this.status !== 'reconnecting') {
+                this.status = 'reconnecting';
+                this.resumeAttempts = 0;
             }
-        };
-        this.ws.onmessage = (ev) => this.onMessage(String(ev.data));
+            if (this.resumeAttempts >= RESUME_ATTEMPTS) {
+                this.status = 'error';
+                this.error = 'could not reconnect';
+                return;
+            }
+            this.resumeAttempts++;
+            this.retryTimer = setTimeout(() => this.connect(true), this.resumeAttempts === 1 ? 50 : RESUME_RETRY_MS);
+            return;
+        }
+        this.status = 'error';
+        this.error = 'connection lost';
     }
     close() {
+        this.intentionalClose = true;
+        if (this.retryTimer) {
+            clearTimeout(this.retryTimer);
+            this.retryTimer = null;
+        }
+        if (this.status === 'reconnecting') {
+            this.status = 'error';
+            this.error = 'left the match';
+        }
+        try {
+            this.ws.close();
+        }
+        catch { /* already closed */ }
+    }
+    /** Test hook: sever the socket WITHOUT the intent flag (simulated blip). */
+    debugDrop() {
         try {
             this.ws.close();
         }
@@ -3132,6 +3204,10 @@ class NetSession {
             case 'match': {
                 this.setup = msg;
                 // The caller installs characters/stage, then calls begin().
+                return;
+            }
+            case 'resumed': {
+                this.rebuildFrom(msg);
                 return;
             }
             case 'i': {
@@ -3178,6 +3254,41 @@ class NetSession {
             this.myInputs[k] = 0;
             this.send({ t: 'i', k, v: 0 });
         }
+        this.status = 'playing';
+    }
+    /**
+     * Successful resume: rebuild the ENTIRE sim from the server's ledger —
+     * fresh game state, lockstep replay of the both-known prefix (repopulating
+     * the snapshot ring exactly like frame() would have), then hand back to the
+     * normal rollback loop. Characters/stage are still installed client-side
+     * from the original setup; the pinned data has not changed.
+     */
+    rebuildFrom(s) {
+        this.setup = s;
+        const asSparse = (a) => a.map((v) => (v === null ? undefined : v));
+        this.myInputs = asSparse(s.side === 0 ? s.inputs[0] : s.inputs[1]);
+        this.oppInputs = asSparse(s.side === 0 ? s.inputs[1] : s.inputs[0]);
+        this.usedOpp = [];
+        this.snaps = new Array(SNAP_RING).fill(null);
+        this.game = createGameState(s.seed);
+        let t = 0;
+        while (this.myInputs[t] !== undefined && this.oppInputs[t] !== undefined
+            && this.game.phase !== 3 /* Phase.MatchOver */) {
+            const opp = this.oppInputs[t];
+            this.usedOpp[t] = opp;
+            this.snaps[t % SNAP_RING] = snapshot(this.game);
+            this.stepTick(t, this.myInputs[t], opp);
+            t++;
+        }
+        this.localTick = t;
+        let k = 0;
+        while (this.oppInputs[k] !== undefined)
+            k++;
+        this.oppKnown = k;
+        this.resimFrom = -1;
+        this.overSent = false; // replay may re-reach MatchOver; 'over' is idempotent
+        this.nextHashTick = Math.floor(Math.max(0, this.localTick - 1) / HASH_EVERY) * HASH_EVERY;
+        this.resumeAttempts = 0;
         this.status = 'playing';
     }
     /** My side's fighter index (for HUD orientation etc.). */
@@ -3269,6 +3380,12 @@ class NetSession {
  * Public surface mirrors NetSession — main.ts uses them interchangeably.
  */
 class SoloSession {
+    url;
+    name;
+    character;
+    bundleHash;
+    authToken;
+    email;
     status = 'connecting';
     error = '';
     setup = null;
@@ -3281,26 +3398,39 @@ class SoloSession {
     houseAi = null;
     tick = 0;
     overSent = false;
+    intentionalClose = false;
+    resumeAttempts = 0;
+    retryTimer = null;
     constructor(url, name, character, bundleHash, authToken, email) {
-        this.ws = new WebSocket(url);
-        this.ws.onopen = () => {
-            this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION, auth: authToken, email });
-            this.send({ t: 'queue', character, bundleHash, mode: 'solo' });
-            this.status = 'queued';
+        this.url = url;
+        this.name = name;
+        this.character = character;
+        this.bundleHash = bundleHash;
+        this.authToken = authToken;
+        this.email = email;
+        this.connect(false);
+    }
+    connect(resume) {
+        const ws = new WebSocket(this.url);
+        this.ws = ws;
+        ws.onopen = () => {
+            this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email });
+            if (resume && this.setup?.resume) {
+                this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
+            }
+            else {
+                this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: 'solo' });
+                this.status = 'queued';
+            }
         };
-        this.ws.onerror = () => {
-            if (this.status !== 'done') {
+        ws.onerror = () => {
+            if (this.status !== 'done' && this.status !== 'reconnecting') {
                 this.status = 'error';
                 this.error = 'connection failed';
             }
         };
-        this.ws.onclose = () => {
-            if (this.status !== 'done' && this.status !== 'error') {
-                this.status = 'error';
-                this.error = 'connection lost';
-            }
-        };
-        this.ws.onmessage = (ev) => {
+        ws.onclose = () => this.onSocketClose();
+        ws.onmessage = (ev) => {
             const msg = JSON.parse(String(ev.data));
             switch (msg.t) {
                 case 'error':
@@ -3313,6 +3443,9 @@ class SoloSession {
                 case 'match':
                     this.setup = msg;
                     return;
+                case 'resumed':
+                    this.rebuildFrom(msg);
+                    return;
                 case 'result':
                     this.result = msg;
                     this.status = 'done';
@@ -3324,8 +3457,67 @@ class SoloSession {
             }
         };
     }
+    /** Same reconnect ladder as NetSession (ADR 0005) — see there for why. */
+    onSocketClose() {
+        if (this.intentionalClose || this.status === 'done' || this.status === 'error')
+            return;
+        const canResume = !!this.setup?.resume && !this.result;
+        if ((this.status === 'playing' && canResume) || this.status === 'reconnecting') {
+            if (this.status !== 'reconnecting') {
+                this.status = 'reconnecting';
+                this.resumeAttempts = 0;
+            }
+            if (this.resumeAttempts >= RESUME_ATTEMPTS) {
+                this.status = 'error';
+                this.error = 'could not reconnect';
+                return;
+            }
+            this.resumeAttempts++;
+            this.retryTimer = setTimeout(() => this.connect(true), this.resumeAttempts === 1 ? 50 : RESUME_RETRY_MS);
+            return;
+        }
+        this.status = 'error';
+        this.error = 'connection lost';
+    }
+    /**
+     * Resume rebuild, local-sim style: replay MY OWN contiguous inputs against
+     * a fresh copy of the pinned house AI — identical to what the verifier
+     * does, so the rebuilt state is exactly where the match really is.
+     */
+    rebuildFrom(s) {
+        this.setup = s;
+        this.game = createGameState(s.seed);
+        this.houseAi = createAi(1, s.solo.skill, s.solo.aiSeed);
+        const mine = s.inputs[0];
+        let t = 0;
+        while (t < mine.length && mine[t] !== null && this.game.phase !== 3 /* Phase.MatchOver */) {
+            const opp = aiPoll(this.houseAi, this.game);
+            step(this.game, [mine[t] | 0, opp]);
+            t++;
+        }
+        this.tick = t;
+        this.overSent = false; // 'over' is idempotent server-side
+        this.resumeAttempts = 0;
+        this.status = 'playing';
+    }
     get side() { return 0; } // solo player is always side 0
     close() {
+        this.intentionalClose = true;
+        if (this.retryTimer) {
+            clearTimeout(this.retryTimer);
+            this.retryTimer = null;
+        }
+        if (this.status === 'reconnecting') {
+            this.status = 'error';
+            this.error = 'left the match';
+        }
+        try {
+            this.ws.close();
+        }
+        catch { /* already closed */ }
+    }
+    /** Test hook: sever the socket WITHOUT the intent flag (simulated blip). */
+    debugDrop() {
         try {
             this.ws.close();
         }
@@ -5720,52 +5912,325 @@ const drawWallet = (ctx, w, delta) => {
     }
 };
 // ---------------------------------------------------------------- VS card
+/** Deterministic per-index pseudo-random in [0,1) — stable ember layouts. */
+const hash01 = (i, salt = 0) => {
+    const s = Math.sin(i * 127.1 + salt * 311.7) * 43758.5453;
+    return s - Math.floor(s);
+};
+/** The VS card's fixed portrait frame — the SAME box for every character. */
+const VS_FRAME_W = 250;
+const VS_FRAME_H = 340;
+const VS_FEET_Y = VH - 52; // frame bottom / nameplate baseline
+const VS_CX = [188, VW - 188];
+/**
+ * One fighter on the VS card.
+ *  · Authored VS pose (Studio meta.vsPortrait) → COVER-fit into the fixed
+ *    frame, so every character fills exactly the same box however its source
+ *    art is proportioned. Clipped to a diagonal-cut panel for the classic
+ *    VS-screen slash.
+ *  · No VS pose → contain-fit the select portrait, bottom-anchored so feet are
+ *    never cropped (sizes vary — that's why authoring a VS pose is better).
+ */
+const drawVsFighter = (ctx, roster, side, slide, tick) => {
+    const cx = VS_CX[side] + (side === 0 ? -slide : slide);
+    const dir = side === 0 ? 1 : -1;
+    const x = cx - VS_FRAME_W / 2;
+    const y = VS_FEET_Y - VS_FRAME_H;
+    if (roster.vsPortrait) {
+        ctx.save();
+        // Diagonal-cut panel: the inner edge rakes toward the center like a slash.
+        const rake = 26;
+        ctx.beginPath();
+        if (side === 0) {
+            ctx.moveTo(x, y);
+            ctx.lineTo(x + VS_FRAME_W + rake, y);
+            ctx.lineTo(x + VS_FRAME_W - rake, y + VS_FRAME_H);
+            ctx.lineTo(x, y + VS_FRAME_H);
+        }
+        else {
+            ctx.moveTo(x - rake, y);
+            ctx.lineTo(x + VS_FRAME_W, y);
+            ctx.lineTo(x + VS_FRAME_W, y + VS_FRAME_H);
+            ctx.lineTo(x + rake, y + VS_FRAME_H);
+        }
+        ctx.closePath();
+        ctx.clip();
+        // Backing wash so a transparent pose still reads against the video.
+        const g = ctx.createLinearGradient(x, y, x, y + VS_FRAME_H);
+        g.addColorStop(0, side === 0 ? '#2a0f14cc' : '#0f1a2acc');
+        g.addColorStop(1, '#06040ccc');
+        ctx.fillStyle = g;
+        ctx.fillRect(x - rake, y, VS_FRAME_W + rake * 2, VS_FRAME_H);
+        // The authored pose, mirrored so both fighters face the center.
+        ctx.save();
+        ctx.translate(cx, 0);
+        ctx.scale(dir, 1);
+        drawPortrait(ctx, roster, -VS_FRAME_W / 2, y, VS_FRAME_W, VS_FRAME_H, 'vs');
+        ctx.restore();
+        // Rim light along the raking edge.
+        ctx.strokeStyle = side === 0 ? 'rgba(255,120,120,0.5)' : 'rgba(120,190,255,0.5)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        if (side === 0) {
+            ctx.moveTo(x + VS_FRAME_W + rake, y);
+            ctx.lineTo(x + VS_FRAME_W - rake, y + VS_FRAME_H);
+        }
+        else {
+            ctx.moveTo(x - rake, y);
+            ctx.lineTo(x + rake, y + VS_FRAME_H);
+        }
+        ctx.stroke();
+        ctx.restore();
+        return;
+    }
+    // Fallback: contain-fit the select portrait, bottom-anchored (never cropped).
+    const img = roster.portrait;
+    if (!img?.naturalWidth || !img.naturalHeight)
+        return;
+    const fit = Math.min(VS_FRAME_H / img.naturalHeight, (VS_FRAME_W + 20) / img.naturalWidth);
+    const w = img.naturalWidth * fit;
+    const h = img.naturalHeight * fit;
+    ctx.save();
+    ctx.translate(cx, VS_FEET_Y + 6 + Math.sin(tick / 40 + side) * 2); // idle bob
+    ctx.scale(dir, 1);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(img, -w / 2, -h, w, h);
+    ctx.restore();
+};
 /**
  * Pre-fight stakes card (P0): 2½ seconds of "this is what's on the line" —
- * portraits, names, and the exact credit/XP terms of the match. Doubles as
- * the fight's establishing beat (the 'vs' stinger already plays under it).
- * Pure overlay: the caller decides whether the sim runs beneath it.
+ * fighters, names, and the exact credit/XP terms. Doubles as the fight's
+ * establishing beat (the 'vs' stinger plays under it). Pure overlay: the
+ * caller decides whether the sim runs beneath it.
+ *
+ * All FX are procedural (no assets): the menu background video, a diagonal
+ * red/blue split, converging speed lines, an impact burst behind the VS mark,
+ * drifting embers, scanlines and a vignette. Cheap by construction — a few
+ * dozen strokes per frame, no per-pixel work.
  */
 const drawVsCard = (ctx, rosters, names, stakes, // 1-3 short lines, most important first
 age) => {
     const inT = easeOutBack(clamp01(age / 14));
-    ctx.fillStyle = `rgba(6,4,12,${0.9 * clamp01(age / 8)})`;
-    ctx.fillRect(0, 0, VW, VH);
-    // Portraits slide in from their edges, facing each other. Portrait images
-    // are VARIABLE-SIZE reference art (not 192px sprite cells), so they must be
-    // contain-fitted and anchored by their BOTTOM edge — a fixed sprite offset
-    // cropped tall art below the canvas (feet cut off, the reported bug).
-    const slide = (1 - inT) * 220;
-    [0, 1].forEach((i) => {
-        const img = rosters[i].portrait;
-        if (!img || !img.naturalWidth || !img.naturalHeight)
-            return;
-        const fit = Math.min(330 / img.naturalHeight, 270 / img.naturalWidth);
-        const w = img.naturalWidth * fit;
-        const h = img.naturalHeight * fit;
-        ctx.save();
-        ctx.translate(i === 0 ? 185 - slide : VW - 185 + slide, VH - 58);
-        ctx.scale(i === 0 ? 1 : -1, 1); // face each other
-        ctx.imageSmoothingEnabled = true; // hi-res art, not pixel sprites
-        ctx.drawImage(img, -w / 2, -h, w, h); // bottom-anchored: feet always visible
-        ctx.restore();
-        // Nameplate under each fighter.
-        const nx = i === 0 ? 185 : VW - 185;
-        label(ctx, names[i].toUpperCase().slice(0, 20), nx, VH - 38, 15, i === 0 ? '#8fe8a0' : '#ff9d9d');
-    });
+    const wipe = clamp01(age / 18);
+    // ---- backdrop: the menu video, heavily darkened so fighters/text pop.
     ctx.save();
-    ctx.translate(VW / 2, 150);
-    ctx.scale(inT, inT);
-    ctx.translate(-VW / 2, -150);
-    display(ctx, 'VS', VW / 2, 165, 92, { glow: 'rgba(255,209,102,0.6)' });
-    ctx.restore();
-    // The terms — gold, dead center, unmissable.
-    stakes.forEach((s, k) => {
-        label(ctx, s, VW / 2, 235 + k * 26, k === 0 ? 17 : 13, k === 0 ? GOLD_LT : '#ffffff99');
-    });
-    if (age > 40 && age % 50 < 36) {
-        label(ctx, 'ANY KEY — FIGHT', VW / 2, VH - 16, 12, '#ffffff77');
+    ctx.beginPath();
+    ctx.rect(0, 0, VW, VH);
+    ctx.clip();
+    if (!(bgVideo && drawBgVideoCover(ctx, bgVideo, 0, 0, VW, VH))) {
+        ctx.fillStyle = '#0a0616';
+        ctx.fillRect(0, 0, VW, VH);
     }
+    ctx.restore();
+    ctx.fillStyle = `rgba(6,4,12,${0.72 * clamp01(age / 6)})`;
+    ctx.fillRect(0, 0, VW, VH);
+    // ---- diagonal split: red side / blue side, wiping in from the seam.
+    const seamTop = VW * 0.545, seamBot = VW * 0.455;
+    const seamX = (t) => seamTop + (seamBot - seamTop) * t; // t: 0 top → 1 bottom
+    ctx.save();
+    ctx.globalAlpha = 0.5 * wipe;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(seamTop, 0);
+    ctx.lineTo(seamBot, VH);
+    ctx.lineTo(0, VH);
+    ctx.closePath();
+    const gl = ctx.createLinearGradient(0, 0, seamTop, VH);
+    gl.addColorStop(0, '#00000000');
+    gl.addColorStop(1, '#8f1f2e88');
+    ctx.fillStyle = gl;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(seamTop, 0);
+    ctx.lineTo(VW, 0);
+    ctx.lineTo(VW, VH);
+    ctx.lineTo(seamBot, VH);
+    ctx.closePath();
+    const gr = ctx.createLinearGradient(VW, 0, seamBot, VH);
+    gr.addColorStop(0, '#00000000');
+    gr.addColorStop(1, '#1f4f8f88');
+    ctx.fillStyle = gr;
+    ctx.fill();
+    ctx.restore();
+    // ---- converging speed lines (each side rakes toward the seam).
+    ctx.save();
+    ctx.globalAlpha = 0.22 * wipe;
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 26; i++) {
+        const side = i % 2;
+        const t = hash01(i, 1);
+        const y = t * VH;
+        const len = 60 + hash01(i, 2) * 190;
+        const drift = ((age * 3 + hash01(i, 3) * 400) % 460) - 60;
+        const x0 = side === 0 ? drift : VW - drift;
+        ctx.strokeStyle = side === 0 ? '#ff8a9a' : '#8ac6ff';
+        ctx.beginPath();
+        ctx.moveTo(x0, y);
+        ctx.lineTo(x0 + (side === 0 ? len : -len), y);
+        ctx.stroke();
+    }
+    ctx.restore();
+    // ---- fighters (behind the seam flash + text).
+    const slide = (1 - inT) * 210;
+    drawVsFighter(ctx, rosters[0], 0, slide, age);
+    drawVsFighter(ctx, rosters[1], 1, slide, age);
+    // ---- the seam itself: a bright energy slash with a travelling glint.
+    ctx.save();
+    ctx.globalAlpha = wipe;
+    const seamGrad = ctx.createLinearGradient(seamTop, 0, seamBot, VH);
+    seamGrad.addColorStop(0, 'rgba(255,209,102,0)');
+    seamGrad.addColorStop(0.5, 'rgba(255,240,200,0.85)');
+    seamGrad.addColorStop(1, 'rgba(255,209,102,0)');
+    ctx.strokeStyle = seamGrad;
+    ctx.lineWidth = 3;
+    ctx.shadowColor = 'rgba(255,209,102,0.9)';
+    ctx.shadowBlur = 18;
+    ctx.beginPath();
+    ctx.moveTo(seamTop, -10);
+    ctx.lineTo(seamBot, VH + 10);
+    ctx.stroke();
+    // Glint sliding down the slash.
+    const gt = ((age % 90) / 90);
+    ctx.globalAlpha = wipe * (1 - Math.abs(gt - 0.5) * 2) * 0.9;
+    ctx.fillStyle = '#fffbe8';
+    ctx.beginPath();
+    ctx.arc(seamX(gt), gt * VH, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    // ---- embers drifting up the frame (stable per-index layout).
+    ctx.save();
+    for (let i = 0; i < 20; i++) {
+        const speed = 0.35 + hash01(i, 4) * 0.5;
+        const ey = (VH + 40 - ((age * speed + hash01(i, 5) * VH) % (VH + 80)));
+        const ex = hash01(i, 6) * VW + Math.sin((age / 30) + i) * 8;
+        const r = 1 + hash01(i, 7) * 2;
+        ctx.globalAlpha = 0.5 * wipe * (0.4 + hash01(i, 8) * 0.6);
+        ctx.fillStyle = ex < seamX(ey / VH) ? '#ffb08a' : '#8ac6ff';
+        ctx.beginPath();
+        ctx.arc(ex, ey, r, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.restore();
+    // ---- impact burst behind the VS mark, once on entry.
+    if (age < 34) {
+        const bt = age / 34;
+        ctx.save();
+        ctx.globalAlpha = (1 - bt) * 0.8;
+        ctx.strokeStyle = '#ffe9a3';
+        ctx.lineWidth = 6 * (1 - bt) + 1;
+        ctx.beginPath();
+        ctx.arc(VW / 2, 152, 20 + bt * 180, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+    }
+    // White slam flash on the first frames.
+    if (age < 7) {
+        ctx.fillStyle = `rgba(255,255,255,${(1 - age / 7) * 0.5})`;
+        ctx.fillRect(0, 0, VW, VH);
+    }
+    // ---- VS mark: slams in, then breathes.
+    const breathe = 1 + 0.02 * Math.sin(age / 12);
+    ctx.save();
+    ctx.translate(VW / 2, 152);
+    ctx.scale(inT * breathe, inT * breathe);
+    ctx.translate(-VW / 2, -152);
+    display(ctx, 'VS', VW / 2, 168, 96, { glow: 'rgba(255,209,102,0.75)' });
+    ctx.restore();
+    // ---- terms band: a dark scrim keeps the stakes readable over the art.
+    if (stakes.length > 0 && age > 8) {
+        const bandA = clamp01((age - 8) / 12);
+        const bandY = 208, bandH = 24 + stakes.length * 24;
+        ctx.save();
+        ctx.globalAlpha = bandA;
+        const bg = ctx.createLinearGradient(0, bandY, 0, bandY + bandH);
+        bg.addColorStop(0, 'rgba(10,7,20,0.0)');
+        bg.addColorStop(0.15, 'rgba(10,7,20,0.85)');
+        bg.addColorStop(0.85, 'rgba(10,7,20,0.85)');
+        bg.addColorStop(1, 'rgba(10,7,20,0.0)');
+        ctx.fillStyle = bg;
+        ctx.fillRect(0, bandY, VW, bandH);
+        // Gold hairlines top and bottom, drawn from the center out.
+        const lineW = VW * bandA;
+        ctx.fillStyle = 'rgba(255,209,102,0.55)';
+        ctx.fillRect(VW / 2 - lineW / 2, bandY + 6, lineW, 1);
+        ctx.fillRect(VW / 2 - lineW / 2, bandY + bandH - 6, lineW, 1);
+        stakes.forEach((s, k) => {
+            label(ctx, s, VW / 2, bandY + 30 + k * 24, k === 0 ? 17 : 13, k === 0 ? GOLD_LT : '#ffffffaa');
+        });
+        ctx.restore();
+    }
+    // ---- nameplates under each fighter.
+    [0, 1].forEach((i) => {
+        const nx = VS_CX[i] + (i === 0 ? -slide : slide);
+        ctx.save();
+        ctx.globalAlpha = inT;
+        label(ctx, names[i].toUpperCase().slice(0, 20), nx, VH - 26, 16, i === 0 ? '#8fe8a0' : '#ff9d9d');
+        ctx.restore();
+    });
+    // ---- scanlines + vignette: cheap CRT-ish polish.
+    ctx.save();
+    ctx.globalAlpha = 0.06;
+    ctx.fillStyle = '#000';
+    for (let y = 0; y < VH; y += 3)
+        ctx.fillRect(0, y, VW, 1);
+    ctx.restore();
+    const vig = ctx.createRadialGradient(VW / 2, VH / 2, VH * 0.35, VW / 2, VH / 2, VH * 0.85);
+    vig.addColorStop(0, 'rgba(0,0,0,0)');
+    vig.addColorStop(1, 'rgba(0,0,0,0.65)');
+    ctx.fillStyle = vig;
+    ctx.fillRect(0, 0, VW, VH);
+    if (age > 40 && age % 50 < 36) {
+        label(ctx, 'ANY KEY — FIGHT', VW / 2, VH - 8, 12, '#ffffff77');
+    }
+};
+// ------------------------------------------------------- connection failure
+/**
+ * Mid-match connection loss (ADR 0005). The sim is frozen behind this — say
+ * so plainly, say what it costs, and always offer the way out. Never leave a
+ * dead match rendering a live-looking frame with no exit, which reads as a
+ * crash.
+ */
+const drawNetError = (ctx, error, mode, tick) => {
+    ctx.fillStyle = 'rgba(6,4,12,0.82)';
+    ctx.fillRect(0, 0, VW, VH);
+    const boxW = 620, boxH = 190;
+    const boxX = VW / 2 - boxW / 2, boxY = VH / 2 - boxH / 2;
+    bevel(ctx, boxX, boxY, boxW, boxH, PANEL, '#e94560', '#5a1220', 3);
+    const pulse = 1 + 0.03 * Math.sin(tick / 10);
+    display(ctx, 'CONNECTION LOST', VW / 2, boxY + 52, 30, {
+        scale: pulse, from: '#ffd7d7', mid: '#ff6b6b', to: '#8a1f1f', outline: '#2a0808',
+    });
+    // Only surface the raw reason when it adds something over the headline.
+    const detail = error.trim().toUpperCase();
+    if (detail && detail !== 'CONNECTION LOST') {
+        label(ctx, detail.slice(0, 60), VW / 2, boxY + 78, 12, '#ffffff77');
+    }
+    // What happens to the money — the first thing a player wants to know.
+    label(ctx, 'THE SERVER SETTLES THIS MATCH FROM ITS OWN RECORD.', VW / 2, boxY + 108, 13, '#ffffffcc');
+    label(ctx, mode === 'wager'
+        ? 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE THE POT IS REFUNDED'
+        : 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE YOUR CREDIT IS REFUNDED', VW / 2, boxY + 128, 11, '#ffd166');
+    if (tick % 60 < 44) {
+        label(ctx, 'ENTER / ESC — BACK TO MENU', VW / 2, boxY + 162, 14, GOLD_LT);
+    }
+    tapZone(boxX, boxY + 140, boxW, 40, 'back');
+};
+/**
+ * Mid-match reconnect banner (ADR 0005): the socket blipped but the server
+ * is holding our seat — the session retries by itself. Amber, not red: this
+ * is a hiccup, not a verdict.
+ */
+const drawReconnecting = (ctx, tick) => {
+    ctx.fillStyle = 'rgba(6,4,12,0.7)';
+    ctx.fillRect(0, 0, VW, VH);
+    const boxW = 560, boxH = 140;
+    const boxX = VW / 2 - boxW / 2, boxY = VH / 2 - boxH / 2;
+    bevel(ctx, boxX, boxY, boxW, boxH, PANEL, GOLD, GOLD_DK, 3);
+    const dots = '.'.repeat(1 + (Math.trunc(tick / 20) % 3));
+    const pulse = 1 + 0.03 * Math.sin(tick / 10);
+    display(ctx, `RECONNECTING${dots}`, VW / 2, boxY + 52, 28, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+    label(ctx, 'CONNECTION HICCUP — YOUR SEAT IS HELD FOR 20 SECONDS', VW / 2, boxY + 84, 13, '#ffffffcc');
+    label(ctx, 'ESC — ABANDON (COUNTS AS LEAVING)', VW / 2, boxY + 112, 12, '#ffffff77');
 };
 
 // ---- client/src/pwa.js ----
@@ -6308,8 +6773,26 @@ const drawWalletStrip = () => {
         walletDelta = null;
     drawWallet(ctx, account, walletDelta);
 };
-/** Match-server endpoints (?ws= overrides for deploys/dev). */
-const matchWsUrl = () => new URLSearchParams(location.search).get('ws') ?? `ws://${location.hostname}:8477`;
+/**
+ * The deployed match server (Railway). MUST be wss:// — the game is served
+ * over https and browsers block ws:// from an https origin as mixed content,
+ * so a ws:// default here means online play dies before a packet moves.
+ * Railway terminates TLS; the server itself still speaks plain ws.
+ */
+const PROD_MATCH_WS = 'wss://match-server-production.up.railway.app';
+/**
+ * Match-server endpoints. `?ws=` overrides everything (dev/staging/testing);
+ * an https page uses the deployed server; anything else is a local dev box
+ * running the server beside the page (`npm run play`).
+ */
+const matchWsUrl = () => {
+    const override = new URLSearchParams(location.search).get('ws');
+    if (override)
+        return override;
+    if (location.protocol === 'https:')
+        return PROD_MATCH_WS;
+    return `ws://${location.hostname}:8477`;
+};
 const matchHttpUrl = () => matchWsUrl().replace(/^ws/, 'http');
 // Public standings (drawRanks) — fetched from the match server on entry.
 let ranksRows = null;
@@ -7171,13 +7654,17 @@ const frame = () => {
             vsCardAge = VS_CARD_TICKS;
         }
         const holdSim = cardUp && net?.setup?.mode !== 'wager';
-        if (net && !holdSim) {
+        // The socket died mid-match: the sim CANNOT continue (its opponent inputs
+        // are gone, and the server owns the verdict anyway). Freeze, explain, and
+        // offer the exit — never silently stall on a live-looking frame.
+        const netDead = !!net && net.status === 'error' && !net.result;
+        // A resume rebuilds the session's GameState object — re-adopt it, or the
+        // renderer keeps drawing the pre-drop snapshot forever.
+        const netReconnecting = !!net && net.status === 'reconnecting';
+        if (net?.game && net.game !== game)
+            game = net.game;
+        if (net && !holdSim && !netDead) {
             net.frame(pollPad(P0_MAP)); // session owns stepping (rollback or local-sim)
-            if (net.status === 'error' && !net.result) {
-                // Connection died mid-match: back out gracefully.
-                fx.announce = 'CONNECTION LOST';
-                fx.announceAge = 0;
-            }
         }
         else if (!net && !holdSim) {
             const p2 = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
@@ -7186,12 +7673,26 @@ const frame = () => {
         updateJuice(game);
         updateCamera(game);
         renderFight(game);
-        if (cardUp && fighters) {
+        if (cardUp && fighters && !netDead) {
             drawVsCard(ctx, fighters, net?.setup ? net.setup.names : [fighters[0].bundle.name, cpuAi ? `AGENT LV ${cpuLevelFor(profile, lever)}` : fighters[1].bundle.name], vsStakes.filter((s) => s), vsCardAge);
             vsCardAge++;
         }
-        else if (vsCardAge >= 0) {
+        else if (vsCardAge >= 0 && !netDead) {
             vsCardAge = -1;
+        }
+        if (netReconnecting) {
+            drawReconnecting(ctx, uiTick); // ESC falls through to the branch's exit
+        }
+        if (netDead) {
+            drawNetError(ctx, net.error, queuedMode, uiTick);
+            if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('back')) {
+                net.close();
+                net = null;
+                vsCardAge = -1;
+                screen = 'select';
+                locked = [false, false];
+                void audio.playBgm('player_select', { fadeInSec: 0.5 });
+            }
         }
         if (game.phase === 1 /* Phase.Fighting */ && !hurryPlayed && game.timerTicks <= HURRY_UP_TICKS) {
             hurryPlayed = true;
@@ -7353,6 +7854,9 @@ Object.assign(globalThis, {
         status: net.status, error: net.error, setup: net.setup, result: net.result,
         stalled: net.stalled, side: net.side,
     } : null),
+    // Sever the live socket WITHOUT the leave-intent flag — simulates a wifi
+    // blip so the reconnect path can be tested from the console/automation.
+    afNetDrop: () => { net?.debugDrop(); },
 });
 // Mobile: auto-detect touch devices and lay the on-screen controls over the
 // canvas; register the PWA + offer install on the first landing. Both are

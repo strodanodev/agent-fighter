@@ -1,0 +1,30 @@
+# The match server verifies ledgers — it reads characters/<id>/character.json
+# and lists stages/<id>/stage.json, and that is ALL it touches on disk. Every
+# pixel and sample belongs to the client, which Vercel serves. Shipping them
+# here just times out the upload (~175MB → ~5MB without them).
+#
+# Keep every package's source + package.json: `npm ci` validates the workspace
+# set against package-lock.json and fails if a workspace directory is missing.
+
+# Sprites are cosmetic; the sim never reads them (87MB).
+characters/*/sprites/
+characters/*/frames-raw/
+
+# Stage art — only stage.json is read, to enumerate stage ids (34MB).
+stages/*/*.png
+stages/*/*.jpg
+stages/*/*.webp
+stages/*/*.mp4
+
+# Client-only media: audio, bg video, logos, sprite sheets (52MB).
+packages/client/assets/
+packages/client/demo/
+packages/client/shots/
+
+# Build output + local tooling.
+public/
+dist/
+tools/ffmpeg/
+tools/vgmstream/
+sounds/
+docs/
