@@ -19,9 +19,9 @@ import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './a
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  currentStageCamLimits, drawHud, drawNetError, drawRanks, drawResults, drawSelect, drawStage,
-  drawStageSelect, drawTitle, drawVsCard, drawWallet, resetTaps, setBgVideo, setGameLogo,
-  setLogo, setStageAsset, setUiKit, tapHit, tapZone, worldTransform,
+  currentStageCamLimits, drawHud, drawNetError, drawRanks, drawReconnecting, drawResults,
+  drawSelect, drawStage, drawStageSelect, drawTitle, drawVsCard, drawWallet, resetTaps,
+  setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit, tapHit, tapZone, worldTransform,
 } from './ui.js';
 import type { Cam, HudFx, Mode, RankRow, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit } from './chrome.js';
@@ -137,7 +137,7 @@ const drawWalletStrip = (): void => {
  * so a ws:// default here means online play dies before a packet moves.
  * Railway terminates TLS; the server itself still speaks plain ws.
  */
-const PROD_MATCH_WS = '';
+const PROD_MATCH_WS = 'wss://match-server-production.up.railway.app';
 
 /**
  * Match-server endpoints. `?ws=` overrides everything (dev/staging/testing);
@@ -959,6 +959,10 @@ const frame = (): void => {
     // are gone, and the server owns the verdict anyway). Freeze, explain, and
     // offer the exit — never silently stall on a live-looking frame.
     const netDead = !!net && net.status === 'error' && !net.result;
+    // A resume rebuilds the session's GameState object — re-adopt it, or the
+    // renderer keeps drawing the pre-drop snapshot forever.
+    const netReconnecting = !!net && net.status === 'reconnecting';
+    if (net?.game && net.game !== game) game = net.game;
     if (net && !holdSim && !netDead) {
       net.frame(pollPad(P0_MAP)); // session owns stepping (rollback or local-sim)
     } else if (!net && !holdSim) {
@@ -975,6 +979,9 @@ const frame = (): void => {
       vsCardAge++;
     } else if (vsCardAge >= 0 && !netDead) {
       vsCardAge = -1;
+    }
+    if (netReconnecting) {
+      drawReconnecting(ctx, uiTick); // ESC falls through to the branch's exit
     }
     if (netDead) {
       drawNetError(ctx, net!.error, queuedMode, uiTick);
@@ -1147,6 +1154,9 @@ Object.assign(globalThis, {
     status: net.status, error: net.error, setup: net.setup, result: net.result,
     stalled: net.stalled, side: net.side,
   } : null),
+  // Sever the live socket WITHOUT the leave-intent flag — simulates a wifi
+  // blip so the reconnect path can be tested from the console/automation.
+  afNetDrop: () => { net?.debugDrop(); },
 });
 
 // Mobile: auto-detect touch devices and lay the on-screen controls over the

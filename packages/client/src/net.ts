@@ -37,6 +37,8 @@ export interface NetSetup {
   fee?: number;
   /** v3 local-sim solo: the deterministic house AI this client simulates. */
   solo?: { skill: number; aiSeed: number };
+  /** This side's resume token — lets a dropped socket rejoin (ADR 0005). */
+  resume?: string;
 }
 
 export interface NetResult {
@@ -48,7 +50,12 @@ export interface NetResult {
   deviator?: 0 | 1;
 }
 
-export type NetStatus = 'connecting' | 'queued' | 'playing' | 'done' | 'error';
+export type NetStatus = 'connecting' | 'queued' | 'playing' | 'reconnecting' | 'done' | 'error';
+
+/** Resume retry policy: a handful of quick attempts inside the server's
+ * FORFEIT_GRACE window (20s) — 6 × ~1.6s covers a router blip with room. */
+const RESUME_ATTEMPTS = 6;
+const RESUME_RETRY_MS = 1_600;
 
 /** Live account snapshot from the server (credits economy). */
 export interface NetAccount {
@@ -85,7 +92,7 @@ export class NetSession {
   /** Ticks currently stalled waiting on the opponent (UI: "connection…"). */
   stalled = 0;
 
-  private ws: WebSocket;
+  private ws!: WebSocket;
   private myInputs: number[] = [];
   private oppInputs: (number | undefined)[] = [];
   private usedOpp: number[] = [];
@@ -95,35 +102,86 @@ export class NetSession {
   private resimFrom = -1;
   private overSent = false;
   private nextHashTick = 0; // last CONFIRMED checkpoint reported to the server
+  private intentionalClose = false;
+  private resumeAttempts = 0;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
-    url: string,
-    name: string,
-    character: string,
-    bundleHash?: string,
-    authToken?: string,
-    mode: 'wager' | 'solo' = 'wager',
-    email?: string, // AIR-account email — reputation write-back target only
+    private url: string,
+    private name: string,
+    private character: string,
+    private bundleHash?: string,
+    private authToken?: string,
+    private mode: 'wager' | 'solo' = 'wager',
+    private email?: string, // AIR-account email — reputation write-back target only
   ) {
-    this.ws = new WebSocket(url);
-    this.ws.onopen = () => {
-      this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION, auth: authToken, email });
-      this.send({ t: 'queue', character, bundleHash, mode });
-      this.status = 'queued';
-    };
-    this.ws.onerror = () => {
-      if (this.status !== 'done') { this.status = 'error'; this.error = 'connection failed'; }
-    };
-    this.ws.onclose = () => {
-      if (this.status !== 'done' && this.status !== 'error') {
-        this.status = 'error';
-        this.error = 'connection lost';
+    this.connect(false);
+  }
+
+  /** Open a socket — either the initial queue or a resume of a live match. */
+  private connect(resume: boolean): void {
+    const ws = new WebSocket(this.url);
+    this.ws = ws;
+    ws.onopen = () => {
+      this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email });
+      if (resume && this.setup?.resume) {
+        this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
+      } else {
+        this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode });
+        this.status = 'queued';
       }
     };
-    this.ws.onmessage = (ev) => this.onMessage(String(ev.data));
+    // A failed pre-match connection is fatal; mid-resume failures fall
+    // through to onclose, which schedules the next attempt.
+    ws.onerror = () => {
+      if (this.status !== 'done' && this.status !== 'reconnecting') {
+        this.status = 'error';
+        this.error = 'connection failed';
+      }
+    };
+    ws.onclose = () => this.onSocketClose();
+    ws.onmessage = (ev) => this.onMessage(String(ev.data));
+  }
+
+  /**
+   * The reconnect state machine (ADR 0005): a socket dropping MID-MATCH is
+   * not the end — the server holds our seat for FORFEIT_GRACE_MS and the
+   * resume token gets us back in. Only an intentional close (the player
+   * leaving) or exhausted retries settle into 'error'.
+   */
+  private onSocketClose(): void {
+    if (this.intentionalClose || this.status === 'done' || this.status === 'error') return;
+    const canResume = !!this.setup?.resume && !this.result;
+    if ((this.status === 'playing' && canResume) || this.status === 'reconnecting') {
+      if (this.status !== 'reconnecting') {
+        this.status = 'reconnecting';
+        this.resumeAttempts = 0;
+      }
+      if (this.resumeAttempts >= RESUME_ATTEMPTS) {
+        this.status = 'error';
+        this.error = 'could not reconnect';
+        return;
+      }
+      this.resumeAttempts++;
+      this.retryTimer = setTimeout(() => this.connect(true), this.resumeAttempts === 1 ? 50 : RESUME_RETRY_MS);
+      return;
+    }
+    this.status = 'error';
+    this.error = 'connection lost';
   }
 
   close(): void {
+    this.intentionalClose = true;
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+    if (this.status === 'reconnecting') {
+      this.status = 'error';
+      this.error = 'left the match';
+    }
+    try { this.ws.close(); } catch { /* already closed */ }
+  }
+
+  /** Test hook: sever the socket WITHOUT the intent flag (simulated blip). */
+  debugDrop(): void {
     try { this.ws.close(); } catch { /* already closed */ }
   }
 
@@ -152,6 +210,10 @@ export class NetSession {
       case 'match': {
         this.setup = msg as unknown as NetSetup;
         // The caller installs characters/stage, then calls begin().
+        return;
+      }
+      case 'resumed': {
+        this.rebuildFrom(msg as unknown as NetSetup & { inputs: [(number | null)[], (number | null)[]] });
         return;
       }
       case 'i': {
@@ -198,6 +260,44 @@ export class NetSession {
       this.myInputs[k] = 0;
       this.send({ t: 'i', k, v: 0 });
     }
+    this.status = 'playing';
+  }
+
+  /**
+   * Successful resume: rebuild the ENTIRE sim from the server's ledger —
+   * fresh game state, lockstep replay of the both-known prefix (repopulating
+   * the snapshot ring exactly like frame() would have), then hand back to the
+   * normal rollback loop. Characters/stage are still installed client-side
+   * from the original setup; the pinned data has not changed.
+   */
+  private rebuildFrom(s: NetSetup & { inputs: [(number | null)[], (number | null)[]] }): void {
+    this.setup = s;
+    const asSparse = (a: (number | null)[]): (number | undefined)[] =>
+      a.map((v) => (v === null ? undefined : v));
+    this.myInputs = asSparse(s.side === 0 ? s.inputs[0] : s.inputs[1]) as number[];
+    this.oppInputs = asSparse(s.side === 0 ? s.inputs[1] : s.inputs[0]);
+    this.usedOpp = [];
+    this.snaps = new Array(SNAP_RING).fill(null);
+    this.game = createGameState(s.seed);
+    let t = 0;
+    while (
+      this.myInputs[t] !== undefined && this.oppInputs[t] !== undefined
+      && this.game.phase !== Phase.MatchOver
+    ) {
+      const opp = this.oppInputs[t]!;
+      this.usedOpp[t] = opp;
+      this.snaps[t % SNAP_RING] = snapshot(this.game);
+      this.stepTick(t, this.myInputs[t]!, opp);
+      t++;
+    }
+    this.localTick = t;
+    let k = 0;
+    while (this.oppInputs[k] !== undefined) k++;
+    this.oppKnown = k;
+    this.resimFrom = -1;
+    this.overSent = false; // replay may re-reach MatchOver; 'over' is idempotent
+    this.nextHashTick = Math.floor(Math.max(0, this.localTick - 1) / HASH_EVERY) * HASH_EVERY;
+    this.resumeAttempts = 0;
     this.status = 'playing';
   }
 
@@ -308,35 +408,45 @@ export class SoloSession {
   game: GameState | null = null;
   stalled = 0; // never stalls — kept for the shared interface
 
-  private ws: WebSocket;
+  private ws!: WebSocket;
   private houseAi: AiState | null = null;
   private tick = 0;
   private overSent = false;
+  private intentionalClose = false;
+  private resumeAttempts = 0;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
-    url: string,
-    name: string,
-    character: string,
-    bundleHash?: string,
-    authToken?: string,
-    email?: string,
+    private url: string,
+    private name: string,
+    private character: string,
+    private bundleHash?: string,
+    private authToken?: string,
+    private email?: string,
   ) {
-    this.ws = new WebSocket(url);
-    this.ws.onopen = () => {
-      this.send({ t: 'hello', v: NET_PROTOCOL, name, engine: ENGINE_VERSION, auth: authToken, email });
-      this.send({ t: 'queue', character, bundleHash, mode: 'solo' });
-      this.status = 'queued';
-    };
-    this.ws.onerror = () => {
-      if (this.status !== 'done') { this.status = 'error'; this.error = 'connection failed'; }
-    };
-    this.ws.onclose = () => {
-      if (this.status !== 'done' && this.status !== 'error') {
-        this.status = 'error';
-        this.error = 'connection lost';
+    this.connect(false);
+  }
+
+  private connect(resume: boolean): void {
+    const ws = new WebSocket(this.url);
+    this.ws = ws;
+    ws.onopen = () => {
+      this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email });
+      if (resume && this.setup?.resume) {
+        this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
+      } else {
+        this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: 'solo' });
+        this.status = 'queued';
       }
     };
-    this.ws.onmessage = (ev) => {
+    ws.onerror = () => {
+      if (this.status !== 'done' && this.status !== 'reconnecting') {
+        this.status = 'error';
+        this.error = 'connection failed';
+      }
+    };
+    ws.onclose = () => this.onSocketClose();
+    ws.onmessage = (ev) => {
       const msg = JSON.parse(String(ev.data)) as { t: string } & Record<string, unknown>;
       switch (msg.t) {
         case 'error':
@@ -348,6 +458,9 @@ export class SoloSession {
           return;
         case 'match':
           this.setup = msg as unknown as NetSetup;
+          return;
+        case 'resumed':
+          this.rebuildFrom(msg as unknown as NetSetup & { inputs: [(number | null)[], (number | null)[]] });
           return;
         case 'result':
           this.result = msg as unknown as NetResult;
@@ -361,9 +474,64 @@ export class SoloSession {
     };
   }
 
+  /** Same reconnect ladder as NetSession (ADR 0005) — see there for why. */
+  private onSocketClose(): void {
+    if (this.intentionalClose || this.status === 'done' || this.status === 'error') return;
+    const canResume = !!this.setup?.resume && !this.result;
+    if ((this.status === 'playing' && canResume) || this.status === 'reconnecting') {
+      if (this.status !== 'reconnecting') {
+        this.status = 'reconnecting';
+        this.resumeAttempts = 0;
+      }
+      if (this.resumeAttempts >= RESUME_ATTEMPTS) {
+        this.status = 'error';
+        this.error = 'could not reconnect';
+        return;
+      }
+      this.resumeAttempts++;
+      this.retryTimer = setTimeout(() => this.connect(true), this.resumeAttempts === 1 ? 50 : RESUME_RETRY_MS);
+      return;
+    }
+    this.status = 'error';
+    this.error = 'connection lost';
+  }
+
+  /**
+   * Resume rebuild, local-sim style: replay MY OWN contiguous inputs against
+   * a fresh copy of the pinned house AI — identical to what the verifier
+   * does, so the rebuilt state is exactly where the match really is.
+   */
+  private rebuildFrom(s: NetSetup & { inputs: [(number | null)[], (number | null)[]] }): void {
+    this.setup = s;
+    this.game = createGameState(s.seed);
+    this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed);
+    const mine = s.inputs[0];
+    let t = 0;
+    while (t < mine.length && mine[t] !== null && this.game.phase !== Phase.MatchOver) {
+      const opp = aiPoll(this.houseAi, this.game);
+      step(this.game, [mine[t]! | 0, opp]);
+      t++;
+    }
+    this.tick = t;
+    this.overSent = false; // 'over' is idempotent server-side
+    this.resumeAttempts = 0;
+    this.status = 'playing';
+  }
+
   get side(): 0 | 1 { return 0; } // solo player is always side 0
 
   close(): void {
+    this.intentionalClose = true;
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+    if (this.status === 'reconnecting') {
+      this.status = 'error';
+      this.error = 'left the match';
+    }
+    try { this.ws.close(); } catch { /* already closed */ }
+  }
+
+  /** Test hook: sever the socket WITHOUT the intent flag (simulated blip). */
+  debugDrop(): void {
     try { this.ws.close(); } catch { /* already closed */ }
   }
 

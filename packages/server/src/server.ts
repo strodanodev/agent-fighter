@@ -9,6 +9,7 @@
  *
  * Run: npm run server   (or: tsx src/server.ts from packages/server)
  */
+import { randomUUID } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -65,9 +66,12 @@ interface Match {
   seed: number;
   stage: string;
   chars: [string, string];
+  names: [string, string];
   /** Local-sim solo: the deterministic house AI the client must simulate. */
   solo: { skill: number; aiSeed: number } | null;
   startedAt: number; // wall clock — solo pace sanity (SOLO_PACE_*)
+  /** Per-side bearer secrets for CResume — only their owners ever see them. */
+  resumeTokens: [string, string];
   /** Sides whose socket has dropped — both gone = no-contest, not a forfeit. */
   gone: [boolean, boolean];
   /** Wall clock of each side's last input — silence forfeits (IDLE_FORFEIT_MS). */
@@ -192,6 +196,8 @@ export const createMatchServer = (opts: {
 
   const clients = new Set<Client>();
   const queue: Client[] = [];
+  /** In-flight matches by id — the CResume lookup. */
+  const liveMatches = new Map<string, Match>();
   let nextId = 1;
   let nextMatch = 1;
   let matchSeed = (Date.now() % 100_000) | 0; // server-side is allowed wall clock
@@ -204,6 +210,7 @@ export const createMatchServer = (opts: {
   const finishMatch = (m: Match, forfeitLoser: 0 | 1 | null): void => {
     if (m.finished) return;
     m.finished = true;
+    liveMatches.delete(m.id);
     if (m.forfeitTimer) clearTimeout(m.forfeitTimer);
 
     const bundles: [CharacterBundle, CharacterBundle] = [bundleOf(m.chars[0]), bundleOf(m.chars[1])];
@@ -360,8 +367,10 @@ export const createMatchServer = (opts: {
       seed: (matchSeed = (matchSeed * 1103515245 + 12345) & 0x7fffffff),
       stage: stageIds.length > 0 ? stageIds[matchSeed % stageIds.length]! : '',
       chars: [c0.character, c1 ? c1.character : solo!.character],
+      names: [c0.name, c1?.name ?? `HOUSE LV${solo!.level}`],
       solo: solo ? { skill: solo.skill, aiSeed: solo.aiSeed } : null,
       startedAt: Date.now(),
+      resumeTokens: [randomUUID(), randomUUID()],
       gone: [false, false],
       lastInputAt: [Date.now(), Date.now()],
       inputs: [[], []],
@@ -384,13 +393,15 @@ export const createMatchServer = (opts: {
           { id: m.chars[0], hash: bundleOf(m.chars[0]).versionHash },
           { id: m.chars[1], hash: bundleOf(m.chars[1]).versionHash },
         ],
-        names: [m.clients[0].name, oppName],
+        names: m.names,
         agents: [m.clients[0].agent, c1?.agent ?? true],
         mode, fee,
         solo: m.solo ?? undefined,
+        resume: m.resumeTokens[c.side],
       };
       send(c, setup);
     }
+    liveMatches.set(m.id, m);
     console.log(`[match ${m.id}] ${mode}·fee ${fee} · ${c0.name}${c0.agent ? ' (agent)' : ''} vs ${oppName}${c1?.agent ? ' (agent)' : ''} · seed ${m.seed} · stage ${m.stage}`);
   };
 
@@ -545,6 +556,65 @@ export const createMatchServer = (opts: {
           if (mode === 'solo') await startSolo(c);
           else { queue.push(c); void tryPair(); }
         })();
+        return;
+      }
+      case 'resume': {
+        // Rejoin a live match after a drop (ADR 0005): possession of the
+        // per-side bearer token IS the authorization — only its owner ever
+        // received it. The whole ledger goes back so the client can rebuild
+        // its sim by replay and continue exactly where the match really is.
+        if (c.state !== 'lobby') return send(c, { t: 'error', msg: 'already in a match' });
+        const m = liveMatches.get(String(msg.matchId));
+        const side = m && !m.finished
+          ? ([0, 1] as const).find((s) => m.resumeTokens[s] === msg.token && m.clients[s] !== null)
+          : undefined;
+        if (!m || side === undefined) {
+          return send(c, { t: 'error', msg: 'match is gone or already settled' });
+        }
+        const prev = m.clients[side]!;
+        if (prev.ws.readyState === WebSocket.OPEN && prev !== c) {
+          try { prev.ws.close(); } catch { /* stale socket */ }
+        }
+        // Adopt the seat, keeping the ORIGINAL identity/name — settlement and
+        // the opponent's HUD must not change because a socket did.
+        c.name = prev.name;
+        c.agent = prev.agent;
+        c.identity = prev.identity;
+        c.account = prev.account;
+        c.email = prev.email;
+        c.character = prev.character;
+        c.match = m;
+        c.side = side;
+        c.state = 'playing';
+        m.clients[side] = c;
+        m.gone[side] = false;
+        m.lastInputAt[side] = Date.now();
+        if (m.forfeitTimer) { clearTimeout(m.forfeitTimer); m.forfeitTimer = null; }
+        // If the OTHER side is still gone, its clock restarts now — it keeps
+        // its own full grace window rather than inheriting a half-spent one.
+        const otherGone = ([0, 1] as const).find((s) => m.gone[s] && m.clients[s]);
+        if (otherGone !== undefined) {
+          m.forfeitTimer = setTimeout(() => {
+            if (!m.finished) finishMatch(m, otherGone);
+          }, FORFEIT_GRACE_MS);
+        }
+        const toNullable = (a: number[]): (number | null)[] =>
+          Array.from(a, (v) => (v === undefined ? null : v));
+        send(c, {
+          t: 'resumed', matchId: m.id, side, seed: m.seed, stage: m.stage,
+          delay: m.solo ? 0 : INPUT_DELAY,
+          chars: [
+            { id: m.chars[0], hash: bundleOf(m.chars[0]).versionHash },
+            { id: m.chars[1], hash: bundleOf(m.chars[1]).versionHash },
+          ],
+          names: m.names,
+          agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
+          mode: m.mode, fee: m.fee,
+          solo: m.solo ?? undefined,
+          resume: m.resumeTokens[side],
+          inputs: [toNullable(m.inputs[0]), toNullable(m.inputs[1])],
+        });
+        console.log(`[match ${m.id}] side ${side} (${c.name}) resumed`);
         return;
       }
       case 'i': {

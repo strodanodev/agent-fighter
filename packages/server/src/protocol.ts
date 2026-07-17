@@ -30,8 +30,13 @@ export const MAX_AHEAD = 10;
 /** How often clients report stateHash (ticks) — desync forensics. */
 export const HASH_EVERY = 60;
 
-/** Reconnect grace before a mid-match disconnect becomes a forfeit (ms). */
-export const FORFEIT_GRACE_MS = 10_000;
+/**
+ * Reconnect grace before a mid-match disconnect settles (ms). This window is
+ * REAL: the dropped client can rejoin with its resume token (CResume) and
+ * continue the match. 20s = notice the drop + a few reconnect attempts.
+ * Must stay below IDLE_FORFEIT_MS or the idle sweep fires first.
+ */
+export const FORFEIT_GRACE_MS = 20_000;
 
 /**
  * A connected-but-silent client forfeits after this long without sending an
@@ -80,7 +85,13 @@ export interface CQueue {
 export interface CInput { t: 'i'; k: number; v: number }
 export interface CHash { t: 'h'; k: number; x: number }
 export interface COver { t: 'over'; k: number }
-export type ClientMsg = CHello | CQueue | CInput | CHash | COver;
+/**
+ * Rejoin a live match after a dropped socket (sent instead of `queue`, within
+ * FORFEIT_GRACE_MS). The token is a per-side bearer secret from the match
+ * setup — only its owner ever received it, so possession IS authorization.
+ */
+export interface CResume { t: 'resume'; matchId: string; token: string }
+export type ClientMsg = CHello | CQueue | CInput | CHash | COver | CResume;
 
 // ---- server → client
 export interface SWelcome { t: 'welcome'; id: string; engine: string }
@@ -108,8 +119,19 @@ export interface SMatch {
    * that simulates a different opponent fails the ledger re-sim.
    */
   solo?: { skill: number; aiSeed: number };
+  /** This side's resume token (bearer secret — never shown to the opponent). */
+  resume?: string;
 }
 export interface SInput { t: 'i'; k: number; v: number }
+/**
+ * Successful resume: the full pinned setup again PLUS the input ledger so
+ * far (null = tick not yet received), so the client can rebuild its sim by
+ * replaying and then continue live. New opponent inputs follow as SInput.
+ */
+export interface SResumed extends Omit<SMatch, 't'> {
+  t: 'resumed';
+  inputs: [(number | null)[], (number | null)[]];
+}
 export interface SResult {
   t: 'result';
   winner: number; // -1 undecided, 0/1 side, 2 draw
@@ -151,4 +173,4 @@ export interface SXp {
   creditsDelta: number;
   credits: number;
 }
-export type ServerMsg = SWelcome | SQueued | SMatch | SInput | SResult | SError | SAccount | SXp;
+export type ServerMsg = SWelcome | SQueued | SMatch | SResumed | SInput | SResult | SError | SAccount | SXp;

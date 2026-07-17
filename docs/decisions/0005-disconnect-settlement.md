@@ -46,15 +46,21 @@ for a stutter, short enough that nobody's pot is hostage.
 | --- | --- |
 | Rage-quit a losing match | Forfeit → loss. No escape. |
 | Pull the cable after the KO lands | Ledger already decided → the real result. |
-| Genuine blip while winning | Ledger decided → you still win. Undecided → you lose (see below). |
+| Genuine blip while winning | RECONNECT (below); if you can't get back inside the grace: ledger decided → you still win, undecided → you lose. |
 | Lag switch / stall to hold the pot | Idle timeout → forfeit. |
 | Both drop / server dies mid-match | No-contest → both refunded. |
 | **DDoS the opponent offline** | They forfeit — but the transport is a **relay**: peers never learn each other's IPs, so there is nothing to attack. **This protection dies the day WebRTC P2P lands** (ADR 0003's transport upgrade) — revisit before shipping it. |
 
-The honest-blip-while-losing case is deliberately unforgiving: we cannot
-distinguish it from a rage-quit, and pricing it in favour of the quitter
-would make quitting free. The consolation is that the ledger check (rule 1)
-covers every case where the outcome was already knowable.
+The honest-blip case is covered by RESUME: the match setup carries a
+per-side bearer token; a dropped client reconnects, sends `resume`, and the
+server re-attaches the seat and returns the full input ledger so the sim
+rebuilds by replay (both flavours: lockstep-replay for wager rollback,
+AI-replay for local-sim solo). The client retries automatically (~6 attempts
+inside the 20s grace) behind a RECONNECTING overlay. Only a blip that
+outlasts the grace falls through to the forfeit rule — which stays
+deliberately unforgiving, because past that point we cannot distinguish it
+from a rage-quit, and pricing it in favour of the quitter would make
+quitting free.
 
 ## Client contract
 
@@ -64,12 +70,12 @@ happened, states **what happens to the money**, and always offers the exit
 (`drawNetError`). Progression is server-awarded regardless: the verdict
 arrives from the server or the fee comes back.
 
-## Known gap — orphaned escrow
+## Orphaned escrow — CLOSED
 
 Fees are escrowed at pair time and refunded by `record_match` on an
-undecided outcome. If the **server process dies** between those two points,
-no settlement ever runs and the escrow is stranded: the ledger holds a `fee`
-row with no matching `payout`/`refund`. Nothing burns it — the credits are
-simply frozen. A sweeper (refund `fee` rows with no `matches` row older than
-~30 minutes, on startup) is the fix; not built yet. Until then a server crash
-mid-match requires a manual refund pass. Tracked as the next economy chore.
+undecided outcome; a server crash between the two used to strand the fee
+forever. `sweep_orphaned_escrow` (migration 0003 + memoryPersistence mirror)
+now runs at startup and hourly: any fee row past the cutoff whose match id
+has no `matches` row is SETTLED as a synthetic no-contest first (so a late
+settlement finds the id taken and awards nothing) and then refunded, guarded
+by the unique refund ledger row. Deploy restarts no longer freeze pots.

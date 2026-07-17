@@ -67,7 +67,7 @@ test('LEDGER TRUTH: winning then dropping still WINS (no cable-pull escape eithe
   await new Promise((r) => setTimeout(r, 600));
   c.close(); // drop WITHOUT reporting 'over'
 
-  await new Promise((r) => setTimeout(r, 12_000)); // grace + settle
+  await new Promise((r) => setTimeout(r, 22_000)); // grace (20s) + settle
   const acc = await persistence.getAccount({ sub: 'dev:Ghoster' }, 'Ghoster', false);
   // Decided by the ledger → a real W/L was booked, not a refund-y no-contest.
   assert.equal(acc.wins + acc.losses, 1, 'ledger-decided match must book a result');
@@ -89,7 +89,7 @@ test('RAGEQUIT: dropping an UNDECIDED wager loses it; the pot goes to whoever st
   await new Promise((r) => setTimeout(r, 300));
   quitter.close();
 
-  const res = await stayer.until<Extract<ServerMsg, { t: 'result' }>>('result', 20_000);
+  const res = await stayer.until<Extract<ServerMsg, { t: 'result' }>>('result', 30_000);
   assert.equal(res.reason, 'forfeit');
   await new Promise((r) => setTimeout(r, 400));
 
@@ -117,7 +117,7 @@ test('NO CONTEST: both sides gone on an undecided wager refunds both (never an a
   a.close();
   b.close(); // both drop — e.g. a server-side network partition
 
-  await new Promise((r) => setTimeout(r, 12_000));
+  await new Promise((r) => setTimeout(r, 22_000));
   const accA = await persistence.getAccount({ sub: 'dev:GoneA' }, 'GoneA', false);
   const accB = await persistence.getAccount({ sub: 'dev:GoneB' }, 'GoneB', false);
   assert.equal(accA.credits, DAILY_CREDITS, 'A refunded');

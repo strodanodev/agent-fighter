@@ -1910,3 +1910,21 @@ export const drawNetError = (
   }
   tapZone(boxX, boxY + 140, boxW, 40, 'back');
 };
+
+/**
+ * Mid-match reconnect banner (ADR 0005): the socket blipped but the server
+ * is holding our seat — the session retries by itself. Amber, not red: this
+ * is a hiccup, not a verdict.
+ */
+export const drawReconnecting = (ctx: CanvasRenderingContext2D, tick: number): void => {
+  ctx.fillStyle = 'rgba(6,4,12,0.7)';
+  ctx.fillRect(0, 0, VW, VH);
+  const boxW = 560, boxH = 140;
+  const boxX = VW / 2 - boxW / 2, boxY = VH / 2 - boxH / 2;
+  bevel(ctx, boxX, boxY, boxW, boxH, PANEL, GOLD, GOLD_DK, 3);
+  const dots = '.'.repeat(1 + (Math.trunc(tick / 20) % 3));
+  const pulse = 1 + 0.03 * Math.sin(tick / 10);
+  display(ctx, `RECONNECTING${dots}`, VW / 2, boxY + 52, 28, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+  label(ctx, 'CONNECTION HICCUP — YOUR SEAT IS HELD FOR 20 SECONDS', VW / 2, boxY + 84, 13, '#ffffffcc');
+  label(ctx, 'ESC — ABANDON (COUNTS AS LEAVING)', VW / 2, boxY + 112, 12, '#ffffff77');
+};
