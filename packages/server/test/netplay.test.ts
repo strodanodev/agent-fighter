@@ -80,6 +80,10 @@ describe('persistence hook (Phase B)', () => {
       sweepOrphanedEscrow: async () => 0,
       releaseReferral: async () => 0,
       leaderboard: async () => [],
+      getAgent: async () => null,
+      setAgentConfig: async () => false,
+      setAgentKey: async () => false,
+      findByAgentKey: async () => null,
     };
     const s2 = await createMatchServer({ port: 0, persistence: mock });
     try {

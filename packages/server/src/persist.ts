@@ -15,9 +15,16 @@
  * BOTH or the dev economy lies about production):
  *  · daily login bonus: +DAILY_CREDITS once per UTC day, on first
  *    authenticated contact with the server.
- *  · solo (RANKED VS AGENT, house bot): fee 1 → escrowed at match start.
+ *  · solo (single match vs house bot): fee 1 → escrowed at match start.
  *    Win: +2 back (net +1) and +60 XP. Loss: fee burned, −15 XP (clamped at
  *    the level floor — no de-leveling). Draw/incomplete: fee refunded.
+ *  · arcade (AGENT ARCADE — the RANKED gauntlet, one run = ARCADE_FEE 1):
+ *    the fee escrows on battle 1 and is CONSUMED by playing (never returned
+ *    on a win); battles 2+ carry fee 0. Per battle: win +60 XP, loss −15 XP
+ *    (no de-level), draw 0 XP + fee refund, incomplete refund. Credits pay
+ *    only via the explicit `payout` the server computes: +1 at the ⅓ and ⅔
+ *    milestones, +5 for a full clear (ARCADE_MILESTONE_CREDITS /
+ *    ARCADE_CLEAR_CREDITS).
  *  · wager (ONLINE): fee 10 each → 20 pot. Winner takes the pot (net +10).
  *    Draw/undecided/incomplete: both refunded. A hash-flagged DEVIATOR
  *    forfeits: the pot goes to the opponent regardless of the sim outcome.
@@ -39,6 +46,12 @@ export const REFERRAL_CREDITS = 25;
 export const REFERRAL_WEEKLY_CAP = 10;
 export const SOLO_FEE = 1;
 export const WAGER_FEE = 10;
+/** AGENT ARCADE: one credit buys one RUN (escrowed with battle 1, consumed). */
+export const ARCADE_FEE = 1;
+/** Credits paid for clearing the ⅓ and ⅔ milestone battles of a run. */
+export const ARCADE_MILESTONE_CREDITS = 1;
+/** Credits paid for beating EVERY agent in the run (on top of milestones). */
+export const ARCADE_CLEAR_CREDITS = 5;
 /** Solo winner gets the fee back + this profit. */
 export const SOLO_WIN_NET = 1;
 /** XP burned by LOSING a ranked solo match (the user-facing "loser loses XP"). */
@@ -61,7 +74,7 @@ export const loadDotEnv = (root: string): void => {
   }
 };
 
-export type MatchMode = 'wager' | 'solo';
+export type MatchMode = 'wager' | 'solo' | 'arcade';
 
 export interface Account {
   credits: number;
@@ -96,6 +109,12 @@ export interface MatchRecord {
   hash: number;
   deviator?: 0 | 1;
   engine: string;
+  /**
+   * AGENT ARCADE only: explicit winner payout in credits (milestone / clear
+   * bonus), computed by the server from the run position. Arcade wins never
+   * return the fee — the entry credit is consumed by playing the run.
+   */
+  payout?: number;
 }
 
 export interface XpAward {
@@ -113,6 +132,26 @@ export interface XpAward {
 /** Thrown by escrowMatch when a side can't cover the fee. */
 export class InsufficientCredits extends Error {
   constructor(public side: 0 | 1) { super(`INSUFFICIENT:${side}`); }
+}
+
+/**
+ * A trained agent (ADR 0006): STYLE only. The server clamps `personality`
+ * to core AI_PERSONALITY_RANGES and validates `character` against the
+ * roster before this ever persists; skill/stats are never part of it —
+ * skill is re-derived from the owner's level at match time.
+ */
+export interface AgentConfig {
+  character: string;
+  personality: Record<string, number>;
+  motto?: string;
+}
+
+export interface AgentInfo {
+  config: AgentConfig | null;
+  /** ISO timestamp of the current key's mint — null = no key issued. */
+  keyCreatedAt: string | null;
+  name: string;
+  level: number; xp: number; wins: number; losses: number;
 }
 
 export interface Persistence {
@@ -147,6 +186,14 @@ export interface Persistence {
    */
   releaseReferral: (inviteeSub: string) => Promise<number>;
   leaderboard: (limit?: number) => Promise<unknown[]>;
+  /** Trained agent (ADR 0006). Null = profile does not exist. */
+  getAgent: (sub: string) => Promise<AgentInfo | null>;
+  /** Caller has ALREADY clamped/validated the config (server.ts is the authority). */
+  setAgentConfig: (sub: string, config: AgentConfig) => Promise<boolean>;
+  /** Store sha256(key) hex; null revokes. Returns false if no such profile. */
+  setAgentKey: (sub: string, keyHash: string | null) => Promise<boolean>;
+  /** Resolve a presented key hash to its owner. */
+  findByAgentKey: (keyHash: string) => Promise<{ sub: string; name: string } | null>;
 }
 
 // ---------------------------------------------------------------- shared math
@@ -194,6 +241,13 @@ const settleSide = (
   } else if (r.mode === 'wager') {
     payout = won ? r.fee * 2 : draw ? r.fee : 0;
     xpDelta = iDeviated ? 0 : won ? XP_WIN : draw ? XP_DRAW : XP_LOSS;
+  } else if (r.mode === 'arcade') {
+    // AGENT ARCADE battle: the entry fee is consumed by playing (a win does
+    // NOT return it); credits move only via the explicit milestone payout.
+    // A draw still refunds the fee (battle 1 only carries one) — the run
+    // ends, but nothing was decided against the player dishonestly.
+    payout = won ? (r.payout ?? 0) : draw ? r.fee : 0;
+    xpDelta = iDeviated ? 0 : won ? XP_WIN : draw ? 0 : -SOLO_LOSS_XP;
   } else { // solo — this side is the human; the house side has no account
     payout = won ? r.fee + SOLO_WIN_NET : draw ? r.fee : 0;
     xpDelta = iDeviated ? 0 : won ? XP_WIN : draw ? 0 : -SOLO_LOSS_XP;
@@ -214,6 +268,13 @@ export const memoryPersistence = (): Persistence => {
   const names = new Map<string, { name: string; agent: boolean }>();
   /** invitee sub → inviter sub + whether the inviter payout released. */
   const referrals = new Map<string, { inviter: string; released: boolean }>();
+  /** sub → trained agent config + key (ADR 0006). */
+  const agents = new Map<string, { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null }>();
+  const agentOf = (sub: string): { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null } => {
+    let a = agents.get(sub);
+    if (!a) { a = { config: null, keyHash: null, keyCreatedAt: null }; agents.set(sub, a); }
+    return a;
+  };
 
   const prof = (sub: string): ProfileRow & { lastDaily: string } => {
     let p = profiles.get(sub);
@@ -320,6 +381,36 @@ export const memoryPersistence = (): Persistence => {
           id, name: names.get(id)?.name ?? 'anon', is_agent: names.get(id)?.agent ?? false,
           level: p.level, xp: p.xp, wins: p.wins, losses: p.losses, rank: i + 1,
         })),
+    getAgent: async (sub) => {
+      if (!profiles.has(sub)) return null;
+      const p = prof(sub);
+      const a = agentOf(sub);
+      return {
+        config: a.config, keyCreatedAt: a.keyCreatedAt,
+        name: names.get(sub)?.name ?? 'anon',
+        level: p.level, xp: p.xp, wins: p.wins, losses: p.losses,
+      };
+    },
+    setAgentConfig: async (sub, config) => {
+      if (!profiles.has(sub)) return false;
+      agentOf(sub).config = config;
+      return true;
+    },
+    setAgentKey: async (sub, keyHash) => {
+      if (!profiles.has(sub)) return false;
+      const a = agentOf(sub);
+      a.keyHash = keyHash;
+      a.keyCreatedAt = keyHash ? new Date().toISOString() : null;
+      return true;
+    },
+    findByAgentKey: async (keyHash) => {
+      for (const [sub, a] of agents) {
+        if (a.keyHash && a.keyHash === keyHash) {
+          return { sub, name: names.get(sub)?.name ?? 'anon' };
+        }
+      }
+      return null;
+    },
   };
 };
 
@@ -391,6 +482,7 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
           _end_tick: r.endTick, _state_hash: r.hash >>> 0,
           _deviator: r.deviator ?? null,
           _engine: r.engine,
+          _payout: r.payout ?? 0,
         }),
       })) as Array<Record<string, number>>;
       return rows.map((row) => ({
@@ -421,6 +513,35 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
     },
     leaderboard: async (limit = 20) =>
       (await call(`/rest/v1/leaderboard?select=*&limit=${limit | 0}`, { method: 'GET' })) as unknown[],
+    getAgent: async (sub) => {
+      const rows = (await call('/rest/v1/rpc/get_agent', {
+        method: 'POST', body: JSON.stringify({ _id: sub }),
+      })) as Array<Record<string, unknown>>;
+      const row = rows?.[0];
+      if (!row) return null;
+      return {
+        config: (row.config ?? null) as AgentConfig | null,
+        keyCreatedAt: row.key_created_at ? String(row.key_created_at) : null,
+        name: String(row.name ?? 'anon'),
+        level: Number(row.level ?? 1), xp: Number(row.xp ?? 0),
+        wins: Number(row.wins ?? 0), losses: Number(row.losses ?? 0),
+      };
+    },
+    setAgentConfig: async (sub, config) =>
+      Boolean(await call('/rest/v1/rpc/set_agent_config', {
+        method: 'POST', body: JSON.stringify({ _id: sub, _config: config }),
+      })),
+    setAgentKey: async (sub, keyHash) =>
+      Boolean(await call('/rest/v1/rpc/set_agent_key', {
+        method: 'POST', body: JSON.stringify({ _id: sub, _hash: keyHash }),
+      })),
+    findByAgentKey: async (keyHash) => {
+      const rows = (await call('/rest/v1/rpc/find_by_agent_key', {
+        method: 'POST', body: JSON.stringify({ _hash: keyHash }),
+      })) as Array<Record<string, unknown>>;
+      const row = rows?.[0];
+      return row ? { sub: String(row.id), name: String(row.name ?? 'anon') } : null;
+    },
   };
 };
 

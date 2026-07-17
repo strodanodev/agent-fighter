@@ -9,25 +9,26 @@
  *
  * Run: npm run server   (or: tsx src/server.ts from packages/server)
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
-  ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, loadCharacter,
-  setCharacters, stateHash, step,
+  AI_PERSONALITY_RANGES, ENGINE_VERSION, Phase, aiPoll, createAi, createGameState,
+  loadCharacter, setCharacters, stateHash, step,
 } from '@af/core';
 import type { CharacterBundle } from '@af/core';
 import {
-  DEFAULT_PORT, FORFEIT_GRACE_MS, IDLE_FORFEIT_MS, INPUT_DELAY, PROTOCOL_VERSION,
-  SOLO_PACE_MAX, SOLO_PACE_MIN, SOLO_PACE_SLACK_MS,
+  ARCADE_NEXT_GRACE_MS, DEFAULT_PORT, FORFEIT_GRACE_MS, IDLE_FORFEIT_MS, INPUT_DELAY,
+  PROTOCOL_VERSION, SOLO_PACE_MAX, SOLO_PACE_MIN, SOLO_PACE_SLACK_MS,
 } from './protocol.js';
 import type { ClientMsg, SMatch, SResult, ServerMsg } from './protocol.js';
 import { verifyAirToken } from './airjwt.js';
 import type { AirIdentity } from './airjwt.js';
 import {
+  ARCADE_CLEAR_CREDITS, ARCADE_FEE, ARCADE_MILESTONE_CREDITS,
   InsufficientCredits, SOLO_FEE, WAGER_FEE, createPersistence, loadDotEnv,
 } from './persist.js';
 import type { Account, MatchMode, Persistence } from './persist.js';
@@ -36,6 +37,25 @@ import type { AirIssuer } from './air-issuer.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(here, '..', '..', '..');
+
+/** Durable agent keys (ADR 0006): only the sha256 of a key is ever stored. */
+const sha256Hex = (s: string): string => createHash('sha256').update(s).digest('hex');
+
+/**
+ * Clamp a coached personality to the exact bounds random sampling uses
+ * (core AI_PERSONALITY_RANGES) and drop unknown knobs. STYLE only, by
+ * construction — there is no path from this object to skill or stats.
+ */
+const clampPersonality = (raw: unknown): Record<string, number> => {
+  const out: Record<string, number> = {};
+  if (!raw || typeof raw !== 'object') return out;
+  for (const [k, [lo, hi]] of Object.entries(AI_PERSONALITY_RANGES)) {
+    const v = (raw as Record<string, unknown>)[k];
+    if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+    out[k] = Math.max(lo, Math.min(hi, v | 0));
+  }
+  return out;
+};
 
 // ---------------------------------------------------------------- types
 interface Client {
@@ -69,6 +89,8 @@ interface Match {
   names: [string, string];
   /** Local-sim solo: the deterministic house AI the client must simulate. */
   solo: { skill: number; aiSeed: number } | null;
+  /** AGENT ARCADE: the run this battle belongs to (null = not an arcade battle). */
+  arcadeRun: ArcadeRun | null;
   startedAt: number; // wall clock — solo pace sanity (SOLO_PACE_*)
   /** Per-side bearer secrets for CResume — only their owners ever see them. */
   resumeTokens: [string, string];
@@ -89,6 +111,50 @@ export interface MatchServer {
   port: number;
   close: () => void;
 }
+
+/**
+ * AGENT ARCADE run state (v4). Server-authoritative: the opponent order, the
+ * skill ramp, and the milestone payouts all live HERE — a hacked client can't
+ * pick easy opponents, replay a battle, or claim a deeper position. The token
+ * is a bearer secret issued in the battle-1 setup and re-armed per win; it is
+ * additionally pinned to the account that started the run.
+ */
+interface ArcadeRun {
+  token: string;
+  /** Owner identity sub ('' when persistence is off — tests). */
+  sub: string;
+  /** The fighter locked for the whole run (no switching, server-enforced). */
+  charId: string;
+  /** Shuffled opponent character ids — the whole gauntlet, in order. */
+  opponents: string[];
+  /** 0-based index of the battle currently being played (or up next). */
+  battle: number;
+  /** True between a verified win and the next battle's queue. */
+  awaitingNext: boolean;
+  lastActive: number;
+}
+
+/** Battles cleared → credits due AT that clear (milestones + full-clear). */
+export const arcadeMilestonePayout = (cleared: number, total: number): number => {
+  const m1 = Math.ceil(total / 3);
+  const m2 = Math.ceil((2 * total) / 3);
+  let pay = 0;
+  if (cleared === m1 && m1 < total) pay += ARCADE_MILESTONE_CREDITS;
+  if (cleared === m2 && m2 < total && m2 !== m1) pay += ARCADE_MILESTONE_CREDITS;
+  if (cleared === total) pay += ARCADE_CLEAR_CREDITS;
+  return pay;
+};
+
+/**
+ * The gauntlet difficulty ramp: battle 1 is winnable by a newcomer, the last
+ * battle plays near the AI's ceiling. Deliberately NOT level-scaled — every
+ * player faces the same ramp, so ranked arcade records are comparable.
+ */
+const ARCADE_SKILL_MIN = 35;
+const ARCADE_SKILL_MAX = 95;
+export const defaultArcadeSkill = (battle: number, total: number): number =>
+  Math.round(ARCADE_SKILL_MIN
+    + (ARCADE_SKILL_MAX - ARCADE_SKILL_MIN) * (total <= 1 ? 1 : battle / (total - 1)));
 
 // ---------------------------------------------------------------- verify
 interface VerifyOutcome {
@@ -168,6 +234,8 @@ export const createMatchServer = (opts: {
   noPaceCheck?: boolean;
   /** Test hook: overrides the env-configured AIR issuer (null = off). */
   airIssuer?: AirIssuer | null;
+  /** Test hook: overrides the arcade difficulty ramp (battle, total) → skill. */
+  arcadeSkill?: (battle: number, total: number) => number;
 } = {}): Promise<MatchServer> => {
   const root = opts.root ?? REPO_ROOT;
   const charactersDir = join(root, 'characters');
@@ -193,11 +261,19 @@ export const createMatchServer = (opts: {
       : [];
   const characterIds = listIds(charactersDir, 'character.json');
   const stageIds = listIds(stagesDir, 'stage.json');
+  /** The playable roster (meta.disabled mirrors the client's select screen). */
+  const enabledCharacterIds = characterIds.filter((id) => {
+    const meta = (bundleOf(id) as { meta?: { disabled?: boolean } }).meta;
+    return !meta?.disabled;
+  });
+  const arcadeSkill = opts.arcadeSkill ?? defaultArcadeSkill;
 
   const clients = new Set<Client>();
   const queue: Client[] = [];
   /** In-flight matches by id — the CResume lookup. */
   const liveMatches = new Map<string, Match>();
+  /** AGENT ARCADE runs by token (v4). */
+  const arcadeRuns = new Map<string, ArcadeRun>();
   let nextId = 1;
   let nextMatch = 1;
   let matchSeed = (Date.now() % 100_000) | 0; // server-side is allowed wall clock
@@ -273,6 +349,34 @@ export const createMatchServer = (opts: {
         result = { ...result, winner: -1, reason: 'incomplete' };
       }
     }
+
+    // AGENT ARCADE run bookkeeping — decided BEFORE the async persistence so
+    // the milestone payout rides the same record_match settlement.
+    let arcadePayout = 0;
+    const run = m.arcadeRun;
+    if (run) {
+      const wonBattle = result.reason === 'verified' && result.winner === 0
+        && result.deviator !== 0;
+      if (wonBattle) {
+        run.battle++;
+        arcadePayout = arcadeMilestonePayout(run.battle, run.opponents.length);
+        if (run.battle >= run.opponents.length) {
+          arcadeRuns.delete(run.token); // FULL CLEAR — the run is complete
+          console.log(`[arcade] ${m.clients[0].name} CLEARED the gauntlet (${run.opponents.length} battles)`);
+        } else {
+          run.awaitingNext = true; // token re-armed for the next battle
+          run.lastActive = Date.now();
+        }
+      } else if (result.reason === 'incomplete') {
+        // No-contest (network/pace): fee refunded by settlement; the run may
+        // RETRY the same battle until it expires — a blip never burns a run.
+        run.awaitingNext = true;
+        run.lastActive = Date.now();
+      } else {
+        arcadeRuns.delete(run.token); // loss, draw, or forfeit — GAME OVER
+      }
+    }
+
     for (const c of m.clients) {
       if (!c) continue;
       send(c, result);
@@ -285,7 +389,7 @@ export const createMatchServer = (opts: {
     // match id, so a crash-retry can't double-award.
     if (persistence) {
       void persistence.recordMatch({
-        matchId: m.id, mode: m.mode, fee: m.fee,
+        matchId: m.id, mode: m.mode, fee: m.fee, payout: arcadePayout,
         identities: [m.clients[0].identity, m.clients[1]?.identity ?? null],
         names: [m.clients[0].name, m.clients[1]?.name ?? `HOUSE AI`],
         agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
@@ -370,7 +474,12 @@ export const createMatchServer = (opts: {
   const startMatch = (
     c0: Client, c1: Client | null, mode: MatchMode, fee: number, id?: string,
     solo?: { skill: number; aiSeed: number; character: string; level: number },
+    arcadeRun?: ArcadeRun,
   ): void => {
+    // Arcade battles bill as the character, not "HOUSE": the run IS the mode.
+    const houseName = arcadeRun
+      ? `${(bundleOf(solo!.character) as { name?: string }).name ?? solo!.character} · ${arcadeRun.battle + 1}/${arcadeRun.opponents.length}`.toUpperCase()
+      : `HOUSE LV${solo?.level ?? 1}`;
     const m: Match = {
       id: id ?? `m${nextMatch++}`,
       mode, fee,
@@ -378,8 +487,9 @@ export const createMatchServer = (opts: {
       seed: (matchSeed = (matchSeed * 1103515245 + 12345) & 0x7fffffff),
       stage: stageIds.length > 0 ? stageIds[matchSeed % stageIds.length]! : '',
       chars: [c0.character, c1 ? c1.character : solo!.character],
-      names: [c0.name, c1?.name ?? `HOUSE LV${solo!.level}`],
+      names: [c0.name, c1?.name ?? houseName],
       solo: solo ? { skill: solo.skill, aiSeed: solo.aiSeed } : null,
+      arcadeRun: arcadeRun ?? null,
       startedAt: Date.now(),
       resumeTokens: [randomUUID(), randomUUID()],
       gone: [false, false],
@@ -408,6 +518,9 @@ export const createMatchServer = (opts: {
         agents: [m.clients[0].agent, c1?.agent ?? true],
         mode, fee,
         solo: m.solo ?? undefined,
+        arcade: arcadeRun
+          ? { battle: arcadeRun.battle, total: arcadeRun.opponents.length, token: arcadeRun.token }
+          : undefined,
         resume: m.resumeTokens[c.side],
       };
       send(c, setup);
@@ -515,6 +628,41 @@ export const createMatchServer = (opts: {
     };
   };
 
+  /**
+   * AGENT ARCADE (v4): start the run's CURRENT battle. Battle 1 escrows the
+   * run's single entry fee; battles 2+ are already paid for. Each battle is
+   * mechanically a local-sim solo match (pinned AI, ledger re-sim) — only
+   * the fee, the opponent sequencing, and the payouts differ.
+   */
+  const startArcadeBattle = async (c: Client, run: ArcadeRun): Promise<void> => {
+    const fee = run.battle === 0 && persistence ? ARCADE_FEE : 0;
+    const matchId = `m${nextMatch++}`;
+    if (fee > 0) {
+      try {
+        await persistence!.escrowMatch(matchId, [c.identity?.sub ?? null, null], fee);
+      } catch {
+        arcadeRuns.delete(run.token);
+        c.state = 'lobby';
+        return send(c, { t: 'error', code: 'credits', msg: `AGENT ARCADE needs ${fee} credit` });
+      }
+    }
+    run.awaitingNext = false;
+    run.lastActive = Date.now();
+    const opts = {
+      level: c.account?.level ?? 1,
+      skill: arcadeSkill(run.battle, run.opponents.length),
+      character: run.opponents[run.battle]!,
+      aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
+    };
+    if (c.ws.readyState !== WebSocket.OPEN) {
+      // Vanished after escrow → settle as incomplete so the fee refunds
+      // (the run stays retryable until it expires).
+      startMatch(c, null, 'arcade', fee, matchId, opts, run);
+      return finishMatch(c.match!, null);
+    }
+    startMatch(c, null, 'arcade', fee, matchId, opts, run);
+  };
+
   const onMessage = (c: Client, raw: string): void => {
     let msg: ClientMsg;
     try {
@@ -535,10 +683,22 @@ export const createMatchServer = (opts: {
         // Identity + account resolve async — the welcome goes out immediately
         // and queueing AWAITS identityReady (fees need a verified account).
         const auth = typeof msg.auth === 'string' && msg.auth ? msg.auth : null;
+        const agentKey = typeof msg.agentKey === 'string' && msg.agentKey ? msg.agentKey : null;
         c.identityReady = (async () => {
           if (auth) {
             c.identity = await verifyAirToken(auth);
             if (c.identity) console.log(`[auth] ${c.name} = ${c.identity.sub}${c.identity.address ? ` (${c.identity.address.slice(0, 10)}…)` : ''}`);
+          }
+          if (!c.identity && agentKey && persistence) {
+            // Durable agent key (ADR 0006): plays as the OWNER's profile,
+            // always as a DECLARED agent — a key can never masquerade as its
+            // owner's human hands.
+            const owner = await persistence.findByAgentKey(sha256Hex(agentKey));
+            if (owner) {
+              c.identity = { sub: owner.sub };
+              c.agent = true;
+              console.log(`[auth] ${c.name} = ${owner.sub} (agent key)`);
+            }
           }
           if (!c.identity && persistence?.dev) {
             // DEV economy only: name-keyed identity so the whole credit loop
@@ -570,12 +730,60 @@ export const createMatchServer = (opts: {
         }
         c.character = msg.character;
 
-        const mode: MatchMode = msg.mode === 'solo' ? 'solo' : 'wager';
+        const mode: MatchMode = msg.mode === 'solo' ? 'solo' : msg.mode === 'arcade' ? 'arcade' : 'wager';
+        const runToken = typeof msg.runToken === 'string' ? msg.runToken : '';
         void (async () => {
           await c.identityReady;
           if (c.state !== 'lobby' || c.ws.readyState !== WebSocket.OPEN) return;
           if (persistence && !c.identity) {
             return send(c, { t: 'error', code: 'auth', msg: 'sign in to play ranked/wager matches' });
+          }
+          if (mode === 'arcade') {
+            // AGENT ARCADE continuation: a valid run token re-enters the run
+            // (fee already consumed). Everything about the token is
+            // validated — owner, phase, and the locked fighter.
+            const run = runToken ? arcadeRuns.get(runToken) : undefined;
+            if (runToken && !run) {
+              return send(c, { t: 'error', msg: 'arcade run is over — enter again from the title' });
+            }
+            if (run) {
+              if (run.sub !== (c.identity?.sub ?? '')) {
+                return send(c, { t: 'error', code: 'auth', msg: 'not your arcade run' });
+              }
+              if (!run.awaitingNext) {
+                return send(c, { t: 'error', msg: 'arcade run is not awaiting a battle' });
+              }
+              if (run.charId !== c.character) {
+                return send(c, { t: 'error', msg: 'your fighter is locked for the whole arcade run' });
+              }
+              c.state = 'queued';
+              send(c, { t: 'queued' });
+              return startArcadeBattle(c, run);
+            }
+            // New run: 1 credit buys the whole gauntlet. Opponents are every
+            // ENABLED agent except the player's own, shuffled server-side.
+            if (persistence && (c.account?.credits ?? 0) < ARCADE_FEE) {
+              return send(c, { t: 'error', code: 'credits', msg: `AGENT ARCADE needs ${ARCADE_FEE} credit` });
+            }
+            const opponents = enabledCharacterIds.filter((id) => id !== c.character);
+            for (let i = opponents.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [opponents[i], opponents[j]] = [opponents[j]!, opponents[i]!];
+            }
+            if (opponents.length === 0) opponents.push(c.character); // roster of 1 → mirror
+            const fresh: ArcadeRun = {
+              token: randomUUID(),
+              sub: c.identity?.sub ?? '',
+              charId: c.character,
+              opponents,
+              battle: 0,
+              awaitingNext: false,
+              lastActive: Date.now(),
+            };
+            arcadeRuns.set(fresh.token, fresh);
+            c.state = 'queued';
+            send(c, { t: 'queued' });
+            return startArcadeBattle(c, fresh);
           }
           // Fast pre-check for a friendly error; escrow re-checks atomically.
           const fee = mode === 'solo' ? SOLO_FEE : WAGER_FEE;
@@ -721,6 +929,14 @@ export const createMatchServer = (opts: {
 
   const idleSweep = setInterval(() => {
     const now = Date.now();
+    // AGENT ARCADE runs parked on the interstitial expire quietly — nothing
+    // is escrowed between battles, so expiry only forces a fresh (paid) run.
+    // The 60-min belt-and-braces bound also drops runs whose battle died
+    // without ever settling (should be unreachable — matches always settle).
+    for (const [token, r] of arcadeRuns) {
+      const limit = r.awaitingNext ? ARCADE_NEXT_GRACE_MS : 60 * 60 * 1000;
+      if (now - r.lastActive > limit) arcadeRuns.delete(token);
+    }
     for (const c of clients) {
       const m = c.match;
       if (!m || m.finished) continue;
@@ -740,7 +956,7 @@ export const createMatchServer = (opts: {
   // served from a different port/host than the match server).
   const CORS = {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Dev-Name',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Dev-Name, X-Agent-Key',
   };
   const json = (res: import('node:http').ServerResponse, code: number, body: unknown): void => {
     res.writeHead(code, { 'Content-Type': 'application/json', ...CORS });
@@ -790,6 +1006,82 @@ export const createMatchServer = (opts: {
         // ?ref=<dare code> — the title screen redeems a stashed referral here.
         const ref = q.get('ref')?.slice(0, 40) ?? undefined;
         return json(res, 200, await persistence.getAccount(identity, name, false, ref));
+      })().catch((e) => json(res, 502, { error: String(e) }));
+      return;
+    }
+    // ---- TRAIN MY AGENT (ADR 0006). Auth for all /agent routes:
+    //   · Bearer AIR JWT (the owner, e.g. from the game UI), or
+    //   · X-Agent-Key (the durable key — how a Minds coach connects), or
+    //   · X-Dev-Name (dev economy only).
+    // Key mint is OWNER-ONLY: a leaked key must not be able to rotate itself
+    // into a fresh one and hide the leak.
+    if (path === '/agent/key' || path === '/agent' || path === '/agent/matches') {
+      if (!persistence) return json(res, 503, { error: 'persistence not configured' });
+      const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '')?.[1];
+      const devName = persistence.dev ? String(req.headers['x-dev-name'] ?? '') : '';
+      const presentedKey = String(req.headers['x-agent-key'] ?? '');
+      void (async () => {
+        let sub: string | null = null;
+        let ownerAuth = false; // true = AIR/dev session (may mint keys)
+        if (bearer) {
+          const id = await verifyAirToken(bearer);
+          if (id) { sub = id.sub; ownerAuth = true; }
+        } else if (devName) {
+          sub = `dev:${devName.slice(0, 24)}`;
+          ownerAuth = true;
+        } else if (presentedKey) {
+          sub = (await persistence.findByAgentKey(sha256Hex(presentedKey)))?.sub ?? null;
+        }
+        if (!sub) return json(res, 401, { error: 'sign in or present an agent key' });
+
+        if (path === '/agent/key') {
+          if (req.method !== 'POST') return json(res, 405, { error: 'POST to mint/rotate' });
+          if (!ownerAuth) return json(res, 403, { error: 'only the signed-in owner can mint a key' });
+          const key = `afk_${randomBytes(24).toString('hex')}`;
+          if (!(await persistence.setAgentKey(sub, sha256Hex(key)))) {
+            return json(res, 404, { error: 'no profile — connect to the game signed in first' });
+          }
+          // Shown ONCE; only the hash survives server-side.
+          return json(res, 200, { key, note: 'store this now — it is never shown again' });
+        }
+
+        if (path === '/agent' && req.method === 'PUT') {
+          let body = '';
+          for await (const chunk of req) body += chunk;
+          let parsed: Record<string, unknown>;
+          try { parsed = JSON.parse(body || '{}') as Record<string, unknown>; }
+          catch { return json(res, 400, { error: 'bad json' }); }
+          const prev = (await persistence.getAgent(sub))?.config;
+          const character = typeof parsed.character === 'string' && characterIds.includes(parsed.character)
+            ? parsed.character
+            : prev?.character;
+          if (!character) return json(res, 400, { error: `character required (one of: ${characterIds.join(', ')})` });
+          const config = {
+            character,
+            // Merge over the previous coaching so a Mind can nudge one knob.
+            personality: { ...prev?.personality, ...clampPersonality(parsed.personality) },
+            motto: typeof parsed.motto === 'string' ? parsed.motto.slice(0, 90) : prev?.motto,
+          };
+          if (!(await persistence.setAgentConfig(sub, config))) {
+            return json(res, 404, { error: 'no profile — connect to the game signed in first' });
+          }
+          return json(res, 200, { config, ranges: AI_PERSONALITY_RANGES });
+        }
+
+        if (path === '/agent') {
+          const info = await persistence.getAgent(sub);
+          if (!info) return json(res, 404, { error: 'no profile — connect to the game signed in first' });
+          return json(res, 200, {
+            // Stats are read-only context for the coach; skill derives from
+            // level server-side and is not part of the config on purpose.
+            name: info.name, level: info.level, xp: info.xp,
+            wins: info.wins, losses: info.losses,
+            config: info.config, keyCreatedAt: info.keyCreatedAt,
+            ranges: AI_PERSONALITY_RANGES, characters: characterIds,
+          });
+        }
+
+        return json(res, 501, { error: 'match history endpoint lands with the next migration' });
       })().catch((e) => json(res, 502, { error: String(e) }));
       return;
     }

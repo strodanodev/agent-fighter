@@ -43,6 +43,17 @@ export interface AgentOptions {
    */
   authToken?: string;
   /**
+   * Durable agent key (`afk_…`, ADR 0006) — the headless alternative to a
+   * short-lived AIR JWT. Resolves server-side to the owner's profile.
+   */
+  agentKey?: string;
+  /**
+   * Coached personality (ADR 0006) — style knobs for the default aiPoll
+   * brain, clamped in core to AI_PERSONALITY_RANGES. Fetched from
+   * GET /agent by the reference client; ignored when `policy` is set.
+   */
+  personality?: Record<string, number>;
+  /**
    * Queue mode — 'wager' (default, PvP pot) or 'solo' (vs the house AI).
    * Solo is LOCAL-SIM (protocol v3): the server pins a deterministic house
    * AI in the match setup; this session simulates it locally and streams
@@ -121,7 +132,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
     };
 
     ws.on('open', () => {
-      sendMsg({ t: 'hello', v: PROTOCOL_VERSION, name: opts.name, agent: true, engine: ENGINE_VERSION, auth: opts.authToken, email: opts.email });
+      sendMsg({ t: 'hello', v: PROTOCOL_VERSION, name: opts.name, agent: true, engine: ENGINE_VERSION, auth: opts.authToken, agentKey: opts.agentKey, email: opts.email });
       sendMsg({
         t: 'queue',
         character: opts.character,
@@ -145,7 +156,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
           ];
           pinChars();
           game = createGameState(msg.seed);
-          ai = createAi(side, opts.skill, opts.aiSeed ?? msg.seed ^ (side + 1) * 0x9e37);
+          ai = createAi(side, opts.skill, opts.aiSeed ?? msg.seed ^ (side + 1) * 0x9e37, opts.personality);
           const paceMs = opts.paceMs ?? 16;
           const burst = paceMs <= 2 ? 64 : 1;
 

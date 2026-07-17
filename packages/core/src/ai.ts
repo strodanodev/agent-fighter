@@ -204,8 +204,28 @@ const superOdds = (
   return Math.max(0, Math.min(255, odds));
 };
 
+/**
+ * The exact bounds personality sampling draws from (min = base, max = base +
+ * range in createAi). Coached personalities (ADR 0006) are clamped to these
+ * same bounds server-side AND here — a trained agent can play differently,
+ * never outside what a randomly-rolled opponent could be. Keeping the clamp
+ * in core means every consumer (server verify, client solo sim, headless
+ * agents) agrees bit-for-bit on the effective values.
+ */
+export const AI_PERSONALITY_RANGES: Record<keyof AiPersonality, [number, number]> = {
+  aggression: [90, 220],
+  jumpiness: [40, 190],
+  zoner: [40, 210],
+  throwHappy: [30, 150],
+  pushblocker: [60, 220],
+  patience: [60, 200],
+};
+
 // ---------------------------------------------------------------- create
-export const createAi = (side: 0 | 1, skill: number, seed: number): AiState => {
+export const createAi = (
+  side: 0 | 1, skill: number, seed: number,
+  personality?: Partial<AiPersonality>,
+): AiState => {
   const ai: AiState = {
     side,
     skill: Math.max(0, Math.min(100, skill)),
@@ -229,13 +249,23 @@ export const createAi = (side: 0 | 1, skill: number, seed: number): AiState => {
     nextSuperAt: 0,
     bookBuilt: 0,
   };
-  // Personality: sampled once — this "person" for this match.
+  // Personality: sampled once — this "person" for this match. ALWAYS sampled
+  // (even when overridden) so the rng stream downstream of creation is
+  // identical with and without a coached personality.
   ai.p.aggression = 90 + rnd(ai, 130);
   ai.p.jumpiness = 40 + rnd(ai, 150);
   ai.p.zoner = 40 + rnd(ai, 170);
   ai.p.throwHappy = 30 + rnd(ai, 120);
   ai.p.pushblocker = 60 + rnd(ai, 160);
   ai.p.patience = 60 + rnd(ai, 140);
+  if (personality) {
+    for (const k of Object.keys(AI_PERSONALITY_RANGES) as (keyof AiPersonality)[]) {
+      const v = personality[k];
+      if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+      const [lo, hi] = AI_PERSONALITY_RANGES[k];
+      ai.p[k] = Math.max(lo, Math.min(hi, v | 0));
+    }
+  }
   return ai;
 };
 

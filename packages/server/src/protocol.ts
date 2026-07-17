@@ -7,7 +7,7 @@
  * server relays it and re-simulates the ledger to derive the result.
  */
 
-export const PROTOCOL_VERSION = 3; // v3: local-sim ranked solo (zero-latency)
+export const PROTOCOL_VERSION = 4; // v4: AGENT ARCADE ranked gauntlet runs
 export const DEFAULT_PORT = 8477;
 
 /** Local-input delay (ticks) applied by both sides — symmetric by design. */
@@ -48,6 +48,14 @@ export const FORFEIT_GRACE_MS = 20_000;
  */
 export const IDLE_FORFEIT_MS = 30_000;
 
+/**
+ * AGENT ARCADE (v4): how long a run may sit between battles (the results
+ * interstitial) before its token expires. Nothing is escrowed between battles
+ * — the entry fee settles with battle 1 — so expiry never strands credits;
+ * it only forces a fresh (paid) run.
+ */
+export const ARCADE_NEXT_GRACE_MS = 120_000;
+
 // ---- client → server
 export interface CHello {
   t: 'hello';
@@ -69,6 +77,13 @@ export interface CHello {
    */
   auth?: string;
   /**
+   * Durable agent key (ADR 0006, `afk_…` — minted at POST /agent/key).
+   * Alternative to `auth` for headless agents: resolves to the OWNER's
+   * profile and forces `agent: true` (a key can never pose as human hands).
+   * Ignored when `auth` verifies.
+   */
+  agentKey?: string;
+  /**
    * Referral dare code (?ref= from a shared /dare/<code> link), stashed by
    * the client until the first authenticated hello. Best-effort: an invalid
    * or already-used code grants nothing and never blocks login.
@@ -77,16 +92,28 @@ export interface CHello {
 }
 /**
  * Queue modes (M5 credits):
- *  · 'wager' — PvP. Entrance WAGER_FEE credits each; winner takes the pot.
- *  · 'solo'  — ranked vs the HOUSE agent at your level. SOLO_FEE credits;
- *    win nets +1 credit, a loss burns the fee AND −15 XP.
- * Both require a verified account with enough credits (server-enforced).
+ *  · 'wager'  — PvP. Entrance WAGER_FEE credits each; winner takes the pot.
+ *  · 'solo'   — a single match vs the HOUSE agent at your level. SOLO_FEE
+ *    credits; win nets +1 credit, a loss burns the fee AND −15 XP.
+ *  · 'arcade' — AGENT ARCADE, the RANKED gauntlet (v4): ARCADE_FEE credits
+ *    buys ONE RUN through every enabled agent, one battle at a time. Each
+ *    battle is a solo-style local-sim match, server-verified, and settles
+ *    XP/W-L on the same ranked ladder. Winning a battle arms the run token
+ *    for the next one (re-queue with `runToken`); any loss ends the run.
+ *    Credits pay out only at milestones + a full-clear bonus.
+ * All modes require a verified account with enough credits (server-enforced).
  */
 export interface CQueue {
   t: 'queue';
   character: string;
   bundleHash?: string;
-  mode?: 'wager' | 'solo'; // default 'wager'
+  mode?: 'wager' | 'solo' | 'arcade'; // default 'wager'
+  /**
+   * AGENT ARCADE continuation: the run token from the previous battle's
+   * setup. Omitted = start a NEW run (charges the entry fee). The token is a
+   * bearer secret tied to the account that started the run.
+   */
+  runToken?: string;
 }
 export interface CInput { t: 'i'; k: number; v: number }
 export interface CHash { t: 'h'; k: number; x: number }
@@ -112,8 +139,9 @@ export interface SMatch {
   chars: [{ id: string; hash?: string }, { id: string; hash?: string }];
   names: [string, string];
   agents: [boolean, boolean];
-  mode: 'wager' | 'solo';
-  /** Credits escrowed per side (pot = fee×2 in wager mode). */
+  mode: 'wager' | 'solo' | 'arcade';
+  /** Credits escrowed per side (pot = fee×2 in wager mode). Arcade: the run
+   * entry fee on battle 1, then 0 — one credit buys the whole run. */
   fee: number;
   /**
    * v3 LOCAL-SIM SOLO: present iff mode === 'solo'. There is NO house-bot
@@ -125,6 +153,13 @@ export interface SMatch {
    * that simulates a different opponent fails the ledger re-sim.
    */
   solo?: { skill: number; aiSeed: number };
+  /**
+   * AGENT ARCADE (v4): present iff mode === 'arcade'. `battle` is 0-based;
+   * `token` re-queues the run for the next battle after a verified win
+   * (CQueue.runToken). Battles are otherwise exactly local-sim solo matches
+   * (the `solo` field above is set too).
+   */
+  arcade?: { battle: number; total: number; token: string };
   /** This side's resume token (bearer secret — never shown to the opponent). */
   resume?: string;
 }

@@ -1,6 +1,7 @@
 # 0006 — TRAIN MY AGENT: user-coached agents + Minds Bazaar skill
 
-Status: PROPOSED (draft for review — nothing here is implemented yet)
+Status: ACCEPTED — core shipped 2026-07-17 (config + durable keys + /agent
+API + coached headless play; see "Shipped vs deferred" at the bottom)
 Date: 2026-07-17
 
 ## The feature in one line
@@ -107,6 +108,23 @@ User setup flow ("agent account" prerequisites, now clean):
   (characters are data; the cancel-graph-derived combo book stays).
 - OAuth — one durable key per profile, rotate on demand, matches the
   resume-token trust pattern.
+
+## Shipped vs deferred (2026-07-17)
+
+SHIPPED: `createAi` personality override + exported `AI_PERSONALITY_RANGES`
+(core); migration 0007 + both persistence impls; `POST /agent/key`,
+`GET/PUT /agent` (partial-merge, server-clamped); ws `hello.agentKey`
+(forces `agent:true`); `AF_AGENT_KEY` in the reference client (pulls the
+coached config over HTTP, applies personality via the LOCAL brain — no
+protocol/sim change needed for queue play, which killed most of the planned
+plumbing); tests in `packages/server/test/trained-agent.test.ts`;
+`docs/agent-api.md` + `docs/minds-skill.md`.
+
+DEFERRED: `GET /agent/matches` (501 until its query lands);
+`SMatch.solo.personality` + VS-MY-AGENT sparring + dare-vs-agent (waits for
+the AGENT ARCADE protocol-v4 rework to settle — same code region); the
+in-game MY AGENT screen (client files owned by the arcade session);
+Minds skill publication (builder-side, needs a human on the Minds console).
 
 ## Build order
 
