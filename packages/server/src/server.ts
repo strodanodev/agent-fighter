@@ -782,9 +782,13 @@ export const createMatchServer = (opts: {
           : devName ? { sub: `dev:${devName.slice(0, 24)}` }
           : null;
         if (!identity) return json(res, 401, { error: 'sign in required' });
-        const name = devName || identity.sub.slice(0, 12);
+        const q = new URL(req.url ?? '/', 'http://x').searchParams;
+        // ?name= — the client's display name. Without it, get_account upserts
+        // the sub-prefix fallback over the real fighter name (leaderboard
+        // showed a raw UUID until the next ws hello repaired it).
+        const name = devName || (q.get('name') ?? '').slice(0, 24) || identity.sub.slice(0, 12);
         // ?ref=<dare code> — the title screen redeems a stashed referral here.
-        const ref = new URL(req.url ?? '/', 'http://x').searchParams.get('ref')?.slice(0, 40) ?? undefined;
+        const ref = q.get('ref')?.slice(0, 40) ?? undefined;
         return json(res, 200, await persistence.getAccount(identity, name, false, ref));
       })().catch((e) => json(res, 502, { error: String(e) }));
       return;
