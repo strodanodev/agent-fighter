@@ -70,15 +70,18 @@ terminal-free).
 - Skill gains a 4th tool: `signup` → the Bazaar activation itself can
   create the Mind's own fighter.
 
-### Objective 2: in-game AUTO (hands-free) toggle — SPEC'D, client-blocked
-Your coached agent takes the controls: swap the local side's InputSource
-from pad to aiPoll(createAi(side, levelSkill, seed, agent_config
-personality)). Local + deterministic — no protocol/server change, no LLM in
-the loop. Gate: enabled iff the profile HAS an agent_config (the observable
-effect of the Minds skill's first PUT) — greyed toggle hints "Coach your
-agent on Minds to unlock AUTO". Solo/arcade only (no wager — humans staking
-credits deserve a human opponent). XP at a reduced rate TBD. Client files
-(main.ts/ui.ts) are the arcade session's lane — hand this spec over.
+### Objective 2: in-game AUTO (hands-free) toggle — SHIPPED (2026-07-18)
+Press V in a solo/arcade fight: the COACHED agent takes the controls.
+Implementation: SoloSession.setAuto() (net.ts) swaps the pad for
+aiPoll(createAi(0, levelSkill, matchSeed^tick, agent_config.personality)) —
+its outputs are ordinary side-0 inputs, so verification/pace/settlement are
+untouched. main.ts: V toggle + AUTO chip + locked-hint toast; agentCfg
+fetched alongside /me (GET /agent, same auth headers). Gate: config exists
+(the observable effect of the coach's first PUT) — no config → "coach your
+agent on Minds to unlock" toast. Solo/arcade only by construction (the
+toggle only exists on SoloSession; wager runs NetSession). Verified live:
+coached gate loads, V hands over (agent fights alone), V takes back.
+XP-rate reduction for AUTO wins remains an open economy knob.
 
 ### Telegram
 Zero build: Minds' native chat surface IS Telegram/email. The /connect page

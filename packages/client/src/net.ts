@@ -450,6 +450,15 @@ export class SoloSession {
 
   private ws!: WebSocket;
   private houseAi: AiState | null = null;
+  /**
+   * TRAIN MY AGENT hands-free mode (ADR 0006 obj. 2): non-null = the
+   * player's COACHED agent is on the sticks. Its outputs are ordinary
+   * side-0 inputs streamed like any others — the server's re-sim neither
+   * knows nor cares who generated them, so nothing about verification,
+   * pace checks, or settlement changes. Solo/arcade only by construction
+   * (this class never runs wager matches).
+   */
+  private autoAi: AiState | null = null;
   private tick = 0;
   private overSent = false;
   private intentionalClose = false;
@@ -571,6 +580,22 @@ export class SoloSession {
 
   get side(): 0 | 1 { return 0; } // solo player is always side 0
 
+  /** Hands-free state — main.ts renders the AUTO chip off this. */
+  get auto(): boolean { return !!this.autoAi; }
+
+  /**
+   * Toggle hands-free. `skill` is level-derived by the CALLER (mirror of the
+   * server's house ramp — the coached agent is exactly as strong as the
+   * house at your level, style aside); `personality` is the agent_config
+   * saved by the coach, clamped again inside createAi. Seeding off the
+   * match seed + current tick keeps re-toggles from replaying the same
+   * decision stream mid-match.
+   */
+  setAuto(on: boolean, skill: number, personality?: Record<string, number>): void {
+    if (!on || !this.setup) { this.autoAi = null; return; }
+    this.autoAi = createAi(0, skill, (this.setup.seed ^ 0x0a70 ^ this.tick) | 0, personality);
+  }
+
   close(): void {
     this.intentionalClose = true;
     if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
@@ -608,9 +633,12 @@ export class SoloSession {
       if (!this.overSent) { this.overSent = true; this.send({ t: 'over', k: this.tick }); }
       return false;
     }
-    this.send({ t: 'i', k: this.tick, v: pad });
+    // AUTO: the coached agent's decision replaces the pad wholesale (poll
+    // order matters — OUR ai before the house ai, matching createAi order).
+    const mine: InputFrame = this.autoAi ? aiPoll(this.autoAi, g) : pad;
+    this.send({ t: 'i', k: this.tick, v: mine });
     const opp = aiPoll(this.houseAi, g); // aiPoll BEFORE step — verifier ordering
-    step(g, [pad, opp]);
+    step(g, [mine, opp]);
     this.tick++;
     if (this.tick % HASH_EVERY === 0) this.send({ t: 'h', k: this.tick, x: stateHash(g) });
     // step() mutates phase — TS's narrowing from the guard above is stale.

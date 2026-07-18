@@ -3582,6 +3582,15 @@ class SoloSession {
     oppGoneUntil = null; // no peer socket — kept for the shared interface
     ws;
     houseAi = null;
+    /**
+     * TRAIN MY AGENT hands-free mode (ADR 0006 obj. 2): non-null = the
+     * player's COACHED agent is on the sticks. Its outputs are ordinary
+     * side-0 inputs streamed like any others — the server's re-sim neither
+     * knows nor cares who generated them, so nothing about verification,
+     * pace checks, or settlement changes. Solo/arcade only by construction
+     * (this class never runs wager matches).
+     */
+    autoAi = null;
     tick = 0;
     overSent = false;
     intentionalClose = false;
@@ -3699,6 +3708,23 @@ class SoloSession {
         this.status = 'playing';
     }
     get side() { return 0; } // solo player is always side 0
+    /** Hands-free state — main.ts renders the AUTO chip off this. */
+    get auto() { return !!this.autoAi; }
+    /**
+     * Toggle hands-free. `skill` is level-derived by the CALLER (mirror of the
+     * server's house ramp — the coached agent is exactly as strong as the
+     * house at your level, style aside); `personality` is the agent_config
+     * saved by the coach, clamped again inside createAi. Seeding off the
+     * match seed + current tick keeps re-toggles from replaying the same
+     * decision stream mid-match.
+     */
+    setAuto(on, skill, personality) {
+        if (!on || !this.setup) {
+            this.autoAi = null;
+            return;
+        }
+        this.autoAi = createAi(0, skill, (this.setup.seed ^ 0x0a70 ^ this.tick) | 0, personality);
+    }
     close() {
         this.intentionalClose = true;
         if (this.retryTimer) {
@@ -3747,9 +3773,12 @@ class SoloSession {
             }
             return false;
         }
-        this.send({ t: 'i', k: this.tick, v: pad });
+        // AUTO: the coached agent's decision replaces the pad wholesale (poll
+        // order matters — OUR ai before the house ai, matching createAi order).
+        const mine = this.autoAi ? aiPoll(this.autoAi, g) : pad;
+        this.send({ t: 'i', k: this.tick, v: mine });
         const opp = aiPoll(this.houseAi, g); // aiPoll BEFORE step — verifier ordering
-        step(g, [pad, opp]);
+        step(g, [mine, opp]);
         this.tick++;
         if (this.tick % HASH_EVERY === 0)
             this.send({ t: 'h', k: this.tick, x: stateHash(g) });
@@ -4522,20 +4551,25 @@ Object.assign(globalThis, {
 
 // ---- client/src/audio.js ----
 /**
- * Sound playback — Web Audio API, no dependency.
+ * Sound playback — Web Audio API, no dependency. Source library lives in
+ * `sounds/<N>. <Category>/` (see tools/README.md for the raw→shipped
+ * mapping); every id below is named for what it's FOR, not the source
+ * filename.
  *
- * Music (MusicId): the MvC: Clash of Super Heroes BRSTM rips (decoded/
- * re-encoded to ogg offline, see tools/README.md), one file per arcade-mode
- * screen. There's no dedicated stage BGM yet, so the 4 "Ending" themes double
- * as the title-screen loop AND the in-match stage loop (ROTATION), picked
- * round-robin so neither screen repeats the same track back-to-back.
+ * Music (MusicId): the MvC: Clash of Super Heroes BRSTM rips, one file per
+ * arcade-mode screen, plus `credits` (a non-canon victory jingle that rolls
+ * after an AGENT ARCADE full clear). There's no dedicated stage BGM yet, so
+ * the 4 "Ending" themes double as the title-screen loop AND the in-match
+ * stage loop (ROTATION), picked round-robin so neither screen repeats the
+ * same track back-to-back.
  *
- * Hit SFX (SfxId): a 10-clip pack (sounds/SFX HITS/, see tools/README.md)
- * covering swing, punch/kick impact by weight class, block, and a combo
- * accent. `hitSfxFor()` maps a connecting move's button (LP/MP/HP/LK/MK/HK)
- * to the right impact clip — the client-side juice layer (main.ts) is the
- * only caller, keyed off `attackConnected` state changes per the "cosmetic
- * effects live client-side, never inside the sim" rule.
+ * SFX (SfxId): impact/block/combo clips (weight-classed by button, see
+ * `hitSfxFor`), menu stingers (select_confirm, you_lose), the announcer's
+ * fight-call, and the character voice-bark pack (hit/ouch reactions on
+ * taking damage, hiya kiai on some swings, shoryuken/hadouken callouts on
+ * their matching motion specials). The client-side juice layer (main.ts) is
+ * the only caller, keyed off GameState changes per the "cosmetic effects
+ * live client-side, never inside the sim" rule.
  */
 const MUSIC_FILES = {
     continue: '/assets/audio/bgm/continue.ogg',
@@ -4550,6 +4584,10 @@ const MUSIC_FILES = {
     ranking: '/assets/audio/bgm/ranking.ogg',
     vs: '/assets/audio/bgm/vs.ogg',
     win: '/assets/audio/bgm/win.ogg',
+    // Rolls after an AGENT ARCADE full clear — mp3-only (no ogg sibling), the
+    // urlsFor() fallback logic only kicks in for `.ogg` primaries so this is
+    // served as-is everywhere.
+    credits: '/assets/audio/bgm/credits.mp3',
 };
 const SFX_FILES = {
     swing_a: '/assets/audio/sfx/swing_a.mp3',
@@ -4560,8 +4598,25 @@ const SFX_FILES = {
     punch_heavy_b: '/assets/audio/sfx/punch_heavy_b.mp3',
     kick_light: '/assets/audio/sfx/kick_light.mp3',
     kick_heavy: '/assets/audio/sfx/kick_heavy.mp3',
+    special_hit: '/assets/audio/sfx/special_hit.mp3',
     block_hit: '/assets/audio/sfx/block_hit.mp3',
     combo_accent: '/assets/audio/sfx/combo_accent.mp3',
+    select_confirm: '/assets/audio/sfx/select_confirm.mp3',
+    you_lose: '/assets/audio/sfx/you_lose.mp3',
+    fight_call_a: '/assets/audio/voice/fight_call_a.mp3',
+    fight_call_b: '/assets/audio/voice/fight_call_b.mp3',
+    hit_1: '/assets/audio/voice/hit_1.mp3',
+    hit_2: '/assets/audio/voice/hit_2.mp3',
+    hit_3: '/assets/audio/voice/hit_3.mp3',
+    hit_4: '/assets/audio/voice/hit_4.mp3',
+    hiya_1: '/assets/audio/voice/hiya_1.mp3',
+    hiya_2: '/assets/audio/voice/hiya_2.mp3',
+    ouch_1: '/assets/audio/voice/ouch_1.mp3',
+    ouch_2: '/assets/audio/voice/ouch_2.mp3',
+    ouch_3: '/assets/audio/voice/ouch_3.mp3',
+    ouch_long: '/assets/audio/voice/ouch_long.mp3',
+    shoryuken: '/assets/audio/voice/shoryuken.mp3',
+    hadouken: '/assets/audio/voice/hadouken.mp3',
 };
 const FILES = { ...MUSIC_FILES, ...SFX_FILES };
 /** Shared title-screen / stage-BGM pool — the 4 "Ending" themes. */
@@ -4587,10 +4642,17 @@ const swingSfx = () => SWING[Math.floor(Math.random() * SWING.length)];
 const BGM_LEVEL = 0.55;
 const SFX_LEVEL = 0.85;
 const DUCK_LEVEL = 0.12;
-/** Impact / block / combo clips — everything else in SFX_FILES is swing whoosh. */
+/**
+ * Combat clips (impact, block, combo accent, and every character voice bark)
+ * ride the Hits bus. Menu/announcer stingers (swing whoosh, select confirm,
+ * fight-call, you-lose) ride the SFX bus — that split is what the title
+ * screen's Music/SFX/Hits toggles actually mute.
+ */
 const HIT_SFX = new Set([
     'punch_light', 'punch_medium', 'punch_heavy_a', 'punch_heavy_b',
-    'kick_light', 'kick_heavy', 'block_hit', 'combo_accent',
+    'kick_light', 'kick_heavy', 'special_hit', 'block_hit', 'combo_accent',
+    'hit_1', 'hit_2', 'hit_3', 'hit_4', 'hiya_1', 'hiya_2',
+    'ouch_1', 'ouch_2', 'ouch_3', 'ouch_long', 'shoryuken', 'hadouken',
 ]);
 const AUDIO_PREFS_KEY = 'af-audio-mute';
 const defaultMutePrefs = () => ({
@@ -5675,6 +5737,88 @@ const drawAudioControl = (ctx, menu) => {
         label(ctx, txt, px + 12, ry + rowH / 2 + 4, 13, chMuted ? '#ffffff66' : '#ffffffdd', 'left');
         label(ctx, chMuted ? 'OFF' : 'ON', px + panelW - 12, ry + rowH / 2 + 4, 11, chMuted ? '#ff9d9d99' : '#8fe8a0cc', 'right');
     });
+    ctx.lineWidth = 1;
+};
+/**
+ * Boot / "LOADING CHARACTERS…" screen — main badge logo at 200% plus a
+ * charging bar that tracks `progress` (0..1). Intentionally light: no
+ * backdrop video, no roster art, just the brand and a readable charge %.
+ */
+const drawLoading = (ctx, progress, tick, error = '') => {
+    ctx.fillStyle = '#0a0616';
+    ctx.fillRect(0, 0, VW, VH);
+    const cx = VW / 2;
+    const cy = VH / 2 - 24;
+    // Main logo (assets/logo/main_logo_AF.svg) at 200% of the 100px badge base.
+    if (gameLogoImg && gameLogoImg.naturalWidth > 0) {
+        const box = gameLogoBBox ?? {
+            x: 0, y: 0, w: gameLogoImg.naturalWidth, h: gameLogoImg.naturalHeight,
+        };
+        const w = 100 * 2;
+        const h = w * (box.h / box.w);
+        const breathe = fxPulse(tick, 0.05, 0.97, 1.04);
+        ctx.save();
+        ctx.translate(cx, cy - h / 2 - 8);
+        ctx.scale(breathe, breathe);
+        ctx.imageSmoothingEnabled = true;
+        const glowMix = fxPulse(tick, 0.08);
+        ctx.shadowColor = `rgba(${Math.round(210 + 40 * glowMix)},${Math.round(235 + 15 * glowMix)},255,${0.45 + 0.3 * fxPulse(tick, 0.1)})`;
+        ctx.shadowBlur = 16 + 10 * fxPulse(tick, 0.1);
+        ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, -w / 2, 0, w, h);
+        ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, -w / 2, 0, w, h);
+        ctx.restore();
+    }
+    const p = Math.max(0, Math.min(1, progress));
+    const barW = 340, barH = 16;
+    const bx = cx - barW / 2;
+    const by = cy + 78;
+    // Track
+    ctx.fillStyle = '#ffffff14';
+    ctx.fillRect(bx, by, barW, barH);
+    ctx.strokeStyle = '#ffffff40';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(bx + 0.5, by + 0.5, barW - 1, barH - 1);
+    // Charge fill
+    const fillW = Math.max(0, Math.round((barW - 4) * p));
+    if (fillW > 0) {
+        const full = p >= 0.999;
+        const grd = ctx.createLinearGradient(bx, by, bx + barW, by);
+        grd.addColorStop(0, METER_HI);
+        grd.addColorStop(1, full ? METER_FULL : '#9ae6ff');
+        ctx.fillStyle = grd;
+        ctx.fillRect(bx + 2, by + 2, fillW, barH - 4);
+        // Sweeping highlight so the bar reads as "charging" even on a long stall.
+        const sweep = ((tick * 3) % (barW + 40)) - 20;
+        if (sweep > 0 && sweep < fillW) {
+            const sw = Math.min(36, fillW - sweep);
+            const hi = ctx.createLinearGradient(bx + 2 + sweep, by, bx + 2 + sweep + sw, by);
+            hi.addColorStop(0, 'rgba(255,255,255,0)');
+            hi.addColorStop(0.5, 'rgba(255,255,255,0.35)');
+            hi.addColorStop(1, 'rgba(255,255,255,0)');
+            ctx.fillStyle = hi;
+            ctx.fillRect(bx + 2 + sweep, by + 2, sw, barH - 4);
+        }
+        glowBar(ctx, bx, by, Math.max(fillW + 4, 8), barH, full ? METER_FULL : METER_HI, 10, 0.35 + 0.25 * fxPulse(tick, 0.12));
+    }
+    const pct = Math.round(p * 100);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    if (error) {
+        ctx.fillStyle = '#e94560';
+        ctx.font = 'bold 16px "Courier New", monospace';
+        ctx.fillText(error, cx, by + barH + 26);
+        ctx.font = '13px "Courier New", monospace';
+        ctx.fillStyle = '#ffffff88';
+        ctx.fillText('run `npm run play` from the repo root so characters/ is served', cx, by + barH + 48);
+    }
+    else {
+        ctx.fillStyle = '#ffffffaa';
+        ctx.font = 'bold 15px "Courier New", monospace';
+        ctx.fillText('LOADING CHARACTERS…', cx, by + barH + 26);
+        ctx.fillStyle = '#cfe3ff';
+        ctx.font = 'bold 22px "Courier New", monospace';
+        ctx.fillText(`${pct}%`, cx, by + barH + 52);
+    }
     ctx.lineWidth = 1;
 };
 const drawTitle = (ctx, rosters, tick, menu) => {
@@ -7748,6 +7892,8 @@ let netInstalled = false;
 const DEV_GUEST = new URLSearchParams(location.search).get('dev');
 let account = null;
 let accountFetch = 'idle';
+let agentCfg = null;
+let autoHintAge = -1; // ≥0 → "coach your agent to unlock AUTO" toast animating
 let accountToastAge = -1; // ≥0 → the "+10 DAILY CREDITS" toast is animating
 let queuedMode = 'wager';
 let practiceFree = false; // offline-fallback match: no fee, no XP, no records
@@ -7998,6 +8144,14 @@ const fetchAccount = async () => {
         if (ref)
             localStorage.removeItem(REF_CODE_KEY);
         accountFetch = 'done';
+        // TRAIN MY AGENT (ADR 0006): the coached config gates + drives AUTO
+        // (hands-free) mode. Best-effort — no config just leaves AUTO locked.
+        void fetch(`${matchHttpUrl()}/agent`, { headers })
+            .then((r) => (r.ok ? r.json() : null))
+            .then((info) => {
+            agentCfg = info?.config ?? null;
+        })
+            .catch(() => { });
     }
     catch {
         accountFetch = 'fail'; // server offline — title shows it, local play still fine
@@ -8025,8 +8179,15 @@ let game = null;
 let showBoxes = false;
 let seed = 1;
 let loadError = '';
+/** Boot load fraction 0..1 — drives the loading-screen charge bar. */
+let loadProgress = 0;
+/** Smoothed bar fill so step jumps don't look like a stuck meter. */
+let loadDisplay = 0;
 let hurryPlayed = false; // per-round: has the "Hurry Up!" stinger fired yet
 const HURRY_UP_TICKS = 10 * TICKS_PER_SEC; // MvC fires it at 10s left on the clock
+const setLoadProgress = (p) => {
+    loadProgress = Math.max(loadProgress, Math.min(1, p));
+};
 // Cosmetic juice — never simulated.
 const DANGER_RED = '#ff2d4a'; // critical-health aura / warning tint
 let sparks = [];
@@ -8053,24 +8214,39 @@ canvas.addEventListener('pointerdown', (e) => {
 // ---------------------------------------------------------------- boot
 const boot = async () => {
     try {
+        // Kick the badge logo first so the loading screen can show it while the
+        // rest of boot runs — not awaited (same reason as the title logo below).
+        void loadGameLogo().then((img) => { setGameLogo(img); setLoadProgress(0.12); });
         await loadDisplayFont(); // awaited so the title screen never flashes the Impact fallback
+        setLoadProgress(0.08);
         setUiKit(await loadUiKit());
-        // Logo (11MB SVG) and background video (~10MB) are NOT awaited: both have
-        // graceful fallbacks (text wordmark, static stage art), so the title
+        setLoadProgress(0.18);
+        // Title logo (11MB SVG) and background video (~10MB) are NOT awaited: both
+        // have graceful fallbacks (text wordmark, static stage art), so the title
         // screen should be interactive immediately and swap in as they arrive —
         // important on mobile, where blocking boot on ~20MB of art would stall
         // first paint for seconds on a slow connection.
         void loadLogo().then(setLogo);
-        void loadGameLogo().then(setGameLogo);
         setBgVideo(loadBgVideo('/assets/video/bg_video_main_af.mp4'));
         stageIds = await listStages();
-        stageAssets = await Promise.all(stageIds.map(loadStage));
+        setLoadProgress(0.28);
+        stageAssets = [];
+        for (let i = 0; i < stageIds.length; i++) {
+            stageAssets.push(await loadStage(stageIds[i]));
+            setLoadProgress(0.28 + 0.12 * ((i + 1) / Math.max(1, stageIds.length)));
+        }
         if (stageAssets.length > 0)
             setStageAsset(stageAssets[0]);
         const ids = await listCharacters();
         if (ids.length === 0)
             throw new Error('no characters found in characters/');
-        allRosters = await Promise.all(ids.map(loadRoster));
+        setLoadProgress(0.42);
+        allRosters = [];
+        for (let i = 0; i < ids.length; i++) {
+            allRosters.push(await loadRoster(ids[i]));
+            setLoadProgress(0.42 + 0.56 * ((i + 1) / ids.length));
+        }
+        setLoadProgress(1);
         picks = [0, Math.min(1, allRosters.length - 1)];
         screen = 'title';
         audio.preload();
@@ -8407,6 +8583,10 @@ const updateCamera = (g) => {
     cam.x += (targetX - cam.x) * 0.16;
     cam.y += (targetY - cam.y) * 0.12;
 };
+// Victim pain-grunt pools (voice/*.mp3) — light taps get a plain "Hit", the
+// heavy ones ("big" damage, matching the spark/shake threshold) get an "Ouch".
+const HIT_BARK = ['hit_1', 'hit_2', 'hit_3', 'hit_4'];
+const OUCH = ['ouch_1', 'ouch_2', 'ouch_3'];
 // ---------------------------------------------------------------- juice
 const updateJuice = (g) => {
     for (const i of [0, 1]) {
@@ -8420,17 +8600,32 @@ const updateJuice = (g) => {
             emitBurst(hx, hy, P_COLORS[(1 - i)], big ? 1.8 : 0.9);
             shake = big ? 11 : 6;
             hitStopFlash = big ? 3 : 0;
+            // Victim's pain grunt — a bigger "Ouch" bark for the heavier hits.
+            audio.playSfx(big ? OUCH[Math.floor(Math.random() * OUCH.length)] : HIT_BARK[Math.floor(Math.random() * HIT_BARK.length)], { volume: 0.55 });
         }
         // Hit SFX: a swoosh on every swing (attack's very first tick), plus a
         // punch/kick impact or block clip on the tick the attack actually makes
         // contact (attackConnected's rising edge: 0→1 hit, 0→2 block).
         if (f.action === 9 /* Action.Attack */ && f.actionFrame === 0 && f.moveIdx >= 0) {
-            audio.playSfx(swingSfx(), { volume: 0.45 });
+            const move = fighters[i].ch.b.moves[f.moveIdx];
+            // The fireball/uppercut motion specials get their classic voice
+            // callout instead of a generic whoosh — everything else keeps the
+            // plain swing, with a normal occasionally getting a kiai bark too.
+            if (move?.motion === 623)
+                audio.playSfx('shoryuken', { volume: 0.7 });
+            else if (move?.motion === 236)
+                audio.playSfx('hadouken', { volume: 0.7 });
+            else {
+                audio.playSfx(swingSfx(), { volume: 0.45 });
+                if (move?.type === 'normal' && Math.random() < 0.3) {
+                    audio.playSfx(Math.random() < 0.5 ? 'hiya_1' : 'hiya_2', { volume: 0.5 });
+                }
+            }
         }
         if (f.attackConnected !== 0 && f.attackConnected !== prevConnected[i]) {
             if (f.attackConnected === 1) {
                 const move = fighters[i].ch.b.moves[f.moveIdx];
-                audio.playSfx(hitSfxFor(move?.button));
+                audio.playSfx(move?.type === 'special' || move?.type === 'super' ? 'special_hit' : hitSfxFor(move?.button));
                 if (g.fighters[(1 - i)].comboHits >= 2)
                     audio.playSfx('combo_accent', { volume: 0.6 });
             }
@@ -8483,11 +8678,13 @@ const updateJuice = (g) => {
             fx.announce = 'FIGHT!';
             fx.announceAge = 0;
             emitRing(VW / 2, VH / 2 - 40, 240, '#ffd166', { life: 30, width: 5 });
+            audio.playSfx(Math.random() < 0.5 ? 'fight_call_a' : 'fight_call_b', { volume: 0.7 });
         }
         else if (g.phase === 2 /* Phase.RoundOver */) {
             fx.announce = g.roundWinner === 2 ? 'DOUBLE KO' : 'K.O.';
             fx.announceAge = 0;
             emitRing(VW / 2, VH / 2 - 40, 340, DANGER_RED, { life: 40, width: 7 });
+            audio.playSfx('ouch_long', { volume: 0.75 });
         }
         else if (g.phase === 0 /* Phase.PreRound */) {
             fx.announce = `ROUND ${g.roundNum + 1}`;
@@ -8690,8 +8887,10 @@ const tickSelect = () => {
             move(1, 1);
     }
     // A disabled fighter under the cursor cannot be confirmed.
-    if (enabled(picks[0]) && (tapConfirm || CONFIRM[0].some((k) => pressedThisFrame.has(k))))
+    if (!locked[0] && enabled(picks[0]) && (tapConfirm || CONFIRM[0].some((k) => pressedThisFrame.has(k)))) {
         locked[0] = true;
+        audio.playSfx('select_confirm');
+    }
     if (mode === 'online' || mode === 'cpu') {
         // Locking IS the launch. FRIENDLY: queue the private challenge room.
         // ONLINE: the pick is the wager-queue ticket (server matchmakes + charges
@@ -8702,8 +8901,10 @@ const tickSelect = () => {
         return;
     }
     if (mode === '2p') {
-        if (enabled(picks[1]) && CONFIRM[1].some((k) => pressedThisFrame.has(k)))
+        if (!locked[1] && enabled(picks[1]) && CONFIRM[1].some((k) => pressedThisFrame.has(k))) {
             locked[1] = true;
+            audio.playSfx('select_confirm');
+        }
     }
     else if (locked[0] && !locked[1]) {
         // CPU picks its fighter — visibly, like an arcade opponent reveal — but
@@ -8762,17 +8963,11 @@ const frame = () => {
     // layout the player can actually see.
     resetTaps();
     if (screen === 'loading') {
-        ctx.fillStyle = '#0a0616';
-        ctx.fillRect(0, 0, VW, VH);
-        ctx.fillStyle = loadError ? '#e94560' : '#ffffffaa';
-        ctx.font = 'bold 18px "Courier New", monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText(loadError || 'LOADING CHARACTERS…', VW / 2, VH / 2);
-        if (loadError) {
-            ctx.font = '13px "Courier New", monospace';
-            ctx.fillStyle = '#ffffff88';
-            ctx.fillText('run `npm run play` from the repo root so characters/ is served', VW / 2, VH / 2 + 28);
-        }
+        // Ease the bar toward the real fraction so milestone jumps don't stutter.
+        loadDisplay += (loadProgress - loadDisplay) * 0.14;
+        if (loadProgress - loadDisplay < 0.002)
+            loadDisplay = loadProgress;
+        drawLoading(ctx, loadDisplay, uiTick, loadError);
     }
     else if (screen === 'title') {
         // M5: the AIR account IS the wallet the credits settle into — signing in
@@ -9075,6 +9270,21 @@ const frame = () => {
     else if (screen === 'fight' && game) {
         if (pressedThisFrame.has('KeyB'))
             showBoxes = !showBoxes;
+        // AUTO (hands-free, ADR 0006 obj. 2): V hands the sticks to the COACHED
+        // agent — solo/arcade only (never against a staked human), and gated on
+        // a coached config existing (the observable effect of the Minds skill's
+        // first PUT). The agent is exactly house-strength for your level; only
+        // its coached STYLE is yours.
+        if (pressedThisFrame.has('KeyV') && net instanceof SoloSession) {
+            if (!agentCfg) {
+                autoHintAge = 0;
+            }
+            else {
+                const lvl = account?.level ?? profile.level;
+                const skill = Math.max(40, Math.min(100, Math.round((lvl * 100) / 40)));
+                net.setAuto(!net.auto, skill, agentCfg.personality);
+            }
+        }
         if (pressedThisFrame.has('Escape')) {
             if (arcade) {
                 // Quitting mid-gauntlet abandons the run — back to the title, never
@@ -9135,6 +9345,35 @@ const frame = () => {
         else if (vsCardAge >= 0 && !netDead) {
             vsCardAge = -1;
         }
+        // AUTO chip / unlock hint (drawn inline, perf-overlay style — ui.ts is
+        // untouched on purpose). Chip = hands-free is ON; toast = gated.
+        if (net instanceof SoloSession && !netDead && !cardUp) {
+            if (net.auto) {
+                const t = '▶ AUTO · agent has the controls · V to take over';
+                ctx.save();
+                ctx.font = 'bold 13px system-ui, sans-serif';
+                const w = ctx.measureText(t).width + 24;
+                ctx.fillStyle = uiTick % 60 < 45 ? '#101018cc' : '#10101888';
+                ctx.fillRect((VW - w) / 2, 86, w, 24);
+                ctx.strokeStyle = '#f5c542';
+                ctx.strokeRect((VW - w) / 2, 86, w, 24);
+                ctx.fillStyle = '#f5c542';
+                ctx.textAlign = 'center';
+                ctx.fillText(t, VW / 2, 103);
+                ctx.restore();
+            }
+            else if (autoHintAge >= 0 && autoHintAge < 240) {
+                const t = 'AUTO locked — coach your agent on Minds to unlock (see /connect)';
+                ctx.save();
+                ctx.font = '13px system-ui, sans-serif';
+                ctx.globalAlpha = autoHintAge > 180 ? 1 - (autoHintAge - 180) / 60 : 1;
+                ctx.fillStyle = '#ff9d9d';
+                ctx.textAlign = 'center';
+                ctx.fillText(t, VW / 2, 100);
+                ctx.restore();
+                autoHintAge++;
+            }
+        }
         if (netReconnecting) {
             drawReconnecting(ctx, uiTick); // ESC falls through to the branch's exit
         }
@@ -9179,10 +9418,13 @@ const frame = () => {
                 // Whatever ended it, the run is over server-side → GAME OVER card.
                 gameOverAge = 0;
                 screen = 'gameover';
+                audio.playSfx('you_lose', { volume: 0.8 });
                 void audio.playStinger('game_over');
             }
             else {
                 screen = 'results';
+                if (lostIt)
+                    audio.playSfx('you_lose', { volume: 0.8 });
                 void audio.playStinger(lostIt ? 'game_over' : 'win', {
                     onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
                 });
@@ -9201,13 +9443,17 @@ const frame = () => {
                 // practice runs pay nothing by design.
                 if (game.winner === 0) {
                     screen = 'results';
+                    // Clearing the FINAL battle rolls the (very unserious) end credits
+                    // instead of the usual between-battles ranking loop.
+                    const cleared = arcade.stage + 1 >= arcade.total;
                     void audio.playStinger('win', {
-                        onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
+                        onEnded: () => void audio.playBgm(cleared ? 'credits' : 'ranking', { fadeInSec: 1 }),
                     });
                 }
                 else {
                     gameOverAge = 0;
                     screen = 'gameover';
+                    audio.playSfx('you_lose', { volume: 0.8 });
                     void audio.playStinger('game_over');
                 }
             }
@@ -9218,6 +9464,8 @@ const frame = () => {
                 // CPU beat the human → arcade "Game Over" stinger; anything else
                 // (human win, 2P vs 2P, a draw) gets the victory jingle.
                 const lostToCpu = Boolean(cpuAi) && game.winner === 1;
+                if (lostToCpu)
+                    audio.playSfx('you_lose', { volume: 0.8 });
                 void audio.playStinger(lostToCpu ? 'game_over' : 'win', {
                     onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
                 });
@@ -9449,6 +9697,8 @@ Object.assign(globalThis, {
     afNet: () => (net ? {
         status: net.status, error: net.error, setup: net.setup, result: net.result,
         stalled: net.stalled, side: net.side, oppGoneUntil: net.oppGoneUntil,
+        auto: net instanceof SoloSession ? net.auto : false,
+        coached: !!agentCfg,
     } : null),
     // Sever the live socket WITHOUT the leave-intent flag — simulates a wifi
     // blip so the reconnect path can be tested from the console/automation.

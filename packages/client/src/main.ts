@@ -19,7 +19,7 @@ import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './a
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  currentStageCamLimits, drawGameOver, drawHud, drawInvite, drawNetError, drawOpponentGone,
+  currentStageCamLimits, drawGameOver, drawHud, drawInvite, drawLoading, drawNetError, drawOpponentGone,
   drawRanks, drawReconnecting, drawResults, drawSelect, drawStage, drawStageSelect, drawTitle,
   drawVsCard, drawWallet, resetTaps, setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit,
   tapHit, tapZone, worldTransform,
@@ -120,6 +120,10 @@ let netInstalled = false;
 const DEV_GUEST = new URLSearchParams(location.search).get('dev');
 let account: NetAccount | null = null;
 let accountFetch: 'idle' | 'busy' | 'done' | 'fail' = 'idle';
+/** Coached agent config (ADR 0006) — non-null unlocks AUTO in solo/arcade. */
+interface AgentCoachConfig { character?: string; personality?: Record<string, number>; motto?: string }
+let agentCfg: AgentCoachConfig | null = null;
+let autoHintAge = -1; // ≥0 → "coach your agent to unlock AUTO" toast animating
 let accountToastAge = -1; // ≥0 → the "+10 DAILY CREDITS" toast is animating
 let queuedMode: 'solo' | 'wager' | 'arcade' | 'friendly' = 'wager';
 let practiceFree = false; // offline-fallback match: no fee, no XP, no records
@@ -376,6 +380,14 @@ const fetchAccount = async (): Promise<void> => {
     // either way the code is spent for this account. Stop resending it.
     if (ref) localStorage.removeItem(REF_CODE_KEY);
     accountFetch = 'done';
+    // TRAIN MY AGENT (ADR 0006): the coached config gates + drives AUTO
+    // (hands-free) mode. Best-effort — no config just leaves AUTO locked.
+    void fetch(`${matchHttpUrl()}/agent`, { headers })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((info: { config?: AgentCoachConfig | null } | null) => {
+        agentCfg = info?.config ?? null;
+      })
+      .catch(() => { /* coach config is optional */ });
   } catch {
     accountFetch = 'fail'; // server offline — title shows it, local play still fine
   }
@@ -425,8 +437,15 @@ let game: GameState | null = null;
 let showBoxes = false;
 let seed = 1;
 let loadError = '';
+/** Boot load fraction 0..1 — drives the loading-screen charge bar. */
+let loadProgress = 0;
+/** Smoothed bar fill so step jumps don't look like a stuck meter. */
+let loadDisplay = 0;
 let hurryPlayed = false; // per-round: has the "Hurry Up!" stinger fired yet
 const HURRY_UP_TICKS = 10 * TICKS_PER_SEC; // MvC fires it at 10s left on the clock
+const setLoadProgress = (p: number): void => {
+  loadProgress = Math.max(loadProgress, Math.min(1, p));
+};
 
 // Cosmetic juice — never simulated.
 const DANGER_RED = '#ff2d4a'; // critical-health aura / warning tint
@@ -458,22 +477,37 @@ canvas.addEventListener('pointerdown', (e) => {
 // ---------------------------------------------------------------- boot
 const boot = async (): Promise<void> => {
   try {
+    // Kick the badge logo first so the loading screen can show it while the
+    // rest of boot runs — not awaited (same reason as the title logo below).
+    void loadGameLogo().then((img) => { setGameLogo(img); setLoadProgress(0.12); });
     await loadDisplayFont(); // awaited so the title screen never flashes the Impact fallback
+    setLoadProgress(0.08);
     setUiKit(await loadUiKit());
-    // Logo (11MB SVG) and background video (~10MB) are NOT awaited: both have
-    // graceful fallbacks (text wordmark, static stage art), so the title
+    setLoadProgress(0.18);
+    // Title logo (11MB SVG) and background video (~10MB) are NOT awaited: both
+    // have graceful fallbacks (text wordmark, static stage art), so the title
     // screen should be interactive immediately and swap in as they arrive —
     // important on mobile, where blocking boot on ~20MB of art would stall
     // first paint for seconds on a slow connection.
     void loadLogo().then(setLogo);
-    void loadGameLogo().then(setGameLogo);
     setBgVideo(loadBgVideo('/assets/video/bg_video_main_af.mp4'));
     stageIds = await listStages();
-    stageAssets = await Promise.all(stageIds.map(loadStage));
+    setLoadProgress(0.28);
+    stageAssets = [];
+    for (let i = 0; i < stageIds.length; i++) {
+      stageAssets.push(await loadStage(stageIds[i]!));
+      setLoadProgress(0.28 + 0.12 * ((i + 1) / Math.max(1, stageIds.length)));
+    }
     if (stageAssets.length > 0) setStageAsset(stageAssets[0]!);
     const ids = await listCharacters();
     if (ids.length === 0) throw new Error('no characters found in characters/');
-    allRosters = await Promise.all(ids.map(loadRoster));
+    setLoadProgress(0.42);
+    allRosters = [];
+    for (let i = 0; i < ids.length; i++) {
+      allRosters.push(await loadRoster(ids[i]!));
+      setLoadProgress(0.42 + 0.56 * ((i + 1) / ids.length));
+    }
+    setLoadProgress(1);
     picks = [0, Math.min(1, allRosters.length - 1)];
     screen = 'title';
     audio.preload();
@@ -1179,17 +1213,10 @@ const frame = (): void => {
   resetTaps();
 
   if (screen === 'loading') {
-    ctx.fillStyle = '#0a0616';
-    ctx.fillRect(0, 0, VW, VH);
-    ctx.fillStyle = loadError ? '#e94560' : '#ffffffaa';
-    ctx.font = 'bold 18px "Courier New", monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText(loadError || 'LOADING CHARACTERS…', VW / 2, VH / 2);
-    if (loadError) {
-      ctx.font = '13px "Courier New", monospace';
-      ctx.fillStyle = '#ffffff88';
-      ctx.fillText('run `npm run play` from the repo root so characters/ is served', VW / 2, VH / 2 + 28);
-    }
+    // Ease the bar toward the real fraction so milestone jumps don't stutter.
+    loadDisplay += (loadProgress - loadDisplay) * 0.14;
+    if (loadProgress - loadDisplay < 0.002) loadDisplay = loadProgress;
+    drawLoading(ctx, loadDisplay, uiTick, loadError);
   } else if (screen === 'title') {
     // M5: the AIR account IS the wallet the credits settle into — signing in
     // is required to proceed (?dev=NAME bypasses against a dev server).
@@ -1451,6 +1478,20 @@ const frame = (): void => {
     }
   } else if (screen === 'fight' && game) {
     if (pressedThisFrame.has('KeyB')) showBoxes = !showBoxes;
+    // AUTO (hands-free, ADR 0006 obj. 2): V hands the sticks to the COACHED
+    // agent — solo/arcade only (never against a staked human), and gated on
+    // a coached config existing (the observable effect of the Minds skill's
+    // first PUT). The agent is exactly house-strength for your level; only
+    // its coached STYLE is yours.
+    if (pressedThisFrame.has('KeyV') && net instanceof SoloSession) {
+      if (!agentCfg) {
+        autoHintAge = 0;
+      } else {
+        const lvl = account?.level ?? profile.level;
+        const skill = Math.max(40, Math.min(100, Math.round((lvl * 100) / 40)));
+        net.setAuto(!net.auto, skill, agentCfg.personality);
+      }
+    }
     if (pressedThisFrame.has('Escape')) {
       if (arcade) {
         // Quitting mid-gauntlet abandons the run — back to the title, never
@@ -1507,6 +1548,34 @@ const frame = (): void => {
       vsCardAge++;
     } else if (vsCardAge >= 0 && !netDead) {
       vsCardAge = -1;
+    }
+    // AUTO chip / unlock hint (drawn inline, perf-overlay style — ui.ts is
+    // untouched on purpose). Chip = hands-free is ON; toast = gated.
+    if (net instanceof SoloSession && !netDead && !cardUp) {
+      if (net.auto) {
+        const t = '▶ AUTO · agent has the controls · V to take over';
+        ctx.save();
+        ctx.font = 'bold 13px system-ui, sans-serif';
+        const w = ctx.measureText(t).width + 24;
+        ctx.fillStyle = uiTick % 60 < 45 ? '#101018cc' : '#10101888';
+        ctx.fillRect((VW - w) / 2, 86, w, 24);
+        ctx.strokeStyle = '#f5c542';
+        ctx.strokeRect((VW - w) / 2, 86, w, 24);
+        ctx.fillStyle = '#f5c542';
+        ctx.textAlign = 'center';
+        ctx.fillText(t, VW / 2, 103);
+        ctx.restore();
+      } else if (autoHintAge >= 0 && autoHintAge < 240) {
+        const t = 'AUTO locked — coach your agent on Minds to unlock (see /connect)';
+        ctx.save();
+        ctx.font = '13px system-ui, sans-serif';
+        ctx.globalAlpha = autoHintAge > 180 ? 1 - (autoHintAge - 180) / 60 : 1;
+        ctx.fillStyle = '#ff9d9d';
+        ctx.textAlign = 'center';
+        ctx.fillText(t, VW / 2, 100);
+        ctx.restore();
+        autoHintAge++;
+      }
     }
     if (netReconnecting) {
       drawReconnecting(ctx, uiTick); // ESC falls through to the branch's exit
@@ -1818,6 +1887,8 @@ Object.assign(globalThis, {
   afNet: () => (net ? {
     status: net.status, error: net.error, setup: net.setup, result: net.result,
     stalled: net.stalled, side: net.side, oppGoneUntil: net.oppGoneUntil,
+    auto: net instanceof SoloSession ? net.auto : false,
+    coached: !!agentCfg,
   } : null),
   // Sever the live socket WITHOUT the leave-intent flag — simulates a wifi
   // blip so the reconnect path can be tested from the console/automation.

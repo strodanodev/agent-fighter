@@ -276,6 +276,13 @@ export const createMatchServer = (opts: {
   const stagesDir = join(root, 'stages');
   loadDotEnv(root); // SUPABASE_URL / SUPABASE_SERVICE_KEY / AIR_* config
   const persistence = opts.persistence !== undefined ? opts.persistence : createPersistence();
+  // The pace check is the only thing between local-sim ranked play and
+  // tool-assisted slow-motion — disabling it on a REAL economy must be
+  // impossible no matter which env flags are set (an env-flag-only guard
+  // once let AF_NO_PACE_CHECK ride alongside live Supabase keys).
+  if (opts.noPaceCheck && persistence && !persistence.dev) {
+    throw new Error('noPaceCheck is dev/test-only: refusing with a non-dev persistence');
+  }
   // AIR reputation write-back (ADR 0004) — on only when fully configured.
   const airCfg = opts.airIssuer === undefined ? loadIssuerConfig(root) : null;
   const airIssuer: AirIssuer | null = opts.airIssuer !== undefined

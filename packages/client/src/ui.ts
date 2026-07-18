@@ -996,6 +996,100 @@ export const drawAudioControl = (ctx: CanvasRenderingContext2D, menu: AudioMenuS
   ctx.lineWidth = 1;
 };
 
+/**
+ * Boot / "LOADING CHARACTERS…" screen — main badge logo at 200% plus a
+ * charging bar that tracks `progress` (0..1). Intentionally light: no
+ * backdrop video, no roster art, just the brand and a readable charge %.
+ */
+export const drawLoading = (
+  ctx: CanvasRenderingContext2D,
+  progress: number,
+  tick: number,
+  error = '',
+): void => {
+  ctx.fillStyle = '#0a0616';
+  ctx.fillRect(0, 0, VW, VH);
+
+  const cx = VW / 2;
+  const cy = VH / 2 - 24;
+
+  // Main logo (assets/logo/main_logo_AF.svg) at 200% of the 100px badge base.
+  if (gameLogoImg && gameLogoImg.naturalWidth > 0) {
+    const box = gameLogoBBox ?? {
+      x: 0, y: 0, w: gameLogoImg.naturalWidth, h: gameLogoImg.naturalHeight,
+    };
+    const w = 100 * 2;
+    const h = w * (box.h / box.w);
+    const breathe = fxPulse(tick, 0.05, 0.97, 1.04);
+    ctx.save();
+    ctx.translate(cx, cy - h / 2 - 8);
+    ctx.scale(breathe, breathe);
+    ctx.imageSmoothingEnabled = true;
+    const glowMix = fxPulse(tick, 0.08);
+    ctx.shadowColor = `rgba(${Math.round(210 + 40 * glowMix)},${Math.round(235 + 15 * glowMix)},255,${0.45 + 0.3 * fxPulse(tick, 0.1)})`;
+    ctx.shadowBlur = 16 + 10 * fxPulse(tick, 0.1);
+    ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, -w / 2, 0, w, h);
+    ctx.drawImage(gameLogoImg, box.x, box.y, box.w, box.h, -w / 2, 0, w, h);
+    ctx.restore();
+  }
+
+  const p = Math.max(0, Math.min(1, progress));
+  const barW = 340, barH = 16;
+  const bx = cx - barW / 2;
+  const by = cy + 78;
+
+  // Track
+  ctx.fillStyle = '#ffffff14';
+  ctx.fillRect(bx, by, barW, barH);
+  ctx.strokeStyle = '#ffffff40';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(bx + 0.5, by + 0.5, barW - 1, barH - 1);
+
+  // Charge fill
+  const fillW = Math.max(0, Math.round((barW - 4) * p));
+  if (fillW > 0) {
+    const full = p >= 0.999;
+    const grd = ctx.createLinearGradient(bx, by, bx + barW, by);
+    grd.addColorStop(0, METER_HI);
+    grd.addColorStop(1, full ? METER_FULL : '#9ae6ff');
+    ctx.fillStyle = grd;
+    ctx.fillRect(bx + 2, by + 2, fillW, barH - 4);
+    // Sweeping highlight so the bar reads as "charging" even on a long stall.
+    const sweep = ((tick * 3) % (barW + 40)) - 20;
+    if (sweep > 0 && sweep < fillW) {
+      const sw = Math.min(36, fillW - sweep);
+      const hi = ctx.createLinearGradient(bx + 2 + sweep, by, bx + 2 + sweep + sw, by);
+      hi.addColorStop(0, 'rgba(255,255,255,0)');
+      hi.addColorStop(0.5, 'rgba(255,255,255,0.35)');
+      hi.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = hi;
+      ctx.fillRect(bx + 2 + sweep, by + 2, sw, barH - 4);
+    }
+    glowBar(ctx, bx, by, Math.max(fillW + 4, 8), barH, full ? METER_FULL : METER_HI, 10,
+      0.35 + 0.25 * fxPulse(tick, 0.12));
+  }
+
+  const pct = Math.round(p * 100);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  if (error) {
+    ctx.fillStyle = '#e94560';
+    ctx.font = 'bold 16px "Courier New", monospace';
+    ctx.fillText(error, cx, by + barH + 26);
+    ctx.font = '13px "Courier New", monospace';
+    ctx.fillStyle = '#ffffff88';
+    ctx.fillText('run `npm run play` from the repo root so characters/ is served', cx, by + barH + 48);
+  } else {
+    ctx.fillStyle = '#ffffffaa';
+    ctx.font = 'bold 15px "Courier New", monospace';
+    ctx.fillText('LOADING CHARACTERS…', cx, by + barH + 26);
+    ctx.fillStyle = '#cfe3ff';
+    ctx.font = 'bold 22px "Courier New", monospace';
+    ctx.fillText(`${pct}%`, cx, by + barH + 52);
+  }
+  ctx.lineWidth = 1;
+};
+
 export const drawTitle = (
   ctx: CanvasRenderingContext2D, rosters: Roster[], tick: number, menu: TitleMenuState,
 ): void => {
