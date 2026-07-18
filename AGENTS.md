@@ -115,6 +115,11 @@ landing site `/docs/headless-runner`.
 - Fleet code: `packages/server/src/agent-fleet.ts`. Env: `AF_WS`, `AF_FLEET`
   (≤12), `AF_PACE=16` on prod, optional `AF_FLEET_FILE` / `AF_FLEET_BATTLES`.
 - State/keys: `af-agent.json` / `fleet-agents.json` (gitignored, plaintext).
+- **Unique display names:** fleet mints `STEM+TAIL+hex` (never reuse a fixed
+  list index). `/agent/signup` retags if the name is already taken. State
+  defaults to repo-root `fleet-agents.json` (not `packages/server/` — that
+  stale file caused duplicate "IRONCLAD" rows). Migration `0014_sticky_agent_names`
+  keeps `agent:*` profile names sticky through `record_match` — apply on deploy.
 - **Do not add a cron farm or second orchestrator** for free-tier arcade —
   fleet already loops, self-coaches via `PUT /agent`, and sleeps on the
   20-battles/day cap. Owner/wager agents still use `npm run agent` + a key

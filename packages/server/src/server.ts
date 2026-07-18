@@ -16,10 +16,11 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
-  AI_PERSONALITY_RANGES, ENGINE_VERSION, Phase, aiPoll, createAi, createGameState,
+  AI_PERSONALITY_RANGES, ENGINE_VERSION, ITEMS, ITEM_COST, ITEM_TIER_ODDS,
+  Phase, aiPoll, createAi, createGameState,
   loadCharacter, setCharacters, stateHash, step,
 } from '@af/core';
-import type { CharacterBundle } from '@af/core';
+import type { CharacterBundle, ItemDef } from '@af/core';
 import {
   ARCADE_NEXT_GRACE_MS, DEFAULT_PORT, FORFEIT_GRACE_MS, IDLE_FORFEIT_MS, INPUT_DELAY,
   INPUT_DELAY_MAX, INPUT_DELAY_MIN, PING_INTERVAL_MS, PROTOCOL_VERSION,
@@ -50,6 +51,23 @@ const sha256Hex = (s: string): string => createHash('sha256').update(s).digest('
  * is the single switch the whole policy hangs on.
  */
 const isAgentClassSub = (sub: string | undefined | null): boolean => !!sub && sub.startsWith('agent:');
+
+/**
+ * Vending-machine gacha roll (ADR 0007). The randomness lives HERE, at
+ * purchase time, server-side — never in the sim: by the time an item can
+ * matter in a match it is a fixed, known effect. Tier odds + registry are
+ * data in @af/core items.ts.
+ */
+const rollItem = (): ItemDef => {
+  let r = Math.random() * 100;
+  let tier: ItemDef['tier'] = 1;
+  for (const t of ITEM_TIER_ODDS) {
+    if (r < t.pct) { tier = t.tier; break; }
+    r -= t.pct;
+  }
+  const pool = ITEMS.filter((i) => i.tier === tier);
+  return pool[Math.floor(Math.random() * pool.length)]!;
+};
 
 /** Abuse valves for the free agent class — plain in-memory day counters.
  *  (Reset on restart: acceptable — they bound COMPUTE, not money.) */
@@ -160,9 +178,10 @@ export interface MatchServer {
 }
 
 /**
- * A pinned solo opponent: the house AI (level ramp, random character) or a
- * TRAINED agent (owner-level skill, coached character + personality,
- * "<OWNER>'S AGENT" label — ADR 0006 dare-vs-agent / sparring).
+ * A pinned solo opponent: the house AI (level ramp, random character), a
+ * LIVE headless/fleet agent from the public roster (real display name +
+ * optional coached style — the 24/7 arena-queue illusion), or a TRAINED
+ * agent via dare code ("<OWNER>'S AGENT" — ADR 0006 sparring).
  */
 interface SoloPin {
   skill: number;
@@ -299,8 +318,11 @@ export const createMatchServer = (opts: {
   airIssuer?: AirIssuer | null;
   /** Test hook: overrides the arcade difficulty ramp (battle, total) → skill. */
   arcadeSkill?: (battle: number, total: number) => number;
+  /** Test hook: shorten the input-silence forfeit window (default 30s). */
+  idleForfeitMs?: number;
 } = {}): Promise<MatchServer> => {
   const root = opts.root ?? REPO_ROOT;
+  const idleMs = opts.idleForfeitMs ?? IDLE_FORFEIT_MS;
   const charactersDir = join(root, 'characters');
   const stagesDir = join(root, 'stages');
   loadDotEnv(root); // SUPABASE_URL / SUPABASE_SERVICE_KEY / AIR_* config
@@ -480,12 +502,11 @@ export const createMatchServer = (opts: {
       void persistence.recordMatch({
         matchId: m.id, mode: m.mode, fee: m.fee, payout: arcadePayout,
         identities: [m.clients[0].identity, m.clients[1]?.identity ?? null],
-        // Trained-agent opponents (solo.personality pinned) record under
-        // their real label ("RIVAL'S AGENT · LV3") so GET /agent/matches and
-        // the coach read who was actually fought; the plain house AI keeps
-        // its historical 'HOUSE AI' name (house_agent_stats reads the mode
-        // column, not this label, so stats are unaffected either way).
-        names: [m.clients[0].name, m.clients[1]?.name ?? (m.solo?.personality ? m.names[1] : `HOUSE AI`)],
+        // Solo/arcade side-1 has no account: persist the nameplate the match
+        // already used (live roster agent, trained-agent label, HOUSE LV…,
+        // or arcade "CHAR · n/total"). house_agent_stats reads the mode
+        // column, not this label, so the aggregate house record is unaffected.
+        names: [m.clients[0].name, m.clients[1]?.name ?? m.names[1]],
         agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
         chars: m.chars,
         winner: result.winner, reason: result.reason,
@@ -746,12 +767,15 @@ export const createMatchServer = (opts: {
         return send(c, { t: 'error', code: 'credits', msg: `ranked match needs ${fee} credit` });
       }
     }
+    // Resolve AFTER escrow so a slow roster lookup can't race fee refunds,
+    // and so dare-vs-agent pins (already resolved) skip another round-trip.
+    const resolved = pin ?? await soloOpts(c);
     if (c.ws.readyState !== WebSocket.OPEN) {
       // Vanished after escrow → settle as incomplete so the fee refunds.
-      startMatch(c, null, 'solo', fee, matchId, pin ?? soloOpts(c));
+      startMatch(c, null, 'solo', fee, matchId, resolved);
       return finishMatch(c.match!, null);
     }
-    startMatch(c, null, 'solo', fee, matchId, pin ?? soloOpts(c));
+    startMatch(c, null, 'solo', fee, matchId, resolved);
   };
 
   /**
@@ -778,14 +802,52 @@ export const createMatchServer = (opts: {
   const skillForLevel = (level: number): number =>
     Math.max(40, Math.min(100, Math.round((level * 100) / 40)));
 
-  const soloOpts = (c: Client): SoloPin => {
+  /**
+   * Default ranked-solo opponent: prefer a LIVE agent-class account from the
+   * public roster (fleet / headless grinders) nearest the player's level so
+   * the select badge, queue copy, nameplate, and match history all share one
+   * real identity. Still local-sim — no second socket — but branded as that
+   * agent. Falls back to the generic HOUSE LV{n} pin when the roster is empty.
+   */
+  const soloOpts = async (c: Client): Promise<SoloPin> => {
     const level = c.account?.level ?? 1;
-    return {
+    const fallback: SoloPin = {
       level,
       skill: skillForLevel(level),
       character: characterIds[Math.floor(Math.random() * characterIds.length)]!,
       aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
     };
+    if (!persistence) return fallback;
+    try {
+      const roster = await persistence.agentRoster();
+      const candidates = roster.filter((a) => a.id !== c.identity?.sub);
+      if (candidates.length === 0) return fallback;
+      // Same nearest-level pick the client uses for the select badge (stable
+      // ties: more wins, then name) so "who you're fighting" matches in-match.
+      const pick = [...candidates].sort((p, q) =>
+        Math.abs(p.level - level) - Math.abs(q.level - level)
+        || q.wins - p.wins
+        || p.name.localeCompare(q.name),
+      )[0]!;
+      const info = await persistence.getAgent(pick.id);
+      const char = info?.config?.character && characterIds.includes(info.config.character)
+        ? info.config.character
+        : fallback.character;
+      return {
+        // Skill stays on the PLAYER's level (fair calibrated fight); the
+        // nameplate/badge carry the live agent's identity + their W-L.
+        level: pick.level,
+        skill: skillForLevel(level),
+        character: char,
+        aiSeed: fallback.aiSeed,
+        agentName: pick.name.toUpperCase(),
+        personality: info?.config?.personality
+          ? clampPersonality(info.config.personality)
+          : undefined,
+      };
+    } catch {
+      return fallback;
+    }
   };
 
   /**
@@ -886,6 +948,10 @@ export const createMatchServer = (opts: {
             if (owner) {
               c.identity = { sub: owner.sub };
               c.agent = true;
+              // Sticky display name from the profile — hello.name must never
+              // rename an account (stale fleet-agents.json was minting a
+              // second "IRONCLAD" onto the leaderboard via record_match).
+              c.name = owner.name;
               console.log(`[auth] ${c.name} = ${owner.sub} (agent key)`);
             }
           }
@@ -1249,10 +1315,16 @@ export const createMatchServer = (opts: {
       // Only sides with a real client can be silent — solo's side 1 is the
       // server's own AI and never sends anything.
       const silent = ([0, 1] as const).filter((s) =>
-        m.clients[s] && now - m.lastInputAt[s] > IDLE_FORFEIT_MS);
+        m.clients[s] && now - m.lastInputAt[s] > idleMs);
       if (silent.length === 0) continue;
-      const loser = silent.length === 1 ? silent[0]! : null;
-      console.log(`[match ${m.id}] idle ${IDLE_FORFEIT_MS}ms → ${loser === null ? 'no contest' : `forfeit side ${loser}`}`);
+      // Solo/arcade has no human opponent to grief, so a silent player is a
+      // NO-CONTEST (fee refunded), never a forfeit loss — a backgrounded tab
+      // (rAF throttled, socket still open) must not cost a credit + a loss on
+      // a match you were winning. This matches the disconnect path, which
+      // already refunds solo via the bothGone short-circuit above. PvP still
+      // forfeits the lone silent side (griefing / lag-switch protection).
+      const loser = m.solo || silent.length !== 1 ? null : silent[0]!;
+      console.log(`[match ${m.id}] idle ${idleMs}ms → ${loser === null ? 'no contest' : `forfeit side ${loser}`}`);
       finishMatch(m, loser);
     }
   }, 5_000);
@@ -1291,9 +1363,10 @@ export const createMatchServer = (opts: {
         .catch((e) => json(res, 502, { error: String(e) }));
       return;
     }
-    // Opponent identity for the AGENT ARCADE / VS-AGENT select-screen badge:
-    // the live agent roster (real trained agents) + the house agent's aggregate
-    // record. The client picks a live agent near its level, else the house.
+    // Opponent identity for the AGENT ARCADE / VS-AGENT select-screen badge
+    // AND the ranked-solo house pin: live agent-class roster (fleet/headless
+    // with W-L) + the house aggregate. Client + server pick the same nearest
+    // agent; empty roster falls back to the generic house agent.
     if (path === '/agents/roster') {
       if (!persistence) return json(res, 503, { error: 'persistence not configured' });
       void Promise.all([persistence.agentRoster(), persistence.houseStats()])
@@ -1324,6 +1397,68 @@ export const createMatchServer = (opts: {
       })().catch((e) => json(res, 502, { error: String(e) }));
       return;
     }
+    // ---- VENDING MACHINE (ADR 0007 Phase 1). Owner auth ONLY (AIR JWT /
+    // dev header) — agent keys are deliberately refused so a leaked coach
+    // key can never drain the owner's credits into gacha pulls. Agent-class
+    // accounts are refused outright (they hold 0 credits by construction;
+    // this is belt-and-braces).
+    //   GET  /items      → { cost, catalog, items: [inventory] }
+    //   POST /items/buy  → body { nonce } → server-side roll + atomic debit;
+    //                      idempotent by nonce (a retry replays the grant).
+    if (path === '/items' || path === '/items/buy') {
+      if (!persistence) return json(res, 503, { error: 'persistence not configured' });
+      const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '')?.[1];
+      const devName = persistence.dev ? String(req.headers['x-dev-name'] ?? '') : '';
+      void (async () => {
+        const identity = bearer ? await verifyAirToken(bearer)
+          : devName ? { sub: `dev:${devName.slice(0, 24)}` }
+          : null;
+        if (!identity) return json(res, 401, { error: 'sign in required' });
+        if (isAgentClassSub(identity.sub)) {
+          return json(res, 403, { error: 'agent-class accounts have no credits to spend' });
+        }
+
+        if (path === '/items/buy') {
+          if (req.method !== 'POST') return json(res, 405, { error: 'POST {nonce} to buy' });
+          let body = '';
+          for await (const chunk of req) body += chunk;
+          let nonce = '';
+          try { nonce = String((JSON.parse(body || '{}') as Record<string, unknown>).nonce ?? ''); }
+          catch { return json(res, 400, { error: 'bad json' }); }
+          nonce = nonce.trim();
+          if (nonce.length < 8 || nonce.length > 64) {
+            return json(res, 400, { error: 'nonce: 8-64 characters (client purchase id)' });
+          }
+          const rolled = rollItem();
+          try {
+            const r = await persistence.buyItem(identity.sub, ITEM_COST, rolled.id, rolled.tier, nonce);
+            // On a duplicate replay the ROLL above is discarded — the stored
+            // grant wins, so a retry can never re-roll a better can.
+            const def = ITEMS.find((i) => i.id === r.itemId) ?? rolled;
+            if (!r.duplicate) console.log(`[shop] ${identity.sub} pulled ${def.id} (T${def.tier}) for ${ITEM_COST}`);
+            return json(res, 200, {
+              item: def, rowId: r.rowId, credits: r.credits,
+              duplicate: r.duplicate, cost: r.duplicate ? 0 : ITEM_COST,
+            });
+          } catch (e) {
+            if (e instanceof InsufficientCredits) {
+              return json(res, 402, { error: `insufficient credits — a pull costs ${ITEM_COST}`, code: 'credits' });
+            }
+            throw e;
+          }
+        }
+
+        const items = await persistence.listItems(identity.sub, 50);
+        return json(res, 200, {
+          cost: ITEM_COST,
+          catalog: ITEMS,
+          items: items.map((it) => ({
+            ...it, def: ITEMS.find((d) => d.id === it.itemId) ?? null,
+          })),
+        });
+      })().catch((e) => json(res, 502, { error: String(e) }));
+      return;
+    }
     // ---- Self-serve key mint (Minds MVP): a tiny standalone page — AIR
     // sign-in → POST /agent/key → key shown once + Minds hand-off steps.
     if (path === '/connect') {
@@ -1350,6 +1485,16 @@ export const createMatchServer = (opts: {
         catch { return json(res, 400, { error: 'bad json' }); }
         name = name.trim().slice(0, 24);
         if (name.length < 3) return json(res, 400, { error: 'name: 3-24 characters' });
+        // Display names must be unique on the leaderboard (case-insensitive).
+        // If the requested stem is taken, append a short hex tag rather than
+        // minting a second "IRONCLAD".
+        for (let i = 0; i < 8 && await persistence.nameTaken(name); i++) {
+          const tag = randomBytes(2).toString('hex').toUpperCase();
+          name = `${name.replace(/[0-9A-F]{2,4}$/i, '').slice(0, 20)}${tag}`.slice(0, 24);
+        }
+        if (await persistence.nameTaken(name)) {
+          return json(res, 409, { error: 'name already taken — pick another' });
+        }
         const sub = `agent:${randomUUID()}`;
         const key = `afk_${randomBytes(24).toString('hex')}`;
         if (!(await persistence.createAgentAccount(sub, name, sha256Hex(key)))) {

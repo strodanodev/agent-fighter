@@ -412,6 +412,39 @@ class AudioManager {
       src.start();
     });
   }
+
+  /**
+   * Synthesized UI "button press" blip — fired whenever a tap triggers a menu
+   * action (mode select, character/stage pick, back/exit, start, ranks…).
+   * No asset: a short oscillator through sfxGain, so it honors SFX volume and
+   * needs nothing decoded/loaded. Guarded so it's a silent no-op if Web Audio
+   * is unavailable or the context hasn't been unlocked by a gesture yet.
+   */
+  blip(opts: { freq?: number; volume?: number } = {}): void {
+    if (!this.unlocked) return;
+    try {
+      const ctx = this.ctxOf();
+      if (ctx.state === 'suspended') void ctx.resume();
+      const now = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      osc.type = 'square';
+      const freq = opts.freq ?? 880;
+      osc.frequency.setValueAtTime(freq, now);
+      // Tiny downward pitch drop reads as a crisp physical "tick", not a tone.
+      osc.frequency.exponentialRampToValueAtTime(freq * 0.66, now + 0.05);
+      const gain = ctx.createGain();
+      const level = opts.volume ?? 0.35;
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(level, now + 0.006);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.09);
+      osc.connect(gain);
+      gain.connect(this.sfxGain!);
+      osc.start(now);
+      osc.stop(now + 0.1);
+    } catch {
+      /* Web Audio unavailable — UI stays silent, never throws into the tap path */
+    }
+  }
 }
 
 export const audio = new AudioManager();

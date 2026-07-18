@@ -33,6 +33,9 @@ export const setGameLogo = (img: HTMLImageElement | null): void => {
   gameLogoBBox = img ? opaqueBBox(img) : null;
 };
 export const setBgVideo = (v: BgVideo | null): void => { bgVideo = v; };
+// Vending-machine art (ADR 0007) — already alpha-matted tight, no bbox pass.
+let vendingImg: HTMLImageElement | null = null;
+export const setVendingArt = (img: HTMLImageElement | null): void => { vendingImg = img; };
 
 /**
  * Menu backdrop: the looping ambient video when it's playing, falling back
@@ -1231,6 +1234,10 @@ export const drawTitle = (
       label(ctx, txt, x + pillW / 2, py + pillH / 2 + 4, 12, col);
     });
     ctx.lineWidth = 1;
+
+    // VENDING MACHINE (ADR 0007) — upper-RIGHT corner, the only chrome that
+    // lives there on the title. Signed-in only: pulls cost credits.
+    drawVendingIcon(ctx, tick);
   }
 
   // Account/wallet block — upper LEFT, under the audio chip (M5 spec).
@@ -1270,6 +1277,316 @@ export const drawTitle = (
 
   // Audio chip last so its tap zones sit above the wallet/toast text.
   if (menu.audio) drawAudioControl(ctx, menu.audio);
+};
+
+// ----------------------------------------------------------------- shop
+// VENDING MACHINE (ADR 0007 Phase 1): gacha energy drinks for credits.
+// All art is procedural (consistent with the chrome) until the Studio
+// grows an item-art path.
+
+/** Tier accents — LV1 steel, LV2 cool blue, LV3 gold (mirrors core ITEM_TIER_COLORS). */
+const TIER_COLORS = ['', '#cfd8e3', '#6fd3ff', '#ffd166'] as const;
+const TIER_LABELS = ['', 'LV 1', 'LV 2', 'LV 3'] as const;
+
+/** A little energy-drink can: body, shine, pull tab — tinted per tier. */
+const drawCan = (
+  ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number,
+  color: string, glow = 0,
+): void => {
+  ctx.save();
+  if (glow > 0) {
+    ctx.shadowColor = color;
+    ctx.shadowBlur = glow;
+  }
+  ctx.fillStyle = '#1b1826';
+  ctx.fillRect(x, y, w, h);
+  // Slanted two-tone label (energy-drink trade-dress homage, original art):
+  // silver upper-left / tier color lower-right, split on a diagonal.
+  const ly = y + h * 0.14, lh = h * 0.72;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, ly, w, lh);
+  ctx.clip();
+  ctx.fillStyle = '#cdd6e2';
+  ctx.fillRect(x, ly, w, lh);
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x, ly + lh);
+  ctx.lineTo(x + w, ly + lh * 0.22);
+  ctx.lineTo(x + w, ly + lh);
+  ctx.closePath();
+  ctx.fill();
+  // Lightning bolt over the split (readable ≥18px wide; skip when tiny).
+  if (w >= 18) {
+    const bx = x + w * 0.5, byy = ly + lh * 0.18;
+    ctx.fillStyle = '#1b1206';
+    ctx.beginPath();
+    ctx.moveTo(bx + w * 0.10, byy);
+    ctx.lineTo(bx - w * 0.16, byy + lh * 0.38);
+    ctx.lineTo(bx - w * 0.02, byy + lh * 0.38);
+    ctx.lineTo(bx - w * 0.12, byy + lh * 0.66);
+    ctx.lineTo(bx + w * 0.18, byy + lh * 0.28);
+    ctx.lineTo(bx + w * 0.02, byy + lh * 0.28);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#e8eef5';
+  ctx.fillRect(x, y, w, h * 0.1); // lid
+  ctx.fillRect(x, y + h * 0.92, w, h * 0.08); // base
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  ctx.fillRect(x + w * 0.16, y + h * 0.12, w * 0.14, h * 0.76); // shine
+  ctx.fillStyle = '#0a0812';
+  ctx.fillRect(x + w * 0.4, y + h * 0.02, w * 0.24, h * 0.05); // tab
+  ctx.restore();
+};
+
+/**
+ * Compact vending-machine chip — title screen upper-right (the corner is
+ * otherwise empty; the account block owns the upper-LEFT). Whole thing is
+ * one tap target: 'shop'.
+ */
+const drawVendingIcon = (ctx: CanvasRenderingContext2D, tick: number): void => {
+  const glowMix = fxPulse(tick, 0.06);
+  if (vendingImg && vendingImg.naturalWidth > 0) {
+    // Authored machine art (wider than tall) — contain-fit into the corner.
+    const dw = 108, dh = dw * (vendingImg.naturalHeight / vendingImg.naturalWidth);
+    const x = VW - 14 - dw, y = 8;
+    tapZone(x - 4, y - 4, dw + 8, dh + 26, 'shop');
+    ctx.save();
+    ctx.shadowColor = `rgba(120,255,170,${0.4 + 0.35 * glowMix})`;
+    ctx.shadowBlur = 16;
+    ctx.drawImage(vendingImg, x, y, dw, dh);
+    ctx.restore();
+    label(ctx, 'B · SHOP', x + dw / 2, y + dh + 14, 11,
+      tick % 44 < 36 ? '#ffd166' : '#ffe9a3');
+    return;
+  }
+  const w = 74, h = 96;
+  const x = VW - 14 - w, y = 10;
+  tapZone(x - 4, y - 4, w + 8, h + 26, 'shop');
+  ctx.save();
+  ctx.shadowColor = `rgba(255,209,102,${0.35 + 0.3 * glowMix})`;
+  ctx.shadowBlur = 14;
+  bevel(ctx, x, y, w, h, PANEL);
+  ctx.restore();
+  // Marquee strip.
+  ctx.fillStyle = GOLD;
+  ctx.fillRect(x + 4, y + 4, w - 8, 12);
+  label(ctx, 'ENERGY', x + w / 2, y + 14, 9, '#1b1206');
+  // Glass window with two shelves of cans (one can per tier + repeats).
+  ctx.fillStyle = '#0a0812';
+  ctx.fillRect(x + 6, y + 20, w - 22, h - 44);
+  for (let row = 0; row < 2; row++) {
+    for (let col = 0; col < 3; col++) {
+      const tier = 1 + ((row + col) % 3);
+      drawCan(ctx, x + 9 + col * 15, y + 25 + row * 34, 11, 26,
+        TIER_COLORS[tier]!, tier === 3 ? 6 : 0);
+    }
+  }
+  // Coin slot + dispense tray.
+  ctx.fillStyle = PANEL_LT;
+  ctx.fillRect(x + w - 13, y + 24, 7, 26);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(x + w - 11, y + 30, 3, 12);
+  ctx.fillStyle = '#000000cc';
+  ctx.fillRect(x + 6, y + h - 20, w - 12, 12);
+  label(ctx, 'B · SHOP', x + w / 2, y + h + 14, 11,
+    tick % 44 < 36 ? '#ffd166' : '#ffe9a3');
+};
+
+export interface ShopInventoryEntry {
+  rowId: number;
+  name: string;
+  tier: number;
+  desc: string;
+}
+
+export interface ShopReveal { name: string; tier: number; desc: string; flavor: string }
+
+export interface ShopView {
+  status: 'idle' | 'busy' | 'done' | 'fail';
+  /** Balance (null = unknown / server offline). */
+  credits: number | null;
+  cost: number;
+  /** Unconsumed drinks, newest first. */
+  items: ShopInventoryEntry[];
+  pullBusy: boolean;
+  /** The drink the last pull granted (drives the reveal card). */
+  reveal: ShopReveal | null;
+  /** Ticks since the reveal landed; -1 = none. */
+  revealAge: number;
+  /** Error line (e.g. insufficient credits); -1 age = hidden. */
+  err: string;
+  errAge: number;
+}
+
+/** The vending-machine screen: machine + PULL + reveal card + stash shelf. */
+export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopView): void => {
+  drawMenuBackdrop(ctx);
+  ctx.fillStyle = 'rgba(6,4,14,0.72)';
+  ctx.fillRect(0, 0, VW, VH);
+  const cx = VW / 2;
+
+  display(ctx, 'VENDING MACHINE', cx, 54, 40, { glow: 'rgba(255,209,102,0.5)' });
+  label(ctx, 'GACHA ENERGY DRINKS · RANDOM EFFECT · RANDOM TIER (LV 1 / 2 / 3)', cx, 78, 12, '#ffd166cc');
+
+  // Wallet (upper-left, same treatment as the title) + back (upper-right).
+  if (v.credits !== null) drawCredits(ctx, 16, 34, v.credits, 19);
+  tapZone(VW - 118, 10, 104, 30, 'back');
+  ctx.fillStyle = 'rgba(10,6,22,0.55)';
+  ctx.fillRect(VW - 118, 10, 104, 30);
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(VW - 117.5, 10.5, 103, 29);
+  label(ctx, '‹ TITLE', VW - 66, 30, 13, '#ffffffcc');
+
+  if (v.status === 'fail') {
+    label(ctx, 'SERVER OFFLINE · THE MACHINE TAKES NO COINS', cx, VH / 2, 16, '#ff9d9d');
+    label(ctx, 'ESC · BACK', cx, VH / 2 + 26, 12, '#ffffff77');
+    return;
+  }
+
+  // ---- The machine (left column) -----------------------------------------
+  const mx = 92, my = 108, mw = 250, mh = 320;
+  if (vendingImg && vendingImg.naturalWidth > 0) {
+    // Authored art (assets/shop/) — contain-fit over the same layout box so
+    // the PULL button/reveal geometry is identical to the procedural path.
+    const dw = 290, dh = dw * (vendingImg.naturalHeight / vendingImg.naturalWidth);
+    const ix = mx + (mw - dw) / 2, iy = my + (mh - dh) / 2;
+    ctx.save();
+    ctx.shadowColor = v.pullBusy
+      ? `rgba(255,209,102,${0.5 + 0.3 * Math.sin(tick / 4)})`
+      : 'rgba(120,255,170,0.35)';
+    ctx.shadowBlur = v.pullBusy ? 34 : 24;
+    ctx.drawImage(vendingImg, ix, iy, dw, dh);
+    ctx.restore();
+  } else {
+    ctx.save();
+    ctx.shadowColor = 'rgba(255,209,102,0.25)';
+    ctx.shadowBlur = 24;
+    bevel(ctx, mx, my, mw, mh, PANEL, GOLD_LT, GOLD_DK, 3);
+    ctx.restore();
+    ctx.fillStyle = GOLD;
+    ctx.fillRect(mx + 8, my + 8, mw - 16, 30);
+    label(ctx, 'ENERGY', mx + mw / 2, my + 30, 22, '#1b1206');
+    ctx.fillStyle = '#0a0812';
+    ctx.fillRect(mx + 12, my + 46, mw - 60, mh - 120);
+    // Shelves: 3 rows × 4 cans, tiers cycling; the LV3 can glows.
+    for (let row = 0; row < 3; row++) {
+      for (let col = 0; col < 4; col++) {
+        const tier = 1 + ((row * 4 + col) % 3);
+        const wob = tier === 3 ? Math.sin((tick + col * 9) / 16) * 1.5 : 0;
+        drawCan(ctx, mx + 24 + col * 42, my + 58 + row * 60 + wob, 26, 46,
+          TIER_COLORS[tier]!, tier === 3 ? 10 : 0);
+        ctx.fillStyle = 'rgba(255,255,255,0.10)';
+        ctx.fillRect(mx + 12, my + 46 + (row + 1) * 60 - 3, mw - 60, 2); // shelf lip
+      }
+    }
+    // Coin panel + tray.
+    ctx.fillStyle = PANEL_LT;
+    ctx.fillRect(mx + mw - 42, my + 46, 30, 90);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(mx + mw - 32, my + 58, 10, 30);
+    label(ctx, `${v.cost}`, mx + mw - 27, my + 112, 15, GOLD_LT);
+    label(ctx, 'CR', mx + mw - 27, my + 126, 9, '#ffffff88');
+    ctx.fillStyle = '#000000cc';
+    ctx.fillRect(mx + 16, my + mh - 62, mw - 32, 44);
+    label(ctx, v.pullBusy ? 'DISPENSING…' : 'PUSH', mx + mw / 2, my + mh - 36, 13,
+      v.pullBusy ? '#ffd166' : '#ffffff44');
+  }
+
+  // ---- PULL button (under the machine) -----------------------------------
+  const canAfford = v.credits === null || v.credits >= v.cost;
+  const bw = 250, bh = 44, bx = mx, by = my + mh + 14;
+  tapZone(bx, by, bw, bh, 'shop:pull');
+  const armed = !v.pullBusy && canAfford;
+  ctx.fillStyle = armed ? 'rgba(58,38,10,0.9)' : 'rgba(20,16,28,0.8)';
+  ctx.fillRect(bx, by, bw, bh);
+  ctx.strokeStyle = armed ? GOLD : 'rgba(255,255,255,0.2)';
+  ctx.lineWidth = armed ? 2.5 : 1.5;
+  ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+  if (armed) {
+    const pulse = 1 + 0.03 * Math.sin(tick / 9);
+    display(ctx, `INSERT ${v.cost} CR · PULL`, bx + bw / 2, by + 29, 19,
+      { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+  } else {
+    label(ctx, v.pullBusy ? 'DISPENSING…' : `INSERT ${v.cost} CR · PULL`, bx + bw / 2, by + 27, 15,
+      '#ffffff66');
+  }
+  if (!canAfford) {
+    label(ctx, 'NOT ENOUGH CREDITS — WIN MATCHES OR CLAIM THE DAILY +10', bx + bw / 2, by + bh + 16, 10, '#ff9d9d');
+  }
+
+  // ---- Reveal card (right column) ----------------------------------------
+  const rx = 400, rw = VW - rx - 26;
+  if (v.reveal && v.revealAge >= 0) {
+    const t = clamp01(v.revealAge / 16);
+    const pop = easeOutBack(t);
+    const tier = Math.max(1, Math.min(3, v.reveal.tier));
+    const col = TIER_COLORS[tier]!;
+    const ry = 108, rh = 224;
+    ctx.save();
+    ctx.globalAlpha = clamp01(v.revealAge / 6);
+    ctx.translate(rx + rw / 2, ry + rh / 2);
+    ctx.scale(pop, pop);
+    ctx.translate(-(rx + rw / 2), -(ry + rh / 2));
+    ctx.shadowColor = col;
+    ctx.shadowBlur = tier === 3 ? 34 : 18;
+    bevel(ctx, rx, ry, rw, rh, PANEL, col, GOLD_DK, 3);
+    ctx.shadowBlur = 0;
+    drawCan(ctx, rx + 30, ry + 42, 64, 130, col, tier === 3 ? 18 : 8);
+    label(ctx, TIER_LABELS[tier]!, rx + 62, ry + 196, 14, col);
+    display(ctx, v.reveal.name, rx + 118, ry + 74, 24,
+      tier === 3 ? { align: 'left' }
+        : tier === 2 ? { ...COOL_OPTS, align: 'left' }
+        : { from: '#ffffff', mid: '#cfd8e3', to: '#6b7686', outline: '#101318', align: 'left' });
+    label(ctx, v.reveal.desc, rx + 118, ry + 104, 14, '#ffffffdd', 'left');
+    label(ctx, `“${v.reveal.flavor}”`, rx + 118, ry + 126, 11, '#ffffff88', 'left');
+    label(ctx, 'USABLE IN RANKED MODES SOON — PHASE 2', rx + 118, ry + 158, 10, '#8fd0ff', 'left');
+    ctx.restore();
+    // Sparkle ring on a fresh LV3.
+    if (tier === 3 && v.revealAge < 40) {
+      ctx.save();
+      ctx.strokeStyle = `rgba(255,209,102,${1 - v.revealAge / 40})`;
+      ctx.lineWidth = 3;
+      const rad = 30 + v.revealAge * 5;
+      ctx.beginPath();
+      ctx.arc(rx + 62, ry + 106, rad, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+  } else {
+    label(ctx, v.status === 'busy' ? 'STOCKING THE MACHINE…' : 'FEELING LUCKY?', rx + rw / 2, 170, 16, '#ffffff77');
+    label(ctx, `LV 1 COMMON · LV 2 UNCOMMON · LV 3 RARE`, rx + rw / 2, 194, 11, '#ffffff55');
+    label(ctx, 'HEAL · DAMAGE UP · DEFENSE UP · SUPER METER', rx + rw / 2, 212, 11, '#ffffff55');
+  }
+
+  // ---- Stash (inventory shelf, right-bottom) -----------------------------
+  const sy = 348;
+  label(ctx, `MY STASH · ${v.items.length}`, rx, sy, 14, GOLD_LT, 'left');
+  if (v.items.length === 0) {
+    label(ctx, v.status === 'done' ? 'EMPTY — PULL YOUR FIRST DRINK' : '…', rx, sy + 26, 12, '#ffffff66', 'left');
+  }
+  const shown = v.items.slice(0, 6);
+  shown.forEach((it, k) => {
+    const y = sy + 12 + k * 26;
+    const tier = Math.max(1, Math.min(3, it.tier));
+    drawCan(ctx, rx, y, 12, 20, TIER_COLORS[tier]!);
+    label(ctx, `${it.name}  ·  ${TIER_LABELS[tier]}`, rx + 20, y + 14, 12, '#ffffffcc', 'left');
+    label(ctx, it.desc, rx + 20 + 190, y + 14, 10, '#ffffff66', 'left');
+  });
+  if (v.items.length > shown.length) {
+    label(ctx, `+${v.items.length - shown.length} MORE IN THE STASH`, rx, sy + 12 + shown.length * 26 + 14, 10, '#ffffff55', 'left');
+  }
+
+  // Error toast (insufficient credits / server hiccup) — flashing red.
+  if (v.err && v.errAge >= 0 && v.errAge % 30 < 22) {
+    label(ctx, `⚠ ${v.err}`, cx, VH - 30, 14, '#ff5d7e');
+  }
+  label(ctx, 'ENTER / TAP PULL · ESC BACK', cx, VH - 8, 10, '#ffffff55');
+  ctx.lineWidth = 1;
 };
 
 // ---------------------------------------------------------------- invite
@@ -1336,7 +1653,7 @@ export const drawInvite = (
     label(ctx, '⚠ PUT A BOUNTY ON YOUR OWN HEAD ⚠', cx, 44, 14, '#ff5d7e');
   }
   display(ctx, 'I DARE YOU', cx, 100, 46, {});
-  display(ctx, 'TO BEAT ME', cx, 150, 46, DARE_OPTS);
+  display(ctx, 'TO FIGHT', cx, 150, 46, DARE_OPTS);
 
   // ---- poster panel: the wanted-poster preview of what the friend sees.
   // Left = full-body mugshot (contain-fit, never cropped); middle = the

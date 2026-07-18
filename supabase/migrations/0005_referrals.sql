@@ -1,4 +1,4 @@
--- Agent Fighter — REFERRAL DARES ("I dare you to beat me"). Run AFTER 0004.
+-- Agent Fighter — REFERRAL DARES ("I dare you to fight"). Run AFTER 0004.
 --
 -- Every profile gets a shareable REF CODE (NAME-XXXX). The landing site
 -- serves agent-fighter-web.vercel.app/dare/<code>; a friend who accepts and

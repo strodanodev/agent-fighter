@@ -20,12 +20,12 @@ import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
   currentStageCamLimits, drawAgent, drawGameOver, drawHud, drawInvite, drawLoading, drawNetError, drawOpponentGone,
-  drawRanks, drawReconnecting, drawResults, drawSelect, drawStage, drawStageSelect, drawTitle,
+  drawRanks, drawReconnecting, drawResults, drawSelect, drawShop, drawStage, drawStageSelect, drawTitle,
   drawVsCard, drawWallet, resetTaps, setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit,
-  tapHit, tapZone, worldTransform,
+  setVendingArt, tapHit, tapZone, worldTransform,
 } from './ui.js';
-import type { AgentOpponent, Cam, HudFx, HudId, Mode, RankRow, XpInfo } from './ui.js';
-import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit } from './chrome.js';
+import type { AgentOpponent, Cam, HudFx, HudId, Mode, RankRow, ShopInventoryEntry, ShopReveal, XpInfo } from './ui.js';
+import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit, loadVendingArt } from './chrome.js';
 import type { StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
 import type { AudioChannel, SfxId } from './audio.js';
@@ -102,11 +102,14 @@ const tapAt = (clientX: number, clientY: number): void => {
   const vy = ((clientY - r.top) / r.height) * VH;
   if (vx < 0 || vy < 0 || vx > VW || vy > VH) return;
   const action = tapHit(vx, vy);
-  if (action) taps.add(action);
+  if (action) {
+    audio.blip(); // UI feedback: a tap that lands on a real menu zone clicks
+    taps.add(action);
+  }
 };
 
 // ---------------------------------------------------------------- state
-type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'gameover' | 'ranks' | 'invite' | 'agent';
+type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'gameover' | 'ranks' | 'invite' | 'agent' | 'shop';
 
 let screen: Screen = 'loading';
 let mode: Mode = 'cpu';
@@ -155,7 +158,7 @@ const toggleSignIn = (): void => {
   }
 };
 
-// ---- Referral dares ("I dare you to beat me"). A shared landing link
+// ---- Referral dares ("I dare you to fight"). A shared landing link
 // (agent-fighter-web.vercel.app/dare/<code>) deep-links here with ?ref=;
 // the code waits in localStorage until the first authenticated contact
 // redeems it server-side (+25 credits each, once ever, new accounts only).
@@ -227,7 +230,7 @@ const shareDare = (): void => {
   const link = dareLink();
   const text = dareVsAgent
     ? `${currentTaunt()} — MY AGENT FIGHTS FOR ME. Beat it and prove something. +25 credits when you sign in.`
-    : `${currentTaunt()} — I DARE YOU TO BEAT ME. +25 credits if you can take one round.`;
+    : `${currentTaunt()} — I DARE YOU TO FIGHT. +25 credits if you can take one round.`;
   const done = (): void => { inviteCopiedAge = 0; };
   const copyFallback = (): void => {
     void navigator.clipboard?.writeText(`${text}\n${link}`).then(done)
@@ -307,10 +310,10 @@ const fetchRanks = (): void => {
 };
 
 // ---- AGENT OPPONENT identity (select-screen badge) ------------------------
-// The match server's /agents/roster returns real LIVE agents plus the house
-// agent's live aggregate record. The badge shows a live agent near the
-// player's calibrated level when one exists, else the house agent (real W-L +
-// streak, per-player level, "Connected to Minds™").
+// The match server's /agents/roster returns real LIVE agents (fleet/headless
+// accounts with W-L) plus the house aggregate record. Ranked solo pins that
+// same nearest-level agent server-side (name + optional personality), so the
+// badge, queue copy, nameplate, and match history share one identity.
 interface RosterAgent {
   id: string; name: string; address: string | null;
   level: number; xp: number; wins: number; losses: number; streak: number;
@@ -332,6 +335,17 @@ const fetchAgentRoster = (): void => {
   void fetch(`${matchHttpUrl()}/agents/roster`)
     .then(async (r) => { if (r.ok) agentRoster = (await r.json()) as RosterResp; })
     .catch(() => { /* offline — the house agent is synthesized in resolveAgentOpp */ });
+};
+
+/** Nearest-level live agent — mirrors server `soloOpts` pick order. */
+const pickLiveAgentOpp = (target: number): RosterAgent | null => {
+  const agents = (agentRoster?.agents ?? []).filter((a) => a.name);
+  if (agents.length === 0) return null;
+  return [...agents].sort((p, q) =>
+    Math.abs(p.level - target) - Math.abs(q.level - target)
+    || q.wins - p.wins
+    || p.name.localeCompare(q.name),
+  )[0] ?? null;
 };
 
 /**
@@ -367,10 +381,10 @@ const hudIds = (): [HudId | null, HudId | null] => {
 
 /** Resolve the current AI-agent opponent for the select-screen badge. */
 const resolveAgentOpp = (): AgentOpponent => {
-  const target = cpuLevelFor(profile, lever);
-  const agents = agentRoster?.agents ?? [];
-  if (agents.length > 0) {
-    const a = [...agents].sort((p, q) => Math.abs(p.level - target) - Math.abs(q.level - target))[0]!;
+  // Online solo pins by account level; offline CPU still uses the local lever.
+  const target = account?.level ?? cpuLevelFor(profile, lever);
+  const a = pickLiveAgentOpp(target);
+  if (a) {
     return {
       kind: 'live', name: a.name, level: a.level, wins: a.wins, losses: a.losses,
       streak: a.streak, wallet: shortAddr(a.address), minds: false,
@@ -501,6 +515,104 @@ const enterAgentScreen = (): void => {
   keyCopiedAge = -1;
   void fetchAgentScreen();
 };
+
+// ---- VENDING MACHINE (ADR 0007 Phase 1): gacha energy drinks for credits.
+// The roll is SERVER-side at purchase time; the client only renders what the
+// machine dispensed. Purchases are idempotent by a client nonce, so a flaky
+// network retry can never double-charge or re-roll.
+interface ShopCatalogDef { id: string; name: string; tier: number; desc: string; flavor: string }
+let shopFetch: 'idle' | 'busy' | 'done' | 'fail' = 'idle';
+let shopInv: ShopInventoryEntry[] = [];
+let shopCost = 5; // server-confirmed on fetch (core ITEM_COST)
+let shopPullBusy = false;
+let shopReveal: ShopReveal | null = null;
+let shopRevealAge = -1;
+let shopErr = '';
+let shopErrAge = -1;
+
+const mapOwned = (
+  it: { rowId?: number; tier?: number; def?: ShopCatalogDef | null },
+): ShopInventoryEntry => ({
+  rowId: Number(it.rowId ?? 0),
+  name: it.def?.name ?? 'UNKNOWN CAN',
+  tier: Number(it.def?.tier ?? it.tier ?? 1),
+  desc: it.def?.desc ?? '',
+});
+
+const fetchShop = async (): Promise<void> => {
+  shopFetch = 'busy';
+  try {
+    const headers = await agentAuthHeaders();
+    if (!headers) { shopFetch = 'fail'; return; }
+    const res = await fetch(`${matchHttpUrl()}/items`, { headers });
+    if (!res.ok) { shopFetch = 'fail'; return; }
+    const body = (await res.json()) as {
+      cost?: number;
+      items?: Array<{ rowId?: number; tier?: number; def?: ShopCatalogDef | null }>;
+    };
+    shopCost = Number(body.cost ?? 5);
+    shopInv = (body.items ?? []).map(mapOwned);
+    shopFetch = 'done';
+  } catch {
+    shopFetch = 'fail';
+  }
+};
+
+const pullShop = async (): Promise<void> => {
+  if (shopPullBusy) return;
+  shopPullBusy = true;
+  shopErr = '';
+  shopErrAge = -1;
+  try {
+    const headers = await agentAuthHeaders();
+    if (!headers) return;
+    // Client purchase id — the server's idempotency key for THIS pull.
+    const nonce = `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+    const res = await fetch(`${matchHttpUrl()}/items/buy`, {
+      method: 'POST', headers, body: JSON.stringify({ nonce }),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      item?: ShopCatalogDef; rowId?: number; credits?: number; error?: string;
+    };
+    if (!res.ok) {
+      shopErr = res.status === 402
+        ? `NOT ENOUGH CREDITS — A PULL COSTS ${shopCost}`
+        : (body.error ?? 'THE MACHINE ATE YOUR COIN — TRY AGAIN').toUpperCase().slice(0, 64);
+      shopErrAge = 0;
+      return;
+    }
+    if (body.item) {
+      shopReveal = {
+        name: body.item.name, tier: body.item.tier,
+        desc: body.item.desc, flavor: body.item.flavor,
+      };
+      shopRevealAge = 0;
+      shopInv.unshift(mapOwned({ rowId: body.rowId, def: body.item }));
+    }
+    // The purchase changed the balance — keep the wallet chip honest.
+    if (account && typeof body.credits === 'number') account.credits = body.credits;
+  } catch {
+    shopErr = 'SERVER UNREACHABLE — NOTHING WAS CHARGED';
+    shopErrAge = 0;
+  } finally {
+    shopPullBusy = false;
+  }
+};
+
+const enterShop = (): void => {
+  audioMenuOpen = false;
+  screen = 'shop';
+  shopReveal = null;
+  shopRevealAge = -1;
+  shopErr = '';
+  shopErrAge = -1;
+  // Re-sync the account alongside the shop fetch: both resolve auth NOW, so
+  // the wallet shown is the wallet charged. (Without this, a boot-time /me
+  // that raced AIR-session rehydration can display one profile while the
+  // pull debits another — found live: wallet said 10 CR, buy 402'd at 0.)
+  void fetchAccount();
+  void fetchShop();
+};
 let uiTick = 0;
 let allRosters: Roster[] = [];
 let picks: [number, number] = [0, 0];
@@ -599,6 +711,7 @@ const boot = async (): Promise<void> => {
     // important on mobile, where blocking boot on ~20MB of art would stall
     // first paint for seconds on a slow connection.
     void loadLogo().then(setLogo);
+    void loadVendingArt().then(setVendingArt); // shop art — procedural fallback until it lands
     setBgVideo(loadBgVideo('/assets/video/bg_video_main_af.mp4'));
     stageIds = await listStages();
     setLoadProgress(0.28);
@@ -1464,13 +1577,16 @@ const frame = (): void => {
       screen = 'ranks';
       fetchRanks();
     } else if (signedIn && account?.refCode && (pressedThisFrame.has('KeyD') || taps.has('dare'))) {
-      // "I DARE YOU TO BEAT ME" — the full invite screen (poster, taunt,
+      // "I DARE YOU TO FIGHT" — the full invite screen (poster, taunt,
       // shareable link). Both sides earn +25 credits when a friend accepts.
       enterInvite('title');
     } else if (signedIn && (pressedThisFrame.has('KeyA') || taps.has('myagent'))) {
       // MY AGENT (ADR 0006): view the coached config, mint the coach key,
       // spar your own agent. Sign-in required — the agent IS the account.
       enterAgentScreen();
+    } else if (signedIn && (pressedThisFrame.has('KeyB') || taps.has('shop'))) {
+      // VENDING MACHINE (ADR 0007): gacha energy drinks for credits.
+      enterShop();
     } else if (!signedIn) {
       // Gated: every other key/tap waits for the sign-in.
     } else if (tappedMode) {
@@ -1508,6 +1624,26 @@ const frame = (): void => {
       startAgentDare(sparCode);
     } else if (!mintBusy && (pressedThisFrame.has('KeyK') || taps.has('agent:mint'))) {
       void mintAgentKey();
+    } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
+      screen = 'title';
+    }
+  } else if (screen === 'shop') {
+    if (shopRevealAge >= 0) shopRevealAge++;
+    if (shopErrAge >= 0 && ++shopErrAge > 240) { shopErrAge = -1; shopErr = ''; }
+    drawShop(ctx, uiTick, {
+      status: shopFetch,
+      credits: account ? account.credits : null,
+      cost: shopCost,
+      items: shopInv,
+      pullBusy: shopPullBusy,
+      reveal: shopReveal,
+      revealAge: shopRevealAge,
+      err: shopErr,
+      errAge: shopErrAge,
+    });
+    if (!shopPullBusy && shopFetch !== 'fail'
+      && (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('shop:pull'))) {
+      void pullShop();
     } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
       screen = 'title';
     }
@@ -1577,8 +1713,9 @@ const frame = (): void => {
     tickSelect();
     if (!agentRosterFetched) fetchAgentRoster();
     // The upper-right AGENT OPPONENT card: who you're about to fight (level,
-    // W-L, streak, wallet) — a live agent when one exists, else the house
-    // agent. Shown for the AI-agent gauntlet; PvP-friendly select has no CPU.
+    // W-L, streak, wallet) — a live roster agent when one exists (same pick
+    // ranked solo pins server-side), else the house agent. PvP-friendly
+    // select has no CPU.
     const badge = !selectingFriendly
       ? { cpuLevel: cpuLevelFor(profile, lever), lever, opp: resolveAgentOpp() }
       : undefined;
@@ -1598,13 +1735,17 @@ const frame = (): void => {
     const arcadeQ = queuedMode === 'arcade';
     const friendlyQ = queuedMode === 'friendly';
     const failed = net?.status === 'error';
+    const soloOpp = solo ? resolveAgentOpp() : null;
+    const soloCall = soloOpp
+      ? `CALLING ${soloOpp.name.toUpperCase()}${dots}`
+      : `CALLING THE HOUSE AGENT${dots}`;
     const msg = !net ? `CONNECTING${dots}` // token fetch in flight
       : failed ? `OFFLINE: ${net.error}`
       : net.setup ? 'OPPONENT FOUND — STARTING'
       : net.status === 'queued'
         ? (arcadeQ ? `ENTERING AGENT ARCADE${dots}`
           : friendlyQ ? `WAITING FOR YOUR CHALLENGER${dots}`
-          : solo ? `CALLING THE HOUSE AGENT${dots}` : `SEARCHING FOR OPPONENT${dots}`)
+          : solo ? soloCall : `SEARCHING FOR OPPONENT${dots}`)
       : `CONNECTING${dots}`;
     ctx.font = 'bold 22px "Courier New", monospace';
     ctx.textAlign = 'center';

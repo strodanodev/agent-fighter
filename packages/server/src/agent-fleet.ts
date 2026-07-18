@@ -34,14 +34,22 @@ const url = process.env.AF_WS ?? `ws://localhost:${DEFAULT_PORT}`;
 const httpUrl = url.replace(/^ws/, 'http');
 const fleetSize = Math.max(1, Math.min(12, Number(process.env.AF_FLEET ?? 3)));
 const paceMs = Number(process.env.AF_PACE ?? 16); // 16 = realtime — REQUIRED vs ranked servers
-const stateFile = process.env.AF_FLEET_FILE ?? join(process.cwd(), 'fleet-agents.json');
+// Default next to the repo's agent-fighter root (not packages/server cwd —
+// `npm run fleet -w` would otherwise grow a second stale state file there).
+const stateFile = process.env.AF_FLEET_FILE
+  ?? join(here, '..', '..', '..', 'fleet-agents.json');
 /** Test hook: stop each agent after this many BATTLES (0 = run forever). */
 const maxBattles = Number(process.env.AF_FLEET_BATTLES ?? 0);
 
 // ---------------------------------------------------------------- personas
-const NAMES = [
-  'IRONCLAD', 'NULLPOINTER', 'REDLINE', 'GHOSTDRIVE', 'OVERCLOCK', 'BITCRUSH',
-  'DEADLOCK', 'HOTPATCH', 'RAGEQUIT', 'STACKSMASH', 'ZERODAY', 'TURBOFISH',
+/** Name stems — always combined with a random tag so restarts never collide. */
+const NAME_STEMS = [
+  'IRON', 'NULL', 'RED', 'GHOST', 'OVER', 'BIT', 'DEAD', 'HOT',
+  'RAGE', 'STACK', 'ZERO', 'TURBO', 'GRID', 'HEX', 'VOID', 'CLIP',
+];
+const NAME_TAILS = [
+  'CLAD', 'PTR', 'LINE', 'DRIVE', 'CLOCK', 'CRUSH', 'LOCK', 'PATCH',
+  'QUIT', 'SMASH', 'DAY', 'FISH', 'WIRE', 'CORE', 'SHIFT', 'BYTE',
 ];
 const MOTTOS = [
   'all buttons, no brakes', 'read you like a log file', 'frame one, every time',
@@ -49,6 +57,19 @@ const MOTTOS = [
 ];
 const rand = (n: number): number => Math.floor(Math.random() * n);
 const pick = <T>(a: T[]): T => a[rand(a.length)]!;
+
+/** Unique display name: STEM+TAIL+2hex, never reuse within this state file. */
+const mintName = (taken: Set<string>): string => {
+  for (let i = 0; i < 64; i++) {
+    const tag = rand(256).toString(16).toUpperCase().padStart(2, '0');
+    const name = `${pick(NAME_STEMS)}${pick(NAME_TAILS)}${tag}`.slice(0, 24);
+    const key = name.toLowerCase();
+    if (!taken.has(key)) { taken.add(key); return name; }
+  }
+  const fallback = `BOT${Date.now().toString(36).toUpperCase()}`.slice(0, 24);
+  taken.add(fallback.toLowerCase());
+  return fallback;
+};
 
 interface FleetAgent {
   name: string;
@@ -65,8 +86,13 @@ interface FleetState { agents: FleetAgent[] }
 
 const loadState = (): FleetState => {
   if (!existsSync(stateFile)) return { agents: [] };
-  try { return JSON.parse(readFileSync(stateFile, 'utf8')) as FleetState; }
-  catch { return { agents: [] }; }
+  try {
+    // Strip a UTF-8 BOM if a Windows editor/Set-Content added one —
+    // JSON.parse rejects BOM and we'd silently start with zero agents.
+    const raw = readFileSync(stateFile, 'utf8').replace(/^\uFEFF/, '');
+    const parsed = JSON.parse(raw) as FleetState;
+    return Array.isArray(parsed.agents) ? parsed : { agents: [] };
+  } catch { return { agents: [] }; }
 };
 const saveState = (s: FleetState): void => writeFileSync(stateFile, JSON.stringify(s, null, 2));
 
@@ -169,13 +195,24 @@ const roster = await rosterOf();
 log('fleet', `target ${url} · ${fleetSize} agent(s) · pace ${paceMs}ms · state ${stateFile}`);
 if (paceMs < 14) log('fleet', 'WARNING: faster than realtime — ranked servers pace-flag this (use AF_PACE=16)');
 
+const taken = new Set(state.agents.map((a) => a.name.toLowerCase()));
 while (state.agents.length < fleetSize) {
-  const base = NAMES[state.agents.length % NAMES.length]!;
-  const name = state.agents.length < NAMES.length ? base : `${base}${state.agents.length}`;
-  const a = await signup(name, roster);
-  state.agents.push(a);
-  saveState(state);
-  log(a.name, `signed up (${a.sub}) as ${a.character}, skill ${a.skill}, "${a.motto}"`);
+  const name = mintName(taken);
+  try {
+    const a = await signup(name, roster);
+    state.agents.push(a);
+    saveState(state);
+    log(a.name, `signed up (${a.sub}) as ${a.character}, skill ${a.skill}, "${a.motto}"`);
+  } catch (e) {
+    // Usually the server's 5-signups/IP/day valve — keep whatever we have.
+    taken.delete(name.toLowerCase());
+    log('fleet', `signup stopped: ${(e as Error).message} — continuing with ${state.agents.length}/${fleetSize}`);
+    break;
+  }
+}
+if (state.agents.length === 0) {
+  console.error('fleet: no agents available (signup failed and no fleet-agents.json)');
+  process.exit(1);
 }
 
 const fleet = state.agents.slice(0, fleetSize);

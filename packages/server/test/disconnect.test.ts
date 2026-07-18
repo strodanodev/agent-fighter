@@ -145,6 +145,37 @@ test('HEADS-UP: when the opponent drops, the survivor is told immediately (v6 op
   stayer.close();
 });
 
+test('SOLO IDLE: a silent (backgrounded-tab) player is a no-contest REFUND, not a forfeit loss', async (t) => {
+  const persistence = memoryPersistence();
+  // Short idle window so the test doesn't wait out the real 30s. The idle
+  // sweep itself runs every 5s, so the settle still lands a few seconds in.
+  const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true, idleForfeitMs: 500 });
+  t.after(() => server.close());
+  const url = `ws://127.0.0.1:${server.port}`;
+
+  // Solo, side 1 is the house AI (no socket). Play a few UNDECIDED ticks then
+  // go silent WITHOUT closing the socket — exactly what a throttled/hidden tab
+  // does (rAF stops firing, the WebSocket stays open). Pre-fix this idle-
+  // forfeited the human into a −1 loss even when they were ahead; there is no
+  // opponent to grief in PvE, so it must refund instead.
+  const c = rawClient(url, 'Backgrounded', 'solo');
+  await c.ready;
+  await c.until('match');
+  for (let k = 0; k < 30; k++) c.send({ t: 'i', k, v: 0 }); // nowhere near a KO
+  // ...then nothing. Socket stays open; the idle sweep must settle it.
+
+  const res = await c.until<Extract<ServerMsg, { t: 'result' }>>('result', 15_000);
+  assert.equal(res.reason, 'incomplete', 'a silent solo player is a no-contest, not a forfeit');
+  assert.equal(res.winner, -1, 'nobody wins an idle solo match');
+  await new Promise((r) => setTimeout(r, 400));
+
+  const acc = await persistence.getAccount({ sub: 'dev:Backgrounded' }, 'Backgrounded', false);
+  assert.equal(acc.credits, DAILY_CREDITS, 'the entry fee is refunded — no credit burned');
+  assert.equal(acc.losses, 0, 'no loss is booked against a backgrounded solo player');
+  assert.equal(acc.wins, 0);
+  c.close();
+});
+
 test('the honest path still settles: a normal solo match pays out', async (t) => {
   const persistence = memoryPersistence();
   const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true });

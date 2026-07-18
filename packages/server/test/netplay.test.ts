@@ -89,7 +89,12 @@ describe('persistence hook (Phase B)', () => {
       findByAgentKey: async () => null,
       findByRefCode: async () => null,
       createAgentAccount: async () => false,
+      nameTaken: async () => false,
       recentMatches: async () => [],
+      buyItem: async () => ({
+        rowId: 0, itemId: 'patch1', tier: 1, createdAt: '', credits: 100, duplicate: false,
+      }),
+      listItems: async () => [],
     };
     const s2 = await createMatchServer({ port: 0, persistence: mock, noPaceCheck: true });
     try {

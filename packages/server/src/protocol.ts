@@ -230,11 +230,11 @@ export interface SMatch {
     skill: number;
     aiSeed: number;
     /**
-     * DARE-VS-AGENT (ADR 0006): present iff the opponent is a TRAINED agent
-     * rather than the plain house AI. The client (and the verifier) must
-     * construct the opponent with createAi(1, skill, aiSeed, personality) —
-     * the knobs are clamped server-side to AI_PERSONALITY_RANGES before they
-     * ever ride this message. Only sent to clients that queued `agentOf`.
+     * Present when the opponent is a coached style (dare-vs-agent, or a live
+     * roster/fleet agent with a saved personality). The client and verifier
+     * must construct the opponent with createAi(1, skill, aiSeed, personality)
+     * — knobs are clamped server-side to AI_PERSONALITY_RANGES before they
+     * ride this message. Omitted for the plain generic house AI.
      */
     personality?: Record<string, number>;
   };

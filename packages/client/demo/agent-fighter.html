@@ -2687,6 +2687,12 @@ const loadDisplayFont = async () => {
 const loadLogo = () => loadImg(`/assets/logo/main_title_AF.svg?v=${Date.now()}`);
 /** The compact in-game badge logo (assets/logo/), shown below the fight timer. */
 const loadGameLogo = () => loadImg(`/assets/logo/main_logo_AF.svg?v=${Date.now()}`);
+/**
+ * Vending-machine art (assets/shop/, ADR 0007) — user-authored neon machine,
+ * alpha-matted from the source SVG in assets/. Swap the file to re-skin the
+ * shop; drawShop/drawVendingIcon fall back to procedural art while loading.
+ */
+const loadVendingArt = () => loadImg(`/assets/shop/vending-machine.png?v=${Date.now()}`);
 const opaqueBBox = (img) => {
     const iw = img.naturalWidth, ih = img.naturalHeight;
     const full = { x: 0, y: 0, w: iw, h: ih };
@@ -4985,6 +4991,41 @@ class AudioManager {
             src.start();
         });
     }
+    /**
+     * Synthesized UI "button press" blip — fired whenever a tap triggers a menu
+     * action (mode select, character/stage pick, back/exit, start, ranks…).
+     * No asset: a short oscillator through sfxGain, so it honors SFX volume and
+     * needs nothing decoded/loaded. Guarded so it's a silent no-op if Web Audio
+     * is unavailable or the context hasn't been unlocked by a gesture yet.
+     */
+    blip(opts = {}) {
+        if (!this.unlocked)
+            return;
+        try {
+            const ctx = this.ctxOf();
+            if (ctx.state === 'suspended')
+                void ctx.resume();
+            const now = ctx.currentTime;
+            const osc = ctx.createOscillator();
+            osc.type = 'square';
+            const freq = opts.freq ?? 880;
+            osc.frequency.setValueAtTime(freq, now);
+            // Tiny downward pitch drop reads as a crisp physical "tick", not a tone.
+            osc.frequency.exponentialRampToValueAtTime(freq * 0.66, now + 0.05);
+            const gain = ctx.createGain();
+            const level = opts.volume ?? 0.35;
+            gain.gain.setValueAtTime(0.0001, now);
+            gain.gain.exponentialRampToValueAtTime(level, now + 0.006);
+            gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.09);
+            osc.connect(gain);
+            gain.connect(this.sfxGain);
+            osc.start(now);
+            osc.stop(now + 0.1);
+        }
+        catch {
+            /* Web Audio unavailable — UI stays silent, never throws into the tap path */
+        }
+    }
 }
 const audio = new AudioManager();
 
@@ -5013,6 +5054,9 @@ const setGameLogo = (img) => {
     gameLogoBBox = img ? opaqueBBox(img) : null;
 };
 const setBgVideo = (v) => { bgVideo = v; };
+// Vending-machine art (ADR 0007) — already alpha-matted tight, no bbox pass.
+let vendingImg = null;
+const setVendingArt = (img) => { vendingImg = img; };
 /**
  * Menu backdrop: the looping ambient video when it's playing, falling back
  * to the static stage art (menuCam + drawStage) otherwise — used by both the
@@ -6022,6 +6066,9 @@ const drawTitle = (ctx, rosters, tick, menu) => {
             label(ctx, txt, x + pillW / 2, py + pillH / 2 + 4, 12, col);
         });
         ctx.lineWidth = 1;
+        // VENDING MACHINE (ADR 0007) — upper-RIGHT corner, the only chrome that
+        // lives there on the title. Signed-in only: pulls cost credits.
+        drawVendingIcon(ctx, tick);
     }
     // Account/wallet block — upper LEFT, under the audio chip (M5 spec).
     const acctBase = 48; // leaves room for the speaker control at y=10
@@ -6060,6 +6107,270 @@ const drawTitle = (ctx, rosters, tick, menu) => {
     if (menu.audio)
         drawAudioControl(ctx, menu.audio);
 };
+// ----------------------------------------------------------------- shop
+// VENDING MACHINE (ADR 0007 Phase 1): gacha energy drinks for credits.
+// All art is procedural (consistent with the chrome) until the Studio
+// grows an item-art path.
+/** Tier accents — LV1 steel, LV2 cool blue, LV3 gold (mirrors core ITEM_TIER_COLORS). */
+const TIER_COLORS = ['', '#cfd8e3', '#6fd3ff', '#ffd166'];
+const TIER_LABELS = ['', 'LV 1', 'LV 2', 'LV 3'];
+/** A little energy-drink can: body, shine, pull tab — tinted per tier. */
+const drawCan = (ctx, x, y, w, h, color, glow = 0) => {
+    ctx.save();
+    if (glow > 0) {
+        ctx.shadowColor = color;
+        ctx.shadowBlur = glow;
+    }
+    ctx.fillStyle = '#1b1826';
+    ctx.fillRect(x, y, w, h);
+    // Slanted two-tone label (energy-drink trade-dress homage, original art):
+    // silver upper-left / tier color lower-right, split on a diagonal.
+    const ly = y + h * 0.14, lh = h * 0.72;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, ly, w, lh);
+    ctx.clip();
+    ctx.fillStyle = '#cdd6e2';
+    ctx.fillRect(x, ly, w, lh);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(x, ly + lh);
+    ctx.lineTo(x + w, ly + lh * 0.22);
+    ctx.lineTo(x + w, ly + lh);
+    ctx.closePath();
+    ctx.fill();
+    // Lightning bolt over the split (readable ≥18px wide; skip when tiny).
+    if (w >= 18) {
+        const bx = x + w * 0.5, byy = ly + lh * 0.18;
+        ctx.fillStyle = '#1b1206';
+        ctx.beginPath();
+        ctx.moveTo(bx + w * 0.10, byy);
+        ctx.lineTo(bx - w * 0.16, byy + lh * 0.38);
+        ctx.lineTo(bx - w * 0.02, byy + lh * 0.38);
+        ctx.lineTo(bx - w * 0.12, byy + lh * 0.66);
+        ctx.lineTo(bx + w * 0.18, byy + lh * 0.28);
+        ctx.lineTo(bx + w * 0.02, byy + lh * 0.28);
+        ctx.closePath();
+        ctx.fill();
+    }
+    ctx.restore();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#e8eef5';
+    ctx.fillRect(x, y, w, h * 0.1); // lid
+    ctx.fillRect(x, y + h * 0.92, w, h * 0.08); // base
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.fillRect(x + w * 0.16, y + h * 0.12, w * 0.14, h * 0.76); // shine
+    ctx.fillStyle = '#0a0812';
+    ctx.fillRect(x + w * 0.4, y + h * 0.02, w * 0.24, h * 0.05); // tab
+    ctx.restore();
+};
+/**
+ * Compact vending-machine chip — title screen upper-right (the corner is
+ * otherwise empty; the account block owns the upper-LEFT). Whole thing is
+ * one tap target: 'shop'.
+ */
+const drawVendingIcon = (ctx, tick) => {
+    const glowMix = fxPulse(tick, 0.06);
+    if (vendingImg && vendingImg.naturalWidth > 0) {
+        // Authored machine art (wider than tall) — contain-fit into the corner.
+        const dw = 108, dh = dw * (vendingImg.naturalHeight / vendingImg.naturalWidth);
+        const x = VW - 14 - dw, y = 8;
+        tapZone(x - 4, y - 4, dw + 8, dh + 26, 'shop');
+        ctx.save();
+        ctx.shadowColor = `rgba(120,255,170,${0.4 + 0.35 * glowMix})`;
+        ctx.shadowBlur = 16;
+        ctx.drawImage(vendingImg, x, y, dw, dh);
+        ctx.restore();
+        label(ctx, 'B · SHOP', x + dw / 2, y + dh + 14, 11, tick % 44 < 36 ? '#ffd166' : '#ffe9a3');
+        return;
+    }
+    const w = 74, h = 96;
+    const x = VW - 14 - w, y = 10;
+    tapZone(x - 4, y - 4, w + 8, h + 26, 'shop');
+    ctx.save();
+    ctx.shadowColor = `rgba(255,209,102,${0.35 + 0.3 * glowMix})`;
+    ctx.shadowBlur = 14;
+    bevel(ctx, x, y, w, h, PANEL);
+    ctx.restore();
+    // Marquee strip.
+    ctx.fillStyle = GOLD;
+    ctx.fillRect(x + 4, y + 4, w - 8, 12);
+    label(ctx, 'ENERGY', x + w / 2, y + 14, 9, '#1b1206');
+    // Glass window with two shelves of cans (one can per tier + repeats).
+    ctx.fillStyle = '#0a0812';
+    ctx.fillRect(x + 6, y + 20, w - 22, h - 44);
+    for (let row = 0; row < 2; row++) {
+        for (let col = 0; col < 3; col++) {
+            const tier = 1 + ((row + col) % 3);
+            drawCan(ctx, x + 9 + col * 15, y + 25 + row * 34, 11, 26, TIER_COLORS[tier], tier === 3 ? 6 : 0);
+        }
+    }
+    // Coin slot + dispense tray.
+    ctx.fillStyle = PANEL_LT;
+    ctx.fillRect(x + w - 13, y + 24, 7, 26);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(x + w - 11, y + 30, 3, 12);
+    ctx.fillStyle = '#000000cc';
+    ctx.fillRect(x + 6, y + h - 20, w - 12, 12);
+    label(ctx, 'B · SHOP', x + w / 2, y + h + 14, 11, tick % 44 < 36 ? '#ffd166' : '#ffe9a3');
+};
+/** The vending-machine screen: machine + PULL + reveal card + stash shelf. */
+const drawShop = (ctx, tick, v) => {
+    drawMenuBackdrop(ctx);
+    ctx.fillStyle = 'rgba(6,4,14,0.72)';
+    ctx.fillRect(0, 0, VW, VH);
+    const cx = VW / 2;
+    display(ctx, 'VENDING MACHINE', cx, 54, 40, { glow: 'rgba(255,209,102,0.5)' });
+    label(ctx, 'GACHA ENERGY DRINKS · RANDOM EFFECT · RANDOM TIER (LV 1 / 2 / 3)', cx, 78, 12, '#ffd166cc');
+    // Wallet (upper-left, same treatment as the title) + back (upper-right).
+    if (v.credits !== null)
+        drawCredits(ctx, 16, 34, v.credits, 19);
+    tapZone(VW - 118, 10, 104, 30, 'back');
+    ctx.fillStyle = 'rgba(10,6,22,0.55)';
+    ctx.fillRect(VW - 118, 10, 104, 30);
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(VW - 117.5, 10.5, 103, 29);
+    label(ctx, '‹ TITLE', VW - 66, 30, 13, '#ffffffcc');
+    if (v.status === 'fail') {
+        label(ctx, 'SERVER OFFLINE · THE MACHINE TAKES NO COINS', cx, VH / 2, 16, '#ff9d9d');
+        label(ctx, 'ESC · BACK', cx, VH / 2 + 26, 12, '#ffffff77');
+        return;
+    }
+    // ---- The machine (left column) -----------------------------------------
+    const mx = 92, my = 108, mw = 250, mh = 320;
+    if (vendingImg && vendingImg.naturalWidth > 0) {
+        // Authored art (assets/shop/) — contain-fit over the same layout box so
+        // the PULL button/reveal geometry is identical to the procedural path.
+        const dw = 290, dh = dw * (vendingImg.naturalHeight / vendingImg.naturalWidth);
+        const ix = mx + (mw - dw) / 2, iy = my + (mh - dh) / 2;
+        ctx.save();
+        ctx.shadowColor = v.pullBusy
+            ? `rgba(255,209,102,${0.5 + 0.3 * Math.sin(tick / 4)})`
+            : 'rgba(120,255,170,0.35)';
+        ctx.shadowBlur = v.pullBusy ? 34 : 24;
+        ctx.drawImage(vendingImg, ix, iy, dw, dh);
+        ctx.restore();
+    }
+    else {
+        ctx.save();
+        ctx.shadowColor = 'rgba(255,209,102,0.25)';
+        ctx.shadowBlur = 24;
+        bevel(ctx, mx, my, mw, mh, PANEL, GOLD_LT, GOLD_DK, 3);
+        ctx.restore();
+        ctx.fillStyle = GOLD;
+        ctx.fillRect(mx + 8, my + 8, mw - 16, 30);
+        label(ctx, 'ENERGY', mx + mw / 2, my + 30, 22, '#1b1206');
+        ctx.fillStyle = '#0a0812';
+        ctx.fillRect(mx + 12, my + 46, mw - 60, mh - 120);
+        // Shelves: 3 rows × 4 cans, tiers cycling; the LV3 can glows.
+        for (let row = 0; row < 3; row++) {
+            for (let col = 0; col < 4; col++) {
+                const tier = 1 + ((row * 4 + col) % 3);
+                const wob = tier === 3 ? Math.sin((tick + col * 9) / 16) * 1.5 : 0;
+                drawCan(ctx, mx + 24 + col * 42, my + 58 + row * 60 + wob, 26, 46, TIER_COLORS[tier], tier === 3 ? 10 : 0);
+                ctx.fillStyle = 'rgba(255,255,255,0.10)';
+                ctx.fillRect(mx + 12, my + 46 + (row + 1) * 60 - 3, mw - 60, 2); // shelf lip
+            }
+        }
+        // Coin panel + tray.
+        ctx.fillStyle = PANEL_LT;
+        ctx.fillRect(mx + mw - 42, my + 46, 30, 90);
+        ctx.fillStyle = '#000';
+        ctx.fillRect(mx + mw - 32, my + 58, 10, 30);
+        label(ctx, `${v.cost}`, mx + mw - 27, my + 112, 15, GOLD_LT);
+        label(ctx, 'CR', mx + mw - 27, my + 126, 9, '#ffffff88');
+        ctx.fillStyle = '#000000cc';
+        ctx.fillRect(mx + 16, my + mh - 62, mw - 32, 44);
+        label(ctx, v.pullBusy ? 'DISPENSING…' : 'PUSH', mx + mw / 2, my + mh - 36, 13, v.pullBusy ? '#ffd166' : '#ffffff44');
+    }
+    // ---- PULL button (under the machine) -----------------------------------
+    const canAfford = v.credits === null || v.credits >= v.cost;
+    const bw = 250, bh = 44, bx = mx, by = my + mh + 14;
+    tapZone(bx, by, bw, bh, 'shop:pull');
+    const armed = !v.pullBusy && canAfford;
+    ctx.fillStyle = armed ? 'rgba(58,38,10,0.9)' : 'rgba(20,16,28,0.8)';
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.strokeStyle = armed ? GOLD : 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = armed ? 2.5 : 1.5;
+    ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+    if (armed) {
+        const pulse = 1 + 0.03 * Math.sin(tick / 9);
+        display(ctx, `INSERT ${v.cost} CR · PULL`, bx + bw / 2, by + 29, 19, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+    }
+    else {
+        label(ctx, v.pullBusy ? 'DISPENSING…' : `INSERT ${v.cost} CR · PULL`, bx + bw / 2, by + 27, 15, '#ffffff66');
+    }
+    if (!canAfford) {
+        label(ctx, 'NOT ENOUGH CREDITS — WIN MATCHES OR CLAIM THE DAILY +10', bx + bw / 2, by + bh + 16, 10, '#ff9d9d');
+    }
+    // ---- Reveal card (right column) ----------------------------------------
+    const rx = 400, rw = VW - rx - 26;
+    if (v.reveal && v.revealAge >= 0) {
+        const t = clamp01(v.revealAge / 16);
+        const pop = easeOutBack(t);
+        const tier = Math.max(1, Math.min(3, v.reveal.tier));
+        const col = TIER_COLORS[tier];
+        const ry = 108, rh = 224;
+        ctx.save();
+        ctx.globalAlpha = clamp01(v.revealAge / 6);
+        ctx.translate(rx + rw / 2, ry + rh / 2);
+        ctx.scale(pop, pop);
+        ctx.translate(-(rx + rw / 2), -(ry + rh / 2));
+        ctx.shadowColor = col;
+        ctx.shadowBlur = tier === 3 ? 34 : 18;
+        bevel(ctx, rx, ry, rw, rh, PANEL, col, GOLD_DK, 3);
+        ctx.shadowBlur = 0;
+        drawCan(ctx, rx + 30, ry + 42, 64, 130, col, tier === 3 ? 18 : 8);
+        label(ctx, TIER_LABELS[tier], rx + 62, ry + 196, 14, col);
+        display(ctx, v.reveal.name, rx + 118, ry + 74, 24, tier === 3 ? { align: 'left' }
+            : tier === 2 ? { ...COOL_OPTS, align: 'left' }
+                : { from: '#ffffff', mid: '#cfd8e3', to: '#6b7686', outline: '#101318', align: 'left' });
+        label(ctx, v.reveal.desc, rx + 118, ry + 104, 14, '#ffffffdd', 'left');
+        label(ctx, `“${v.reveal.flavor}”`, rx + 118, ry + 126, 11, '#ffffff88', 'left');
+        label(ctx, 'USABLE IN RANKED MODES SOON — PHASE 2', rx + 118, ry + 158, 10, '#8fd0ff', 'left');
+        ctx.restore();
+        // Sparkle ring on a fresh LV3.
+        if (tier === 3 && v.revealAge < 40) {
+            ctx.save();
+            ctx.strokeStyle = `rgba(255,209,102,${1 - v.revealAge / 40})`;
+            ctx.lineWidth = 3;
+            const rad = 30 + v.revealAge * 5;
+            ctx.beginPath();
+            ctx.arc(rx + 62, ry + 106, rad, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.restore();
+        }
+    }
+    else {
+        label(ctx, v.status === 'busy' ? 'STOCKING THE MACHINE…' : 'FEELING LUCKY?', rx + rw / 2, 170, 16, '#ffffff77');
+        label(ctx, `LV 1 COMMON · LV 2 UNCOMMON · LV 3 RARE`, rx + rw / 2, 194, 11, '#ffffff55');
+        label(ctx, 'HEAL · DAMAGE UP · DEFENSE UP · SUPER METER', rx + rw / 2, 212, 11, '#ffffff55');
+    }
+    // ---- Stash (inventory shelf, right-bottom) -----------------------------
+    const sy = 348;
+    label(ctx, `MY STASH · ${v.items.length}`, rx, sy, 14, GOLD_LT, 'left');
+    if (v.items.length === 0) {
+        label(ctx, v.status === 'done' ? 'EMPTY — PULL YOUR FIRST DRINK' : '…', rx, sy + 26, 12, '#ffffff66', 'left');
+    }
+    const shown = v.items.slice(0, 6);
+    shown.forEach((it, k) => {
+        const y = sy + 12 + k * 26;
+        const tier = Math.max(1, Math.min(3, it.tier));
+        drawCan(ctx, rx, y, 12, 20, TIER_COLORS[tier]);
+        label(ctx, `${it.name}  ·  ${TIER_LABELS[tier]}`, rx + 20, y + 14, 12, '#ffffffcc', 'left');
+        label(ctx, it.desc, rx + 20 + 190, y + 14, 10, '#ffffff66', 'left');
+    });
+    if (v.items.length > shown.length) {
+        label(ctx, `+${v.items.length - shown.length} MORE IN THE STASH`, rx, sy + 12 + shown.length * 26 + 14, 10, '#ffffff55', 'left');
+    }
+    // Error toast (insufficient credits / server hiccup) — flashing red.
+    if (v.err && v.errAge >= 0 && v.errAge % 30 < 22) {
+        label(ctx, `⚠ ${v.err}`, cx, VH - 30, 14, '#ff5d7e');
+    }
+    label(ctx, 'ENTER / TAP PULL · ESC BACK', cx, VH - 8, 10, '#ffffff55');
+    ctx.lineWidth = 1;
+};
 // ---------------------------------------------------------------- invite
 /** Hot-red display() treatment for the dare headline / CTA. */
 const DARE_OPTS = { from: '#ffe3e3', mid: '#ff5d7e', to: '#93202f', outline: '#2a060f' };
@@ -6078,7 +6389,7 @@ const drawInvite = (ctx, tick, v) => {
         label(ctx, '⚠ PUT A BOUNTY ON YOUR OWN HEAD ⚠', cx, 44, 14, '#ff5d7e');
     }
     display(ctx, 'I DARE YOU', cx, 100, 46, {});
-    display(ctx, 'TO BEAT ME', cx, 150, 46, DARE_OPTS);
+    display(ctx, 'TO FIGHT', cx, 150, 46, DARE_OPTS);
     // ---- poster panel: the wanted-poster preview of what the friend sees.
     // Left = full-body mugshot (contain-fit, never cropped); middle = the
     // callout + this player's live record; right = the fighter's stat profile,
@@ -7733,6 +8044,7 @@ const initPwa = () => {
  * Multi-touch is fully supported (throws = LP+LK, super = 2 punches, etc.) via
  * global pointer tracking keyed by pointerId.
  */
+
 /**
  * Set by initTouchControls once the overlay exists. Kept as a module-level
  * hook so main.ts can push the current screen from inside its own game frame
@@ -7914,16 +8226,19 @@ const initTouchControls = () => {
     pauseBtn.addEventListener('pointerdown', (e) => {
         e.preventDefault();
         e.stopPropagation();
+        audio.blip();
         setMenu(true);
     });
     menu.querySelector('.resume').addEventListener('pointerdown', (e) => {
         e.preventDefault();
         e.stopPropagation();
+        audio.blip();
         setMenu(false);
     });
     menu.querySelector('.quit').addEventListener('pointerdown', (e) => {
         e.preventDefault();
         e.stopPropagation();
+        audio.blip();
         setMenu(false);
         // Escape is already what the fight screen treats as "leave the match".
         press(K.back);
@@ -8118,8 +8433,10 @@ const tapAt = (clientX, clientY) => {
     if (vx < 0 || vy < 0 || vx > VW || vy > VH)
         return;
     const action = tapHit(vx, vy);
-    if (action)
+    if (action) {
+        audio.blip(); // UI feedback: a tap that lands on a real menu zone clicks
         taps.add(action);
+    }
 };
 let screen = 'loading';
 let mode = 'cpu';
@@ -8163,7 +8480,7 @@ const toggleSignIn = () => {
         void authLogin();
     }
 };
-// ---- Referral dares ("I dare you to beat me"). A shared landing link
+// ---- Referral dares ("I dare you to fight"). A shared landing link
 // (agent-fighter-web.vercel.app/dare/<code>) deep-links here with ?ref=;
 // the code waits in localStorage until the first authenticated contact
 // redeems it server-side (+25 credits each, once ever, new accounts only).
@@ -8233,7 +8550,7 @@ const shareDare = () => {
     const link = dareLink();
     const text = dareVsAgent
         ? `${currentTaunt()} — MY AGENT FIGHTS FOR ME. Beat it and prove something. +25 credits when you sign in.`
-        : `${currentTaunt()} — I DARE YOU TO BEAT ME. +25 credits if you can take one round.`;
+        : `${currentTaunt()} — I DARE YOU TO FIGHT. +25 credits if you can take one round.`;
     const done = () => { inviteCopiedAge = 0; };
     const copyFallback = () => {
         void navigator.clipboard?.writeText(`${text}\n${link}`).then(done)
@@ -8326,6 +8643,15 @@ const fetchAgentRoster = () => {
         agentRoster = (await r.json()); })
         .catch(() => { });
 };
+/** Nearest-level live agent — mirrors server `soloOpts` pick order. */
+const pickLiveAgentOpp = (target) => {
+    const agents = (agentRoster?.agents ?? []).filter((a) => a.name);
+    if (agents.length === 0)
+        return null;
+    return [...agents].sort((p, q) => Math.abs(p.level - target) - Math.abs(q.level - target)
+        || q.wins - p.wins
+        || p.name.localeCompare(q.name))[0] ?? null;
+};
 /**
  * The two HUD identity strips (wallet + on-chain stats) drawn under each
  * fighter's portrait/health/meter. The signed-in player's row shows credits;
@@ -8360,10 +8686,10 @@ const hudIds = () => {
 };
 /** Resolve the current AI-agent opponent for the select-screen badge. */
 const resolveAgentOpp = () => {
-    const target = cpuLevelFor(profile, lever);
-    const agents = agentRoster?.agents ?? [];
-    if (agents.length > 0) {
-        const a = [...agents].sort((p, q) => Math.abs(p.level - target) - Math.abs(q.level - target))[0];
+    // Online solo pins by account level; offline CPU still uses the local lever.
+    const target = account?.level ?? cpuLevelFor(profile, lever);
+    const a = pickLiveAgentOpp(target);
+    if (a) {
         return {
             kind: 'live', name: a.name, level: a.level, wins: a.wins, losses: a.losses,
             streak: a.streak, wallet: shortAddr(a.address), minds: false,
@@ -8508,6 +8834,99 @@ const enterAgentScreen = () => {
     keyCopiedAge = -1;
     void fetchAgentScreen();
 };
+let shopFetch = 'idle';
+let shopInv = [];
+let shopCost = 5; // server-confirmed on fetch (core ITEM_COST)
+let shopPullBusy = false;
+let shopReveal = null;
+let shopRevealAge = -1;
+let shopErr = '';
+let shopErrAge = -1;
+const mapOwned = (it) => ({
+    rowId: Number(it.rowId ?? 0),
+    name: it.def?.name ?? 'UNKNOWN CAN',
+    tier: Number(it.def?.tier ?? it.tier ?? 1),
+    desc: it.def?.desc ?? '',
+});
+const fetchShop = async () => {
+    shopFetch = 'busy';
+    try {
+        const headers = await agentAuthHeaders();
+        if (!headers) {
+            shopFetch = 'fail';
+            return;
+        }
+        const res = await fetch(`${matchHttpUrl()}/items`, { headers });
+        if (!res.ok) {
+            shopFetch = 'fail';
+            return;
+        }
+        const body = (await res.json());
+        shopCost = Number(body.cost ?? 5);
+        shopInv = (body.items ?? []).map(mapOwned);
+        shopFetch = 'done';
+    }
+    catch {
+        shopFetch = 'fail';
+    }
+};
+const pullShop = async () => {
+    if (shopPullBusy)
+        return;
+    shopPullBusy = true;
+    shopErr = '';
+    shopErrAge = -1;
+    try {
+        const headers = await agentAuthHeaders();
+        if (!headers)
+            return;
+        // Client purchase id — the server's idempotency key for THIS pull.
+        const nonce = `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+        const res = await fetch(`${matchHttpUrl()}/items/buy`, {
+            method: 'POST', headers, body: JSON.stringify({ nonce }),
+        });
+        const body = (await res.json().catch(() => ({})));
+        if (!res.ok) {
+            shopErr = res.status === 402
+                ? `NOT ENOUGH CREDITS — A PULL COSTS ${shopCost}`
+                : (body.error ?? 'THE MACHINE ATE YOUR COIN — TRY AGAIN').toUpperCase().slice(0, 64);
+            shopErrAge = 0;
+            return;
+        }
+        if (body.item) {
+            shopReveal = {
+                name: body.item.name, tier: body.item.tier,
+                desc: body.item.desc, flavor: body.item.flavor,
+            };
+            shopRevealAge = 0;
+            shopInv.unshift(mapOwned({ rowId: body.rowId, def: body.item }));
+        }
+        // The purchase changed the balance — keep the wallet chip honest.
+        if (account && typeof body.credits === 'number')
+            account.credits = body.credits;
+    }
+    catch {
+        shopErr = 'SERVER UNREACHABLE — NOTHING WAS CHARGED';
+        shopErrAge = 0;
+    }
+    finally {
+        shopPullBusy = false;
+    }
+};
+const enterShop = () => {
+    audioMenuOpen = false;
+    screen = 'shop';
+    shopReveal = null;
+    shopRevealAge = -1;
+    shopErr = '';
+    shopErrAge = -1;
+    // Re-sync the account alongside the shop fetch: both resolve auth NOW, so
+    // the wallet shown is the wallet charged. (Without this, a boot-time /me
+    // that raced AIR-session rehydration can display one profile while the
+    // pull debits another — found live: wallet said 10 CR, buy 402'd at 0.)
+    void fetchAccount();
+    void fetchShop();
+};
 let uiTick = 0;
 let allRosters = [];
 let picks = [0, 0];
@@ -8578,6 +8997,7 @@ const boot = async () => {
         // important on mobile, where blocking boot on ~20MB of art would stall
         // first paint for seconds on a slow connection.
         void loadLogo().then(setLogo);
+        void loadVendingArt().then(setVendingArt); // shop art — procedural fallback until it lands
         setBgVideo(loadBgVideo('/assets/video/bg_video_main_af.mp4'));
         stageIds = await listStages();
         setLoadProgress(0.28);
@@ -9471,7 +9891,7 @@ const frame = () => {
             fetchRanks();
         }
         else if (signedIn && account?.refCode && (pressedThisFrame.has('KeyD') || taps.has('dare'))) {
-            // "I DARE YOU TO BEAT ME" — the full invite screen (poster, taunt,
+            // "I DARE YOU TO FIGHT" — the full invite screen (poster, taunt,
             // shareable link). Both sides earn +25 credits when a friend accepts.
             enterInvite('title');
         }
@@ -9479,6 +9899,10 @@ const frame = () => {
             // MY AGENT (ADR 0006): view the coached config, mint the coach key,
             // spar your own agent. Sign-in required — the agent IS the account.
             enterAgentScreen();
+        }
+        else if (signedIn && (pressedThisFrame.has('KeyB') || taps.has('shop'))) {
+            // VENDING MACHINE (ADR 0007): gacha energy drinks for credits.
+            enterShop();
         }
         else if (!signedIn) {
             // Gated: every other key/tap waits for the sign-in.
@@ -9525,6 +9949,32 @@ const frame = () => {
         }
         else if (!mintBusy && (pressedThisFrame.has('KeyK') || taps.has('agent:mint'))) {
             void mintAgentKey();
+        }
+        else if (pressedThisFrame.has('Escape') || taps.has('back')) {
+            screen = 'title';
+        }
+    }
+    else if (screen === 'shop') {
+        if (shopRevealAge >= 0)
+            shopRevealAge++;
+        if (shopErrAge >= 0 && ++shopErrAge > 240) {
+            shopErrAge = -1;
+            shopErr = '';
+        }
+        drawShop(ctx, uiTick, {
+            status: shopFetch,
+            credits: account ? account.credits : null,
+            cost: shopCost,
+            items: shopInv,
+            pullBusy: shopPullBusy,
+            reveal: shopReveal,
+            revealAge: shopRevealAge,
+            err: shopErr,
+            errAge: shopErrAge,
+        });
+        if (!shopPullBusy && shopFetch !== 'fail'
+            && (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('shop:pull'))) {
+            void pullShop();
         }
         else if (pressedThisFrame.has('Escape') || taps.has('back')) {
             screen = 'title';
@@ -9608,8 +10058,9 @@ const frame = () => {
         if (!agentRosterFetched)
             fetchAgentRoster();
         // The upper-right AGENT OPPONENT card: who you're about to fight (level,
-        // W-L, streak, wallet) — a live agent when one exists, else the house
-        // agent. Shown for the AI-agent gauntlet; PvP-friendly select has no CPU.
+        // W-L, streak, wallet) — a live roster agent when one exists (same pick
+        // ranked solo pins server-side), else the house agent. PvP-friendly
+        // select has no CPU.
         const badge = !selectingFriendly
             ? { cpuLevel: cpuLevelFor(profile, lever), lever, opp: resolveAgentOpp() }
             : undefined;
@@ -9629,13 +10080,17 @@ const frame = () => {
         const arcadeQ = queuedMode === 'arcade';
         const friendlyQ = queuedMode === 'friendly';
         const failed = net?.status === 'error';
+        const soloOpp = solo ? resolveAgentOpp() : null;
+        const soloCall = soloOpp
+            ? `CALLING ${soloOpp.name.toUpperCase()}${dots}`
+            : `CALLING THE HOUSE AGENT${dots}`;
         const msg = !net ? `CONNECTING${dots}` // token fetch in flight
             : failed ? `OFFLINE: ${net.error}`
                 : net.setup ? 'OPPONENT FOUND — STARTING'
                     : net.status === 'queued'
                         ? (arcadeQ ? `ENTERING AGENT ARCADE${dots}`
                             : friendlyQ ? `WAITING FOR YOUR CHALLENGER${dots}`
-                                : solo ? `CALLING THE HOUSE AGENT${dots}` : `SEARCHING FOR OPPONENT${dots}`)
+                                : solo ? soloCall : `SEARCHING FOR OPPONENT${dots}`)
                         : `CONNECTING${dots}`;
         ctx.font = 'bold 22px "Courier New", monospace';
         ctx.textAlign = 'center';

@@ -79,6 +79,14 @@ export const loadGameLogo = (): Promise<HTMLImageElement | null> =>
   loadImg(`/assets/logo/main_logo_AF.svg?v=${Date.now()}`);
 
 /**
+ * Vending-machine art (assets/shop/, ADR 0007) — user-authored neon machine,
+ * alpha-matted from the source SVG in assets/. Swap the file to re-skin the
+ * shop; drawShop/drawVendingIcon fall back to procedural art while loading.
+ */
+export const loadVendingArt = (): Promise<HTMLImageElement | null> =>
+  loadImg(`/assets/shop/vending-machine.png?v=${Date.now()}`);
+
+/**
  * Tight bounding box (image pixel space) of an image's non-transparent
  * content. Design-tool SVG exports (e.g. the title logo) often carry large
  * fully-transparent padding around the actual artwork — drawing the full

@@ -13,6 +13,8 @@
  * global pointer tracking keyed by pointerId.
  */
 
+import { audio } from './audio.js';
+
 /**
  * Set by initTouchControls once the overlay exists. Kept as a module-level
  * hook so main.ts can push the current screen from inside its own game frame
@@ -194,13 +196,13 @@ export const initTouchControls = (): void => {
     if (open) { clearPad(); pointers.clear(); releaseAll(); } // never strand a held key behind the menu
   };
   pauseBtn.addEventListener('pointerdown', (e) => {
-    e.preventDefault(); e.stopPropagation(); setMenu(true);
+    e.preventDefault(); e.stopPropagation(); audio.blip(); setMenu(true);
   });
   menu.querySelector('.resume')!.addEventListener('pointerdown', (e) => {
-    e.preventDefault(); e.stopPropagation(); setMenu(false);
+    e.preventDefault(); e.stopPropagation(); audio.blip(); setMenu(false);
   });
   menu.querySelector('.quit')!.addEventListener('pointerdown', (e) => {
-    e.preventDefault(); e.stopPropagation();
+    e.preventDefault(); e.stopPropagation(); audio.blip();
     setMenu(false);
     // Escape is already what the fight screen treats as "leave the match".
     press(K.back); release(K.back);

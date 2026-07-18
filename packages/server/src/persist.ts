@@ -155,9 +155,10 @@ export interface AgentInfo {
 }
 
 /**
- * A LIVE agent (a real player's trained agent) as an opponent identity — the
- * select-screen badge card (0010 `agent_roster` view). `address` is the AIR
- * smart-account wallet; `streak` is the current consecutive-win count.
+ * A LIVE agent-class account (fleet/headless or coached) as an opponent
+ * identity — select-screen badge + ranked-solo house pin (0010 `agent_roster`
+ * view). `address` is the AIR smart-account wallet; `streak` is the current
+ * consecutive-win count.
  */
 export interface AgentRosterRow {
   id: string;
@@ -231,11 +232,38 @@ export interface Persistence {
    * one shot. False = the id already existed (retry with a fresh uuid).
    */
   createAgentAccount: (sub: string, name: string, keyHash: string) => Promise<boolean>;
+  /** Case-insensitive display-name collision check (leaderboard uniqueness). */
+  nameTaken: (name: string) => Promise<boolean>;
   /**
    * Recent settled matches involving `sub`, newest first (coach food —
    * GET /agent/matches). Raw rows; the endpoint maps them sub-centric.
    */
   recentMatches: (sub: string, limit: number) => Promise<MatchRow[]>;
+  /**
+   * Vending-machine purchase (ADR 0007): debit `cost` credits and grant the
+   * SERVER-rolled item (the gacha roll happens in server.ts — persistence
+   * just records it atomically). Idempotent by `nonce`: a replayed purchase
+   * returns the already-granted item with `duplicate: true` and charges
+   * nothing. Throws InsufficientCredits(0) when the balance can't cover it.
+   */
+  buyItem: (sub: string, cost: number, itemId: string, tier: number, nonce: string) => Promise<PurchaseResult>;
+  /** Unconsumed inventory for `sub`, newest first. */
+  listItems: (sub: string, limit?: number) => Promise<OwnedItem[]>;
+}
+
+/** One granted (not yet consumed) consumable in a player's inventory. */
+export interface OwnedItem {
+  rowId: number;
+  itemId: string;
+  tier: number;
+  createdAt: string;
+}
+
+export interface PurchaseResult extends OwnedItem {
+  /** Balance after the purchase (unchanged on a duplicate replay). */
+  credits: number;
+  /** True = this nonce already bought something; nothing was charged. */
+  duplicate: boolean;
 }
 
 /** One settled match as stored (subset of the matches table the coach needs). */
@@ -327,6 +355,9 @@ export const memoryPersistence = (): Persistence => {
   const referrals = new Map<string, { inviter: string; released: boolean }>();
   /** sub → trained agent config + key (ADR 0006). */
   const agents = new Map<string, { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null }>();
+  /** Granted consumables, newest first (ADR 0007). Nonce = idempotency key. */
+  const ownedItems: (OwnedItem & { sub: string; nonce: string })[] = [];
+  let nextItemRow = 1;
   /** Newest-first ring of settled matches (GET /agent/matches food). */
   const matchRows: MatchRow[] = [];
   const agentOf = (sub: string): { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null } => {
@@ -521,6 +552,39 @@ export const memoryPersistence = (): Persistence => {
       a.keyCreatedAt = new Date().toISOString();
       return true;
     },
+    nameTaken: async (name) => {
+      const want = name.trim().toLowerCase();
+      if (!want) return false;
+      for (const n of names.values()) if (n.name.toLowerCase() === want) return true;
+      return false;
+    },
+    // Mirrors 0013_items.sql buy_item — keep in sync (money logic lives twice).
+    buyItem: async (sub, cost, itemId, tier, nonce) => {
+      const replay = ownedItems.find((i) => i.sub === sub && i.nonce === nonce);
+      if (replay) {
+        return {
+          rowId: replay.rowId, itemId: replay.itemId, tier: replay.tier,
+          createdAt: replay.createdAt, credits: prof(sub).credits, duplicate: true,
+        };
+      }
+      const p = prof(sub);
+      if (p.credits < cost) throw new InsufficientCredits(0);
+      p.credits -= cost;
+      const row = {
+        sub, nonce, rowId: nextItemRow++, itemId, tier,
+        createdAt: new Date().toISOString(),
+      };
+      ownedItems.unshift(row);
+      return {
+        rowId: row.rowId, itemId: row.itemId, tier: row.tier,
+        createdAt: row.createdAt, credits: p.credits, duplicate: false,
+      };
+    },
+    listItems: async (sub, limit = 50) =>
+      ownedItems
+        .filter((i) => i.sub === sub)
+        .slice(0, limit)
+        .map(({ rowId, itemId, tier, createdAt }) => ({ rowId, itemId, tier, createdAt })),
   };
 };
 
@@ -690,6 +754,16 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
       Boolean(await call('/rest/v1/rpc/create_agent_account', {
         method: 'POST', body: JSON.stringify({ _id: sub, _name: name, _hash: keyHash }),
       })),
+    nameTaken: async (name) => {
+      const want = name.trim();
+      if (!want) return false;
+      // ilike without wildcards = case-insensitive exact match in PostgREST.
+      const rows = (await call(
+        `/rest/v1/profiles?select=id&name=ilike.${encodeURIComponent(want)}&limit=1`,
+        { method: 'GET' },
+      )) as unknown[];
+      return Array.isArray(rows) && rows.length > 0;
+    },
     recentMatches: async (sub, limit) => {
       // Straight PostgREST read — matches is public-read anyway; the service
       // key just skips the anon path. Indexes matches_p0/p1_idx cover this.
@@ -699,6 +773,36 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         `/rest/v1/matches?select=${cols}&or=(p0.eq.${s},p1.eq.${s})&order=created_at.desc&limit=${limit | 0}`,
         { method: 'GET' },
       )) as MatchRow[];
+    },
+    buyItem: async (sub, cost, itemId, tier, nonce) => {
+      const rows = (await call('/rest/v1/rpc/buy_item', {
+        method: 'POST',
+        body: JSON.stringify({
+          _profile: sub, _cost: cost | 0, _item: itemId, _tier: tier | 0, _nonce: nonce,
+        }),
+      })) as Array<Record<string, unknown>>;
+      const row = rows?.[0] ?? {};
+      return {
+        rowId: Number(row.row_id ?? 0),
+        itemId: String(row.granted_item ?? itemId),
+        tier: Number(row.granted_tier ?? tier),
+        createdAt: new Date().toISOString(),
+        credits: Number(row.credits ?? 0),
+        duplicate: Boolean(row.duplicate),
+      };
+    },
+    listItems: async (sub, limit = 50) => {
+      // Items table is RLS default-deny — only this service-role path reads it.
+      const rows = (await call(
+        `/rest/v1/items?select=id,item_id,tier,created_at&profile_id=eq.${encodeURIComponent(sub)}&consumed_match_id=is.null&order=created_at.desc&limit=${limit | 0}`,
+        { method: 'GET' },
+      )) as Array<Record<string, unknown>>;
+      return rows.map((r) => ({
+        rowId: Number(r.id ?? 0),
+        itemId: String(r.item_id ?? ''),
+        tier: Number(r.tier ?? 1),
+        createdAt: String(r.created_at ?? ''),
+      }));
     },
   };
 };

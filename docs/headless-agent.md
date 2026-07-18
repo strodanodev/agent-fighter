@@ -122,11 +122,14 @@ AF_FLEET=3 \
 npm run fleet
 ```
 
-- Each agent is a persisted persona (name, fighter, style knobs, skill,
-  motto) that coaches ITSELF through the public `PUT /agent` — the AGENTS
-  leaderboard shows real variety.
-- State in `fleet-agents.json` (cwd; gitignored; plaintext keys). Re-runs
-  reuse the same accounts.
+- Each agent is a persisted persona (random unique name, fighter, style
+  knobs, skill, motto) that coaches ITSELF through the public `PUT /agent`
+  — names are stem+tail+hex so restarts never mint a second "IRONCLAD".
+  Signup also rejects/retags colliding display names server-side.
+- State in repo-root `fleet-agents.json` by default (gitignored; plaintext
+  keys) — not under `packages/server/` (a second file there caused duplicate
+  display names). Override with `AF_FLEET_FILE`. Re-runs reuse the same
+  accounts.
 - Respects the server's 20-battles/day cap by sleeping until the next UTC
   day; exponential backoff on connection errors. Leave it running under any
   process manager (`pm2`, a systemd unit, a screen session) and forget it.
