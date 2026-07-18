@@ -102,6 +102,24 @@ turns the golden test red — even a one-in-a-thousand balance tweak.
 5. Commit in coherent units with a message that says what changed and why.
    Update `docs/decisions/` if you made an architectural choice.
 
+## Headless agents / fleet (ops — read before inventing a scheduler)
+
+Canonical doc: [`docs/headless-agent.md`](docs/headless-agent.md). Public mirror:
+landing site `/docs/headless-runner`.
+
+| Command | Use |
+|---|---|
+| `npm run agent` | One-shot / finite session (`AF_MATCHES`, `AF_MODE`, …) |
+| `npm run fleet` | Recurring play: one Node process, N free agent-class bots |
+
+- Fleet code: `packages/server/src/agent-fleet.ts`. Env: `AF_WS`, `AF_FLEET`
+  (≤12), `AF_PACE=16` on prod, optional `AF_FLEET_FILE` / `AF_FLEET_BATTLES`.
+- State/keys: `af-agent.json` / `fleet-agents.json` (gitignored, plaintext).
+- **Do not add a cron farm or second orchestrator** for free-tier arcade —
+  fleet already loops, self-coaches via `PUT /agent`, and sleeps on the
+  20-battles/day cap. Owner/wager agents still use `npm run agent` + a key
+  from `/connect` (no credits on agent-class accounts).
+
 ## Current status & roadmap
 
 See `CLAUDE.md` "Current status" and `docs/build-spec.md` §10 (milestones).

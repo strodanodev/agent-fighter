@@ -22,7 +22,8 @@ import {
 import type { CharacterBundle } from '@af/core';
 import {
   ARCADE_NEXT_GRACE_MS, DEFAULT_PORT, FORFEIT_GRACE_MS, IDLE_FORFEIT_MS, INPUT_DELAY,
-  PROTOCOL_VERSION, SOLO_PACE_MAX, SOLO_PACE_MIN, SOLO_PACE_SLACK_MS,
+  INPUT_DELAY_MAX, INPUT_DELAY_MIN, PING_INTERVAL_MS, PROTOCOL_VERSION,
+  SOLO_PACE_MAX, SOLO_PACE_MIN, SOLO_PACE_SLACK_MS, TICK_MS,
 } from './protocol.js';
 import type { ClientMsg, SMatch, SResult, ServerMsg } from './protocol.js';
 import { verifyAirToken } from './airjwt.js';
@@ -103,6 +104,14 @@ interface Client {
   account: Account | null;
   /** AIR-account email — only the reputation write-back target (ADR 0004). */
   email: string;
+  /**
+   * Measured round-trip to this client in ms (EMA; -1 = unknown). Fed by
+   * the lobby ping loop's pong echoes; read once at pair time to size the
+   * adaptive input delay. Client-supplied timing, so it is only ever used
+   * to pick a delay inside [INPUT_DELAY_MIN, INPUT_DELAY_MAX] — lying
+   * about it just gives the liar the same worse delay as their opponent.
+   */
+  rtt: number;
 }
 
 interface Match {
@@ -121,8 +130,10 @@ interface Match {
   stage: string;
   chars: [string, string];
   names: [string, string];
-  /** Local-sim solo: the deterministic house AI the client must simulate. */
-  solo: { skill: number; aiSeed: number } | null;
+  /** Local-sim solo: the deterministic house AI the client must simulate.
+   *  `personality` present = a TRAINED agent opponent (dare-vs-agent /
+   *  sparring, ADR 0006) — verification re-derives the AI with it. */
+  solo: { skill: number; aiSeed: number; personality?: Record<string, number> } | null;
   /** AGENT ARCADE: the run this battle belongs to (null = not an arcade battle). */
   arcadeRun: ArcadeRun | null;
   startedAt: number; // wall clock — solo pace sanity (SOLO_PACE_*)
@@ -130,6 +141,8 @@ interface Match {
   resumeTokens: [string, string];
   /** Sides whose socket has dropped — both gone = no-contest, not a forfeit. */
   gone: [boolean, boolean];
+  /** Input delay (ticks) pinned at pair time — resume must resend the SAME value. */
+  delay: number;
   /** Wall clock of each side's last input — silence forfeits (IDLE_FORFEIT_MS). */
   lastInputAt: [number, number];
   /** The ledger: per side, inputs by tick. TCP keeps them in order. */
@@ -144,6 +157,20 @@ interface Match {
 export interface MatchServer {
   port: number;
   close: () => void;
+}
+
+/**
+ * A pinned solo opponent: the house AI (level ramp, random character) or a
+ * TRAINED agent (owner-level skill, coached character + personality,
+ * "<OWNER>'S AGENT" label — ADR 0006 dare-vs-agent / sparring).
+ */
+interface SoloPin {
+  skill: number;
+  aiSeed: number;
+  character: string;
+  level: number;
+  personality?: Record<string, number>;
+  agentName?: string;
 }
 
 /**
@@ -237,11 +264,13 @@ const verifySoloLedger = (
   bundles: [CharacterBundle, CharacterBundle],
   seed: number,
   playerInputs: number[],
-  solo: { skill: number; aiSeed: number },
+  solo: { skill: number; aiSeed: number; personality?: Record<string, number> },
 ): VerifyOutcome => {
   setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
   const g = createGameState(seed);
-  const ai = createAi(1, solo.skill, solo.aiSeed);
+  // Trained-agent opponents (ADR 0006) pin a personality too — same
+  // re-derivation, so a coached agent can't be puppeteered either.
+  const ai = createAi(1, solo.skill, solo.aiSeed, solo.personality);
   let t = 0;
   while (g.phase !== Phase.MatchOver && t < playerInputs.length) {
     const opp = aiPoll(ai, g);
@@ -451,7 +480,12 @@ export const createMatchServer = (opts: {
       void persistence.recordMatch({
         matchId: m.id, mode: m.mode, fee: m.fee, payout: arcadePayout,
         identities: [m.clients[0].identity, m.clients[1]?.identity ?? null],
-        names: [m.clients[0].name, m.clients[1]?.name ?? `HOUSE AI`],
+        // Trained-agent opponents (solo.personality pinned) record under
+        // their real label ("RIVAL'S AGENT · LV3") so GET /agent/matches and
+        // the coach read who was actually fought; the plain house AI keeps
+        // its historical 'HOUSE AI' name (house_agent_stats reads the mode
+        // column, not this label, so stats are unaffected either way).
+        names: [m.clients[0].name, m.clients[1]?.name ?? (m.solo?.personality ? m.names[1] : `HOUSE AI`)],
         agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
         chars: m.chars,
         winner: result.winner, reason: result.reason,
@@ -539,7 +573,7 @@ export const createMatchServer = (opts: {
 
     setCharacters(loadCharacter(bundleOf(m.chars[0])), loadCharacter(bundleOf(m.chars[1])));
     const g = createGameState(m.seed);
-    const ai = m.solo ? createAi(1, m.solo.skill, m.solo.aiSeed) : null;
+    const ai = m.solo ? createAi(1, m.solo.skill, m.solo.aiSeed, m.solo.personality) : null;
     let t = 0;
     for (const tick of ticks) {
       while (t < tick && g.phase !== Phase.MatchOver) {
@@ -558,15 +592,29 @@ export const createMatchServer = (opts: {
     return undefined;
   };
 
+  /**
+   * Adaptive input delay (2026-07-18): size the symmetric delay from both
+   * clients' measured RTT to THIS relay. One-way A→B = A→server + server→B
+   * ≈ (rttA + rttB) / 2; half of it is hidden by delay, the rest by
+   * rollback prediction. Unknown RTT (old client, unanswered pings) falls
+   * back to the fixed INPUT_DELAY — exactly the pre-adaptive behavior.
+   */
+  const adaptiveDelay = (a: Client, b: Client): number => {
+    if (a.rtt < 0 || b.rtt < 0) return INPUT_DELAY;
+    const oneWayMs = (a.rtt + b.rtt) / 2;
+    return Math.max(INPUT_DELAY_MIN, Math.min(INPUT_DELAY_MAX, Math.round(oneWayMs / TICK_MS / 2)));
+  };
+
   const startMatch = (
     c0: Client, c1: Client | null, mode: MatchMode | 'friendly', fee: number, id?: string,
-    solo?: { skill: number; aiSeed: number; character: string; level: number },
+    solo?: SoloPin,
     arcadeRun?: ArcadeRun,
   ): void => {
     // Arcade battles bill as the character, not "HOUSE": the run IS the mode.
+    // Trained-agent opponents (dare/spar) bill as their owner's agent.
     const houseName = arcadeRun
       ? `${(bundleOf(solo!.character) as { name?: string }).name ?? solo!.character} · ${arcadeRun.battle + 1}/${arcadeRun.opponents.length}`.toUpperCase()
-      : `HOUSE LV${solo?.level ?? 1}`;
+      : solo?.agentName ?? `HOUSE LV${solo?.level ?? 1}`;
     const m: Match = {
       id: id ?? newMatchId(),
       mode, fee,
@@ -575,8 +623,11 @@ export const createMatchServer = (opts: {
       stage: stageIds.length > 0 ? stageIds[matchSeed % stageIds.length]! : '',
       chars: [c0.character, c1 ? c1.character : solo!.character],
       names: [c0.name, c1?.name ?? houseName],
-      solo: solo ? { skill: solo.skill, aiSeed: solo.aiSeed } : null,
+      solo: solo ? { skill: solo.skill, aiSeed: solo.aiSeed, personality: solo.personality } : null,
       arcadeRun: arcadeRun ?? null,
+      // Local-sim solo has NO input scheduling at all — zero added latency.
+      // PvP sizes the delay from both sides' measured RTT (fallback: fixed).
+      delay: solo ? 0 : c1 ? adaptiveDelay(c0, c1) : INPUT_DELAY,
       startedAt: Date.now(),
       resumeTokens: [randomUUID(), randomUUID()],
       gone: [false, false],
@@ -590,13 +641,12 @@ export const createMatchServer = (opts: {
     c0.match = m; c0.side = 0; c0.state = 'playing';
     if (c1) { c1.match = m; c1.side = 1; c1.state = 'playing'; }
 
-    const oppName = c1?.name ?? `HOUSE LV${solo!.level}`;
+    const oppName = c1?.name ?? houseName;
     for (const c of m.clients) {
       if (!c) continue;
       const setup: SMatch = {
         t: 'match', matchId: m.id, side: c.side, seed: m.seed, stage: m.stage,
-        // Local-sim solo has NO input scheduling at all — zero added latency.
-        delay: m.solo ? 0 : INPUT_DELAY,
+        delay: m.delay,
         chars: [
           { id: m.chars[0], hash: bundleOf(m.chars[0]).versionHash },
           { id: m.chars[1], hash: bundleOf(m.chars[1]).versionHash },
@@ -613,7 +663,7 @@ export const createMatchServer = (opts: {
       send(c, setup);
     }
     liveMatches.set(m.id, m);
-    console.log(`[match ${m.id}] ${mode}·fee ${fee} · ${c0.name}${c0.agent ? ' (agent)' : ''} vs ${oppName}${c1?.agent ? ' (agent)' : ''} · seed ${m.seed} · stage ${m.stage}`);
+    console.log(`[match ${m.id}] ${mode}·fee ${fee} · ${c0.name}${c0.agent ? ' (agent)' : ''} vs ${oppName}${c1?.agent ? ' (agent)' : ''} · seed ${m.seed} · stage ${m.stage}${c1 ? ` · delay ${m.delay} (rtt ${c0.rtt}/${c1.rtt}ms)` : ''}`);
   };
 
   /**
@@ -678,8 +728,14 @@ export const createMatchServer = (opts: {
    * Ranked solo (v3): no house-bot process, no relay. Escrow the fee, pin a
    * deterministic house AI (skill from the player's level), and hand the
    * whole sim to the client — verification re-derives the same AI.
+   *
+   * DARE-VS-AGENT / SPARRING (ADR 0006): `pin` overrides the house AI with a
+   * TRAINED agent (character + clamped personality from its owner's saved
+   * config, skill from the OWNER's level). Everything else — fee, escrow,
+   * pace check, ledger re-sim, settlement — is exactly ranked solo: the
+   * agent's owner is not a party to the match and earns nothing.
    */
-  const startSolo = async (c: Client): Promise<void> => {
+  const startSolo = async (c: Client, pin?: SoloPin): Promise<void> => {
     const fee = persistence ? SOLO_FEE : 0;
     const matchId = newMatchId();
     if (fee > 0) {
@@ -692,36 +748,70 @@ export const createMatchServer = (opts: {
     }
     if (c.ws.readyState !== WebSocket.OPEN) {
       // Vanished after escrow → settle as incomplete so the fee refunds.
-      startMatch(c, null, 'solo', fee, matchId, soloOpts(c));
+      startMatch(c, null, 'solo', fee, matchId, pin ?? soloOpts(c));
       return finishMatch(c.match!, null);
     }
-    startMatch(c, null, 'solo', fee, matchId, soloOpts(c));
+    startMatch(c, null, 'solo', fee, matchId, pin ?? soloOpts(c));
   };
 
-  const soloOpts = (c: Client): { skill: number; aiSeed: number; character: string; level: number } => {
+  /**
+   * The one level→skill ramp (house AI AND trained agents — ADR 0006 pins
+   * agent strength to its OWNER's level; only style is coachable).
+   *
+   * Floored at 40 instead of 3: meter decisions in ai.ts are (deliberately)
+   * skill-gated, because a novice agent that cashes out bars flattens the
+   * difficulty lever the whole CPU system rides on. The side effect was
+   * that LV1 faced skill 3, and a skill-3 agent measurably finishes a
+   * match sitting on 2857/3000 meter having thrown 2 supers — it hoards
+   * three bars and dies with them. 40 is the cheapest skill that actually
+   * spends meter (~20 supers / 14 matches, ~2269 leftover) and it only
+   * moves the bot's win rate against a weak opponent from 47% to ~57%.
+   *
+   * Only the FLOOR changed: level 17+ keeps exactly its old skill, so
+   * mid/high-level difficulty is untouched. Levels 1-16 now share skill 40
+   * (they were 3..40 — all "harmless" tiers, so little progression is lost
+   * and every one of them now uses its meter).
+   *
+   * Server-side only: skill rides in the `solo` setup message and the
+   * client obeys it, so this needs no ENGINE_VERSION bump.
+   */
+  const skillForLevel = (level: number): number =>
+    Math.max(40, Math.min(100, Math.round((level * 100) / 40)));
+
+  const soloOpts = (c: Client): SoloPin => {
     const level = c.account?.level ?? 1;
     return {
       level,
-      // Same level→skill ramp as before, but floored at 40 instead of 3.
-      //
-      // Why the floor moved: meter decisions in ai.ts are (deliberately)
-      // skill-gated, because a novice agent that cashes out bars flattens the
-      // difficulty lever the whole CPU system rides on. The side effect was
-      // that LV1 faced skill 3, and a skill-3 agent measurably finishes a
-      // match sitting on 2857/3000 meter having thrown 2 supers — it hoards
-      // three bars and dies with them. 40 is the cheapest skill that actually
-      // spends meter (~20 supers / 14 matches, ~2269 leftover) and it only
-      // moves the bot's win rate against a weak opponent from 47% to ~57%.
-      //
-      // Only the FLOOR changed: level 17+ keeps exactly its old skill, so
-      // mid/high-level difficulty is untouched. Levels 1-16 now share skill 40
-      // (they were 3..40 — all "harmless" tiers, so little progression is lost
-      // and every one of them now uses its meter).
-      //
-      // Server-side only: skill rides in the `solo` setup message and the
-      // client obeys it, so this needs no ENGINE_VERSION bump.
-      skill: Math.max(40, Math.min(100, Math.round((level * 100) / 40))),
+      skill: skillForLevel(level),
       character: characterIds[Math.floor(Math.random() * characterIds.length)]!,
+      aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
+    };
+  };
+
+  /**
+   * Resolve a dare/ref code to a pinned TRAINED-agent opponent (ADR 0006).
+   * Your own code works too — that's VS MY AGENT sparring. Returns a string
+   * error for the client when the code doesn't lead to a coached agent.
+   */
+  const trainedAgentPin = async (code: string): Promise<SoloPin | string> => {
+    if (!persistence) return 'trained agents need the online economy';
+    const owner = await persistence.findByRefCode(code);
+    if (!owner) return 'no fighter behind that code';
+    const info = await persistence.getAgent(owner.sub);
+    if (!info?.config) return `${owner.name} has not trained an agent yet`;
+    // Validated at PUT time, but the roster can shrink between then and now.
+    if (!characterIds.includes(info.config.character)) {
+      return `${owner.name}'s agent mains a retired fighter — they need to re-coach`;
+    }
+    return {
+      level: info.level,
+      skill: skillForLevel(info.level),
+      character: info.config.character,
+      // Style-only by construction: the knobs were clamped at PUT /agent
+      // time; clamp again here so a hand-edited DB row still can't smuggle
+      // out-of-range values into the pinned setup.
+      personality: clampPersonality(info.config.personality),
+      agentName: `${owner.name.toUpperCase()}'S AGENT · LV${info.level}`,
       aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
     };
   };
@@ -937,6 +1027,16 @@ export const createMatchServer = (opts: {
           if (persistence && (c.account?.credits ?? 0) < fee) {
             return send(c, { t: 'error', code: 'credits', msg: `${mode === 'solo' ? 'ranked' : 'wager'} match needs ${fee} credit${fee > 1 ? 's' : ''}` });
           }
+          // DARE-VS-AGENT / SPARRING (ADR 0006): solo, but the opponent is a
+          // TRAINED agent resolved from a dare code. Resolve BEFORE queueing
+          // so a bad code is a clean error, not a consumed fee.
+          if (mode === 'solo' && typeof msg.agentOf === 'string' && msg.agentOf.trim()) {
+            const pin = await trainedAgentPin(msg.agentOf.trim().slice(0, 40));
+            if (typeof pin === 'string') return send(c, { t: 'error', msg: pin });
+            c.state = 'queued';
+            send(c, { t: 'queued' });
+            return startSolo(c, pin);
+          }
           c.state = 'queued';
           send(c, { t: 'queued' });
           if (mode === 'solo') await startSolo(c);
@@ -988,7 +1088,7 @@ export const createMatchServer = (opts: {
           Array.from(a, (v) => (v === undefined ? null : v));
         send(c, {
           t: 'resumed', matchId: m.id, side, seed: m.seed, stage: m.stage,
-          delay: m.solo ? 0 : INPUT_DELAY,
+          delay: m.delay, // the PINNED pair-time delay — the ledger was scheduled with it
           chars: [
             { id: m.chars[0], hash: bundleOf(m.chars[0]).versionHash },
             { id: m.chars[1], hash: bundleOf(m.chars[1]).versionHash },
@@ -1040,6 +1140,19 @@ export const createMatchServer = (opts: {
         const m = c.match;
         if (!m || m.finished) return;
         if (m.hashes[c.side].size < 400) m.hashes[c.side].set(msg.k | 0, msg.x >>> 0);
+        return;
+      }
+      case 'ping': {
+        // Client-initiated RTT probe (connection-quality overlay): echo the
+        // client's clock back verbatim — we never interpret it.
+        return send(c, { t: 'pong', ts: Number(msg.ts) || 0 });
+      }
+      case 'pong': {
+        // Echo of OUR lobby ping — `ts` is our own Date.now() at send time.
+        // Bound the sample so a garbage/replayed ts can't poison the EMA.
+        const sample = Date.now() - Number(msg.ts);
+        if (!Number.isFinite(sample) || sample < 0 || sample > 60_000) return;
+        c.rtt = c.rtt < 0 ? sample : Math.round(c.rtt * 0.7 + sample * 0.3);
         return;
       }
       case 'over': {
@@ -1103,6 +1216,22 @@ export const createMatchServer = (opts: {
   sweepEscrow();
   const escrowSweep = setInterval(sweepEscrow, 60 * 60 * 1000);
   escrowSweep.unref?.();
+
+  /**
+   * Lobby RTT probe: ping every connected HUMAN who isn't mid-match, so
+   * that by pair time both sides carry a live RTT estimate for the
+   * adaptive input delay. Agents are skipped (headless, latency-blind,
+   * and third-party skills may not echo); playing clients are skipped
+   * (the delay is pinned at pair time — mid-match probing buys nothing).
+   * Old clients simply never answer → INPUT_DELAY fallback at pair time.
+   */
+  const pingSweep = setInterval(() => {
+    for (const c of clients) {
+      if (c.agent || c.state === 'playing') continue;
+      send(c, { t: 'ping', ts: Date.now() });
+    }
+  }, PING_INTERVAL_MS);
+  pingSweep.unref?.();
 
   const idleSweep = setInterval(() => {
     const now = Date.now();
@@ -1338,10 +1467,12 @@ export const createMatchServer = (opts: {
       })().catch((e) => json(res, 502, { error: String(e) }));
       return;
     }
+    let agentsOnline = 0;
+    for (const c of clients) if (c.agent) agentsOnline++;
     return json(res, 200, {
       game: 'agent-fighter', engine: ENGINE_VERSION, protocol: PROTOCOL_VERSION,
       characters: characterIds, stages: stageIds,
-      online: clients.size, queued: queue.length,
+      online: clients.size, agents: agentsOnline, queued: queue.length,
       persistence: !!persistence,
     });
   });
@@ -1358,6 +1489,7 @@ export const createMatchServer = (opts: {
       identityReady: Promise.resolve(),
       account: null,
       email: '',
+      rtt: -1,
     };
     clients.add(c);
     ws.on('message', (data) => onMessage(c, String(data)));
@@ -1371,7 +1503,7 @@ export const createMatchServer = (opts: {
       const port = typeof address === 'object' && address ? address.port : DEFAULT_PORT;
       resolve({
         port,
-        close: () => { clearInterval(idleSweep); clearInterval(escrowSweep); wss.close(); http.close(); },
+        close: () => { clearInterval(idleSweep); clearInterval(escrowSweep); clearInterval(pingSweep); wss.close(); http.close(); },
       });
     });
   });

@@ -217,6 +217,12 @@ export interface Persistence {
   /** Resolve a presented key hash to its owner. */
   findByAgentKey: (keyHash: string) => Promise<{ sub: string; name: string } | null>;
   /**
+   * Resolve a dare/ref code to its profile (dare-vs-agent, ADR 0006). Ref
+   * codes are public by design (they ride share links), so this leaks
+   * nothing new — the caller still only gets what GET /agents/roster shows.
+   */
+  findByRefCode: (code: string) => Promise<{ sub: string; name: string } | null>;
+  /**
    * Self-signup for AGENT-CLASS accounts (sub `agent:<uuid>`, Minds obj. 1):
    * economically INERT — created with 0 credits, never granted the daily,
    * never paid out (server enforces fee 0 / payout 0 by the sub prefix), so
@@ -495,6 +501,13 @@ export const memoryPersistence = (): Persistence => {
       }
       return null;
     },
+    findByRefCode: async (code) => {
+      const wanted = code.trim().toUpperCase();
+      for (const sub of profiles.keys()) {
+        if (refCodeOf(sub) === wanted) return { sub, name: names.get(sub)?.name ?? 'anon' };
+      }
+      return null;
+    },
     recentMatches: async (sub, limit) =>
       matchRows.filter((m) => m.p0 === sub || m.p1 === sub).slice(0, limit),
     createAgentAccount: async (sub, name, keyHash) => {
@@ -660,6 +673,16 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
       const rows = (await call('/rest/v1/rpc/find_by_agent_key', {
         method: 'POST', body: JSON.stringify({ _hash: keyHash }),
       })) as Array<Record<string, unknown>>;
+      const row = rows?.[0];
+      return row ? { sub: String(row.id), name: String(row.name ?? 'anon') } : null;
+    },
+    findByRefCode: async (code) => {
+      // Straight PostgREST read on the unique ref_code index (0005). The
+      // code is uppercased at generation time; normalize to match.
+      const rows = (await call(
+        `/rest/v1/profiles?ref_code=eq.${encodeURIComponent(code.trim().toUpperCase())}&select=id,name&limit=1`,
+        { method: 'GET' },
+      )) as Array<Record<string, unknown>>;
       const row = rows?.[0];
       return row ? { sub: String(row.id), name: String(row.name ?? 'anon') } : null;
     },

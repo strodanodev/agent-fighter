@@ -19,7 +19,7 @@ import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './a
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  currentStageCamLimits, drawGameOver, drawHud, drawInvite, drawLoading, drawNetError, drawOpponentGone,
+  currentStageCamLimits, drawAgent, drawGameOver, drawHud, drawInvite, drawLoading, drawNetError, drawOpponentGone,
   drawRanks, drawReconnecting, drawResults, drawSelect, drawStage, drawStageSelect, drawTitle,
   drawVsCard, drawWallet, resetTaps, setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit,
   tapHit, tapZone, worldTransform,
@@ -106,7 +106,7 @@ const tapAt = (clientX: number, clientY: number): void => {
 };
 
 // ---------------------------------------------------------------- state
-type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'gameover' | 'ranks' | 'invite';
+type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'gameover' | 'ranks' | 'invite' | 'agent';
 
 let screen: Screen = 'loading';
 let mode: Mode = 'cpu';
@@ -201,9 +201,19 @@ let pendingRoom = ''; // ?room= from a challenge link, waiting on sign-in
 // pick). This flag tells its lock handler which to queue — set true only for
 // the friendly path, reset false on every normal (wager/cpu) select entry.
 let selectingFriendly = false;
+// ---- Dare-vs-agent (ADR 0006): the dare can target the sender's TRAINED
+// AGENT instead of the sender live. Sender side: the invite toggle flips the
+// link to &agent=1. Accepter side: ?agent=1 + ?ref= deep-links into a solo
+// match vs the sender's coached config (server-pinned, verified — the sender
+// stays offline). Same in-memory-only stance as pendingRoom: it's a "fight
+// them NOW" intent, not a durable coupon.
+let dareVsAgent = false; // invite screen toggle state
+let pendingAgentOf = ''; // ?agent=1 dare code waiting on the sign-in gate
+let selectingAgentOf = ''; // select screen: lock queues solo vs this agent
+let queuedAgentOf = ''; // what the live/last online queue used (rematch)
 const currentTaunt = (): string => TAUNTS[tauntIdx]!;
 const dareLink = (): string =>
-  `${DARE_LINK_BASE}/${account?.refCode ?? ''}?t=${encodeURIComponent(currentTaunt())}`;
+  `${DARE_LINK_BASE}/${account?.refCode ?? ''}?t=${encodeURIComponent(currentTaunt())}${dareVsAgent ? '&agent=1' : ''}`;
 /** Coarse pointer ≈ phone/tablet → prefer the OS share sheet over clipboard. */
 const shareViaSheet = (): boolean =>
   typeof navigator.share === 'function' && matchMedia('(pointer: coarse)').matches;
@@ -215,7 +225,9 @@ const enterInvite = (from: 'title' | 'results'): void => {
 const shareDare = (): void => {
   if (!account?.refCode) return;
   const link = dareLink();
-  const text = `${currentTaunt()} — I DARE YOU TO BEAT ME. +25 credits if you can take one round.`;
+  const text = dareVsAgent
+    ? `${currentTaunt()} — MY AGENT FIGHTS FOR ME. Beat it and prove something. +25 credits when you sign in.`
+    : `${currentTaunt()} — I DARE YOU TO BEAT ME. +25 credits if you can take one round.`;
   const done = (): void => { inviteCopiedAge = 0; };
   const copyFallback = (): void => {
     void navigator.clipboard?.writeText(`${text}\n${link}`).then(done)
@@ -421,6 +433,74 @@ const fetchAccount = async (): Promise<void> => {
     accountFetch = 'fail'; // server offline — title shows it, local play still fine
   }
 };
+
+// ---- MY AGENT screen (ADR 0006): the in-game face of the coaching loop.
+// Read-only view of GET /agent + the two actions the game owns: minting the
+// coach key (POST /agent/key) and sparring vs your own agent (ranked solo
+// with agentOf = your ref code). Coaching itself stays in Minds by design.
+interface AgentScreenInfo {
+  name?: string; level?: number; xp?: number; wins?: number; losses?: number;
+  config?: AgentCoachConfig | null;
+  keyCreatedAt?: string | null;
+}
+let agentScreenFetch: 'idle' | 'busy' | 'done' | 'fail' = 'idle';
+let agentScreenInfo: AgentScreenInfo | null = null;
+let mintedKey = ''; // plaintext from POST /agent/key — shown once, never stored
+let mintBusy = false;
+let keyCopiedAge = -1; // ≥0 → the "copied" flash is animating
+
+const agentAuthHeaders = async (): Promise<Record<string, string> | null> => {
+  const headers: Record<string, string> = {};
+  const token = await authToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  else if (DEV_GUEST) headers['X-Dev-Name'] = DEV_GUEST;
+  else return null;
+  return headers;
+};
+
+const fetchAgentScreen = async (): Promise<void> => {
+  agentScreenFetch = 'busy';
+  try {
+    const headers = await agentAuthHeaders();
+    if (!headers) { agentScreenFetch = 'fail'; return; }
+    const res = await fetch(`${matchHttpUrl()}/agent`, { headers });
+    if (!res.ok) { agentScreenFetch = 'fail'; return; }
+    agentScreenInfo = (await res.json()) as AgentScreenInfo;
+    agentCfg = agentScreenInfo.config ?? null; // keep the AUTO gate in sync
+    agentScreenFetch = 'done';
+  } catch {
+    agentScreenFetch = 'fail';
+  }
+};
+
+const mintAgentKey = async (): Promise<void> => {
+  if (mintBusy) return;
+  mintBusy = true;
+  keyCopiedAge = -1;
+  try {
+    const headers = await agentAuthHeaders();
+    if (!headers) return;
+    const res = await fetch(`${matchHttpUrl()}/agent/key`, { method: 'POST', headers });
+    if (!res.ok) return;
+    const body = (await res.json()) as { key?: string };
+    if (body.key) {
+      mintedKey = body.key;
+      // The key's existence changes the screen copy — refresh the snapshot.
+      void fetchAgentScreen();
+    }
+  } catch { /* the screen keeps its MINT button — just tap again */
+  } finally {
+    mintBusy = false;
+  }
+};
+
+const enterAgentScreen = (): void => {
+  screen = 'agent';
+  mintedKey = '';
+  mintBusy = false;
+  keyCopiedAge = -1;
+  void fetchAgentScreen();
+};
 let uiTick = 0;
 let allRosters: Roster[] = [];
 let picks: [number, number] = [0, 0];
@@ -584,6 +664,13 @@ const applyBootDeepLink = (): void => {
     pendingRoom = roomQ.toUpperCase();
   }
 
+  // Dare-vs-agent (?agent=1 riding a ?ref= dare link): after the sign-in
+  // gate, the title auto-routes into a solo match vs the SENDER's trained
+  // agent. In-memory only — same "fight them now" stance as ?room=.
+  if (q.get('agent') === '1' && refQ && /^[A-Za-z0-9-]{3,40}$/.test(refQ)) {
+    pendingAgentOf = refQ.toUpperCase();
+  }
+
   if (modeQ === 'cpu' || modeQ === 'online' || modeQ === '2p') {
     mode = modeQ;
   }
@@ -651,11 +738,12 @@ const resetMatchFx = (g: GameState): void => {
  * 'friendly' = private challenge (v5): PvP paired by `friendlyRoom` instead
  *   of the public queue. FREE and UNRANKED — verified winner, nothing else.
  */
-const startOnline = (m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: string): void => {
+const startOnline = (m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: string, agentOf?: string): void => {
   const roster = allRosters[picks[0]]!;
   lastFighter = roster.id;
   localStorage.setItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
   queuedMode = m;
+  queuedAgentOf = m === 'solo' ? agentOf ?? '' : ''; // rematch re-queues the same agent
   practiceFree = false;
   netInstalled = false;
   screen = 'online';
@@ -667,12 +755,14 @@ const startOnline = (m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: str
     const email = auth.email || undefined; // AIR write-back target (ADR 0004)
     // Solo/arcade (v3/v4): pure LOCAL simulation of the pinned house AI —
     // zero added latency; the server re-derives the AI to verify. Wager and
-    // friendly: rollback PvP over the relay.
+    // friendly: rollback PvP over the relay. `agentOf` (ADR 0006) swaps the
+    // solo house AI for the trained agent behind a dare code.
     net = m === 'wager' || m === 'friendly'
       ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(),
         m === 'friendly' ? friendlyRoom : undefined)
       : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(),
-        m === 'arcade' ? { runToken } : undefined);
+        m === 'arcade' ? { runToken } : undefined,
+        m === 'solo' ? agentOf : undefined);
   });
 };
 
@@ -689,6 +779,24 @@ const startFriendly = (room: string): void => {
   locked = [false, false];
   // Cursor starts on the remembered fighter — one confirm away, but they CAN
   // move it now (the whole point of this screen).
+  let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
+  if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+  picks = [fe, fe];
+  void audio.playBgm('player_select', { fadeInSec: 0.5 });
+};
+
+/**
+ * Dare-vs-agent (ADR 0006): a ?agent=1 dare link → the CHARACTER SELECT
+ * screen, then locking queues a ranked-solo match whose opponent is the
+ * SENDER's trained agent (the server resolves the code and pins their
+ * coached config — the sender stays offline, the match still verifies).
+ */
+const startAgentDare = (code: string): void => {
+  selectingAgentOf = code.toUpperCase();
+  selectingFriendly = false;
+  mode = 'online';
+  screen = 'select';
+  locked = [false, false];
   let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
   if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
   picks = [fe, fe];
@@ -736,7 +844,9 @@ const installOnlineMatch = (): void => {
       "RANKED GAUNTLET · SERVER-VERIFIED · LOSE ONCE AND IT'S GAME OVER",
     ]
     : s.mode === 'solo'
-      ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP', 'RANKED · SERVER-VERIFIED']
+      ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP',
+        // Dare-vs-agent (ADR 0006): the pinned personality is the tell.
+        s.solo?.personality ? 'VS A COACHED AGENT · RANKED · SERVER-VERIFIED' : 'RANKED · SERVER-VERIFIED']
       : s.mode === 'friendly'
         ? ['FRIENDLY CHALLENGE      NO FEE · NO POT · NO RECORDS', 'BRAGGING RIGHTS ONLY · SERVER-VERIFIED']
         : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
@@ -1139,6 +1249,14 @@ const tickSelect = (): void => {
       selectingFriendly = false;
       screen = 'invite';
       return;
+    } else if (selectingAgentOf) {
+      // Backing out of a dare-vs-agent pick → title (the accepter arrived by
+      // link; there is no invite screen behind them). The dare stays declined
+      // until they follow the link again.
+      selectingAgentOf = '';
+      screen = 'title';
+      void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
+      return;
     } else {
       screen = 'title';
       void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
@@ -1188,7 +1306,10 @@ const tickSelect = (): void => {
     // ONLINE: the pick is the wager-queue ticket (server matchmakes + charges
     // the fee). ARCADE: the pick is sealed for the whole gauntlet — no
     // switching until the run ends — and queues the RANKED run (1 credit).
-    if (locked[0]) startOnline(selectingFriendly ? 'friendly' : mode === 'cpu' ? 'arcade' : 'wager');
+    if (locked[0]) {
+      if (selectingAgentOf) startOnline('solo', undefined, selectingAgentOf);
+      else startOnline(selectingFriendly ? 'friendly' : mode === 'cpu' ? 'arcade' : 'wager');
+    }
     return;
   }
   if (mode === '2p') {
@@ -1262,6 +1383,13 @@ const frame = (): void => {
       pendingRoom = '';
       startFriendly(room);
     }
+    // A dare-vs-agent link (?agent=1&ref=) routes the same way: clicking the
+    // link WAS the consent; the fighter pick is still theirs to make.
+    if (signedIn && accountFetch === 'done' && pendingAgentOf && !pendingRoom) {
+      const code = pendingAgentOf;
+      pendingAgentOf = '';
+      startAgentDare(code);
+    }
     drawTitle(ctx, allRosters, uiTick, {
       mode, cpuLevel: cpuLevelFor(profile, lever),
       authLabel: authName() ?? (DEV_GUEST ? `DEV·${DEV_GUEST.toUpperCase()}` : null),
@@ -1296,6 +1424,7 @@ const frame = (): void => {
       screen = 'select';
       locked = [false, false];
       selectingFriendly = false; // a title select is always wager (online) or arcade (cpu)
+      selectingAgentOf = ''; // …never a dare-vs-agent leftover
       // Cursor starts on the REMEMBERED fighter so select is one confirm away.
       let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
       if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
@@ -1338,6 +1467,10 @@ const frame = (): void => {
       // "I DARE YOU TO BEAT ME" — the full invite screen (poster, taunt,
       // shareable link). Both sides earn +25 credits when a friend accepts.
       enterInvite('title');
+    } else if (signedIn && (pressedThisFrame.has('KeyA') || taps.has('myagent'))) {
+      // MY AGENT (ADR 0006): view the coached config, mint the coach key,
+      // spar your own agent. Sign-in required — the agent IS the account.
+      enterAgentScreen();
     } else if (!signedIn) {
       // Gated: every other key/tap waits for the sign-in.
     } else if (tappedMode) {
@@ -1351,6 +1484,32 @@ const frame = (): void => {
       enterSelect();
     } else if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('start')) {
       launchMode();
+    }
+  } else if (screen === 'agent') {
+    if (keyCopiedAge >= 0 && ++keyCopiedAge > 300) keyCopiedAge = -1;
+    drawAgent(ctx, uiTick, {
+      status: agentScreenFetch,
+      name: agentScreenInfo?.name ?? authName() ?? undefined,
+      level: agentScreenInfo?.level,
+      wins: agentScreenInfo?.wins,
+      losses: agentScreenInfo?.losses,
+      config: agentScreenInfo?.config ?? null,
+      keyCreatedAt: agentScreenInfo?.keyCreatedAt ?? null,
+      roster: allRosters.find((r) => r.id === agentScreenInfo?.config?.character),
+      mintedKey: mintedKey || undefined,
+      mintBusy,
+      keyCopiedAge,
+      connectLabel: `${matchHttpUrl().replace(/^https?:\/\//, '')}/connect`,
+    });
+    const sparCode = agentScreenFetch === 'done' && agentScreenInfo?.config ? account?.refCode : undefined;
+    if (sparCode && (pressedThisFrame.has('KeyS') || taps.has('agent:spar'))) {
+      // Sparring IS dare-vs-agent aimed at yourself: ranked solo, your own
+      // ref code — the coach → spar → adjust feedback loop (ADR 0006).
+      startAgentDare(sparCode);
+    } else if (!mintBusy && (pressedThisFrame.has('KeyK') || taps.has('agent:mint'))) {
+      void mintAgentKey();
+    } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
+      screen = 'title';
     }
   } else if (screen === 'ranks') {
     drawRanks(ctx, ranksRows, ranksTab, ranksErr, uiTick,
@@ -1385,8 +1544,16 @@ const frame = (): void => {
       bountiesLeft: account
         ? Math.max(0, REFERRAL_WEEKLY_CAP - (account.daresPaidWeek ?? 0))
         : undefined,
+      agentReady: !!agentCfg,
+      vsAgent: dareVsAgent,
     });
-    if (pressedThisFrame.has('ArrowLeft') || pressedThisFrame.has('KeyA') || taps.has('taunt:prev')) {
+    if (agentCfg && (pressedThisFrame.has('KeyT') || taps.has('daretype:me') || taps.has('daretype:agent'))) {
+      // Dare target toggle (ADR 0006): T cycles; taps set directly.
+      dareVsAgent = taps.has('daretype:agent') ? true
+        : taps.has('daretype:me') ? false
+        : !dareVsAgent;
+      inviteCopiedAge = -1; // the link changed — re-arm the button
+    } else if (pressedThisFrame.has('ArrowLeft') || pressedThisFrame.has('KeyA') || taps.has('taunt:prev')) {
       tauntIdx = (tauntIdx + TAUNTS.length - 1) % TAUNTS.length;
       inviteCopiedAge = -1; // new taunt = new link — re-arm the button
     } else if (pressedThisFrame.has('ArrowRight') || pressedThisFrame.has('KeyD') || taps.has('taunt:next')) {
@@ -1615,6 +1782,26 @@ const frame = (): void => {
       drawOpponentGone(ctx, (oppGoneUntil - Date.now()) / 1000,
         net?.setup?.mode === 'friendly', uiTick);
     }
+    // Rollback throttle stall: the sim halted waiting on opponent inputs but
+    // their socket is still up (throttled tab, wifi hiccup, cross-region
+    // jitter). Without this chip the freeze reads as a crash. Yields to the
+    // reconnect/oppgone/dead overlays — those are the more urgent story.
+    // (Audit 2026-07-18 client finding 3.)
+    if (net instanceof NetSession && net.status === 'playing' && net.stalled > 20
+      && oppGoneUntil === null && !netReconnecting && !netDead && !net.result) {
+      const t = `⚠ CONNECTION — waiting for opponent… ${Math.floor(net.stalled / 60)}s`;
+      ctx.save();
+      ctx.font = 'bold 13px system-ui, sans-serif';
+      const w = ctx.measureText(t).width + 24;
+      ctx.fillStyle = uiTick % 60 < 45 ? '#101018cc' : '#10101888';
+      ctx.fillRect((VW - w) / 2, 86, w, 24);
+      ctx.strokeStyle = '#ffd166';
+      ctx.strokeRect((VW - w) / 2, 86, w, 24);
+      ctx.fillStyle = '#ffd166';
+      ctx.textAlign = 'center';
+      ctx.fillText(t, VW / 2, 103);
+      ctx.restore();
+    }
     if (netDead) {
       drawNetError(ctx, net!.error, queuedMode, uiTick);
       if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('back')) {
@@ -1791,10 +1978,12 @@ const frame = (): void => {
       } else if (net) {
         // INSTANT REMATCH (P0): one input → straight back into the queue
         // with the same fighter and mode. No select detour, no re-confirm.
+        // A dare-vs-agent solo rematches the SAME trained agent (run it back).
         const again = queuedMode;
+        const againAgent = queuedAgentOf || undefined;
         net.close();
         net = null;
-        startOnline(again);
+        startOnline(again, undefined, againAgent);
       } else {
         startFight();
       }
@@ -1857,9 +2046,28 @@ let perfFps = 60;
 let perfMs = 0;
 addEventListener('keydown', (e) => { if (e.code === 'KeyF') perfShow = !perfShow; });
 
+// Touch path to the same overlay (no keyboard on mobile): 3 quick taps in
+// the top-right corner of the canvas. Passive observer — game input never
+// routes through this, and the corner is dead HUD space during fights.
+let perfTaps = 0;
+let perfTapAt = 0;
+ctx.canvas.addEventListener('pointerdown', (e) => {
+  const r = ctx.canvas.getBoundingClientRect();
+  if (r.width === 0 || e.clientX - r.left < r.width * 0.85 || e.clientY - r.top > r.height * 0.15) return;
+  const now = performance.now();
+  perfTaps = now - perfTapAt < 600 ? perfTaps + 1 : 1;
+  perfTapAt = now;
+  if (perfTaps >= 3) { perfShow = !perfShow; perfTaps = 0; }
+});
+
 const drawPerf = (): void => {
   const stalled = net ? net.stalled : 0;
-  const txt = `${perfFps.toFixed(0)} FPS  ·  ${perfMs.toFixed(1)} ms/f${net ? `  ·  stall ${stalled}` : ''}`;
+  // ping = RTT to the relay (netplay only; solo sims locally and shows —).
+  // rb last/max = rollback re-sim depth — how hard prediction is working.
+  const netTxt = net
+    ? `  ·  ping ${net.rtt < 0 ? '—' : `${Math.round(net.rtt)}ms`}  ·  rb ${net.lastRollback}/${net.maxRollback}  ·  stall ${stalled}`
+    : '';
+  const txt = `${perfFps.toFixed(0)} FPS  ·  ${perfMs.toFixed(1)} ms/f${netTxt}`;
   ctx.save();
   ctx.font = 'bold 11px "Courier New", monospace';
   ctx.textAlign = 'right';
@@ -1913,6 +2121,7 @@ Object.assign(globalThis, {
   afNet: () => (net ? {
     status: net.status, error: net.error, setup: net.setup, result: net.result,
     stalled: net.stalled, side: net.side, oppGoneUntil: net.oppGoneUntil,
+    rtt: net.rtt, rollback: net.lastRollback, maxRollback: net.maxRollback, stallTotal: net.stallTotal,
     auto: net instanceof SoloSession ? net.auto : false,
     coached: !!agentCfg,
   } : null),
@@ -1934,6 +2143,15 @@ canvas.addEventListener('pointerdown', () => {
   if (screen === 'title' && !audioMenuOpen && taps.has('signin')) {
     toggleSignIn();
     taps.delete('signin');
+    return;
+  }
+  // MY AGENT: copying the freshly minted coach key is a clipboard write —
+  // same iOS user-activation rule as the share sheet (see block comment).
+  if (screen === 'agent' && taps.has('agent:copykey') && mintedKey) {
+    void navigator.clipboard?.writeText(mintedKey)
+      .then(() => { keyCopiedAge = 0; })
+      .catch(() => { window.prompt('COPY YOUR COACH KEY:', mintedKey); keyCopiedAge = 0; });
+    taps.delete('agent:copykey');
     return;
   }
   if (screen !== 'invite') return;

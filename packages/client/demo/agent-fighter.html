@@ -3208,9 +3208,11 @@ Object.assign(globalThis, {
  */
 // Protocol constants — must match packages/server/src/protocol.ts.
 const NET_PROTOCOL = 6;
-const MAX_AHEAD = 10;
+const MAX_AHEAD = 15;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
+/** Client-initiated RTT probe cadence (connection-quality overlay). */
+const PING_MS = 2_000;
 /** Resume retry policy: a handful of quick attempts inside the server's
  * FORFEIT_GRACE window (20s) — 6 × ~1.6s covers a router blip with room. */
 const RESUME_ATTEMPTS = 6;
@@ -3243,7 +3245,16 @@ class NetSession {
      * by `oppback` or the final `result`.
      */
     oppGoneUntil = null;
+    /** Measured round-trip to the relay in ms (EMA; -1 until the first pong). */
+    rtt = -1;
+    /** Depth (ticks) of the most recent rollback re-sim — connection telemetry. */
+    lastRollback = 0;
+    /** Deepest rollback this match — how hard prediction is working. */
+    maxRollback = 0;
+    /** Total ticks spent stalled this match (`stalled` is just the current run). */
+    stallTotal = 0;
     ws;
+    pingTimer = null;
     myInputs = [];
     oppInputs = [];
     usedOpp = [];
@@ -3283,6 +3294,9 @@ class NetSession {
                 this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode, room: this.room });
                 this.status = 'queued';
             }
+            // RTT probe loop (additive to protocol 6 — an old server just never
+            // answers). send() drops pings while the socket is closed/reconnecting.
+            this.startPing();
         };
         // A failed pre-match connection is fatal; mid-resume failures fall
         // through to onclose, which schedules the next attempt.
@@ -3302,6 +3316,7 @@ class NetSession {
      * leaving) or exhausted retries settle into 'error'.
      */
     onSocketClose() {
+        this.stopPing(); // a fresh loop starts on the next successful onopen
         if (this.intentionalClose || this.status === 'done' || this.status === 'error')
             return;
         const canResume = !!this.setup?.resume && !this.result;
@@ -3324,6 +3339,7 @@ class NetSession {
     }
     close() {
         this.intentionalClose = true;
+        this.stopPing();
         if (this.retryTimer) {
             clearTimeout(this.retryTimer);
             this.retryTimer = null;
@@ -3344,6 +3360,16 @@ class NetSession {
         }
         catch { /* already closed */ }
     }
+    startPing() {
+        this.stopPing();
+        this.pingTimer = setInterval(() => this.send({ t: 'ping', ts: Date.now() }), PING_MS);
+    }
+    stopPing() {
+        if (this.pingTimer) {
+            clearInterval(this.pingTimer);
+            this.pingTimer = null;
+        }
+    }
     send(msg) {
         if (this.ws.readyState === WebSocket.OPEN)
             this.ws.send(JSON.stringify(msg));
@@ -3354,7 +3380,21 @@ class NetSession {
             case 'error':
                 this.status = 'error';
                 this.error = String(msg.msg ?? 'server error');
+                this.stopPing();
                 return;
+            case 'ping':
+                // The server's lobby probe (sizes the adaptive input delay): echo
+                // its clock back verbatim.
+                this.send({ t: 'pong', ts: msg.ts });
+                return;
+            case 'pong': {
+                // Echo of OUR probe — sample = now minus the clock we sent.
+                const sample = Date.now() - Number(msg.ts);
+                if (Number.isFinite(sample) && sample >= 0 && sample < 60_000) {
+                    this.rtt = this.rtt < 0 ? sample : Math.round(this.rtt * 0.7 + sample * 0.3);
+                }
+                return;
+            }
             case 'account': {
                 this.account = {
                     credits: Number(msg.credits ?? 0),
@@ -3403,6 +3443,7 @@ class NetSession {
                 this.result = msg;
                 this.status = 'done';
                 this.oppGoneUntil = null;
+                this.stopPing();
                 return;
             }
             case 'xp': {
@@ -3494,6 +3535,9 @@ class NetSession {
         // Apply pending rollback before stepping forward.
         if (this.resimFrom >= 0 && this.resimFrom < this.localTick) {
             const from = this.resimFrom;
+            this.lastRollback = this.localTick - from;
+            if (this.lastRollback > this.maxRollback)
+                this.maxRollback = this.lastRollback;
             restore(this.game, this.snaps[from % SNAP_RING]);
             for (let t = from; t < this.localTick; t++) {
                 const opp = this.oppInputs[t] ?? this.lastKnownOpp();
@@ -3526,6 +3570,7 @@ class NetSession {
         // GGPO throttle: never simulate too far past the opponent's confirmed inputs.
         if (this.localTick - this.oppKnown > MAX_AHEAD) {
             this.stalled++;
+            this.stallTotal++;
             return false;
         }
         this.stalled = 0;
@@ -3571,6 +3616,7 @@ class SoloSession {
     email;
     ref;
     arcadeQueue;
+    agentOf;
     status = 'connecting';
     error = '';
     setup = null;
@@ -3580,6 +3626,11 @@ class SoloSession {
     game = null;
     stalled = 0; // never stalls — kept for the shared interface
     oppGoneUntil = null; // no peer socket — kept for the shared interface
+    // Local sim has no netplay telemetry — kept for the shared interface.
+    rtt = -1;
+    lastRollback = 0;
+    maxRollback = 0;
+    stallTotal = 0;
     ws;
     houseAi = null;
     /**
@@ -3602,7 +3653,13 @@ class SoloSession {
      * match. `runToken` (from the previous battle's setup.arcade.token)
      * continues an existing run; omitted = start a new run (entry fee).
      */
-    arcadeQueue) {
+    arcadeQueue, 
+    /**
+     * DARE-VS-AGENT / SPARRING (ADR 0006): fight the TRAINED agent behind
+     * this dare/ref code instead of the house AI (your own code = sparring).
+     * Solo mode only — ignored when arcadeQueue is set.
+     */
+    agentOf) {
         this.url = url;
         this.name = name;
         this.character = character;
@@ -3611,6 +3668,7 @@ class SoloSession {
         this.email = email;
         this.ref = ref;
         this.arcadeQueue = arcadeQueue;
+        this.agentOf = agentOf;
         this.connect(false);
     }
     connect(resume) {
@@ -3626,6 +3684,7 @@ class SoloSession {
                     t: 'queue', character: this.character, bundleHash: this.bundleHash,
                     mode: this.arcadeQueue ? 'arcade' : 'solo',
                     runToken: this.arcadeQueue?.runToken || undefined,
+                    agentOf: this.arcadeQueue ? undefined : this.agentOf || undefined,
                 });
                 this.status = 'queued';
             }
@@ -3694,7 +3753,7 @@ class SoloSession {
     rebuildFrom(s) {
         this.setup = s;
         this.game = createGameState(s.seed);
-        this.houseAi = createAi(1, s.solo.skill, s.solo.aiSeed);
+        this.houseAi = createAi(1, s.solo.skill, s.solo.aiSeed, s.solo.personality);
         const mine = s.inputs[0];
         let t = 0;
         while (t < mine.length && mine[t] !== null && this.game.phase !== 3 /* Phase.MatchOver */) {
@@ -3755,7 +3814,7 @@ class SoloSession {
     begin() {
         const s = this.setup;
         this.game = createGameState(s.seed);
-        this.houseAi = createAi(1, s.solo.skill, s.solo.aiSeed);
+        this.houseAi = createAi(1, s.solo.skill, s.solo.aiSeed, s.solo.personality);
         // Same throttled-tab race as NetSession.begin(): a result that landed
         // before the first frame must keep its terminal status.
         if (this.status !== 'done')
@@ -5943,6 +6002,7 @@ const drawTitle = (ctx, rosters, tick, menu) => {
         // Bottom action pills: every keyboard shortcut gets a real button — no
         // keyboard on a phone. Registered as generous ≥30px-tall tap targets.
         const pills = [
+            ['A · MY AGENT', 'myagent', '#8fd0ff'],
             ['R · RANKINGS', 'ranks', '#ffffffcc'],
             ['L · SIGN OUT', 'signin', '#ffffff99'],
         ];
@@ -6098,10 +6158,33 @@ const drawInvite = (ctx, tick, v) => {
     tapZone(cx + 254, ty - 28, 96, 52, 'taunt:next');
     label(ctx, `“${v.taunt}”`, cx, ty, v.taunt.length > 52 ? 12 : 15, '#ffe9a3');
     label(ctx, `TAUNT ${v.tauntIdx + 1}/${v.tauntCount}  ·  ◀ ▶  TO CHANGE`, cx, ty + 20, 11, '#ffffff77');
+    // ---- dare target toggle (ADR 0006): who the invitee actually fights —
+    // YOU live (friendly room / async referral) or your TRAINED AGENT (the
+    // link gains &agent=1 and the accepter fights your coached config via the
+    // verified solo pipeline while you're offline). Only drawn once a coach
+    // has saved a config; everyone else just sees the classic screen.
+    let ctaY = ty + 36;
+    if (v.agentReady) {
+        const tgY = ty + 32;
+        const half = 168, tgH = 26, tgX = cx - half;
+        const opts = [['THEY FIGHT ME', !v.vsAgent], ['THEY FIGHT MY AGENT', !!v.vsAgent]];
+        opts.forEach(([txt, on], k) => {
+            const x = tgX + k * half;
+            tapZone(x, tgY - 6, half, tgH + 12, k === 0 ? 'daretype:me' : 'daretype:agent');
+            ctx.fillStyle = on ? 'rgba(46,26,10,0.85)' : 'rgba(10,6,22,0.55)';
+            ctx.fillRect(x, tgY, half, tgH);
+            ctx.strokeStyle = on ? GOLD : 'rgba(255,255,255,0.2)';
+            ctx.lineWidth = on ? 2 : 1;
+            ctx.strokeRect(x + 0.5, tgY + 0.5, half - 1, tgH - 1);
+            label(ctx, `${on ? '◆' : '◇'} ${txt}`, x + half / 2, tgY + tgH / 2 + 4, 11, on ? GOLD_LT : '#ffffff77');
+        });
+        ctx.lineWidth = 1;
+        ctaY = tgY + tgH + 14;
+    }
     // ---- two CTAs side by side: async dare (copy/send link) + live challenge
     // (park in a room keyed by your code). On copy the left plate greys out
     // with a green ring; challenge stays armed — fight them right now.
-    const gap = 14, bh = 46, by = ty + 36;
+    const gap = 14, bh = 46, by = ctaY;
     const copyW = v.refCode ? 360 : 420;
     const chalW = 220;
     const rowW = v.refCode ? copyW + gap + chalW : copyW;
@@ -6842,6 +6925,154 @@ tab, error, tick, you) => {
         });
     }
     label(ctx, 'TAP  TAB       R  REFRESH       ESC / ‹ TITLE  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
+};
+/** Friendly labels for the six coachable knobs (core AI_PERSONALITY_RANGES). */
+const KNOB_LABELS = {
+    aggression: 'AGGRESSION',
+    jumpiness: 'JUMPINESS',
+    zoner: 'ZONING',
+    throwHappy: 'THROWS',
+    pushblocker: 'PUSHBLOCK',
+    patience: 'PATIENCE',
+};
+const drawAgent = (ctx, tick, v) => {
+    drawMenuBackdrop(ctx);
+    ctx.fillStyle = '#0a0616cc';
+    ctx.fillRect(0, 0, VW, VH);
+    const cx = VW / 2;
+    display(ctx, 'MY AGENT', cx, 58, 38, { glow: 'rgba(143,184,255,0.5)' });
+    label(ctx, 'IT FIGHTS FOR YOU · COACH IT BY CHATTING WITH A MIND · STATS ARE NEVER EDITABLE', cx, 84, 11, '#ffffff88');
+    // Escape hatch — same chip as ranks/select.
+    const backW = 110, backH = 34;
+    tapZone(VW - 16 - backW, 12, backW, backH, 'back');
+    ctx.fillStyle = 'rgba(10,6,22,0.6)';
+    ctx.fillRect(VW - 16 - backW, 12, backW, backH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(VW - 16 - backW + 0.5, 12.5, backW - 1, backH - 1);
+    ctx.lineWidth = 1;
+    label(ctx, '‹ TITLE', VW - 16 - backW / 2, 12 + backH / 2 + 4, 12, '#ffffffcc');
+    const pw = 720, ph = 210, px0 = cx - pw / 2, py0 = 102;
+    bevel(ctx, px0, py0, pw, ph, PANEL, GOLD, GOLD_DK, 3);
+    if (v.status === 'busy' || v.status === 'idle') {
+        const dots = '.'.repeat(1 + (Math.trunc(tick / 20) % 3));
+        label(ctx, `FETCHING YOUR AGENT${dots}`, cx, py0 + ph / 2, 15, '#f7e0a3');
+    }
+    else if (v.status === 'fail') {
+        label(ctx, '⚠ COULD NOT REACH THE MATCH SERVER', cx, py0 + ph / 2 - 10, 15, '#ff9d9d');
+        label(ctx, 'your agent lives server-side — try again once you are online', cx, py0 + ph / 2 + 16, 12, '#ffffff77');
+    }
+    else if (!v.config) {
+        // ---- untrained: the screen IS the onboarding funnel.
+        label(ctx, 'NO COACH CONNECTED YET', cx, py0 + 42, 16, GOLD_LT);
+        const steps = [
+            '1 · MINT YOUR COACH KEY BELOW (shown once — copy it)',
+            '2 · IN MINDS: ADD THE KEY UNDER “MY CONNECTIONS”',
+            '3 · ENABLE THE “AGENT FIGHTER COACH” SKILL FROM THE BAZAAR',
+            '4 · TELL YOUR MIND: “SET UP MY AGENT — AGGRESSIVE RUSHDOWN”',
+        ];
+        steps.forEach((s, i) => label(ctx, s, cx, py0 + 78 + i * 24, 12, '#ffffffbb'));
+        if (v.connectLabel) {
+            label(ctx, `NO MINDS ACCOUNT? THE SAME KEY MINTS AT  ${v.connectLabel}`, cx, py0 + ph - 22, 11, '#8fd0ff');
+        }
+    }
+    else {
+        // ---- trained: portrait + identity + record | the six coached knobs.
+        const cellX = px0 + 12, cellY = py0 + 12, cellW = 120, cellH = ph - 24;
+        ctx.save();
+        rrect(ctx, cellX, cellY, cellW, cellH, 6);
+        ctx.clip();
+        const foot = ctx.createRadialGradient(cellX + cellW / 2, cellY + cellH, 8, cellX + cellW / 2, cellY + cellH, cellH);
+        foot.addColorStop(0, 'rgba(93,184,255,0.22)');
+        foot.addColorStop(1, 'rgba(6,4,12,0.92)');
+        ctx.fillStyle = foot;
+        ctx.fillRect(cellX, cellY, cellW, cellH);
+        const img = v.roster?.portrait;
+        if (img?.naturalWidth) {
+            const fit = Math.min((cellW - 14) / img.naturalWidth, (cellH - 10) / img.naturalHeight);
+            const w = img.naturalWidth * fit, h = img.naturalHeight * fit;
+            ctx.imageSmoothingEnabled = false;
+            ctx.drawImage(img, cellX + cellW / 2 - w / 2, cellY + cellH - 5 - h, w, h);
+        }
+        else {
+            label(ctx, '?', cellX + cellW / 2, cellY + cellH / 2 + 14, 40, '#ffffff33');
+        }
+        ctx.restore();
+        ctx.strokeStyle = 'rgba(93,184,255,0.55)';
+        ctx.lineWidth = 1.5;
+        rrect(ctx, cellX, cellY, cellW, cellH, 6);
+        ctx.stroke();
+        const tx = px0 + 150;
+        const owner = (v.name ?? 'FIGHTER').toUpperCase();
+        display(ctx, `${owner}'S AGENT`, tx, py0 + 40, owner.length > 10 ? 17 : 21, { align: 'left' });
+        label(ctx, `MAINS ${(v.roster?.bundle.name ?? v.config.character ?? '?').toUpperCase()}`, tx, py0 + 64, 13, '#8fd0ff', 'left');
+        if (v.config.motto) {
+            label(ctx, `“${v.config.motto.slice(0, 40)}”`, tx, py0 + 88, 11, '#ffe9a3', 'left');
+        }
+        label(ctx, `LV ${v.level ?? 1}    ·    ${v.wins ?? 0}W — ${v.losses ?? 0}L  (YOUR RECORD — THE AGENT PLAYS AT YOUR STRENGTH)`, tx, py0 + (v.config.motto ? 112 : 92), 10, '#ffd166', 'left');
+        label(ctx, v.keyCreatedAt
+            ? `COACH KEY ACTIVE SINCE ${v.keyCreatedAt.slice(0, 10)}`
+            : 'NO COACH KEY YET — MINT ONE BELOW', tx, py0 + ph - 20, 10, v.keyCreatedAt ? '#8fe8a0' : '#ff9db0', 'left');
+        // Right column: the coached style, normalized inside each knob's legal
+        // range — the bars visualize what the coach last saved, nothing more.
+        ctx.fillStyle = 'rgba(217,164,65,0.22)';
+        ctx.fillRect(px0 + 432, py0 + 14, 1, ph - 28);
+        const sx = px0 + 452, sw = pw - 452 - 18;
+        label(ctx, 'COACHED STYLE', sx, py0 + 26, 10, '#c8b98a', 'left');
+        Object.entries(AI_PERSONALITY_RANGES).forEach(([key, [lo, hi]], i) => {
+            const y = py0 + 44 + i * 27;
+            const raw = v.config?.personality?.[key];
+            const t = raw === undefined ? 0.5 : Math.max(0, Math.min(1, (raw - lo) / (hi - lo)));
+            label(ctx, KNOB_LABELS[key] ?? key.toUpperCase(), sx, y + 9, 10, '#ffffff99', 'left');
+            const bx = sx + 92, bw = sw - 92;
+            ctx.fillStyle = 'rgba(255,255,255,0.10)';
+            ctx.fillRect(bx, y, bw, 12);
+            ctx.fillStyle = raw === undefined ? 'rgba(255,255,255,0.25)' : '#e8a24a';
+            ctx.fillRect(bx, y, Math.max(3, bw * t), 12);
+            ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(bx + 0.5, y + 0.5, bw - 1, 11);
+        });
+    }
+    // ---- fresh key reveal (mint response, shown exactly once).
+    const kb = py0 + ph + 14;
+    if (v.mintedKey) {
+        const kw = 620, kx = cx - kw / 2, kh = 54;
+        bevel(ctx, kx, kb, kw, kh, '#101a12', '#7ee85a', '#123018', 3);
+        label(ctx, 'YOUR COACH KEY — COPY IT NOW, IT IS NEVER SHOWN AGAIN', cx, kb + 18, 11, '#8fe8a0');
+        const copied = (v.keyCopiedAge ?? -1) >= 0;
+        label(ctx, copied ? '✓ COPIED — PASTE IT INTO MINDS › MY CONNECTIONS' : v.mintedKey, cx, kb + 40, copied ? 13 : v.mintedKey.length > 44 ? 12 : 14, copied ? '#8fe8a0' : '#eafff0');
+        tapZone(kx, kb, kw, kh, 'agent:copykey');
+    }
+    // ---- CTA row: spar (the training feedback loop) + mint/rotate.
+    const bh = 46, by = v.mintedKey ? kb + 68 : kb + 10;
+    const canSpar = v.status === 'done' && !!v.config;
+    const sparW = 300, mintW = 300, gap = 16;
+    const rowX = cx - (sparW + gap + mintW) / 2;
+    if (canSpar) {
+        const pulse = 1 + 0.03 * Math.sin(tick / 8);
+        bevel(ctx, rowX, by, sparW, bh, '#2a1a08', GOLD, GOLD_DK, 3);
+        display(ctx, '⚔ SPAR MY AGENT · 1 CR', rowX + sparW / 2, by + 31, 17, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+    }
+    else {
+        bevel(ctx, rowX, by, sparW, bh, '#191a20', '#3f414c', '#101116', 3);
+        label(ctx, 'SPAR MY AGENT (COACH FIRST)', rowX + sparW / 2, by + 29, 13, '#ffffff55');
+    }
+    tapZone(rowX, by, sparW, bh, 'agent:spar');
+    const mx = rowX + sparW + gap;
+    if (v.mintBusy) {
+        bevel(ctx, mx, by, mintW, bh, '#191a20', '#3f414c', '#101116', 3);
+        label(ctx, 'MINTING…', mx + mintW / 2, by + 29, 13, '#ffffff88');
+    }
+    else {
+        bevel(ctx, mx, by, mintW, bh, '#0e2438', '#5db8ff', '#163a5a', 3);
+        display(ctx, v.keyCreatedAt || v.mintedKey ? '↻ ROTATE COACH KEY' : '🔑 MINT COACH KEY', mx + mintW / 2, by + 31, 16, { from: '#eaf6ff', mid: '#8fd0ff', to: '#3a7ab0', outline: '#0a1a2a' });
+    }
+    tapZone(mx, by, mintW, bh, 'agent:mint');
+    if (v.keyCreatedAt && !v.mintedKey) {
+        label(ctx, 'ROTATING INVALIDATES THE OLD KEY — YOUR MIND NEEDS THE NEW ONE', cx, by + bh + 16, 10, '#ffffff66');
+    }
+    label(ctx, 'S  SPAR       K  MINT KEY       V IN-MATCH  HANDS-FREE AUTO       ESC / ‹ TITLE  BACK', cx, VH - 14, 11, '#ffffff99');
 };
 const drawWallet = (ctx, w, delta) => {
     if (!w)
@@ -7977,8 +8208,18 @@ let pendingRoom = ''; // ?room= from a challenge link, waiting on sign-in
 // pick). This flag tells its lock handler which to queue — set true only for
 // the friendly path, reset false on every normal (wager/cpu) select entry.
 let selectingFriendly = false;
+// ---- Dare-vs-agent (ADR 0006): the dare can target the sender's TRAINED
+// AGENT instead of the sender live. Sender side: the invite toggle flips the
+// link to &agent=1. Accepter side: ?agent=1 + ?ref= deep-links into a solo
+// match vs the sender's coached config (server-pinned, verified — the sender
+// stays offline). Same in-memory-only stance as pendingRoom: it's a "fight
+// them NOW" intent, not a durable coupon.
+let dareVsAgent = false; // invite screen toggle state
+let pendingAgentOf = ''; // ?agent=1 dare code waiting on the sign-in gate
+let selectingAgentOf = ''; // select screen: lock queues solo vs this agent
+let queuedAgentOf = ''; // what the live/last online queue used (rematch)
 const currentTaunt = () => TAUNTS[tauntIdx];
-const dareLink = () => `${DARE_LINK_BASE}/${account?.refCode ?? ''}?t=${encodeURIComponent(currentTaunt())}`;
+const dareLink = () => `${DARE_LINK_BASE}/${account?.refCode ?? ''}?t=${encodeURIComponent(currentTaunt())}${dareVsAgent ? '&agent=1' : ''}`;
 /** Coarse pointer ≈ phone/tablet → prefer the OS share sheet over clipboard. */
 const shareViaSheet = () => typeof navigator.share === 'function' && matchMedia('(pointer: coarse)').matches;
 const enterInvite = (from) => {
@@ -7990,7 +8231,9 @@ const shareDare = () => {
     if (!account?.refCode)
         return;
     const link = dareLink();
-    const text = `${currentTaunt()} — I DARE YOU TO BEAT ME. +25 credits if you can take one round.`;
+    const text = dareVsAgent
+        ? `${currentTaunt()} — MY AGENT FIGHTS FOR ME. Beat it and prove something. +25 credits when you sign in.`
+        : `${currentTaunt()} — I DARE YOU TO BEAT ME. +25 credits if you can take one round.`;
     const done = () => { inviteCopiedAge = 0; };
     const copyFallback = () => {
         void navigator.clipboard?.writeText(`${text}\n${link}`).then(done)
@@ -8196,6 +8439,75 @@ const fetchAccount = async () => {
         accountFetch = 'fail'; // server offline — title shows it, local play still fine
     }
 };
+let agentScreenFetch = 'idle';
+let agentScreenInfo = null;
+let mintedKey = ''; // plaintext from POST /agent/key — shown once, never stored
+let mintBusy = false;
+let keyCopiedAge = -1; // ≥0 → the "copied" flash is animating
+const agentAuthHeaders = async () => {
+    const headers = {};
+    const token = await authToken();
+    if (token)
+        headers.Authorization = `Bearer ${token}`;
+    else if (DEV_GUEST)
+        headers['X-Dev-Name'] = DEV_GUEST;
+    else
+        return null;
+    return headers;
+};
+const fetchAgentScreen = async () => {
+    agentScreenFetch = 'busy';
+    try {
+        const headers = await agentAuthHeaders();
+        if (!headers) {
+            agentScreenFetch = 'fail';
+            return;
+        }
+        const res = await fetch(`${matchHttpUrl()}/agent`, { headers });
+        if (!res.ok) {
+            agentScreenFetch = 'fail';
+            return;
+        }
+        agentScreenInfo = (await res.json());
+        agentCfg = agentScreenInfo.config ?? null; // keep the AUTO gate in sync
+        agentScreenFetch = 'done';
+    }
+    catch {
+        agentScreenFetch = 'fail';
+    }
+};
+const mintAgentKey = async () => {
+    if (mintBusy)
+        return;
+    mintBusy = true;
+    keyCopiedAge = -1;
+    try {
+        const headers = await agentAuthHeaders();
+        if (!headers)
+            return;
+        const res = await fetch(`${matchHttpUrl()}/agent/key`, { method: 'POST', headers });
+        if (!res.ok)
+            return;
+        const body = (await res.json());
+        if (body.key) {
+            mintedKey = body.key;
+            // The key's existence changes the screen copy — refresh the snapshot.
+            void fetchAgentScreen();
+        }
+    }
+    catch { /* the screen keeps its MINT button — just tap again */
+    }
+    finally {
+        mintBusy = false;
+    }
+};
+const enterAgentScreen = () => {
+    screen = 'agent';
+    mintedKey = '';
+    mintBusy = false;
+    keyCopiedAge = -1;
+    void fetchAgentScreen();
+};
 let uiTick = 0;
 let allRosters = [];
 let picks = [0, 0];
@@ -8331,6 +8643,12 @@ const applyBootDeepLink = () => {
     if (roomQ && /^[A-Za-z0-9-]{3,40}$/.test(roomQ)) {
         pendingRoom = roomQ.toUpperCase();
     }
+    // Dare-vs-agent (?agent=1 riding a ?ref= dare link): after the sign-in
+    // gate, the title auto-routes into a solo match vs the SENDER's trained
+    // agent. In-memory only — same "fight them now" stance as ?room=.
+    if (q.get('agent') === '1' && refQ && /^[A-Za-z0-9-]{3,40}$/.test(refQ)) {
+        pendingAgentOf = refQ.toUpperCase();
+    }
     if (modeQ === 'cpu' || modeQ === 'online' || modeQ === '2p') {
         mode = modeQ;
     }
@@ -8396,11 +8714,12 @@ const resetMatchFx = (g) => {
  * 'friendly' = private challenge (v5): PvP paired by `friendlyRoom` instead
  *   of the public queue. FREE and UNRANKED — verified winner, nothing else.
  */
-const startOnline = (m, runToken) => {
+const startOnline = (m, runToken, agentOf) => {
     const roster = allRosters[picks[0]];
     lastFighter = roster.id;
     localStorage.setItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
     queuedMode = m;
+    queuedAgentOf = m === 'solo' ? agentOf ?? '' : ''; // rematch re-queues the same agent
     practiceFree = false;
     netInstalled = false;
     screen = 'online';
@@ -8413,10 +8732,11 @@ const startOnline = (m, runToken) => {
         const email = auth.email || undefined; // AIR write-back target (ADR 0004)
         // Solo/arcade (v3/v4): pure LOCAL simulation of the pinned house AI —
         // zero added latency; the server re-derives the AI to verify. Wager and
-        // friendly: rollback PvP over the relay.
+        // friendly: rollback PvP over the relay. `agentOf` (ADR 0006) swaps the
+        // solo house AI for the trained agent behind a dare code.
         net = m === 'wager' || m === 'friendly'
             ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(), m === 'friendly' ? friendlyRoom : undefined)
-            : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(), m === 'arcade' ? { runToken } : undefined);
+            : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(), m === 'arcade' ? { runToken } : undefined, m === 'solo' ? agentOf : undefined);
     });
 };
 /**
@@ -8432,6 +8752,24 @@ const startFriendly = (room) => {
     locked = [false, false];
     // Cursor starts on the remembered fighter — one confirm away, but they CAN
     // move it now (the whole point of this screen).
+    let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
+    if (fe < 0)
+        fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+    picks = [fe, fe];
+    void audio.playBgm('player_select', { fadeInSec: 0.5 });
+};
+/**
+ * Dare-vs-agent (ADR 0006): a ?agent=1 dare link → the CHARACTER SELECT
+ * screen, then locking queues a ranked-solo match whose opponent is the
+ * SENDER's trained agent (the server resolves the code and pins their
+ * coached config — the sender stays offline, the match still verifies).
+ */
+const startAgentDare = (code) => {
+    selectingAgentOf = code.toUpperCase();
+    selectingFriendly = false;
+    mode = 'online';
+    screen = 'select';
+    locked = [false, false];
     let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
     if (fe < 0)
         fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
@@ -8480,7 +8818,9 @@ const installOnlineMatch = () => {
             "RANKED GAUNTLET · SERVER-VERIFIED · LOSE ONCE AND IT'S GAME OVER",
         ]
         : s.mode === 'solo'
-            ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP', 'RANKED · SERVER-VERIFIED']
+            ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP',
+                // Dare-vs-agent (ADR 0006): the pinned personality is the tell.
+                s.solo?.personality ? 'VS A COACHED AGENT · RANKED · SERVER-VERIFIED' : 'RANKED · SERVER-VERIFIED']
             : s.mode === 'friendly'
                 ? ['FRIENDLY CHALLENGE      NO FEE · NO POT · NO RECORDS', 'BRAGGING RIGHTS ONLY · SERVER-VERIFIED']
                 : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
@@ -8870,6 +9210,15 @@ const tickSelect = () => {
             screen = 'invite';
             return;
         }
+        else if (selectingAgentOf) {
+            // Backing out of a dare-vs-agent pick → title (the accepter arrived by
+            // link; there is no invite screen behind them). The dare stays declined
+            // until they follow the link again.
+            selectingAgentOf = '';
+            screen = 'title';
+            void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
+            return;
+        }
         else {
             screen = 'title';
             void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
@@ -8935,8 +9284,12 @@ const tickSelect = () => {
         // ONLINE: the pick is the wager-queue ticket (server matchmakes + charges
         // the fee). ARCADE: the pick is sealed for the whole gauntlet — no
         // switching until the run ends — and queues the RANKED run (1 credit).
-        if (locked[0])
-            startOnline(selectingFriendly ? 'friendly' : mode === 'cpu' ? 'arcade' : 'wager');
+        if (locked[0]) {
+            if (selectingAgentOf)
+                startOnline('solo', undefined, selectingAgentOf);
+            else
+                startOnline(selectingFriendly ? 'friendly' : mode === 'cpu' ? 'arcade' : 'wager');
+        }
         return;
     }
     if (mode === '2p') {
@@ -9030,6 +9383,13 @@ const frame = () => {
             pendingRoom = '';
             startFriendly(room);
         }
+        // A dare-vs-agent link (?agent=1&ref=) routes the same way: clicking the
+        // link WAS the consent; the fighter pick is still theirs to make.
+        if (signedIn && accountFetch === 'done' && pendingAgentOf && !pendingRoom) {
+            const code = pendingAgentOf;
+            pendingAgentOf = '';
+            startAgentDare(code);
+        }
         drawTitle(ctx, allRosters, uiTick, {
             mode, cpuLevel: cpuLevelFor(profile, lever),
             authLabel: authName() ?? (DEV_GUEST ? `DEV·${DEV_GUEST.toUpperCase()}` : null),
@@ -9064,6 +9424,7 @@ const frame = () => {
             screen = 'select';
             locked = [false, false];
             selectingFriendly = false; // a title select is always wager (online) or arcade (cpu)
+            selectingAgentOf = ''; // …never a dare-vs-agent leftover
             // Cursor starts on the REMEMBERED fighter so select is one confirm away.
             let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
             if (fe < 0)
@@ -9114,6 +9475,11 @@ const frame = () => {
             // shareable link). Both sides earn +25 credits when a friend accepts.
             enterInvite('title');
         }
+        else if (signedIn && (pressedThisFrame.has('KeyA') || taps.has('myagent'))) {
+            // MY AGENT (ADR 0006): view the coached config, mint the coach key,
+            // spar your own agent. Sign-in required — the agent IS the account.
+            enterAgentScreen();
+        }
         else if (!signedIn) {
             // Gated: every other key/tap waits for the sign-in.
         }
@@ -9132,6 +9498,36 @@ const frame = () => {
         }
         else if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('start')) {
             launchMode();
+        }
+    }
+    else if (screen === 'agent') {
+        if (keyCopiedAge >= 0 && ++keyCopiedAge > 300)
+            keyCopiedAge = -1;
+        drawAgent(ctx, uiTick, {
+            status: agentScreenFetch,
+            name: agentScreenInfo?.name ?? authName() ?? undefined,
+            level: agentScreenInfo?.level,
+            wins: agentScreenInfo?.wins,
+            losses: agentScreenInfo?.losses,
+            config: agentScreenInfo?.config ?? null,
+            keyCreatedAt: agentScreenInfo?.keyCreatedAt ?? null,
+            roster: allRosters.find((r) => r.id === agentScreenInfo?.config?.character),
+            mintedKey: mintedKey || undefined,
+            mintBusy,
+            keyCopiedAge,
+            connectLabel: `${matchHttpUrl().replace(/^https?:\/\//, '')}/connect`,
+        });
+        const sparCode = agentScreenFetch === 'done' && agentScreenInfo?.config ? account?.refCode : undefined;
+        if (sparCode && (pressedThisFrame.has('KeyS') || taps.has('agent:spar'))) {
+            // Sparring IS dare-vs-agent aimed at yourself: ranked solo, your own
+            // ref code — the coach → spar → adjust feedback loop (ADR 0006).
+            startAgentDare(sparCode);
+        }
+        else if (!mintBusy && (pressedThisFrame.has('KeyK') || taps.has('agent:mint'))) {
+            void mintAgentKey();
+        }
+        else if (pressedThisFrame.has('Escape') || taps.has('back')) {
+            screen = 'title';
         }
     }
     else if (screen === 'ranks') {
@@ -9172,8 +9568,17 @@ const frame = () => {
             bountiesLeft: account
                 ? Math.max(0, REFERRAL_WEEKLY_CAP - (account.daresPaidWeek ?? 0))
                 : undefined,
+            agentReady: !!agentCfg,
+            vsAgent: dareVsAgent,
         });
-        if (pressedThisFrame.has('ArrowLeft') || pressedThisFrame.has('KeyA') || taps.has('taunt:prev')) {
+        if (agentCfg && (pressedThisFrame.has('KeyT') || taps.has('daretype:me') || taps.has('daretype:agent'))) {
+            // Dare target toggle (ADR 0006): T cycles; taps set directly.
+            dareVsAgent = taps.has('daretype:agent') ? true
+                : taps.has('daretype:me') ? false
+                    : !dareVsAgent;
+            inviteCopiedAge = -1; // the link changed — re-arm the button
+        }
+        else if (pressedThisFrame.has('ArrowLeft') || pressedThisFrame.has('KeyA') || taps.has('taunt:prev')) {
             tauntIdx = (tauntIdx + TAUNTS.length - 1) % TAUNTS.length;
             inviteCopiedAge = -1; // new taunt = new link — re-arm the button
         }
@@ -9420,6 +9825,26 @@ const frame = () => {
         if (oppGoneUntil !== null && !netReconnecting && !netDead && !net?.result) {
             drawOpponentGone(ctx, (oppGoneUntil - Date.now()) / 1000, net?.setup?.mode === 'friendly', uiTick);
         }
+        // Rollback throttle stall: the sim halted waiting on opponent inputs but
+        // their socket is still up (throttled tab, wifi hiccup, cross-region
+        // jitter). Without this chip the freeze reads as a crash. Yields to the
+        // reconnect/oppgone/dead overlays — those are the more urgent story.
+        // (Audit 2026-07-18 client finding 3.)
+        if (net instanceof NetSession && net.status === 'playing' && net.stalled > 20
+            && oppGoneUntil === null && !netReconnecting && !netDead && !net.result) {
+            const t = `⚠ CONNECTION — waiting for opponent… ${Math.floor(net.stalled / 60)}s`;
+            ctx.save();
+            ctx.font = 'bold 13px system-ui, sans-serif';
+            const w = ctx.measureText(t).width + 24;
+            ctx.fillStyle = uiTick % 60 < 45 ? '#101018cc' : '#10101888';
+            ctx.fillRect((VW - w) / 2, 86, w, 24);
+            ctx.strokeStyle = '#ffd166';
+            ctx.strokeRect((VW - w) / 2, 86, w, 24);
+            ctx.fillStyle = '#ffd166';
+            ctx.textAlign = 'center';
+            ctx.fillText(t, VW / 2, 103);
+            ctx.restore();
+        }
         if (netDead) {
             drawNetError(ctx, net.error, queuedMode, uiTick);
             if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('back')) {
@@ -9608,10 +10033,12 @@ const frame = () => {
             else if (net) {
                 // INSTANT REMATCH (P0): one input → straight back into the queue
                 // with the same fighter and mode. No select detour, no re-confirm.
+                // A dare-vs-agent solo rematches the SAME trained agent (run it back).
                 const again = queuedMode;
+                const againAgent = queuedAgentOf || undefined;
                 net.close();
                 net = null;
-                startOnline(again);
+                startOnline(again, undefined, againAgent);
             }
             else {
                 startFight();
@@ -9674,9 +10101,31 @@ let perfFps = 60;
 let perfMs = 0;
 addEventListener('keydown', (e) => { if (e.code === 'KeyF')
     perfShow = !perfShow; });
+// Touch path to the same overlay (no keyboard on mobile): 3 quick taps in
+// the top-right corner of the canvas. Passive observer — game input never
+// routes through this, and the corner is dead HUD space during fights.
+let perfTaps = 0;
+let perfTapAt = 0;
+ctx.canvas.addEventListener('pointerdown', (e) => {
+    const r = ctx.canvas.getBoundingClientRect();
+    if (r.width === 0 || e.clientX - r.left < r.width * 0.85 || e.clientY - r.top > r.height * 0.15)
+        return;
+    const now = performance.now();
+    perfTaps = now - perfTapAt < 600 ? perfTaps + 1 : 1;
+    perfTapAt = now;
+    if (perfTaps >= 3) {
+        perfShow = !perfShow;
+        perfTaps = 0;
+    }
+});
 const drawPerf = () => {
     const stalled = net ? net.stalled : 0;
-    const txt = `${perfFps.toFixed(0)} FPS  ·  ${perfMs.toFixed(1)} ms/f${net ? `  ·  stall ${stalled}` : ''}`;
+    // ping = RTT to the relay (netplay only; solo sims locally and shows —).
+    // rb last/max = rollback re-sim depth — how hard prediction is working.
+    const netTxt = net
+        ? `  ·  ping ${net.rtt < 0 ? '—' : `${Math.round(net.rtt)}ms`}  ·  rb ${net.lastRollback}/${net.maxRollback}  ·  stall ${stalled}`
+        : '';
+    const txt = `${perfFps.toFixed(0)} FPS  ·  ${perfMs.toFixed(1)} ms/f${netTxt}`;
     ctx.save();
     ctx.font = 'bold 11px "Courier New", monospace';
     ctx.textAlign = 'right';
@@ -9732,6 +10181,7 @@ Object.assign(globalThis, {
     afNet: () => (net ? {
         status: net.status, error: net.error, setup: net.setup, result: net.result,
         stalled: net.stalled, side: net.side, oppGoneUntil: net.oppGoneUntil,
+        rtt: net.rtt, rollback: net.lastRollback, maxRollback: net.maxRollback, stallTotal: net.stallTotal,
         auto: net instanceof SoloSession ? net.auto : false,
         coached: !!agentCfg,
     } : null),
@@ -9752,6 +10202,15 @@ canvas.addEventListener('pointerdown', () => {
     if (screen === 'title' && !audioMenuOpen && taps.has('signin')) {
         toggleSignIn();
         taps.delete('signin');
+        return;
+    }
+    // MY AGENT: copying the freshly minted coach key is a clipboard write —
+    // same iOS user-activation rule as the share sheet (see block comment).
+    if (screen === 'agent' && taps.has('agent:copykey') && mintedKey) {
+        void navigator.clipboard?.writeText(mintedKey)
+            .then(() => { keyCopiedAge = 0; })
+            .catch(() => { window.prompt('COPY YOUR COACH KEY:', mintedKey); keyCopiedAge = 0; });
+        taps.delete('agent:copykey');
         return;
     }
     if (screen !== 'invite')

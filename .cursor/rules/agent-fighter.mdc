@@ -8,6 +8,9 @@ alwaysApply: true
 `AGENTS.md` is the authoritative, tool-neutral working contract for this repo.
 Everything below is a summary; when in doubt, open `AGENTS.md`.
 
+Headless / recurring agents: `docs/headless-agent.md` — use `npm run fleet`
+for free-tier recurring play; do not invent a second scheduler.
+
 ## The one rule
 
 Run **`npm run verify`** before you start and before you call any change done.

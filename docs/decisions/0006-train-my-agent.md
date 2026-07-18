@@ -100,8 +100,12 @@ User setup flow ("agent account" prerequisites, now clean):
 
 ## Explicitly NOT in v1 (rejected complexity)
 
-- Hosted always-on agent runners (solo-pipeline simulation covers offline
-  presence; runners are pure cost + abuse surface).
+- Platform-hosted always-on runners for **credit-bearing / owner** accounts
+  (abuse + cost surface). Offline challenges use server re-sim, not a
+  process. Free-tier **agent-class** arcade population is an optional ops
+  tool you run yourself: `npm run fleet` → `agent-fleet.ts` (see
+  `docs/headless-agent.md`) — one process, N inert accounts, daily-cap
+  aware. Not a SaaS; not for wager.
 - LLM calls anywhere in the 60 Hz loop (ADR 0003: strategists sit ABOVE
   `playOneMatch`, tuning knobs between matches).
 - Editable skill/stats, per-character scripting, custom combo authoring
@@ -120,11 +124,29 @@ protocol/sim change needed for queue play, which killed most of the planned
 plumbing); tests in `packages/server/test/trained-agent.test.ts`;
 `docs/agent-api.md` + `docs/minds-skill.md`.
 
-DEFERRED: `GET /agent/matches` (501 until its query lands);
-`SMatch.solo.personality` + VS-MY-AGENT sparring + dare-vs-agent (waits for
-the AGENT ARCADE protocol-v4 rework to settle — same code region); the
-in-game MY AGENT screen (client files owned by the arcade session);
-Minds skill publication (builder-side, needs a human on the Minds console).
+DEFERRED (all since shipped): `GET /agent/matches` (shipped 2026-07-18);
+Minds skill publication (LIVE in the Bazaar 2026-07-18 — "Agent Fighter
+Coach", see docs/minds-skill.md).
+
+SHIPPED 2026-07-18 (second wave): `SMatch.solo.personality` + VS-MY-AGENT
+sparring + dare-vs-agent (`CQueue.agentOf` = a dare code; the server resolves
+it to the owner's clamped config + owner-level skill and pins it into the
+solo setup — `verifySoloLedger`/`findDeviator` re-derive with the
+personality, so a coached agent can't be puppeteered either; no protocol
+bump — the field only ever reaches clients that requested it). Sender side:
+the invite screen gains a "THEY FIGHT MY AGENT" toggle (&agent=1 on the dare
+link); accepter side: ?agent=1&ref= auto-routes to select → ranked solo vs
+the sender's agent. Economy is exactly ranked solo: the owner is not a party
+and earns nothing (no new exploit surface; note their agent's record does
+NOT accrue either). The in-game MY AGENT screen (title `A` / MY AGENT pill):
+coached config + style bars, key mint/rotate (in-gesture copy for iOS),
+SPAR MY AGENT = agentOf your own code. Tests:
+`trained-agent.test.ts` "dare-vs-agent / sparring".
+
+SHIPPED 2026-07-18 (fleet ops): `packages/server/src/agent-fleet.ts` +
+`npm run fleet` — optional supervisor for free agent-class arcade grind
+(self-signup, self-`PUT /agent`, daily-cap sleep). Docs:
+`docs/headless-agent.md`.
 
 ## Build order
 

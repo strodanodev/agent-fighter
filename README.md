@@ -53,6 +53,8 @@ packages/client   @af/client — Canvas 2D renderer + camera + HUD + input.
 ```
 npm test                   # determinism + rollback + combat mechanics (tsx --test)
 npm run demo               # bundle single-file playable demo → packages/client/demo/
+npm run agent              # one-shot headless client (AF_* env — docs/headless-agent.md)
+npm run fleet              # recurring free-tier agent supervisor (AF_FLEET=N)
 ```
 
 ## Controls (M1 demo)

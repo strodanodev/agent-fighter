@@ -20,9 +20,11 @@ import type { AiState, GameState, InputFrame } from '@af/core';
 
 // Protocol constants — must match packages/server/src/protocol.ts.
 const NET_PROTOCOL = 6;
-const MAX_AHEAD = 10;
+const MAX_AHEAD = 15;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
+/** Client-initiated RTT probe cadence (connection-quality overlay). */
+const PING_MS = 2_000;
 
 export interface NetSetup {
   matchId: string;
@@ -35,8 +37,11 @@ export interface NetSetup {
   agents: [boolean, boolean];
   mode?: 'wager' | 'solo' | 'arcade' | 'friendly';
   fee?: number;
-  /** v3 local-sim solo: the deterministic house AI this client simulates. */
-  solo?: { skill: number; aiSeed: number };
+  /** v3 local-sim solo: the deterministic house AI this client simulates.
+   *  `personality` present = the opponent is a TRAINED agent (dare-vs-agent
+   *  / sparring, ADR 0006) — the sim MUST construct it with these knobs or
+   *  the server's re-sim disagrees and the match won't settle. */
+  solo?: { skill: number; aiSeed: number; personality?: Record<string, number> };
   /**
    * AGENT ARCADE (v4): run position + the bearer token that re-queues the
    * run for the next battle after a verified win.
@@ -111,8 +116,17 @@ export class NetSession {
    * by `oppback` or the final `result`.
    */
   oppGoneUntil: number | null = null;
+  /** Measured round-trip to the relay in ms (EMA; -1 until the first pong). */
+  rtt = -1;
+  /** Depth (ticks) of the most recent rollback re-sim — connection telemetry. */
+  lastRollback = 0;
+  /** Deepest rollback this match — how hard prediction is working. */
+  maxRollback = 0;
+  /** Total ticks spent stalled this match (`stalled` is just the current run). */
+  stallTotal = 0;
 
   private ws!: WebSocket;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
   private myInputs: number[] = [];
   private oppInputs: (number | undefined)[] = [];
   private usedOpp: number[] = [];
@@ -152,6 +166,9 @@ export class NetSession {
         this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode, room: this.room });
         this.status = 'queued';
       }
+      // RTT probe loop (additive to protocol 6 — an old server just never
+      // answers). send() drops pings while the socket is closed/reconnecting.
+      this.startPing();
     };
     // A failed pre-match connection is fatal; mid-resume failures fall
     // through to onclose, which schedules the next attempt.
@@ -172,6 +189,7 @@ export class NetSession {
    * leaving) or exhausted retries settle into 'error'.
    */
   private onSocketClose(): void {
+    this.stopPing(); // a fresh loop starts on the next successful onopen
     if (this.intentionalClose || this.status === 'done' || this.status === 'error') return;
     const canResume = !!this.setup?.resume && !this.result;
     if ((this.status === 'playing' && canResume) || this.status === 'reconnecting') {
@@ -194,6 +212,7 @@ export class NetSession {
 
   close(): void {
     this.intentionalClose = true;
+    this.stopPing();
     if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
     if (this.status === 'reconnecting') {
       this.status = 'error';
@@ -207,6 +226,15 @@ export class NetSession {
     try { this.ws.close(); } catch { /* already closed */ }
   }
 
+  private startPing(): void {
+    this.stopPing();
+    this.pingTimer = setInterval(() => this.send({ t: 'ping', ts: Date.now() }), PING_MS);
+  }
+
+  private stopPing(): void {
+    if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+  }
+
   private send(msg: unknown): void {
     if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
   }
@@ -217,7 +245,21 @@ export class NetSession {
       case 'error':
         this.status = 'error';
         this.error = String(msg.msg ?? 'server error');
+        this.stopPing();
         return;
+      case 'ping':
+        // The server's lobby probe (sizes the adaptive input delay): echo
+        // its clock back verbatim.
+        this.send({ t: 'pong', ts: msg.ts });
+        return;
+      case 'pong': {
+        // Echo of OUR probe — sample = now minus the clock we sent.
+        const sample = Date.now() - Number(msg.ts);
+        if (Number.isFinite(sample) && sample >= 0 && sample < 60_000) {
+          this.rtt = this.rtt < 0 ? sample : Math.round(this.rtt * 0.7 + sample * 0.3);
+        }
+        return;
+      }
       case 'account': {
         this.account = {
           credits: Number(msg.credits ?? 0),
@@ -265,6 +307,7 @@ export class NetSession {
         this.result = msg as unknown as NetResult;
         this.status = 'done';
         this.oppGoneUntil = null;
+        this.stopPing();
         return;
       }
       case 'xp': {
@@ -363,6 +406,8 @@ export class NetSession {
     // Apply pending rollback before stepping forward.
     if (this.resimFrom >= 0 && this.resimFrom < this.localTick) {
       const from = this.resimFrom;
+      this.lastRollback = this.localTick - from;
+      if (this.lastRollback > this.maxRollback) this.maxRollback = this.lastRollback;
       restore(this.game, this.snaps[from % SNAP_RING]!);
       for (let t = from; t < this.localTick; t++) {
         const opp = this.oppInputs[t] ?? this.lastKnownOpp();
@@ -397,6 +442,7 @@ export class NetSession {
     // GGPO throttle: never simulate too far past the opponent's confirmed inputs.
     if (this.localTick - this.oppKnown > MAX_AHEAD) {
       this.stalled++;
+      this.stallTotal++;
       return false;
     }
     this.stalled = 0;
@@ -447,6 +493,11 @@ export class SoloSession {
   game: GameState | null = null;
   stalled = 0; // never stalls — kept for the shared interface
   oppGoneUntil: number | null = null; // no peer socket — kept for the shared interface
+  // Local sim has no netplay telemetry — kept for the shared interface.
+  rtt = -1;
+  lastRollback = 0;
+  maxRollback = 0;
+  stallTotal = 0;
 
   private ws!: WebSocket;
   private houseAi: AiState | null = null;
@@ -479,6 +530,12 @@ export class SoloSession {
      * continues an existing run; omitted = start a new run (entry fee).
      */
     private arcadeQueue?: { runToken?: string },
+    /**
+     * DARE-VS-AGENT / SPARRING (ADR 0006): fight the TRAINED agent behind
+     * this dare/ref code instead of the house AI (your own code = sparring).
+     * Solo mode only — ignored when arcadeQueue is set.
+     */
+    private agentOf?: string,
   ) {
     this.connect(false);
   }
@@ -495,6 +552,7 @@ export class SoloSession {
           t: 'queue', character: this.character, bundleHash: this.bundleHash,
           mode: this.arcadeQueue ? 'arcade' : 'solo',
           runToken: this.arcadeQueue?.runToken || undefined,
+          agentOf: this.arcadeQueue ? undefined : this.agentOf || undefined,
         });
         this.status = 'queued';
       }
@@ -564,7 +622,7 @@ export class SoloSession {
   private rebuildFrom(s: NetSetup & { inputs: [(number | null)[], (number | null)[]] }): void {
     this.setup = s;
     this.game = createGameState(s.seed);
-    this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed);
+    this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed, s.solo!.personality);
     const mine = s.inputs[0];
     let t = 0;
     while (t < mine.length && mine[t] !== null && this.game.phase !== Phase.MatchOver) {
@@ -619,7 +677,7 @@ export class SoloSession {
   begin(): void {
     const s = this.setup!;
     this.game = createGameState(s.seed);
-    this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed);
+    this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed, s.solo!.personality);
     // Same throttled-tab race as NetSession.begin(): a result that landed
     // before the first frame must keep its terminal status.
     if (this.status !== 'done') this.status = 'playing';

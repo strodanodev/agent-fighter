@@ -132,6 +132,9 @@ Analog frame data from playtests.
 
 - `npm test` — full test suite (`tsx --test`, no framework deps)
 - `npm run demo` — bundle single-file playable demo → `packages/client/demo/`
+- `npm run server` — match server (`packages/server`)
+- `npm run agent` — one-shot headless client (env `AF_*`; see `docs/headless-agent.md`)
+- `npm run fleet` — recurring free-tier agent supervisor (`AF_FLEET=N`; same doc)
 - `typescript` + `tsx` are devDependencies (npm install at the root).
 - The client renderer is designed to move to PixiJS v8 in M2+ — but keep
   `@af/core` dependency-free forever.

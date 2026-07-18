@@ -36,6 +36,9 @@ const mode = process.env.AF_MODE === 'solo' ? 'solo' as const
   : process.env.AF_MODE === 'arcade' ? 'arcade' as const
   : 'wager' as const;
 const email = process.env.AF_EMAIL; // owner's AIR email → on-chain reputation write-back
+// Solo only (ADR 0006): fight the TRAINED agent behind this dare/ref code
+// instead of the house AI (your own code = sparring vs your own coaching).
+const agentOf = process.env.AF_AGENT_OF;
 
 // ---- Self-signup / stored credentials (agent-class account).
 const credFile = join(process.cwd(), 'af-agent.json');
@@ -92,7 +95,7 @@ if (agentKey) {
 
 console.log(`${name} → ${url} as ${character} (skill ${skill}), mode ${mode}, ${matches} ${mode === 'arcade' ? 'run(s)' : 'match(es)'}`);
 
-const base = { url, name, character, skill, charactersDir, paceMs, authToken, agentKey, personality, email };
+const base = { url, name, character, skill, charactersDir, paceMs, authToken, agentKey, personality, email, agentOf };
 const report = (tag: string, r: Awaited<ReturnType<typeof playOneMatch>>): void => {
   const hashOk = r.localHash === (r.result.hash >>> 0);
   console.log(`${tag} ${r.result.reason} · winner side ${r.result.winner} · `

@@ -244,3 +244,115 @@ describe('agent self-signup (inert agent class)', () => {
     );
   });
 });
+
+describe('dare-vs-agent / sparring (solo agentOf, ADR 0006)', () => {
+  let server: MatchServer;
+  let mem: Persistence;
+  let http = '';
+  let rivalCode = ''; // RIVAL's public dare code — what rides the share link
+  const RIVAL = { 'X-Dev-Name': 'Rival' };
+
+  before(async () => {
+    mem = memoryPersistence();
+    server = await createMatchServer({ port: 0, persistence: mem, noPaceCheck: true });
+    http = `http://localhost:${server.port}`;
+    // RIVAL: profile + coached config (over-max aggression must clamp).
+    const me = await (await fetch(`${http}/me`, { headers: RIVAL })).json() as { refCode: string };
+    rivalCode = me.refCode;
+    assert.ok(rivalCode, 'dev economy issues a dare code');
+    const put = await fetch(`${http}/agent`, {
+      method: 'PUT', headers: RIVAL,
+      body: JSON.stringify({
+        character: 'vector',
+        personality: { aggression: 100000, zoner: 60 },
+        motto: 'fear the grid',
+      }),
+    });
+    assert.equal(put.status, 200);
+  });
+  after(() => server.close());
+
+  it('pins the coached character + CLAMPED personality into the solo setup', async () => {
+    // Raw ws client: assert the actual wire setup (playOneMatch hides it).
+    const { WebSocket } = await import('ws');
+    const { PROTOCOL_VERSION } = await import('../src/protocol.js');
+    const { ENGINE_VERSION } = await import('@af/core');
+    const setup = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const ws = new WebSocket(`ws://localhost:${server.port}`);
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ t: 'hello', v: PROTOCOL_VERSION, name: 'Hero', engine: ENGINE_VERSION }));
+        ws.send(JSON.stringify({ t: 'queue', character: 'analog', mode: 'solo', agentOf: rivalCode }));
+      });
+      ws.on('message', (d) => {
+        const m = JSON.parse(String(d)) as Record<string, unknown>;
+        if (m.t === 'match') { ws.close(); resolve(m); }
+        if (m.t === 'error') { ws.close(); reject(new Error(String(m.msg))); }
+      });
+      ws.on('error', reject);
+      setTimeout(() => reject(new Error('no setup within 5s')), 5000).unref();
+    });
+    const solo = setup.solo as { skill: number; personality?: Record<string, number> };
+    assert.ok(solo, 'still a local-sim solo match');
+    assert.equal((setup.chars as Array<{ id: string }>)[1]!.id, 'vector', "opponent is the RIVAL's coached character");
+    assert.ok(solo.personality, 'personality pinned in the setup');
+    assert.equal(solo.personality!.aggression, AI_PERSONALITY_RANGES.aggression[1],
+      'over-max coaching arrives CLAMPED — a DB row can never smuggle range-breaking knobs');
+    assert.equal(solo.personality!.zoner, 60);
+    assert.match((setup.names as string[])[1]!, /RIVAL'S AGENT/, 'billed as the owner\'s agent, not HOUSE');
+  });
+
+  it('the full loop verifies and settles on the CHALLENGER only', async () => {
+    const before = await mem.getAccount({ sub: 'dev:Rival' }, 'Rival', false);
+    const r = await playOneMatch({
+      url: `ws://localhost:${server.port}`,
+      name: 'Hero', character: 'analog', skill: 55,
+      charactersDir, aiSeed: 11, paceMs: 1, mode: 'solo',
+      agentOf: rivalCode,
+    });
+    assert.equal(r.result.reason, 'verified',
+      'the local sim honored the pinned personality — re-sim agrees');
+    assert.equal(r.localHash, r.result.hash >>> 0, 'no desync');
+    const hero = await mem.getAccount({ sub: 'dev:Hero' }, 'Hero', false);
+    assert.equal(hero.wins + hero.losses, 1, 'challenger settled');
+    const rival = await mem.getAccount({ sub: 'dev:Rival' }, 'Rival', false);
+    assert.equal(rival.wins + rival.losses, before.wins + before.losses,
+      "the agent's OWNER is not a party — no W-L, no payout (economy v1)");
+  });
+
+  it('sparring = your own code (the coach → spar → adjust loop)', async () => {
+    const r = await playOneMatch({
+      url: `ws://localhost:${server.port}`,
+      name: 'Rival', character: 'analog', skill: 55,
+      charactersDir, aiSeed: 13, paceMs: 1, mode: 'solo',
+      agentOf: rivalCode,
+    });
+    assert.equal(r.result.reason, 'verified');
+  });
+
+  it('bad codes fail clean BEFORE any fee moves', async () => {
+    const heroBefore = await mem.getAccount({ sub: 'dev:Hero' }, 'Hero', false);
+    await assert.rejects(
+      playOneMatch({
+        url: `ws://localhost:${server.port}`,
+        name: 'Hero', character: 'analog', skill: 55,
+        charactersDir, aiSeed: 17, paceMs: 1, mode: 'solo',
+        agentOf: 'NOBODY-9999',
+      }),
+      /no fighter behind that code/,
+    );
+    // An existing profile with NO coached config is also a clean error.
+    await fetch(`${http}/me`, { headers: { 'X-Dev-Name': 'Untrained' } });
+    const untrained = await (await fetch(`${http}/me`, { headers: { 'X-Dev-Name': 'Untrained' } })).json() as { refCode: string };
+    await assert.rejects(
+      playOneMatch({
+        url: `ws://localhost:${server.port}`,
+        name: 'Hero', character: 'analog', skill: 55,
+        charactersDir, aiSeed: 19, paceMs: 1, mode: 'solo',
+        agentOf: untrained.refCode,
+      }),
+      /has not trained an agent yet/,
+    );
+    const heroAfter = await mem.getAccount({ sub: 'dev:Hero' }, 'Hero', false);
+    assert.equal(heroAfter.credits, heroBefore.credits, 'no fee was escrowed for either failure');
+  });
+});

@@ -64,6 +64,11 @@ export interface AgentOptions {
   mode?: 'wager' | 'solo' | 'arcade';
   /** Arcade continuation: the run token from the previous battle's result. */
   runToken?: string;
+  /**
+   * Solo only (ADR 0006): fight the TRAINED agent behind this dare/ref code
+   * instead of the house AI (your own code = sparring vs your own agent).
+   */
+  agentOf?: string;
   /** Owner's AIR email — target for the reputation write-back (ADR 0004). */
   email?: string;
 }
@@ -145,6 +150,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
         bundleHash: bundleOf(opts.character).versionHash,
         mode: opts.mode ?? 'wager',
         runToken: opts.runToken,
+        agentOf: opts.agentOf,
       });
     });
 
@@ -172,7 +178,9 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
             // the pinned deterministic house AI locally (aiPoll BEFORE step,
             // the exact ordering the server's verifier re-derives) and
             // stream only OUR inputs.
-            const houseAi = createAi(1, msg.solo.skill, msg.solo.aiSeed);
+            // A pinned personality = the opponent is a TRAINED agent
+            // (dare-vs-agent, ADR 0006) — same re-derivation either way.
+            const houseAi = createAi(1, msg.solo.skill, msg.solo.aiSeed, msg.solo.personality);
             pacer = setInterval(() => {
               if (!game || !ai) return;
               pinChars();

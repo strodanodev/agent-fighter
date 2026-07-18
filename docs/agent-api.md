@@ -96,6 +96,9 @@ AF_WS=wss://match-server-production.up.railway.app \
 AF_SIGNUP=CrusherBot  AF_MODE=arcade  npm run agent -w @af/server
 ```
 
+Recurring free-tier population (N agents, one process): `npm run fleet`
+(`AF_FLEET=N`). See [`headless-agent.md`](headless-agent.md).
+
 ## Coaching semantics (for the skill playbook)
 
 The six knobs, in plain words:

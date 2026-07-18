@@ -10,8 +10,37 @@
 export const PROTOCOL_VERSION = 6; // v6: opponent-disconnect heads-up (oppgone/oppback)
 export const DEFAULT_PORT = 8477;
 
-/** Local-input delay (ticks) applied by both sides — symmetric by design. */
+/**
+ * Local-input delay (ticks) applied by both sides — symmetric by design.
+ * FALLBACK value: PvP matches use an ADAPTIVE delay derived from both
+ * clients' measured RTT to the relay (see adaptive bounds below); this
+ * constant is used only when either side's RTT is unknown (old client,
+ * instant pair, agents that don't answer pings).
+ */
 export const INPUT_DELAY = 3;
+
+/** One sim tick in milliseconds (60 ticks/sec) — RTT→ticks conversion. */
+export const TICK_MS = 1000 / 60;
+
+/**
+ * Adaptive-delay bounds. The relay computes
+ *   delay = round(oneWayMs / TICK_MS / 2), clamped to [MIN, MAX]
+ * where oneWayMs = (rttA + rttB) / 2 (A→server + server→B). Half the
+ * one-way latency is absorbed by input delay, the other half by rollback —
+ * the classic split that keeps local inputs snappy without deep visual
+ * corrections. MAX stays modest on purpose: past 6 ticks of delay the game
+ * feels muddy, and rollback (MAX_AHEAD below) covers the remainder.
+ */
+export const INPUT_DELAY_MIN = 2;
+export const INPUT_DELAY_MAX = 6;
+
+/**
+ * Lobby/queue RTT probe cadence (server→client `ping`; client echoes
+ * `pong`). Additive to protocol 6 — clients that don't answer simply get
+ * the INPUT_DELAY fallback. Agents are never pinged (headless players
+ * don't care about 30 ms, and third-party skills may not echo).
+ */
+export const PING_INTERVAL_MS = 2_000;
 
 /**
  * Ranked-solo pace sanity (server-side): the client sims locally, so wall
@@ -24,8 +53,16 @@ export const SOLO_PACE_MIN = 0.7;
 export const SOLO_PACE_MAX = 3;
 export const SOLO_PACE_SLACK_MS = 20_000;
 
-/** Client must not simulate further than this past the opponent's inputs. */
-export const MAX_AHEAD = 10;
+/**
+ * Client must not simulate further than this past the opponent's inputs.
+ * 15 ticks (~250 ms) of prediction headroom: past it the client stalls.
+ * Raised from 10 (2026-07-18) — on high-latency paths the old value put
+ * the sim permanently at the stall threshold (constant stutter); deeper
+ * prediction trades those halts for rollback corrections, which read far
+ * better in play. Bounded well inside the client's 128-slot snapshot ring
+ * and the 100-tick hash-checkpoint window.
+ */
+export const MAX_AHEAD = 15;
 
 /** How often clients report stateHash (ticks) — desync forensics. */
 export const HASH_EVERY = 60;
@@ -128,17 +165,39 @@ export interface CQueue {
    * carried to the friend by the challenge link's ?room= param.
    */
   room?: string;
+  /**
+   * DARE-VS-AGENT / SPARRING (ADR 0006, solo mode only): the ref code of the
+   * profile whose TRAINED agent to fight instead of the house AI. The server
+   * resolves it to that profile's agent_config and pins {skill from the
+   * OWNER's level (same house ramp — never coachable), aiSeed, personality,
+   * character} into `solo`. Your own code = VS MY AGENT sparring. Economy is
+   * exactly ranked solo (fee/payout vs the house; the agent's owner earns
+   * nothing — no new exploit surface). Additive field: servers ignore it in
+   * other modes, and `solo.personality` is only ever sent to the client that
+   * asked for it, so no protocol bump is needed.
+   */
+  agentOf?: string;
 }
 export interface CInput { t: 'i'; k: number; v: number }
 export interface CHash { t: 'h'; k: number; x: number }
 export interface COver { t: 'over'; k: number }
+/**
+ * RTT probes (additive, 2026-07-18 — no protocol bump: both sides ignore
+ * unknown message types, so old peers degrade to the INPUT_DELAY fallback).
+ * Symmetric: either side may send `ping` with its own clock in `ts`; the
+ * receiver echoes `ts` back verbatim in `pong`. The CLIENT pings to drive
+ * its connection-quality overlay; the SERVER pings queued humans to size
+ * the adaptive input delay at pair time.
+ */
+export interface CPing { t: 'ping'; ts: number }
+export interface CPong { t: 'pong'; ts: number }
 /**
  * Rejoin a live match after a dropped socket (sent instead of `queue`, within
  * FORFEIT_GRACE_MS). The token is a per-side bearer secret from the match
  * setup — only its owner ever received it, so possession IS authorization.
  */
 export interface CResume { t: 'resume'; matchId: string; token: string }
-export type ClientMsg = CHello | CQueue | CInput | CHash | COver | CResume;
+export type ClientMsg = CHello | CQueue | CInput | CHash | COver | CResume | CPing | CPong;
 
 // ---- server → client
 export interface SWelcome { t: 'welcome'; id: string; engine: string }
@@ -167,7 +226,18 @@ export interface SMatch {
    * during verification, so the opponent cannot be puppeteered: any client
    * that simulates a different opponent fails the ledger re-sim.
    */
-  solo?: { skill: number; aiSeed: number };
+  solo?: {
+    skill: number;
+    aiSeed: number;
+    /**
+     * DARE-VS-AGENT (ADR 0006): present iff the opponent is a TRAINED agent
+     * rather than the plain house AI. The client (and the verifier) must
+     * construct the opponent with createAi(1, skill, aiSeed, personality) —
+     * the knobs are clamped server-side to AI_PERSONALITY_RANGES before they
+     * ever ride this message. Only sent to clients that queued `agentOf`.
+     */
+    personality?: Record<string, number>;
+  };
   /**
    * AGENT ARCADE (v4): present iff mode === 'arcade'. `battle` is 0-based;
    * `token` re-queues the run for the next battle after a verified win
@@ -250,4 +320,7 @@ export interface SXp {
   creditsDelta: number;
   credits: number;
 }
-export type ServerMsg = SWelcome | SQueued | SMatch | SResumed | SInput | SResult | SError | SAccount | SXp | SOppGone | SOppBack;
+/** Server-side RTT probe / echo — same shape and rules as CPing/CPong. */
+export interface SPing { t: 'ping'; ts: number }
+export interface SPong { t: 'pong'; ts: number }
+export type ServerMsg = SWelcome | SQueued | SMatch | SResumed | SInput | SResult | SError | SAccount | SXp | SOppGone | SOppBack | SPing | SPong;

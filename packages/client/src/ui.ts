@@ -1,4 +1,4 @@
-import { STAGE, TICKS_PER_SEC, TUNING } from '@af/core';
+import { AI_PERSONALITY_RANGES, STAGE, TICKS_PER_SEC, TUNING } from '@af/core';
 import type { GameState } from '@af/core';
 import { drawPortrait } from './atlas.js';
 import type { Roster } from './atlas.js';
@@ -1212,6 +1212,7 @@ export const drawTitle = (
     // Bottom action pills: every keyboard shortcut gets a real button — no
     // keyboard on a phone. Registered as generous ≥30px-tall tap targets.
     const pills: [string, string, string][] = [
+      ['A · MY AGENT', 'myagent', '#8fd0ff'],
       ['R · RANKINGS', 'ranks', '#ffffffcc'],
       ['L · SIGN OUT', 'signin', '#ffffff99'],
     ];
@@ -1307,6 +1308,14 @@ export interface InviteView {
   daresAccepted?: number;
   /** Inviter payouts remaining in the rolling week (server caps at 10). */
   bountiesLeft?: number;
+  /**
+   * DARE-VS-AGENT (ADR 0006): a coached agent config exists, so the dare can
+   * target the sender's TRAINED AGENT instead of the sender live. Absent =
+   * no toggle drawn (coach on Minds first).
+   */
+  agentReady?: boolean;
+  /** The toggle's current state: true = the link dares them to beat MY AGENT. */
+  vsAgent?: boolean;
 }
 
 export const drawInvite = (
@@ -1414,10 +1423,35 @@ export const drawInvite = (
   label(ctx, `“${v.taunt}”`, cx, ty, v.taunt.length > 52 ? 12 : 15, '#ffe9a3');
   label(ctx, `TAUNT ${v.tauntIdx + 1}/${v.tauntCount}  ·  ◀ ▶  TO CHANGE`, cx, ty + 20, 11, '#ffffff77');
 
+  // ---- dare target toggle (ADR 0006): who the invitee actually fights —
+  // YOU live (friendly room / async referral) or your TRAINED AGENT (the
+  // link gains &agent=1 and the accepter fights your coached config via the
+  // verified solo pipeline while you're offline). Only drawn once a coach
+  // has saved a config; everyone else just sees the classic screen.
+  let ctaY = ty + 36;
+  if (v.agentReady) {
+    const tgY = ty + 32;
+    const half = 168, tgH = 26, tgX = cx - half;
+    const opts: [string, boolean][] = [['THEY FIGHT ME', !v.vsAgent], ['THEY FIGHT MY AGENT', !!v.vsAgent]];
+    opts.forEach(([txt, on], k) => {
+      const x = tgX + k * half;
+      tapZone(x, tgY - 6, half, tgH + 12, k === 0 ? 'daretype:me' : 'daretype:agent');
+      ctx.fillStyle = on ? 'rgba(46,26,10,0.85)' : 'rgba(10,6,22,0.55)';
+      ctx.fillRect(x, tgY, half, tgH);
+      ctx.strokeStyle = on ? GOLD : 'rgba(255,255,255,0.2)';
+      ctx.lineWidth = on ? 2 : 1;
+      ctx.strokeRect(x + 0.5, tgY + 0.5, half - 1, tgH - 1);
+      label(ctx, `${on ? '◆' : '◇'} ${txt}`, x + half / 2, tgY + tgH / 2 + 4, 11,
+        on ? GOLD_LT : '#ffffff77');
+    });
+    ctx.lineWidth = 1;
+    ctaY = tgY + tgH + 14;
+  }
+
   // ---- two CTAs side by side: async dare (copy/send link) + live challenge
   // (park in a room keyed by your code). On copy the left plate greys out
   // with a green ring; challenge stays armed — fight them right now.
-  const gap = 14, bh = 46, by = ty + 36;
+  const gap = 14, bh = 46, by = ctaY;
   const copyW = v.refCode ? 360 : 420;
   const chalW = 220;
   const rowW = v.refCode ? copyW + gap + chalW : copyW;
@@ -2303,6 +2337,197 @@ export const drawRanks = (
   }
 
   label(ctx, 'TAP  TAB       R  REFRESH       ESC / ‹ TITLE  BACK', VW / 2, VH - 26, 13, '#ffffffaa');
+};
+
+// ---------------------------------------------------------------- MY AGENT
+/**
+ * The in-game face of TRAIN MY AGENT (ADR 0006). Everything here is
+ * read-only EXCEPT key minting and the spar entry — coaching itself happens
+ * through a Mind (PUT /agent), which is the whole product: the screen shows
+ * the observable RESULT of coaching, never an editor (stats are hardcoded,
+ * style belongs to the coach conversation).
+ */
+export interface AgentView {
+  /** GET /agent fetch state — 'fail' renders the offline hint. */
+  status: 'idle' | 'busy' | 'done' | 'fail';
+  /** Owner display name (the agent fights as "<NAME>'S AGENT"). */
+  name?: string;
+  level?: number;
+  wins?: number;
+  losses?: number;
+  /** The coached config (null = no coach has saved one yet). */
+  config?: { character?: string; personality?: Record<string, number>; motto?: string } | null;
+  /** Key age — proof a coach connection exists (the key itself is hashed). */
+  keyCreatedAt?: string | null;
+  /** Roster entry of the coached character — portrait + display name. */
+  roster?: Roster;
+  /** Fresh plaintext key (shown ONCE, straight from POST /agent/key). */
+  mintedKey?: string;
+  mintBusy?: boolean;
+  /** ≥0 → ticks since the key was copied (flips the copy chip green). */
+  keyCopiedAge?: number;
+  /** Human-readable /connect URL for the Minds hand-off instructions. */
+  connectLabel?: string;
+}
+
+/** Friendly labels for the six coachable knobs (core AI_PERSONALITY_RANGES). */
+const KNOB_LABELS: Record<string, string> = {
+  aggression: 'AGGRESSION',
+  jumpiness: 'JUMPINESS',
+  zoner: 'ZONING',
+  throwHappy: 'THROWS',
+  pushblocker: 'PUSHBLOCK',
+  patience: 'PATIENCE',
+};
+
+export const drawAgent = (
+  ctx: CanvasRenderingContext2D, tick: number, v: AgentView,
+): void => {
+  drawMenuBackdrop(ctx);
+  ctx.fillStyle = '#0a0616cc';
+  ctx.fillRect(0, 0, VW, VH);
+  const cx = VW / 2;
+
+  display(ctx, 'MY AGENT', cx, 58, 38, { glow: 'rgba(143,184,255,0.5)' });
+  label(ctx, 'IT FIGHTS FOR YOU · COACH IT BY CHATTING WITH A MIND · STATS ARE NEVER EDITABLE', cx, 84, 11, '#ffffff88');
+
+  // Escape hatch — same chip as ranks/select.
+  const backW = 110, backH = 34;
+  tapZone(VW - 16 - backW, 12, backW, backH, 'back');
+  ctx.fillStyle = 'rgba(10,6,22,0.6)';
+  ctx.fillRect(VW - 16 - backW, 12, backW, backH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(VW - 16 - backW + 0.5, 12.5, backW - 1, backH - 1);
+  ctx.lineWidth = 1;
+  label(ctx, '‹ TITLE', VW - 16 - backW / 2, 12 + backH / 2 + 4, 12, '#ffffffcc');
+
+  const pw = 720, ph = 210, px0 = cx - pw / 2, py0 = 102;
+  bevel(ctx, px0, py0, pw, ph, PANEL, GOLD, GOLD_DK, 3);
+
+  if (v.status === 'busy' || v.status === 'idle') {
+    const dots = '.'.repeat(1 + (Math.trunc(tick / 20) % 3));
+    label(ctx, `FETCHING YOUR AGENT${dots}`, cx, py0 + ph / 2, 15, '#f7e0a3');
+  } else if (v.status === 'fail') {
+    label(ctx, '⚠ COULD NOT REACH THE MATCH SERVER', cx, py0 + ph / 2 - 10, 15, '#ff9d9d');
+    label(ctx, 'your agent lives server-side — try again once you are online', cx, py0 + ph / 2 + 16, 12, '#ffffff77');
+  } else if (!v.config) {
+    // ---- untrained: the screen IS the onboarding funnel.
+    label(ctx, 'NO COACH CONNECTED YET', cx, py0 + 42, 16, GOLD_LT);
+    const steps = [
+      '1 · MINT YOUR COACH KEY BELOW (shown once — copy it)',
+      '2 · IN MINDS: ADD THE KEY UNDER “MY CONNECTIONS”',
+      '3 · ENABLE THE “AGENT FIGHTER COACH” SKILL FROM THE BAZAAR',
+      '4 · TELL YOUR MIND: “SET UP MY AGENT — AGGRESSIVE RUSHDOWN”',
+    ];
+    steps.forEach((s, i) => label(ctx, s, cx, py0 + 78 + i * 24, 12, '#ffffffbb'));
+    if (v.connectLabel) {
+      label(ctx, `NO MINDS ACCOUNT? THE SAME KEY MINTS AT  ${v.connectLabel}`, cx, py0 + ph - 22, 11, '#8fd0ff');
+    }
+  } else {
+    // ---- trained: portrait + identity + record | the six coached knobs.
+    const cellX = px0 + 12, cellY = py0 + 12, cellW = 120, cellH = ph - 24;
+    ctx.save();
+    rrect(ctx, cellX, cellY, cellW, cellH, 6);
+    ctx.clip();
+    const foot = ctx.createRadialGradient(
+      cellX + cellW / 2, cellY + cellH, 8, cellX + cellW / 2, cellY + cellH, cellH);
+    foot.addColorStop(0, 'rgba(93,184,255,0.22)');
+    foot.addColorStop(1, 'rgba(6,4,12,0.92)');
+    ctx.fillStyle = foot;
+    ctx.fillRect(cellX, cellY, cellW, cellH);
+    const img = v.roster?.portrait;
+    if (img?.naturalWidth) {
+      const fit = Math.min((cellW - 14) / img.naturalWidth, (cellH - 10) / img.naturalHeight);
+      const w = img.naturalWidth * fit, h = img.naturalHeight * fit;
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(img, cellX + cellW / 2 - w / 2, cellY + cellH - 5 - h, w, h);
+    } else {
+      label(ctx, '?', cellX + cellW / 2, cellY + cellH / 2 + 14, 40, '#ffffff33');
+    }
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(93,184,255,0.55)';
+    ctx.lineWidth = 1.5;
+    rrect(ctx, cellX, cellY, cellW, cellH, 6);
+    ctx.stroke();
+
+    const tx = px0 + 150;
+    const owner = (v.name ?? 'FIGHTER').toUpperCase();
+    display(ctx, `${owner}'S AGENT`, tx, py0 + 40, owner.length > 10 ? 17 : 21, { align: 'left' });
+    label(ctx, `MAINS ${(v.roster?.bundle.name ?? v.config.character ?? '?').toUpperCase()}`, tx, py0 + 64, 13, '#8fd0ff', 'left');
+    if (v.config.motto) {
+      label(ctx, `“${v.config.motto.slice(0, 40)}”`, tx, py0 + 88, 11, '#ffe9a3', 'left');
+    }
+    label(ctx, `LV ${v.level ?? 1}    ·    ${v.wins ?? 0}W — ${v.losses ?? 0}L  (YOUR RECORD — THE AGENT PLAYS AT YOUR STRENGTH)`, tx, py0 + (v.config.motto ? 112 : 92), 10, '#ffd166', 'left');
+    label(ctx,
+      v.keyCreatedAt
+        ? `COACH KEY ACTIVE SINCE ${v.keyCreatedAt.slice(0, 10)}`
+        : 'NO COACH KEY YET — MINT ONE BELOW',
+      tx, py0 + ph - 20, 10, v.keyCreatedAt ? '#8fe8a0' : '#ff9db0', 'left');
+
+    // Right column: the coached style, normalized inside each knob's legal
+    // range — the bars visualize what the coach last saved, nothing more.
+    ctx.fillStyle = 'rgba(217,164,65,0.22)';
+    ctx.fillRect(px0 + 432, py0 + 14, 1, ph - 28);
+    const sx = px0 + 452, sw = pw - 452 - 18;
+    label(ctx, 'COACHED STYLE', sx, py0 + 26, 10, '#c8b98a', 'left');
+    Object.entries(AI_PERSONALITY_RANGES).forEach(([key, [lo, hi]], i) => {
+      const y = py0 + 44 + i * 27;
+      const raw = v.config?.personality?.[key];
+      const t = raw === undefined ? 0.5 : Math.max(0, Math.min(1, (raw - lo) / (hi - lo)));
+      label(ctx, KNOB_LABELS[key] ?? key.toUpperCase(), sx, y + 9, 10, '#ffffff99', 'left');
+      const bx = sx + 92, bw = sw - 92;
+      ctx.fillStyle = 'rgba(255,255,255,0.10)';
+      ctx.fillRect(bx, y, bw, 12);
+      ctx.fillStyle = raw === undefined ? 'rgba(255,255,255,0.25)' : '#e8a24a';
+      ctx.fillRect(bx, y, Math.max(3, bw * t), 12);
+      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(bx + 0.5, y + 0.5, bw - 1, 11);
+    });
+  }
+
+  // ---- fresh key reveal (mint response, shown exactly once).
+  const kb = py0 + ph + 14;
+  if (v.mintedKey) {
+    const kw = 620, kx = cx - kw / 2, kh = 54;
+    bevel(ctx, kx, kb, kw, kh, '#101a12', '#7ee85a', '#123018', 3);
+    label(ctx, 'YOUR COACH KEY — COPY IT NOW, IT IS NEVER SHOWN AGAIN', cx, kb + 18, 11, '#8fe8a0');
+    const copied = (v.keyCopiedAge ?? -1) >= 0;
+    label(ctx, copied ? '✓ COPIED — PASTE IT INTO MINDS › MY CONNECTIONS' : v.mintedKey, cx, kb + 40,
+      copied ? 13 : v.mintedKey.length > 44 ? 12 : 14, copied ? '#8fe8a0' : '#eafff0');
+    tapZone(kx, kb, kw, kh, 'agent:copykey');
+  }
+
+  // ---- CTA row: spar (the training feedback loop) + mint/rotate.
+  const bh = 46, by = v.mintedKey ? kb + 68 : kb + 10;
+  const canSpar = v.status === 'done' && !!v.config;
+  const sparW = 300, mintW = 300, gap = 16;
+  const rowX = cx - (sparW + gap + mintW) / 2;
+  if (canSpar) {
+    const pulse = 1 + 0.03 * Math.sin(tick / 8);
+    bevel(ctx, rowX, by, sparW, bh, '#2a1a08', GOLD, GOLD_DK, 3);
+    display(ctx, '⚔ SPAR MY AGENT · 1 CR', rowX + sparW / 2, by + 31, 17, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
+  } else {
+    bevel(ctx, rowX, by, sparW, bh, '#191a20', '#3f414c', '#101116', 3);
+    label(ctx, 'SPAR MY AGENT (COACH FIRST)', rowX + sparW / 2, by + 29, 13, '#ffffff55');
+  }
+  tapZone(rowX, by, sparW, bh, 'agent:spar');
+  const mx = rowX + sparW + gap;
+  if (v.mintBusy) {
+    bevel(ctx, mx, by, mintW, bh, '#191a20', '#3f414c', '#101116', 3);
+    label(ctx, 'MINTING…', mx + mintW / 2, by + 29, 13, '#ffffff88');
+  } else {
+    bevel(ctx, mx, by, mintW, bh, '#0e2438', '#5db8ff', '#163a5a', 3);
+    display(ctx, v.keyCreatedAt || v.mintedKey ? '↻ ROTATE COACH KEY' : '🔑 MINT COACH KEY', mx + mintW / 2, by + 31, 16,
+      { from: '#eaf6ff', mid: '#8fd0ff', to: '#3a7ab0', outline: '#0a1a2a' });
+  }
+  tapZone(mx, by, mintW, bh, 'agent:mint');
+  if (v.keyCreatedAt && !v.mintedKey) {
+    label(ctx, 'ROTATING INVALIDATES THE OLD KEY — YOUR MIND NEEDS THE NEW ONE', cx, by + bh + 16, 10, '#ffffff66');
+  }
+
+  label(ctx, 'S  SPAR       K  MINT KEY       V IN-MATCH  HANDS-FREE AUTO       ESC / ‹ TITLE  BACK', cx, VH - 14, 11, '#ffffff99');
 };
 
 // ------------------------------------------------------------ wallet strip
