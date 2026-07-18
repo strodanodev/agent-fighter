@@ -616,6 +616,17 @@ export const createMatchServer = (opts: {
         const c1 = queue.shift()!;
         if (c0.ws.readyState !== WebSocket.OPEN) { queue.unshift(c1); continue; }
         if (c1.ws.readyState !== WebSocket.OPEN) { queue.unshift(c0); continue; }
+        // Never pair an identity against itself: two sockets on one account
+        // would escrow ONE fee (the ledger's per-profile idempotency guard
+        // swallows the second row) while settlement pays the winner fee*2 —
+        // a net credit mint. Kick the later joiner; each pass shrinks the
+        // queue by one client, so the while loop still terminates.
+        if (c0.identity?.sub && c0.identity.sub === c1.identity?.sub) {
+          c1.state = 'lobby';
+          send(c1, { t: 'error', msg: 'this account is already queued for a wager match' });
+          queue.unshift(c0);
+          continue;
+        }
 
         const fee = persistence ? WAGER_FEE : 0;
         // Allocate the id BEFORE the escrow await — a concurrent solo match

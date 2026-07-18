@@ -388,6 +388,10 @@ export const memoryPersistence = (): Persistence => {
       };
     },
     escrowMatch: async (matchId, subs, fee) => {
+      // Mirrors 0012_no_self_match.sql: one profile may never escrow both
+      // sides of a match (the SQL's idempotency guard would half-charge it
+      // while settlement pays the full pot — a credit mint).
+      if (subs[0] !== null && subs[0] === subs[1]) throw new Error('SELF_MATCH');
       const entry = escrows.get(matchId) ?? { subs: new Set<string>(), fee, at: Date.now() };
       escrows.set(matchId, entry);
       const due = ([0, 1] as const).filter((s) => subs[s] && !entry.subs.has(subs[s]!));
