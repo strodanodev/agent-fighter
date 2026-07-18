@@ -19,11 +19,42 @@ folder is ever wiped:
 - vgmstream-cli: https://github.com/vgmstream/vgmstream/releases (`*-win64.zip`)
 - ffmpeg: https://github.com/BtbN/FFmpeg-Builds/releases (`*-win64-gpl*.zip`)
 
-## Hit SFX
+## Sound library layout (`sounds/<N>. <Category>/`)
 
-`packages/client/assets/audio/sfx/*.mp3` are a straight copy (renamed only)
-of `../sounds/SFX HITS/*.mp3` — no conversion needed, mp3 decodes fine via
-`decodeAudioData`. Mapping from pack filename → shipped id, see
-`packages/client/src/audio.ts` (`SFX_FILES`) for the exact list and
-`hitSfxFor()` for how a connecting move's button (LP/MP/HP/LK/MK/HK) picks
-one.
+The source library is organized by category; every raw filename already
+states its in-game purpose. Shipped ids and exact `SFX_FILES`/`MUSIC_FILES`
+paths live in `packages/client/src/audio.ts` — this is just the raw→shipped
+map for re-running the conversion.
+
+- **`1. BGM/`** — `.brstm` rips → `packages/client/assets/audio/bgm/*.ogg`
+  (vgmstream + ffmpeg, same pipeline as above). One arcade-mode screen each:
+  Continue screen, Game Over, Here Comes a New Challenger, Hurry Up, Player
+  Select, Ranking, Versus → `vs`, You Win → `win`.
+- **`2. SFX HITS/`** — mostly already-shipped mp3s (Swoosh 01_02/02_01 →
+  `swing_a`/`swing_b`, swooth & hit 1/2/3 → `punch_light`/`medium`/
+  `heavy_a`, Hit 1 → `punch_heavy_b`, Hit 2x → `combo_accent`, Kick 1/2 →
+  `kick_heavy`/`kick_light`, Block → `block_hit`) plus one new file,
+  **`special attack.wav`** → `special_hit.mp3` (ffmpeg to mp3) — the impact
+  clip for any connecting `special`/`super` move, overriding the normal
+  punch/kick weight pick (see the `updateJuice` call site in `main.ts`).
+- **`3. Credits/`** → `bgm/credits.mp3` (copied as-is, mp3). Plays instead of
+  the usual `ranking` loop the moment an AGENT ARCADE run is fully cleared
+  (`arcade.stage + 1 >= arcade.total` on the win branch) — the closest thing
+  this build has to an arcade ending/credits roll.
+- **`4. FX/`** → `character select confirmed.wav` → `sfx/select_confirm.mp3`
+  (ffmpeg to mp3; plays on the character-lock press in `tickSelect`), `you
+  lose.mp3` → `sfx/you_lose.mp3` (copied as-is; layers over the `game_over`
+  stinger whenever the human/local side is the one losing).
+- **`5. Voice FX/`** → `voice/fight_call_a.mp3` / `fight_call_b.mp3` (copied
+  as-is from `Main FX 1.mp3` / `Main FX 3.mp3`). **Guessed mapping** — the
+  source names aren't self-describing like the other categories, so these
+  were assigned to the round-start "FIGHT!" announcer callout (one picked at
+  random each round) as the single most obvious "generic voice FX" moment;
+  correct the mapping in `audio.ts` if that's not what they actually are.
+- **`6. Voice Hits/`** → `voice/*.mp3` (ffmpeg to mp3). Hit 1-4 → light pain
+  grunt on any hit taken; Ouch 1-3 → heavy pain grunt (damage > 600, same
+  threshold as the screen-shake "big hit" flag); Ouch long → K.O. bark on
+  `Phase.RoundOver`; Hiya 1/2 → occasional (30%) kiai on a connecting-normal
+  swing; kick special shoryuken → voice callout on any move with
+  `motion === 623` (the DP-motion uppercut); projectile hadouken → voice
+  callout on any move with `motion === 236` (the fireball-motion special).

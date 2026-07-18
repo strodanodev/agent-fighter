@@ -324,6 +324,17 @@ export const createMatchServer = (opts: {
   let nextId = 1;
   let nextMatch = 1;
   let matchSeed = (Date.now() % 100_000) | 0; // server-side is allowed wall clock
+  /**
+   * Match ids must be unique ACROSS server lifetimes, not just within one:
+   * the DB's record_match/escrow_match are idempotent BY MATCH ID, so a
+   * plain per-process counter (`m1, m2, …`) collides with rows from before
+   * a restart and every colliding settlement silently no-ops — XP/W-L and
+   * credit payouts vanish with no error anywhere. (Found live: prod had
+   * m1/m11/m13 from three different days.) The epoch prefix makes each
+   * process's sequence disjoint; the counter keeps ids readable in logs.
+   */
+  const matchEpoch = `${Date.now().toString(36)}${randomBytes(2).toString('hex')}`;
+  const newMatchId = (): string => `m${matchEpoch}-${nextMatch++}`;
   /** Filled once http.listen resolves — house bots dial back to this port. */
 
   const send = (c: Client, msg: ServerMsg): void => {
@@ -535,7 +546,7 @@ export const createMatchServer = (opts: {
       ? `${(bundleOf(solo!.character) as { name?: string }).name ?? solo!.character} · ${arcadeRun.battle + 1}/${arcadeRun.opponents.length}`.toUpperCase()
       : `HOUSE LV${solo?.level ?? 1}`;
     const m: Match = {
-      id: id ?? `m${nextMatch++}`,
+      id: id ?? newMatchId(),
       mode, fee,
       clients: [c0, c1],
       seed: (matchSeed = (matchSeed * 1103515245 + 12345) & 0x7fffffff),
@@ -602,7 +613,7 @@ export const createMatchServer = (opts: {
         const fee = persistence ? WAGER_FEE : 0;
         // Allocate the id BEFORE the escrow await — a concurrent solo match
         // starting mid-await must not steal it (the escrow rows key on it).
-        const matchId = `m${nextMatch++}`;
+        const matchId = newMatchId();
         if (fee > 0) {
           try {
             await persistence!.escrowMatch(matchId, [c0.identity!.sub, c1.identity!.sub], fee);
@@ -637,7 +648,7 @@ export const createMatchServer = (opts: {
    */
   const startSolo = async (c: Client): Promise<void> => {
     const fee = persistence ? SOLO_FEE : 0;
-    const matchId = `m${nextMatch++}`;
+    const matchId = newMatchId();
     if (fee > 0) {
       try {
         await persistence!.escrowMatch(matchId, [c.identity?.sub ?? null, null], fee);
@@ -691,7 +702,7 @@ export const createMatchServer = (opts: {
   const startArcadeBattle = async (c: Client, run: ArcadeRun): Promise<void> => {
     // Agent-class runs are FREE (inert economy — XP/rank only).
     const fee = run.battle === 0 && persistence && !isAgentClassSub(run.sub) ? ARCADE_FEE : 0;
-    const matchId = `m${nextMatch++}`;
+    const matchId = newMatchId();
     if (fee > 0) {
       try {
         await persistence!.escrowMatch(matchId, [c.identity?.sub ?? null, null], fee);

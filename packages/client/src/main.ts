@@ -28,6 +28,7 @@ import type { AgentOpponent, Cam, HudFx, HudId, Mode, RankRow, XpInfo } from './
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit } from './chrome.js';
 import type { StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
+import type { AudioChannel, SfxId } from './audio.js';
 import { auth, authLogin, authLogout, authName, authRehydrate, authToken } from './auth.js';
 import { NetSession, SoloSession } from './net.js';
 import type { NetAccount, Session } from './net.js';
@@ -127,6 +128,8 @@ let practiceFree = false; // offline-fallback match: no fee, no XP, no records
 // The remembered fighter makes the title's ENTER a one-input path to a match.
 const LAST_FIGHTER_KEY = 'af-last-fighter';
 let lastFighter = localStorage.getItem(LAST_FIGHTER_KEY) ?? '';
+/** Title-screen Music/SFX/Hits dropdown (speaker chip always visible). */
+let audioMenuOpen = false;
 
 // ---- Referral dares ("I dare you to beat me"). A shared landing link
 // (agent-fighter-web.vercel.app/dare/<code>) deep-links here with ?ref=;
@@ -829,6 +832,11 @@ const updateCamera = (g: GameState): void => {
   cam.y += (targetY - cam.y) * 0.12;
 };
 
+// Victim pain-grunt pools (voice/*.mp3) — light taps get a plain "Hit", the
+// heavy ones ("big" damage, matching the spark/shake threshold) get an "Ouch".
+const HIT_BARK: SfxId[] = ['hit_1', 'hit_2', 'hit_3', 'hit_4'];
+const OUCH: SfxId[] = ['ouch_1', 'ouch_2', 'ouch_3'];
+
 // ---------------------------------------------------------------- juice
 const updateJuice = (g: GameState): void => {
   for (const i of [0, 1] as const) {
@@ -842,17 +850,30 @@ const updateJuice = (g: GameState): void => {
       emitBurst(hx, hy, P_COLORS[(1 - i) as 0 | 1], big ? 1.8 : 0.9);
       shake = big ? 11 : 6;
       hitStopFlash = big ? 3 : 0;
+      // Victim's pain grunt — a bigger "Ouch" bark for the heavier hits.
+      audio.playSfx(big ? OUCH[Math.floor(Math.random() * OUCH.length)]! : HIT_BARK[Math.floor(Math.random() * HIT_BARK.length)]!, { volume: 0.55 });
     }
     // Hit SFX: a swoosh on every swing (attack's very first tick), plus a
     // punch/kick impact or block clip on the tick the attack actually makes
     // contact (attackConnected's rising edge: 0→1 hit, 0→2 block).
     if (f.action === Action.Attack && f.actionFrame === 0 && f.moveIdx >= 0) {
-      audio.playSfx(swingSfx(), { volume: 0.45 });
+      const move = fighters![i].ch.b.moves[f.moveIdx];
+      // The fireball/uppercut motion specials get their classic voice
+      // callout instead of a generic whoosh — everything else keeps the
+      // plain swing, with a normal occasionally getting a kiai bark too.
+      if (move?.motion === 623) audio.playSfx('shoryuken', { volume: 0.7 });
+      else if (move?.motion === 236) audio.playSfx('hadouken', { volume: 0.7 });
+      else {
+        audio.playSfx(swingSfx(), { volume: 0.45 });
+        if (move?.type === 'normal' && Math.random() < 0.3) {
+          audio.playSfx(Math.random() < 0.5 ? 'hiya_1' : 'hiya_2', { volume: 0.5 });
+        }
+      }
     }
     if (f.attackConnected !== 0 && f.attackConnected !== prevConnected[i]) {
       if (f.attackConnected === 1) {
         const move = fighters![i].ch.b.moves[f.moveIdx];
-        audio.playSfx(hitSfxFor(move?.button));
+        audio.playSfx(move?.type === 'special' || move?.type === 'super' ? 'special_hit' : hitSfxFor(move?.button));
         if (g.fighters[(1 - i) as 0 | 1].comboHits >= 2) audio.playSfx('combo_accent', { volume: 0.6 });
       } else if (f.attackConnected === 2) {
         audio.playSfx('block_hit');
@@ -897,10 +918,12 @@ const updateJuice = (g: GameState): void => {
     if (g.phase === Phase.Fighting) {
       fx.announce = 'FIGHT!'; fx.announceAge = 0;
       emitRing(VW / 2, VH / 2 - 40, 240, '#ffd166', { life: 30, width: 5 });
+      audio.playSfx(Math.random() < 0.5 ? 'fight_call_a' : 'fight_call_b', { volume: 0.7 });
     } else if (g.phase === Phase.RoundOver) {
       fx.announce = g.roundWinner === 2 ? 'DOUBLE KO' : 'K.O.';
       fx.announceAge = 0;
       emitRing(VW / 2, VH / 2 - 40, 340, DANGER_RED, { life: 40, width: 7 });
+      audio.playSfx('ouch_long', { volume: 0.75 });
     } else if (g.phase === Phase.PreRound) { fx.announce = `ROUND ${g.roundNum + 1}`; fx.announceAge = 0; }
     prevPhase = g.phase;
   }
@@ -1093,7 +1116,10 @@ const tickSelect = (): void => {
   }
 
   // A disabled fighter under the cursor cannot be confirmed.
-  if (enabled(picks[0]) && (tapConfirm || CONFIRM[0]!.some((k) => pressedThisFrame.has(k)))) locked[0] = true;
+  if (!locked[0] && enabled(picks[0]) && (tapConfirm || CONFIRM[0]!.some((k) => pressedThisFrame.has(k)))) {
+    locked[0] = true;
+    audio.playSfx('select_confirm');
+  }
   if (mode === 'online' || mode === 'cpu') {
     // Locking IS the launch. FRIENDLY: queue the private challenge room.
     // ONLINE: the pick is the wager-queue ticket (server matchmakes + charges
@@ -1103,7 +1129,10 @@ const tickSelect = (): void => {
     return;
   }
   if (mode === '2p') {
-    if (enabled(picks[1]) && CONFIRM[1]!.some((k) => pressedThisFrame.has(k))) locked[1] = true;
+    if (!locked[1] && enabled(picks[1]) && CONFIRM[1]!.some((k) => pressedThisFrame.has(k))) {
+      locked[1] = true;
+      audio.playSfx('select_confirm');
+    }
   } else if (locked[0] && !locked[1]) {
     // CPU picks its fighter — visibly, like an arcade opponent reveal — but
     // never a disabled one.
@@ -1193,6 +1222,13 @@ const frame = (): void => {
       challenge: !!pendingRoom,
       fighter: (allRosters.find((r) => r.id === lastFighter && !r.disabled)
         ?? allRosters.find((r) => !r.disabled))?.bundle.name,
+      audio: {
+        masterMuted: audio.isMasterMuted(),
+        musicMuted: audio.isChannelMuted('music'),
+        sfxMuted: audio.isChannelMuted('sfx'),
+        hitsMuted: audio.isChannelMuted('hits'),
+        open: audioMenuOpen,
+      },
     });
     // 2-player local is disabled on all platforms (single-controller / mobile
     // focus). The '2p' Mode value + its handling stay in the codebase, just no
@@ -1200,6 +1236,7 @@ const frame = (): void => {
     const MODES: Mode[] = ['cpu', 'online'];
     /** Leave the title for the fighter select. */
     const enterSelect = (): void => {
+      audioMenuOpen = false;
       screen = 'select';
       locked = [false, false];
       selectingFriendly = false; // a title select is always wager (online) or arcade (cpu)
@@ -1218,7 +1255,19 @@ const frame = (): void => {
     const launchMode = (): void => { enterSelect(); };
     // A tapped mode row picks the mode AND launches — one tap to a match.
     const tappedMode = MODES.find((m) => taps.has(`mode:${m}`));
-    if (pressedThisFrame.has('KeyL') || taps.has('signin')) {
+    // Audio chip — works on the sign-in gate too (music is already playing).
+    const audioTap = (['music', 'sfx', 'hits'] as const)
+      .find((ch) => taps.has(`audio:${ch}`)) as AudioChannel | undefined;
+    if (taps.has('audio:mute')) {
+      audio.toggleMaster();
+    } else if (taps.has('audio:menu')) {
+      audioMenuOpen = !audioMenuOpen;
+    } else if (audioTap) {
+      audio.toggleChannel(audioTap);
+    } else if (audioMenuOpen && taps.size > 0) {
+      // Any other tap dismisses the dropdown without launching a mode.
+      audioMenuOpen = false;
+    } else if (pressedThisFrame.has('KeyL') || taps.has('signin')) {
       // AIR sign-in/out toggle — must not fall through to "any key starts".
       if (auth.status === 'in') {
         void authLogout();
@@ -1229,6 +1278,7 @@ const frame = (): void => {
       }
     } else if (pressedThisFrame.has('KeyR') || taps.has('ranks')) {
       // Standings are public — viewable even from the sign-in gate.
+      audioMenuOpen = false;
       screen = 'ranks';
       fetchRanks();
     } else if (signedIn && account?.refCode && (pressedThisFrame.has('KeyD') || taps.has('dare'))) {
@@ -1502,9 +1552,11 @@ const frame = (): void => {
         // Whatever ended it, the run is over server-side → GAME OVER card.
         gameOverAge = 0;
         screen = 'gameover';
+        audio.playSfx('you_lose', { volume: 0.8 });
         void audio.playStinger('game_over');
       } else {
         screen = 'results';
+        if (lostIt) audio.playSfx('you_lose', { volume: 0.8 });
         void audio.playStinger(lostIt ? 'game_over' : 'win', {
           onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
         });
@@ -1523,12 +1575,16 @@ const frame = (): void => {
         // practice runs pay nothing by design.
         if (game.winner === 0) {
           screen = 'results';
+          // Clearing the FINAL battle rolls the (very unserious) end credits
+          // instead of the usual between-battles ranking loop.
+          const cleared = arcade.stage + 1 >= arcade.total;
           void audio.playStinger('win', {
-            onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
+            onEnded: () => void audio.playBgm(cleared ? 'credits' : 'ranking', { fadeInSec: 1 }),
           });
         } else {
           gameOverAge = 0;
           screen = 'gameover';
+          audio.playSfx('you_lose', { volume: 0.8 });
           void audio.playStinger('game_over');
         }
       } else {
@@ -1538,6 +1594,7 @@ const frame = (): void => {
         // CPU beat the human → arcade "Game Over" stinger; anything else
         // (human win, 2P vs 2P, a draw) gets the victory jingle.
         const lostToCpu = Boolean(cpuAi) && game.winner === 1;
+        if (lostToCpu) audio.playSfx('you_lose', { volume: 0.8 });
         void audio.playStinger(lostToCpu ? 'game_over' : 'win', {
           onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
         });

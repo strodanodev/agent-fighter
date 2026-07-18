@@ -148,6 +148,32 @@ describe('agent key + config API', () => {
   });
 });
 
+describe('match ids survive server restarts (settlement-drop regression)', () => {
+  it('two server lifetimes over ONE durable persistence never collide ids', async () => {
+    // The DB settles idempotently BY MATCH ID. A per-process counter reused
+    // `m1, m2, …` after every restart, so post-restart settlements silently
+    // no-opped against the old rows (found live on prod). The shared memory
+    // persistence here plays the role of the durable DB.
+    const shared = memoryPersistence();
+    const play = async (): Promise<void> => {
+      const s = await createMatchServer({ port: 0, persistence: shared, noPaceCheck: true });
+      try {
+        const r = await playOneMatch({
+          url: `ws://localhost:${s.port}`,
+          name: 'Restarter', character: 'analog', skill: 60,
+          charactersDir, aiSeed: 3, paceMs: 1, mode: 'solo',
+        });
+        assert.equal(r.result.reason, 'verified');
+      } finally { s.close(); }
+    };
+    await play(); // lifetime 1 → its m…-1 settles
+    await play(); // lifetime 2 → would have been m1 again pre-fix
+    const acc = await shared.getAccount({ sub: 'dev:Restarter' }, 'Restarter', false);
+    assert.equal(acc.wins + acc.losses, 2,
+      'BOTH lifetimes settled — a colliding id would have silently dropped the second');
+  });
+});
+
 describe('agent self-signup (inert agent class)', () => {
   let server: MatchServer;
   let mem: Persistence;

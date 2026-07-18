@@ -889,7 +889,112 @@ export interface TitleMenuState {
   challenge?: boolean;
   /** Remembered fighter (the select cursor's start) — "FIGHTING AS …". */
   fighter?: string;
+  /** Title-screen audio mute chip (upper-left). */
+  audio?: AudioMenuState;
 }
+
+/** Live mute state for the title-screen speaker chip + Music/SFX/Hits menu. */
+export interface AudioMenuState {
+  masterMuted: boolean;
+  musicMuted: boolean;
+  sfxMuted: boolean;
+  hitsMuted: boolean;
+  /** Dropdown open (Music / SFX / Hits rows). */
+  open: boolean;
+}
+
+/**
+ * Compact transparent speaker control — upper-left of the title screen.
+ * Tap the speaker = instant master mute/unmute; tap the chevron = Music /
+ * SFX / Hits dropdown. Drawn last so its tap zones win over the wallet chip.
+ */
+export const drawAudioControl = (ctx: CanvasRenderingContext2D, menu: AudioMenuState): void => {
+  const x = 12, y = 10, h = 28, speakerW = 30, chevW = 18;
+  const w = speakerW + chevW;
+  ctx.fillStyle = 'rgba(10,6,22,0.40)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+  ctx.lineWidth = 1.25;
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+
+  // Speaker glyph (simple path — no emoji dependency on canvas fonts).
+  const muted = menu.masterMuted;
+  const cx = x + speakerW / 2, cy = y + h / 2;
+  ctx.fillStyle = muted ? '#ffffff66' : '#ffffffcc';
+  ctx.strokeStyle = muted ? '#ffffff66' : '#ffffffcc';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(cx - 7, cy - 3);
+  ctx.lineTo(cx - 3, cy - 3);
+  ctx.lineTo(cx + 2, cy - 7);
+  ctx.lineTo(cx + 2, cy + 7);
+  ctx.lineTo(cx - 3, cy + 3);
+  ctx.lineTo(cx - 7, cy + 3);
+  ctx.closePath();
+  ctx.fill();
+  if (muted) {
+    ctx.beginPath();
+    ctx.moveTo(cx + 5, cy - 5);
+    ctx.lineTo(cx + 11, cy + 5);
+    ctx.moveTo(cx + 11, cy - 5);
+    ctx.lineTo(cx + 5, cy + 5);
+    ctx.stroke();
+  } else {
+    ctx.beginPath();
+    ctx.arc(cx + 3, cy, 5, -0.6, 0.6);
+    ctx.stroke();
+  }
+
+  // Chevron separator + caret.
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.beginPath();
+  ctx.moveTo(x + speakerW, y + 5);
+  ctx.lineTo(x + speakerW, y + h - 5);
+  ctx.stroke();
+  const ax = x + speakerW + chevW / 2, ay = y + h / 2 + (menu.open ? -1 : 1);
+  ctx.fillStyle = '#ffffffaa';
+  ctx.beginPath();
+  if (menu.open) {
+    ctx.moveTo(ax - 4, ay + 3);
+    ctx.lineTo(ax + 4, ay + 3);
+    ctx.lineTo(ax, ay - 3);
+  } else {
+    ctx.moveTo(ax - 4, ay - 3);
+    ctx.lineTo(ax + 4, ay - 3);
+    ctx.lineTo(ax, ay + 3);
+  }
+  ctx.closePath();
+  ctx.fill();
+
+  tapZone(x, y, speakerW, h, 'audio:mute');
+  tapZone(x + speakerW, y, chevW, h, 'audio:menu');
+
+  if (!menu.open) {
+    ctx.lineWidth = 1;
+    return;
+  }
+
+  const rows: [string, string, boolean][] = [
+    ['Music', 'audio:music', menu.musicMuted],
+    ['SFX', 'audio:sfx', menu.sfxMuted],
+    ['Hits', 'audio:hits', menu.hitsMuted],
+  ];
+  const rowH = 28, panelW = 118, panelH = rows.length * rowH + 6;
+  const px = x, py = y + h + 4;
+  ctx.fillStyle = 'rgba(10,6,22,0.78)';
+  ctx.fillRect(px, py, panelW, panelH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+  ctx.lineWidth = 1.25;
+  ctx.strokeRect(px + 0.5, py + 0.5, panelW - 1, panelH - 1);
+  rows.forEach(([txt, act, chMuted], i) => {
+    const ry = py + 3 + i * rowH;
+    tapZone(px, ry, panelW, rowH, act);
+    label(ctx, txt, px + 12, ry + rowH / 2 + 4, 13, chMuted ? '#ffffff66' : '#ffffffdd', 'left');
+    label(ctx, chMuted ? 'OFF' : 'ON', px + panelW - 12, ry + rowH / 2 + 4, 11,
+      chMuted ? '#ff9d9d99' : '#8fe8a0cc', 'right');
+  });
+  ctx.lineWidth = 1;
+};
 
 export const drawTitle = (
   ctx: CanvasRenderingContext2D, rosters: Roster[], tick: number, menu: TitleMenuState,
@@ -1033,13 +1138,14 @@ export const drawTitle = (
     ctx.lineWidth = 1;
   }
 
-  // Account/wallet block — upper LEFT, minimal text (M5 spec).
+  // Account/wallet block — upper LEFT, under the audio chip (M5 spec).
+  const acctBase = 48; // leaves room for the speaker control at y=10
   if (menu.authLabel) {
-    label(ctx, `◆ ${menu.authLabel}`, 16, 22, 13, '#8fe8a0', 'left');
+    label(ctx, `◆ ${menu.authLabel}`, 16, acctBase, 13, '#8fe8a0', 'left');
     if (menu.address) {
-      label(ctx, `${menu.address.slice(0, 6)}…${menu.address.slice(-4)}`, 16, 40, 11, '#ffffff77', 'left');
+      label(ctx, `${menu.address.slice(0, 6)}…${menu.address.slice(-4)}`, 16, acctBase + 18, 11, '#ffffff77', 'left');
     }
-    const acctY = menu.address ? 58 : 40;
+    const acctY = menu.address ? acctBase + 36 : acctBase + 18;
     if (menu.account) {
       const a = menu.account;
       // CREDITS emphasized (big, glowing gold); level + record small alongside.
@@ -1053,17 +1159,22 @@ export const drawTitle = (
   // Referral dare bonus toast — the invitee just cashed in an accepted dare.
   if (menu.referralToast) {
     const flash = (tick + 15) % 30 < 22;
-    const y = (menu.address ? 80 : 62) + (menu.dailyToast ? 18 : 0);
+    const y = (menu.address ? acctBase + 58 : acctBase + 40) + (menu.dailyToast ? 18 : 0);
     if (flash) label(ctx, '+25 DARE ACCEPTED — BONUS CREDITS', 16, y, 14, '#8fe8a0', 'left');
   }
 
   // Daily login bonus toast — under the account block, gold, hard to miss.
   if (menu.dailyToast) {
     const flash = tick % 30 < 22;
-    if (flash) label(ctx, `+${10} DAILY LOGIN CREDITS`, 16, menu.address ? 80 : 62, 14, '#ffe9a3', 'left');
+    if (flash) {
+      label(ctx, `+${10} DAILY LOGIN CREDITS`, 16, menu.address ? acctBase + 58 : acctBase + 40, 14, '#ffe9a3', 'left');
+    }
   }
 
   label(ctx, 'MILESTONE 5 · CREDITS BUILD', cx, VH - 4, 9, '#ffffff55');
+
+  // Audio chip last so its tap zones sit above the wallet/toast text.
+  if (menu.audio) drawAudioControl(ctx, menu.audio);
 };
 
 // ---------------------------------------------------------------- invite

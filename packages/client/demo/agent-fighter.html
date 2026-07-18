@@ -4587,16 +4587,50 @@ const swingSfx = () => SWING[Math.floor(Math.random() * SWING.length)];
 const BGM_LEVEL = 0.55;
 const SFX_LEVEL = 0.85;
 const DUCK_LEVEL = 0.12;
+/** Impact / block / combo clips — everything else in SFX_FILES is swing whoosh. */
+const HIT_SFX = new Set([
+    'punch_light', 'punch_medium', 'punch_heavy_a', 'punch_heavy_b',
+    'kick_light', 'kick_heavy', 'block_hit', 'combo_accent',
+]);
+const AUDIO_PREFS_KEY = 'af-audio-mute';
+const defaultMutePrefs = () => ({
+    master: false, music: false, sfx: false, hits: false,
+});
+const loadMutePrefs = () => {
+    try {
+        const raw = localStorage.getItem(AUDIO_PREFS_KEY);
+        if (!raw)
+            return defaultMutePrefs();
+        const p = JSON.parse(raw);
+        return {
+            master: !!p.master,
+            music: !!p.music,
+            sfx: !!p.sfx,
+            hits: !!p.hits,
+        };
+    }
+    catch {
+        return defaultMutePrefs();
+    }
+};
+const saveMutePrefs = (p) => {
+    try {
+        localStorage.setItem(AUDIO_PREFS_KEY, JSON.stringify(p));
+    }
+    catch { /* private mode */ }
+};
 class AudioManager {
     ctx = null;
     bgmGain = null;
     sfxGain = null;
+    hitsGain = null;
     buffers = new Map();
     loading = new Map();
     bgmSource = null;
     bgmId = null;
     rotationIndex = 0;
     unlocked = false;
+    prefs = loadMutePrefs();
     ctxOf() {
         if (!this.ctx) {
             // Safari (esp. older iOS) still exposes webkitAudioContext as the ctor.
@@ -4606,14 +4640,60 @@ class AudioManager {
                 throw new Error('Web Audio API unavailable');
             const ctx = new AC();
             this.bgmGain = ctx.createGain();
-            this.bgmGain.gain.value = BGM_LEVEL;
             this.bgmGain.connect(ctx.destination);
             this.sfxGain = ctx.createGain();
-            this.sfxGain.gain.value = SFX_LEVEL;
             this.sfxGain.connect(ctx.destination);
+            this.hitsGain = ctx.createGain();
+            this.hitsGain.connect(ctx.destination);
             this.ctx = ctx;
+            this.applyGains();
         }
         return this.ctx;
+    }
+    isMasterMuted() { return this.prefs.master; }
+    isChannelMuted(ch) { return this.prefs[ch]; }
+    /** One-tap master mute — silences every bus instantly. */
+    toggleMaster() {
+        this.prefs.master = !this.prefs.master;
+        this.persistAndApply();
+    }
+    toggleChannel(ch) {
+        this.prefs[ch] = !this.prefs[ch];
+        this.persistAndApply();
+    }
+    persistAndApply() {
+        saveMutePrefs(this.prefs);
+        this.applyGains();
+    }
+    musicLevel() {
+        return (this.prefs.master || this.prefs.music) ? 0 : BGM_LEVEL;
+    }
+    sfxLevel() {
+        return (this.prefs.master || this.prefs.sfx) ? 0 : SFX_LEVEL;
+    }
+    hitsLevel() {
+        return (this.prefs.master || this.prefs.hits) ? 0 : SFX_LEVEL;
+    }
+    duckLevel() {
+        return (this.prefs.master || this.prefs.music) ? 0 : DUCK_LEVEL;
+    }
+    /** Snap every bus to its current mute state (instant — no fade). */
+    applyGains() {
+        if (!this.ctx)
+            return;
+        const t = this.ctx.currentTime;
+        if (this.bgmGain) {
+            this.bgmGain.gain.cancelScheduledValues(t);
+            this.bgmGain.gain.setValueAtTime(this.musicLevel(), t);
+        }
+        if (this.sfxGain) {
+            this.sfxGain.gain.cancelScheduledValues(t);
+            this.sfxGain.gain.setValueAtTime(this.sfxLevel(), t);
+        }
+        if (this.hitsGain) {
+            this.hitsGain.gain.cancelScheduledValues(t);
+            this.hitsGain.gain.setValueAtTime(this.hitsLevel(), t);
+        }
     }
     /** Browsers block audio until a user gesture — call from the first input. */
     unlock() {
@@ -4713,15 +4793,16 @@ class AudioManager {
             src.buffer = buffer;
             src.loop = true;
             src.connect(this.bgmGain);
+            const target = this.musicLevel();
             const fade = opts.fadeInSec ?? 0;
-            if (fade > 0 && this.bgmGain) {
+            if (fade > 0 && this.bgmGain && target > 0) {
                 this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
                 this.bgmGain.gain.setValueAtTime(0, ctx.currentTime);
-                this.bgmGain.gain.linearRampToValueAtTime(BGM_LEVEL, ctx.currentTime + fade);
+                this.bgmGain.gain.linearRampToValueAtTime(target, ctx.currentTime + fade);
             }
             else if (this.bgmGain) {
                 this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
-                this.bgmGain.gain.setValueAtTime(BGM_LEVEL, ctx.currentTime);
+                this.bgmGain.gain.setValueAtTime(target, ctx.currentTime);
             }
             src.start();
             this.bgmSource = src;
@@ -4734,6 +4815,8 @@ class AudioManager {
     /**
      * One-shot jingle (VS splash, win/lose stinger, challenger reveal, hurry-up
      * warning). Ducks the BGM bed while it plays and restores after.
+     * Routed through the SFX bus (not Hits) so the Music/SFX/Hits toggles stay
+     * meaningful.
      */
     async playStinger(id, opts = {}) {
         try {
@@ -4745,11 +4828,12 @@ class AudioManager {
             const duck = opts.duck ?? true;
             if (duck && this.bgmGain) {
                 this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
-                this.bgmGain.gain.setTargetAtTime(DUCK_LEVEL, ctx.currentTime, 0.05);
+                this.bgmGain.gain.setTargetAtTime(this.duckLevel(), ctx.currentTime, 0.05);
             }
             src.onended = () => {
-                if (duck && this.bgmGain)
-                    this.bgmGain.gain.setTargetAtTime(BGM_LEVEL, ctx.currentTime, 0.4);
+                if (duck && this.bgmGain) {
+                    this.bgmGain.gain.setTargetAtTime(this.musicLevel(), ctx.currentTime, 0.4);
+                }
                 opts.onEnded?.();
             };
             src.start();
@@ -4759,7 +4843,8 @@ class AudioManager {
         }
     }
     /**
-     * Fire-and-forget hit/impact clip. Freely overlaps (each call is its own
+     * Fire-and-forget combat clip. Swings ride the SFX bus; impacts / blocks /
+     * combo accents ride the Hits bus. Freely overlaps (each call is its own
      * source node) — combat routinely needs two of these in the same tick
      * (P1's swing landing while P2's counter also connects). A small random
      * pitch/gain wobble keeps rapid-fire jabs from sounding mechanically
@@ -4767,6 +4852,7 @@ class AudioManager {
      */
     playSfx(id, opts = {}) {
         const ctx = this.ctxOf();
+        const bus = HIT_SFX.has(id) ? this.hitsGain : this.sfxGain;
         void this.load(id).then((buffer) => {
             const src = ctx.createBufferSource();
             src.buffer = buffer;
@@ -4774,7 +4860,7 @@ class AudioManager {
             const gain = ctx.createGain();
             gain.gain.value = (opts.volume ?? 1) * (0.9 + Math.random() * 0.1);
             src.connect(gain);
-            gain.connect(this.sfxGain);
+            gain.connect(bus);
             src.start();
         });
     }
@@ -5503,6 +5589,94 @@ ids) => {
     if (fx.announce)
         drawAnnounce(ctx, fx.announce, fx.announceAge);
 };
+/**
+ * Compact transparent speaker control — upper-left of the title screen.
+ * Tap the speaker = instant master mute/unmute; tap the chevron = Music /
+ * SFX / Hits dropdown. Drawn last so its tap zones win over the wallet chip.
+ */
+const drawAudioControl = (ctx, menu) => {
+    const x = 12, y = 10, h = 28, speakerW = 30, chevW = 18;
+    const w = speakerW + chevW;
+    ctx.fillStyle = 'rgba(10,6,22,0.40)';
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+    ctx.lineWidth = 1.25;
+    ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+    // Speaker glyph (simple path — no emoji dependency on canvas fonts).
+    const muted = menu.masterMuted;
+    const cx = x + speakerW / 2, cy = y + h / 2;
+    ctx.fillStyle = muted ? '#ffffff66' : '#ffffffcc';
+    ctx.strokeStyle = muted ? '#ffffff66' : '#ffffffcc';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(cx - 7, cy - 3);
+    ctx.lineTo(cx - 3, cy - 3);
+    ctx.lineTo(cx + 2, cy - 7);
+    ctx.lineTo(cx + 2, cy + 7);
+    ctx.lineTo(cx - 3, cy + 3);
+    ctx.lineTo(cx - 7, cy + 3);
+    ctx.closePath();
+    ctx.fill();
+    if (muted) {
+        ctx.beginPath();
+        ctx.moveTo(cx + 5, cy - 5);
+        ctx.lineTo(cx + 11, cy + 5);
+        ctx.moveTo(cx + 11, cy - 5);
+        ctx.lineTo(cx + 5, cy + 5);
+        ctx.stroke();
+    }
+    else {
+        ctx.beginPath();
+        ctx.arc(cx + 3, cy, 5, -0.6, 0.6);
+        ctx.stroke();
+    }
+    // Chevron separator + caret.
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.beginPath();
+    ctx.moveTo(x + speakerW, y + 5);
+    ctx.lineTo(x + speakerW, y + h - 5);
+    ctx.stroke();
+    const ax = x + speakerW + chevW / 2, ay = y + h / 2 + (menu.open ? -1 : 1);
+    ctx.fillStyle = '#ffffffaa';
+    ctx.beginPath();
+    if (menu.open) {
+        ctx.moveTo(ax - 4, ay + 3);
+        ctx.lineTo(ax + 4, ay + 3);
+        ctx.lineTo(ax, ay - 3);
+    }
+    else {
+        ctx.moveTo(ax - 4, ay - 3);
+        ctx.lineTo(ax + 4, ay - 3);
+        ctx.lineTo(ax, ay + 3);
+    }
+    ctx.closePath();
+    ctx.fill();
+    tapZone(x, y, speakerW, h, 'audio:mute');
+    tapZone(x + speakerW, y, chevW, h, 'audio:menu');
+    if (!menu.open) {
+        ctx.lineWidth = 1;
+        return;
+    }
+    const rows = [
+        ['Music', 'audio:music', menu.musicMuted],
+        ['SFX', 'audio:sfx', menu.sfxMuted],
+        ['Hits', 'audio:hits', menu.hitsMuted],
+    ];
+    const rowH = 28, panelW = 118, panelH = rows.length * rowH + 6;
+    const px = x, py = y + h + 4;
+    ctx.fillStyle = 'rgba(10,6,22,0.78)';
+    ctx.fillRect(px, py, panelW, panelH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+    ctx.lineWidth = 1.25;
+    ctx.strokeRect(px + 0.5, py + 0.5, panelW - 1, panelH - 1);
+    rows.forEach(([txt, act, chMuted], i) => {
+        const ry = py + 3 + i * rowH;
+        tapZone(px, ry, panelW, rowH, act);
+        label(ctx, txt, px + 12, ry + rowH / 2 + 4, 13, chMuted ? '#ffffff66' : '#ffffffdd', 'left');
+        label(ctx, chMuted ? 'OFF' : 'ON', px + panelW - 12, ry + rowH / 2 + 4, 11, chMuted ? '#ff9d9d99' : '#8fe8a0cc', 'right');
+    });
+    ctx.lineWidth = 1;
+};
 const drawTitle = (ctx, rosters, tick, menu) => {
     drawMenuBackdrop(ctx);
     const cx = VW / 2;
@@ -5645,13 +5819,14 @@ const drawTitle = (ctx, rosters, tick, menu) => {
         });
         ctx.lineWidth = 1;
     }
-    // Account/wallet block — upper LEFT, minimal text (M5 spec).
+    // Account/wallet block — upper LEFT, under the audio chip (M5 spec).
+    const acctBase = 48; // leaves room for the speaker control at y=10
     if (menu.authLabel) {
-        label(ctx, `◆ ${menu.authLabel}`, 16, 22, 13, '#8fe8a0', 'left');
+        label(ctx, `◆ ${menu.authLabel}`, 16, acctBase, 13, '#8fe8a0', 'left');
         if (menu.address) {
-            label(ctx, `${menu.address.slice(0, 6)}…${menu.address.slice(-4)}`, 16, 40, 11, '#ffffff77', 'left');
+            label(ctx, `${menu.address.slice(0, 6)}…${menu.address.slice(-4)}`, 16, acctBase + 18, 11, '#ffffff77', 'left');
         }
-        const acctY = menu.address ? 58 : 40;
+        const acctY = menu.address ? acctBase + 36 : acctBase + 18;
         if (menu.account) {
             const a = menu.account;
             // CREDITS emphasized (big, glowing gold); level + record small alongside.
@@ -5665,17 +5840,21 @@ const drawTitle = (ctx, rosters, tick, menu) => {
     // Referral dare bonus toast — the invitee just cashed in an accepted dare.
     if (menu.referralToast) {
         const flash = (tick + 15) % 30 < 22;
-        const y = (menu.address ? 80 : 62) + (menu.dailyToast ? 18 : 0);
+        const y = (menu.address ? acctBase + 58 : acctBase + 40) + (menu.dailyToast ? 18 : 0);
         if (flash)
             label(ctx, '+25 DARE ACCEPTED — BONUS CREDITS', 16, y, 14, '#8fe8a0', 'left');
     }
     // Daily login bonus toast — under the account block, gold, hard to miss.
     if (menu.dailyToast) {
         const flash = tick % 30 < 22;
-        if (flash)
-            label(ctx, `+${10} DAILY LOGIN CREDITS`, 16, menu.address ? 80 : 62, 14, '#ffe9a3', 'left');
+        if (flash) {
+            label(ctx, `+${10} DAILY LOGIN CREDITS`, 16, menu.address ? acctBase + 58 : acctBase + 40, 14, '#ffe9a3', 'left');
+        }
     }
     label(ctx, 'MILESTONE 5 · CREDITS BUILD', cx, VH - 4, 9, '#ffffff55');
+    // Audio chip last so its tap zones sit above the wallet/toast text.
+    if (menu.audio)
+        drawAudioControl(ctx, menu.audio);
 };
 // ---------------------------------------------------------------- invite
 /** Hot-red display() treatment for the dare headline / CTA. */
@@ -7576,6 +7755,8 @@ let practiceFree = false; // offline-fallback match: no fee, no XP, no records
 // The remembered fighter makes the title's ENTER a one-input path to a match.
 const LAST_FIGHTER_KEY = 'af-last-fighter';
 let lastFighter = localStorage.getItem(LAST_FIGHTER_KEY) ?? '';
+/** Title-screen Music/SFX/Hits dropdown (speaker chip always visible). */
+let audioMenuOpen = false;
 // ---- Referral dares ("I dare you to beat me"). A shared landing link
 // (agent-fighter-web.vercel.app/dare/<code>) deep-links here with ?ref=;
 // the code waits in localStorage until the first authenticated contact
@@ -8631,6 +8812,13 @@ const frame = () => {
             challenge: !!pendingRoom,
             fighter: (allRosters.find((r) => r.id === lastFighter && !r.disabled)
                 ?? allRosters.find((r) => !r.disabled))?.bundle.name,
+            audio: {
+                masterMuted: audio.isMasterMuted(),
+                musicMuted: audio.isChannelMuted('music'),
+                sfxMuted: audio.isChannelMuted('sfx'),
+                hitsMuted: audio.isChannelMuted('hits'),
+                open: audioMenuOpen,
+            },
         });
         // 2-player local is disabled on all platforms (single-controller / mobile
         // focus). The '2p' Mode value + its handling stay in the codebase, just no
@@ -8638,6 +8826,7 @@ const frame = () => {
         const MODES = ['cpu', 'online'];
         /** Leave the title for the fighter select. */
         const enterSelect = () => {
+            audioMenuOpen = false;
             screen = 'select';
             locked = [false, false];
             selectingFriendly = false; // a title select is always wager (online) or arcade (cpu)
@@ -8657,7 +8846,23 @@ const frame = () => {
         const launchMode = () => { enterSelect(); };
         // A tapped mode row picks the mode AND launches — one tap to a match.
         const tappedMode = MODES.find((m) => taps.has(`mode:${m}`));
-        if (pressedThisFrame.has('KeyL') || taps.has('signin')) {
+        // Audio chip — works on the sign-in gate too (music is already playing).
+        const audioTap = ['music', 'sfx', 'hits']
+            .find((ch) => taps.has(`audio:${ch}`));
+        if (taps.has('audio:mute')) {
+            audio.toggleMaster();
+        }
+        else if (taps.has('audio:menu')) {
+            audioMenuOpen = !audioMenuOpen;
+        }
+        else if (audioTap) {
+            audio.toggleChannel(audioTap);
+        }
+        else if (audioMenuOpen && taps.size > 0) {
+            // Any other tap dismisses the dropdown without launching a mode.
+            audioMenuOpen = false;
+        }
+        else if (pressedThisFrame.has('KeyL') || taps.has('signin')) {
             // AIR sign-in/out toggle — must not fall through to "any key starts".
             if (auth.status === 'in') {
                 void authLogout();
@@ -8670,6 +8875,7 @@ const frame = () => {
         }
         else if (pressedThisFrame.has('KeyR') || taps.has('ranks')) {
             // Standings are public — viewable even from the sign-in gate.
+            audioMenuOpen = false;
             screen = 'ranks';
             fetchRanks();
         }
