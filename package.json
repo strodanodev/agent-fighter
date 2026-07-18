@@ -19,6 +19,7 @@
     "play": "npm run play -w @af/client",
     "server": "npm run start -w @af/server",
     "agent": "npm run agent -w @af/server",
+    "fleet": "npm run fleet -w @af/server",
     "studio": "npm run start -w @af/studio"
   },
   "devDependencies": {

@@ -20,3 +20,7 @@ packages/client/demo/vendor/
 
 .vercel
 air/partner_rs256.pem
+
+# headless agent self-signup credentials (plaintext key — never commit)
+**/af-agent.json
+**/fleet-agents.json

@@ -6,6 +6,7 @@
   "scripts": {
     "start": "tsx src/server.ts",
     "agent": "tsx src/agent-client.ts",
+    "fleet": "tsx src/agent-fleet.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test test/*.test.ts"
   },
