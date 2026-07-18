@@ -135,6 +135,26 @@ let lastFighter = localStorage.getItem(LAST_FIGHTER_KEY) ?? '';
 /** Title-screen Music/SFX/Hits dropdown (speaker chip always visible). */
 let audioMenuOpen = false;
 
+/**
+ * AIR sign-in / sign-out toggle. This MUST be reachable straight from a pointer
+ * event's own call stack: AIR's `login()` opens an OAuth surface (popup /
+ * redirect) that iOS Safari only permits while a user-activation is still live.
+ * Every other menu tap is drained a frame later inside the rAF loop, which on
+ * iPhone drops that activation and the dialog silently never opens — the
+ * sign-in headline looked completely dead. Same failure class the invite share
+ * buttons already work around by firing in-gesture. Desktop `L` still routes
+ * here from the frame loop (keyboard has no activation constraint).
+ */
+const toggleSignIn = (): void => {
+  if (auth.status === 'in') {
+    void authLogout();
+    account = null;
+    accountFetch = 'idle';
+  } else {
+    void authLogin();
+  }
+};
+
 // ---- Referral dares ("I dare you to beat me"). A shared landing link
 // (agent-fighter-web.vercel.app/dare/<code>) deep-links here with ?ref=;
 // the code waits in localStorage until the first authenticated contact
@@ -197,12 +217,21 @@ const shareDare = (): void => {
   const link = dareLink();
   const text = `${currentTaunt()} — I DARE YOU TO BEAT ME. +25 credits if you can take one round.`;
   const done = (): void => { inviteCopiedAge = 0; };
-  if (shareViaSheet()) {
-    void navigator.share({ title: 'AGENT FIGHTER', text, url: link }).then(done)
-      .catch(() => { /* user closed the sheet — not a failure */ });
-  } else {
+  const copyFallback = (): void => {
     void navigator.clipboard?.writeText(`${text}\n${link}`).then(done)
-      .catch(() => { window.prompt('COPY YOUR DARE LINK:', link); });
+      .catch(() => { window.prompt('COPY YOUR DARE LINK:', link); done(); });
+  };
+  if (shareViaSheet()) {
+    // Must be called synchronously from a tap/key gesture on iOS — a deferred
+    // rAF call loses user activation and fails with NotAllowedError.
+    void navigator.share({ title: 'AGENT FIGHTER', text, url: link }).then(done)
+      .catch((err: unknown) => {
+        // User dismissed the sheet — leave the button armed for another try.
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        copyFallback();
+      });
+  } else {
+    copyFallback();
   }
 };
 /** Ticks the pre-fight stakes card has been showing (-1 = off). */
@@ -1296,13 +1325,10 @@ const frame = (): void => {
       audioMenuOpen = false;
     } else if (pressedThisFrame.has('KeyL') || taps.has('signin')) {
       // AIR sign-in/out toggle — must not fall through to "any key starts".
-      if (auth.status === 'in') {
-        void authLogout();
-        account = null;
-        accountFetch = 'idle';
-      } else {
-        void authLogin();
-      }
+      // On touch the gesture-time pointerdown handler below already fired this
+      // and deleted the tap, so iOS keeps the user-activation the OAuth dialog
+      // needs; reaching here means the desktop `L` key (no activation gate).
+      toggleSignIn();
     } else if (pressedThisFrame.has('KeyR') || taps.has('ranks')) {
       // Standings are public — viewable even from the sign-in gate.
       audioMenuOpen = false;
@@ -1893,6 +1919,35 @@ Object.assign(globalThis, {
   // Sever the live socket WITHOUT the leave-intent flag — simulates a wifi
   // blip so the reconnect path can be tested from the console/automation.
   afNetDrop: () => { net?.debugDrop(); },
+});
+
+// Actions that open an OS / OAuth surface (share sheet, clipboard, the AIR
+// sign-in dialog) MUST run in the same turn as the pointer event. The menu
+// frame loop drains taps one frame later, which pushes them past iOS Safari's
+// user-activation window → a silent NotAllowedError / blocked popup, felt as
+// "the buttons do nothing". Handle those few here, in-gesture, and delete the
+// tap so the frame loop never fires it a second time.
+canvas.addEventListener('pointerdown', () => {
+  // Home-screen sign-in gate: the whole game is unreachable on iPhone if this
+  // dialog can't open. (Guard on the audio dropdown so a tap meant to dismiss
+  // it isn't hijacked into a login — mirrors the frame loop's branch order.)
+  if (screen === 'title' && !audioMenuOpen && taps.has('signin')) {
+    toggleSignIn();
+    taps.delete('signin');
+    return;
+  }
+  if (screen !== 'invite') return;
+  if (taps.has('copydare')) {
+    shareDare();
+    taps.delete('copydare'); // frame handler must not fire a second share
+  } else if (taps.has('challenge') && account?.refCode) {
+    const code = account.refCode;
+    void navigator.clipboard
+      ?.writeText(`${location.origin}/?room=${encodeURIComponent(code)}&ref=${encodeURIComponent(code)}`)
+      .catch(() => { /* lobby shows the room code as fallback */ });
+    startFriendly(code);
+    taps.delete('challenge');
+  }
 });
 
 // Mobile: auto-detect touch devices and lay the on-screen controls over the

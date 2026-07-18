@@ -1394,12 +1394,23 @@ export const drawInvite = (
     stats.bars.forEach((s, i) => drawStatBar(ctx, sx, py0 + 36 + i * 21, sw, s, '#e8a24a', tick));
   }
 
-  // ---- taunt row: ◀ ▶ cycles presets, T writes your own (rides the link).
+  // Escape hatch — phones have no ESC. Same chip as select / ranks.
+  const backW = 110, backH = 34;
+  tapZone(VW - 16 - backW, 12, backW, backH, 'back');
+  ctx.fillStyle = 'rgba(10,6,22,0.6)';
+  ctx.fillRect(VW - 16 - backW, 12, backW, backH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(VW - 16 - backW + 0.5, 12.5, backW - 1, backH - 1);
+  ctx.lineWidth = 1;
+  label(ctx, '‹ BACK', VW - 16 - backW / 2, 12 + backH / 2 + 4, 12, '#ffffffcc');
+
+  // ---- taunt row: ◀ ▶ cycles presets (fat hit targets for thumbs).
   const ty = py0 + ph + 26;
   label(ctx, '◀', cx - 300, ty, 18, GOLD_LT);
   label(ctx, '▶', cx + 300, ty, 18, GOLD_LT);
-  tapZone(cx - 336, ty - 20, 72, 34, 'taunt:prev');
-  tapZone(cx + 264, ty - 20, 72, 34, 'taunt:next');
+  tapZone(cx - 350, ty - 28, 96, 52, 'taunt:prev');
+  tapZone(cx + 254, ty - 28, 96, 52, 'taunt:next');
   label(ctx, `“${v.taunt}”`, cx, ty, v.taunt.length > 52 ? 12 : 15, '#ffe9a3');
   label(ctx, `TAUNT ${v.tauntIdx + 1}/${v.tauntCount}  ·  ◀ ▶  TO CHANGE`, cx, ty + 20, 11, '#ffffff77');
 
@@ -1467,9 +1478,8 @@ export const drawInvite = (
   }
 
   label(ctx,
-    `ESC  BACK      ◀ ▶  TAUNT      C  CHALLENGE      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`,
+    `‹ BACK      ◀ ▶  TAUNT      C  CHALLENGE      ENTER  ${v.canShare ? 'SEND' : 'COPY'}`,
     cx, VH - 12, 12, '#ffffff99');
-  tapZone(24, VH - 38, 150, 32, 'back');
 };
 
 // ---------------------------------------------------------------- select
