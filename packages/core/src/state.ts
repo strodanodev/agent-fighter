@@ -1,6 +1,7 @@
 import { fp } from './fp.js';
 import { ROUND_SECONDS, STAGE, TICKS_PER_SEC, TUNING, loadCharacter } from './data.js';
 import type { LoadedCharacter } from './data.js';
+import type { ItemEffect } from './items.js';
 import { HIST_LEN } from './motion.js';
 import { ANALOG } from './characters/analog.js';
 
@@ -71,6 +72,12 @@ export interface FighterState {
   wantThrow: number; // within-tick throw intent: 0/1 fwd/2 back (cleared each tick)
   histIdx: number;
   prevInput: number;
+  // CONSUMABLES (ADR 0007 Phase 2) — set at spawn from the pinned match
+  // loadout, all zero when no drink was carried (strictly additive: a
+  // no-item match behaves bit-identically to pre-item builds).
+  itemDmg: number; // per-mille damage bonus while itemBuffLeft > 0
+  itemDef: number; // per-mille damage-taken reduction while itemBuffLeft > 0
+  itemBuffLeft: number; // buff ticks remaining (counts down in step)
   dirHist: number[]; // ring buffer of numpad dirs, length HIST_LEN
 }
 
@@ -121,15 +128,44 @@ export const setCharacters = (c0: LoadedCharacter, c1: LoadedCharacter): void =>
   characters[1] = c1;
 };
 
+/**
+ * CONSUMABLES (ADR 0007 Phase 2): the per-side drink carried into the next
+ * match. Same contract as setCharacters — install between matches, never
+ * mid-sim, identical on every simulating peer (client, server verifier,
+ * rollback re-sim). The pinned effect comes from SMatch and is applied at
+ * spawn/round-reset; `[null, null]` (the default) is the pre-item behavior.
+ *
+ * Values are CLAMPED here (audit lesson: bound data at the boundary) — a
+ * hostile pin can't mint a 10× damage drink or an hour-long buff.
+ */
+const matchItems: [ItemEffect | null, ItemEffect | null] = [null, null];
+
+export const setMatchItems = (i0: ItemEffect | null, i1: ItemEffect | null): void => {
+  const clampEffect = (e: ItemEffect | null): ItemEffect | null => {
+    if (!e) return null;
+    const amount = Math.max(0, Math.min(500, Math.trunc(e.amount)));
+    const durationTicks = Math.max(0, Math.min(7200, Math.trunc(e.durationTicks)));
+    return { kind: e.kind, amount, durationTicks };
+  };
+  matchItems[0] = clampEffect(i0);
+  matchItems[1] = clampEffect(i1);
+};
+
 const SPAWN_OFFSET = 180;
 
-const spawnFighter = (x: number, facing: 1 | -1, ch: LoadedCharacter): FighterState => ({
+const spawnFighter = (
+  x: number, facing: 1 | -1, ch: LoadedCharacter, side: 0 | 1,
+): FighterState => ({
   x: fp(x),
   y: fp(STAGE.floorYPx),
   velX: 0,
   velY: 0,
   facing,
-  health: ch.b.maxHealth,
+  // PATCH drinks: start each round with bonus health (per-mille of max —
+  // an over-max head start that drains normally; the bar clamps at 100%).
+  health: matchItems[side]?.kind === 'heal'
+    ? Math.trunc((ch.b.maxHealth * (1000 + matchItems[side]!.amount)) / 1000)
+    : ch.b.maxHealth,
   meter: 0,
   action: Action.Idle,
   actionFrame: 0,
@@ -160,6 +196,12 @@ const spawnFighter = (x: number, facing: 1 | -1, ch: LoadedCharacter): FighterSt
   wantThrow: 0,
   histIdx: 0,
   prevInput: 0,
+  // OVERCLOCK / FIREWALL drinks: the buff re-arms at every round start
+  // (spawnFighter runs for round 1 AND resetRound) for its durationTicks.
+  itemDmg: matchItems[side]?.kind === 'damageMult' ? matchItems[side]!.amount : 0,
+  itemDef: matchItems[side]?.kind === 'defenseMult' ? matchItems[side]!.amount : 0,
+  itemBuffLeft: (matchItems[side]?.kind === 'damageMult' || matchItems[side]?.kind === 'defenseMult')
+    ? matchItems[side]!.durationTicks : 0,
   dirHist: new Array(HIST_LEN).fill(5),
 });
 
@@ -181,11 +223,27 @@ export const createGameState = (seed: number): GameState => ({
   hitstopLeft: 0,
   superFlashLeft: 0,
   fighters: [
-    spawnFighter(STAGE.widthPx / 2 - SPAWN_OFFSET, 1, characters[0]),
-    spawnFighter(STAGE.widthPx / 2 + SPAWN_OFFSET, -1, characters[1]),
+    spawnItemFighter(0),
+    spawnItemFighter(1),
   ],
   projectiles: Array.from({ length: PROJECTILE_SLOTS }, emptyProjectile),
 });
+
+/** Spawn side `i` at its corner, with VOLT meter granted at MATCH start only. */
+const spawnItemFighter = (i: 0 | 1): FighterState => {
+  const f = spawnFighter(
+    STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET),
+    i === 0 ? 1 : -1,
+    characters[i],
+    i,
+  );
+  // VOLT drinks: instant meter, once per MATCH (meter persists across
+  // rounds, so resetRound must not re-grant — it keeps the live meter).
+  if (matchItems[i]?.kind === 'meterGain') {
+    f.meter = Math.min(TUNING.meterMax, matchItems[i]!.amount);
+  }
+  return f;
+};
 
 /** Between rounds: reset positions/health/actions; meter and score persist. */
 export const resetRound = (s: GameState): void => {
@@ -195,8 +253,9 @@ export const resetRound = (s: GameState): void => {
       STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET),
       i === 0 ? 1 : -1,
       characters[i],
+      i,
     );
-    fresh.meter = keepMeter;
+    fresh.meter = keepMeter; // meter persists; VOLT is match-start only
     s.fighters[i] = fresh as GameState['fighters'][0];
   }
   for (let i = 0; i < PROJECTILE_SLOTS; i++) s.projectiles[i] = emptyProjectile();
@@ -240,6 +299,7 @@ const FIGHTER_FIELDS = [
   'tapDir', 'tapTimer', 'dashBuf', 'dashBufLeft',
   'pushblocked', 'techLeft', 'throwBack', 'launchJC', 'wantThrow',
   'histIdx', 'prevInput',
+  'itemDmg', 'itemDef', 'itemBuffLeft',
 ] as const;
 
 const PROJECTILE_FIELDS = [

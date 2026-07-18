@@ -535,8 +535,26 @@ interface StrikeSource {
   facing: number; // push direction (+1 right)
   x: number; // for corner-transfer + block side
   attacker: FighterState | null; // null for projectiles
+  /**
+   * Whose item buff (ADR 0007) scales this hit's damage — the attacker for
+   * melee, the OWNER for projectiles (attacker stays null there so meter /
+   * corner-transfer semantics are untouched).
+   */
+  buff: FighterState;
   move: MoveDef;
 }
+
+/** Item-buff damage pipeline: attacker's OVERCLOCK, then victim's FIREWALL. */
+const itemScaled = (dmg: number, src: StrikeSource, vic: FighterState, floor: number): number => {
+  let d = dmg;
+  if (src.buff.itemBuffLeft > 0 && src.buff.itemDmg > 0) {
+    d = Math.trunc((d * (1000 + src.buff.itemDmg)) / 1000);
+  }
+  if (vic.itemBuffLeft > 0 && vic.itemDef > 0) {
+    d = Math.trunc((d * (1000 - vic.itemDef)) / 1000);
+  }
+  return Math.max(floor, d);
+};
 
 /** Apply one hit/block. Returns 0 none, 1 hit, 2 block. */
 const strike = (s: GameState, src: StrikeSource, vic: FighterState, hb: HitboxDef): number => {
@@ -552,7 +570,7 @@ const strike = (s: GameState, src: StrikeSource, vic: FighterState, hb: HitboxDe
   const dir = src.facing;
 
   if (canBlock(vic, src.x, hb.guard)) {
-    vic.health = Math.max(0, vic.health - hb.chip);
+    vic.health = Math.max(0, vic.health - (hb.chip > 0 ? itemScaled(hb.chip, src, vic, 0) : 0));
     vic.blockstunLeft = hb.blockstun;
     vic.velX = dir * fp(hb.pushbackBlock);
     vic.pushblocked = 0;
@@ -575,8 +593,8 @@ const strike = (s: GameState, src: StrikeSource, vic: FighterState, hb: HitboxDe
     vic.juggleBudget = TUNING.juggleBudget;
   }
   vic.comboHits++;
-  const dmg = Math.max(
-    Math.trunc((hb.damage * Math.max(vic.comboScaling, TUNING.scalingFloor)) / 1000), 1);
+  const dmg = itemScaled(Math.max(
+    Math.trunc((hb.damage * Math.max(vic.comboScaling, TUNING.scalingFloor)) / 1000), 1), src, vic, 1);
   vic.comboScaling = Math.max(
     Math.trunc((vic.comboScaling * TUNING.scalingMult) / 1000), TUNING.scalingFloor);
   if (vicAir) vic.juggleBudget -= hb.juggleCost;
@@ -806,6 +824,11 @@ export const step = (s: GameState, inputs: [InputFrame, InputFrame]): void => {
 
   autoFace(f0, f1);
 
+  // Item buffs (ADR 0007) burn only during live fighting — pre-round,
+  // round-over, hitstop and super flash all return before this line.
+  if (f0.itemBuffLeft > 0) f0.itemBuffLeft--;
+  if (f1.itemBuffLeft > 0) f1.itemBuffLeft--;
+
   updateFighter(s, f0, f1, c0, io0);
   updateFighter(s, f1, f0, c1, io1);
 
@@ -842,7 +865,7 @@ export const step = (s: GameState, inputs: [InputFrame, InputFrame]): void => {
       const hbw = worldRect(f.x, f.y, f.facing, hb.rect);
       for (const vb of vicBoxes) {
         if (overlaps(hbw, worldRect(other.x, other.y, other.facing, vb))) {
-          hitPlan.push({ src: { facing: f.facing, x: f.x, attacker: f, move }, vic: other, hb, stepIdx: si });
+          hitPlan.push({ src: { facing: f.facing, x: f.x, attacker: f, buff: f, move }, vic: other, hb, stepIdx: si });
           break outer;
         }
       }
@@ -867,7 +890,7 @@ export const step = (s: GameState, inputs: [InputFrame, InputFrame]): void => {
     for (const vb of hurtboxesOf(vic, vicCh)) {
       if (overlaps(rectW, worldRect(vic.x, vic.y, vic.facing, vb))) {
         const owner = s.fighters[p.owner as 0 | 1];
-        const result = strike(s, { facing: p.velX >= 0 ? 1 : -1, x: p.x, attacker: null, move }, vic, pd.hit);
+        const result = strike(s, { facing: p.velX >= 0 ? 1 : -1, x: p.x, attacker: null, buff: owner, move }, vic, pd.hit);
         if (result !== 0) {
           p.hasHit = 1;
           p.active = 0;

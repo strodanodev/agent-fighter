@@ -831,13 +831,26 @@ export const drawHud = (
   for (const i of [0, 1] as const) {
     const f = g.fighters[i];
     const max = rosters[i].ch.b.maxHealth;
-    const ratio = Math.max(0, f.health) / max;
+    // PATCH drinks spawn ABOVE max health — the bar clamps full and simply
+    // doesn't drain until the overheal is chewed through.
+    const ratio = Math.min(1, Math.max(0, f.health) / max);
     drawHealthBar(ctx, i, ratio, fx.flash[i], g.tick);
     drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
     drawNameplate(ctx, i, rosters[i].bundle.name + (tags?.[i] ? ` · ${tags[i]}` : ''));
     drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
     drawMeter(ctx, i, f.meter, g.tick);
     if (ids?.[i]) drawPlayerId(ctx, i, ids[i]!);
+    // Item buff chip (ADR 0007): a live drink shows its can + countdown just
+    // inside the health bar's end; expiry blinks the last 3 seconds.
+    if (f.itemBuffLeft > 0) {
+      const secs = Math.ceil(f.itemBuffLeft / TICKS_PER_SEC);
+      const blink = secs <= 3 && g.tick % 24 < 14;
+      const bx = i === 0 ? HUD.edge + HUD.barW + 10 : VW - HUD.edge - HUD.barW - 26;
+      if (!blink) {
+        drawCan(ctx, bx, HUD.barY + 2, 16, 30, f.itemDmg > 0 ? '#ff9d6b' : '#6fd3ff', 6);
+        label(ctx, `${secs}`, bx + 8, HUD.barY + 46, 12, '#ffffffdd');
+      }
+    }
   }
   drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
 

@@ -256,6 +256,16 @@ export interface Persistence {
    * charged (the /me wallet can be a different identity mid-AIR-rehydration).
    */
   getCredits: (sub: string) => Promise<number | null>;
+  /**
+   * Claim ONE unconsumed drink for a match (escrow-at-pair-time, the fee
+   * pattern): atomically stamps consumed_match_id. Returns the item, or null
+   * if the row doesn't exist / isn't `sub`'s / was already consumed — except
+   * idempotently: already consumed BY THIS match returns the item again
+   * (safe retry). No-contest settlement calls releaseItems to hand it back.
+   */
+  consumeItem: (sub: string, rowId: number, matchId: string) => Promise<OwnedItem | null>;
+  /** Un-consume every item claimed by `matchId` (refund path). */
+  releaseItems: (matchId: string) => Promise<void>;
 }
 
 /** One granted (not yet consumed) consumable in a player's inventory. */
@@ -363,7 +373,7 @@ export const memoryPersistence = (): Persistence => {
   /** sub → trained agent config + key (ADR 0006). */
   const agents = new Map<string, { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null }>();
   /** Granted consumables, newest first (ADR 0007). Nonce = idempotency key. */
-  const ownedItems: (OwnedItem & { sub: string; nonce: string })[] = [];
+  const ownedItems: (OwnedItem & { sub: string; nonce: string; consumedMatchId?: string })[] = [];
   let nextItemRow = 1;
   /** Newest-first ring of settled matches (GET /agent/matches food). */
   const matchRows: MatchRow[] = [];
@@ -589,10 +599,22 @@ export const memoryPersistence = (): Persistence => {
     },
     listItems: async (sub, limit = 50) =>
       ownedItems
-        .filter((i) => i.sub === sub)
+        .filter((i) => i.sub === sub && !i.consumedMatchId) // consumed = gone
         .slice(0, limit)
         .map(({ rowId, itemId, tier, createdAt }) => ({ rowId, itemId, tier, createdAt })),
     getCredits: async (sub) => (profiles.has(sub) ? prof(sub).credits : null),
+    consumeItem: async (sub, rowId, matchId) => {
+      const row = ownedItems.find((i) => i.sub === sub && i.rowId === rowId);
+      if (!row) return null;
+      if (row.consumedMatchId && row.consumedMatchId !== matchId) return null;
+      row.consumedMatchId = matchId;
+      return { rowId: row.rowId, itemId: row.itemId, tier: row.tier, createdAt: row.createdAt };
+    },
+    releaseItems: async (matchId) => {
+      for (const row of ownedItems) {
+        if (row.consumedMatchId === matchId) row.consumedMatchId = undefined;
+      }
+    },
   };
 };
 
@@ -818,6 +840,43 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         { method: 'GET' },
       )) as Array<Record<string, unknown>>;
       return rows?.[0] ? Number(rows[0].credits ?? 0) : null;
+    },
+    consumeItem: async (sub, rowId, matchId) => {
+      // Atomic claim: the consumed_match_id=is.null filter makes the UPDATE
+      // a compare-and-swap — a row already claimed by another match matches
+      // zero rows. Retry-idempotent via the second read below.
+      const claim = (await call(
+        `/rest/v1/items?id=eq.${rowId | 0}&profile_id=eq.${encodeURIComponent(sub)}`
+        + `&consumed_match_id=is.null`,
+        {
+          method: 'PATCH',
+          headers: { Prefer: 'return=representation' },
+          body: JSON.stringify({ consumed_match_id: matchId, consumed_at: new Date().toISOString() }),
+        },
+      )) as Array<Record<string, unknown>>;
+      let row = claim?.[0];
+      if (!row) {
+        // Maybe WE already claimed it (retry after a crash) — that's fine.
+        const again = (await call(
+          `/rest/v1/items?id=eq.${rowId | 0}&profile_id=eq.${encodeURIComponent(sub)}`
+          + `&consumed_match_id=eq.${encodeURIComponent(matchId)}&select=*&limit=1`,
+          { method: 'GET' },
+        )) as Array<Record<string, unknown>>;
+        row = again?.[0];
+        if (!row) return null;
+      }
+      return {
+        rowId: Number(row.id ?? 0),
+        itemId: String(row.item_id ?? ''),
+        tier: Number(row.tier ?? 1),
+        createdAt: String(row.created_at ?? ''),
+      };
+    },
+    releaseItems: async (matchId) => {
+      await call(
+        `/rest/v1/items?consumed_match_id=eq.${encodeURIComponent(matchId)}`,
+        { method: 'PATCH', body: JSON.stringify({ consumed_match_id: null, consumed_at: null }) },
+      );
     },
   };
 };

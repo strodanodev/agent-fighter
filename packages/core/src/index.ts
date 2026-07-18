@@ -27,4 +27,5 @@ export type { AiState, AiPersonality } from './ai.js';
 export {
   ITEMS, ITEM_COST, ITEM_TIER_ODDS, ITEM_TIER_COLORS, ITEM_TIER_LABELS, itemById,
 } from './items.js';
+export { setMatchItems } from './state.js';
 export type { ItemDef, ItemEffect, ItemEffectKind, ItemTier } from './items.js';

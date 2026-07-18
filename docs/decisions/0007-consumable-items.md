@@ -59,14 +59,33 @@ remain untouchable; this is a separate, priced vocabulary.
   mouse + touch), `'shop'` screen: machine, PULL, reveal animation,
   inventory shelf.
 
-## Phases 2–4 (planned, not in this change)
+## Phases 2–4 (2 SHIPPED 2026-07-19; 3–4 planned)
 
-2. **Pre-match consumable in arcade/solo**: `CQueue.item` → server validates
-   ownership + marks consumed (idempotent by match id, refund on
-   no-contest like fees) → pins both sides' effects into `SMatch` → core
-   applies at spawn. New fighter fields join `FIGHTER_FIELDS`
-   (serialize.test enforces completeness). ENGINE_VERSION bump; additive
-   behavior keeps existing goldens green; add item goldens.
+2. **Pre-match consumable in arcade/solo — SHIPPED.** As designed, with the
+   semantics locked as: gacha rolls at purchase, in-match behavior 100%
+   deterministic. `CQueue.item` (rowId) → server atomically consumes at
+   pair time (`consumeItem`, the escrow pattern; PostgREST compare-and-swap
+   on `consumed_match_id is null`) → pins `{id,name,tier,effect}` per side
+   into `SMatch.items` → EVERY simulating end installs it via core
+   `setMatchItems` before `createGameState` (client begin/rebuild, server
+   verifyLedger/verifySoloLedger/findDeviator, headless agent-session).
+   The client applies items ONLY from the SMatch echo — old servers just
+   yield an item-less match, never a desync. NO-CONTEST settlements release
+   the drink (`releaseItems` by match id); any decided outcome leaves it
+   drunk. Effect semantics (round-scoped): PATCH = bonus starting health
+   each round (over max; HUD bar clamps full); OVERCLOCK/FIREWALL = %-mille
+   damage dealt/taken for durationTicks from each round's FIGHT (ticks only
+   during live play — not pre-round/hitstop/superflash); VOLT = meter once
+   at MATCH start (meter persists rounds). Throws stay unbuffed (flat
+   `throwDamage`, documented). Core clamps hostile pins (amount ≤ 500,
+   duration ≤ 7200). ENGINE_VERSION af-core-2 → **af-core-3** (3 new
+   FighterState fields shift the serialize layout; goldens re-blessed —
+   all 61 behavioral tests unchanged, proving item-less play identical).
+   UI: select-screen drink strip (I / tap cycles NONE→stash, arcade + solo
+   dare/spar only), VS-card "IS IN PLAY" line, in-match buff chip with
+   countdown next to the health bar. Known gap: a server crash between
+   consume and settle strands the drink consumed (the escrow sweeper
+   doesn't release items yet — one 5 CR can, add to the sweeper later).
 3. **In-match activation**: `Btn.Item = 1 << 10`; HUD slot at the meter gap
    (`ui.ts` HUD block); touch button; juice via `updateJuice` edge detect.
 4. **Wager**: DECIDED (2026-07-19) — open carry at player discretion (not

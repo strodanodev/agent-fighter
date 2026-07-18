@@ -15,9 +15,9 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, loadCharacter,
-  setCharacters, stateHash, step,
+  setCharacters, setMatchItems, stateHash, step,
 } from '@af/core';
-import type { AiState, CharacterBundle, GameState, InputFrame } from '@af/core';
+import type { AiState, CharacterBundle, GameState, InputFrame, ItemEffect } from '@af/core';
 import { HASH_EVERY, PROTOCOL_VERSION } from './protocol.js';
 import type { ClientMsg, SMatch, SResult, ServerMsg } from './protocol.js';
 
@@ -69,6 +69,11 @@ export interface AgentOptions {
    * instead of the house AI (your own code = sparring vs your own agent).
    */
   agentOf?: string;
+  /**
+   * CONSUMABLES (ADR 0007 Phase 2, solo/arcade): inventory rowId of one
+   * drink to carry. Applied only if the server echoes it in setup.items.
+   */
+  item?: number;
   /** Owner's AIR email — target for the reputation write-back (ADR 0004). */
   email?: string;
 }
@@ -101,7 +106,18 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
     // with different character pairs would silently corrupt each other's
     // lockstep sims without this.
     let myChars: [ReturnType<typeof loadCharacter>, ReturnType<typeof loadCharacter>] | null = null;
-    const pinChars = (): void => { if (myChars) setCharacters(myChars[0], myChars[1]); };
+    // Pinned drinks (ADR 0007) are engine-global exactly like characters —
+    // re-pin both before every burst or concurrent sessions corrupt each
+    // other. [null, null] when the setup carried no items.
+    let myItems: SMatch['items'] = undefined;
+    const pinChars = (): void => {
+      if (!myChars) return;
+      setCharacters(myChars[0], myChars[1]);
+      setMatchItems(
+        (myItems?.[0]?.effect as ItemEffect | undefined) ?? null,
+        (myItems?.[1]?.effect as ItemEffect | undefined) ?? null,
+      );
+    };
 
     const myInputs: number[] = [];
     const oppInputs: (number | undefined)[] = [];
@@ -151,6 +167,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
         mode: opts.mode ?? 'wager',
         runToken: opts.runToken,
         agentOf: opts.agentOf,
+        item: opts.item,
       });
     });
 
@@ -167,6 +184,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
             loadCharacter(bundleOf(msg.chars[0].id)),
             loadCharacter(bundleOf(msg.chars[1].id)),
           ];
+          myItems = msg.items;
           pinChars();
           game = createGameState(msg.seed);
           ai = createAi(side, opts.skill, opts.aiSeed ?? msg.seed ^ (side + 1) * 0x9e37, opts.personality);

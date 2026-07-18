@@ -241,8 +241,12 @@ export const ROUND_SECONDS = 99;
  *
  * af-core-2: AI meter/special usage (supers no longer gated to skill ≥ 65;
  *            214K wired up) — changes house-bot inputs, hence a new version.
+ * af-core-3: consumable items (ADR 0007 Phase 2) — three new FighterState
+ *            fields (itemDmg/itemDef/itemBuffLeft) change the serialize
+ *            layout (all state hashes shift even for item-less matches:
+ *            goldens re-blessed), and pinned drinks scale strike() damage.
  */
-export const ENGINE_VERSION = 'af-core-2';
+export const ENGINE_VERSION = 'af-core-3';
 
 export const TUNING = {
   roundsToWin: 2, // best of 3

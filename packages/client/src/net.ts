@@ -1,7 +1,7 @@
 import {
-  ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, restore, snapshot, stateHash, step,
+  ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, restore, setMatchItems, snapshot, stateHash, step,
 } from '@af/core';
-import type { AiState, GameState, InputFrame } from '@af/core';
+import type { AiState, GameState, InputFrame, ItemEffect } from '@af/core';
 
 /**
  * Online netplay session — GGPO-style rollback over the match-server relay
@@ -47,9 +47,33 @@ export interface NetSetup {
    * run for the next battle after a verified win.
    */
   arcade?: { battle: number; total: number; token: string };
+  /**
+   * CONSUMABLES (ADR 0007 Phase 2): the server-pinned per-side drinks. The
+   * sim applies items ONLY from this echo — never from what we asked for —
+   * so an old server (which ignores CQueue.item) simply means an item-less
+   * match, not a desync. Installed via installSetupItems() before EVERY
+   * createGameState (begin + resume rebuild); absent clears the slot.
+   */
+  items?: [NetItemPin | null, NetItemPin | null];
   /** This side's resume token — lets a dropped socket rejoin (ADR 0005). */
   resume?: string;
 }
+
+/** One pinned drink as it rides the setup (display fields + sim effect). */
+export interface NetItemPin {
+  id: string;
+  name: string;
+  tier: number;
+  effect: { kind: string; amount: number; durationTicks: number };
+}
+
+/** Install a setup's pinned drinks into core — part of match construction. */
+const installSetupItems = (s: NetSetup): void => {
+  setMatchItems(
+    (s.items?.[0]?.effect as ItemEffect | undefined) ?? null,
+    (s.items?.[1]?.effect as ItemEffect | undefined) ?? null,
+  );
+};
 
 export interface NetResult {
   winner: number;
@@ -95,6 +119,9 @@ export interface NetXp {
   losses: number;
   creditsDelta: number;
   credits: number;
+  /** Free vending pulls earned this match (one per level gained); the client
+   *  resolves each id → full item def and reveals it on the results screen. */
+  freePulls?: { itemId: string; tier: number }[];
 }
 
 export class NetSession {
@@ -332,6 +359,7 @@ export class NetSession {
   /** Call after installing characters for the pinned setup. */
   begin(): void {
     const s = this.setup!;
+    installSetupItems(s);
     this.game = createGameState(s.seed);
     // First `delay` ticks are neutral by convention — symmetric with the peer.
     for (let k = 0; k < s.delay; k++) {
@@ -360,6 +388,7 @@ export class NetSession {
     this.oppInputs = asSparse(s.side === 0 ? s.inputs[1] : s.inputs[0]);
     this.usedOpp = [];
     this.snaps = new Array(SNAP_RING).fill(null);
+    installSetupItems(s);
     this.game = createGameState(s.seed);
     let t = 0;
     while (
@@ -536,6 +565,12 @@ export class SoloSession {
      * Solo mode only — ignored when arcadeQueue is set.
      */
     private agentOf?: string,
+    /**
+     * CONSUMABLES (ADR 0007 Phase 2): inventory rowId of ONE drink to carry
+     * into this match. The buff only applies if the server echoes it back in
+     * setup.items (an old server silently yields an item-less match).
+     */
+    private itemRow?: number,
   ) {
     this.connect(false);
   }
@@ -553,6 +588,7 @@ export class SoloSession {
           mode: this.arcadeQueue ? 'arcade' : 'solo',
           runToken: this.arcadeQueue?.runToken || undefined,
           agentOf: this.arcadeQueue ? undefined : this.agentOf || undefined,
+          item: this.itemRow || undefined,
         });
         this.status = 'queued';
       }
@@ -621,6 +657,7 @@ export class SoloSession {
    */
   private rebuildFrom(s: NetSetup & { inputs: [(number | null)[], (number | null)[]] }): void {
     this.setup = s;
+    installSetupItems(s);
     this.game = createGameState(s.seed);
     this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed, s.solo!.personality);
     const mine = s.inputs[0];
@@ -676,6 +713,7 @@ export class SoloSession {
   /** Call after installing characters for the pinned setup. */
   begin(): void {
     const s = this.setup!;
+    installSetupItems(s);
     this.game = createGameState(s.seed);
     this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed, s.solo!.personality);
     // Same throttled-tab race as NetSession.begin(): a result that landed

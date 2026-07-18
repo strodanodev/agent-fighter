@@ -185,8 +185,12 @@ const ROUND_SECONDS = 99;
  *
  * af-core-2: AI meter/special usage (supers no longer gated to skill ≥ 65;
  *            214K wired up) — changes house-bot inputs, hence a new version.
+ * af-core-3: consumable items (ADR 0007 Phase 2) — three new FighterState
+ *            fields (itemDmg/itemDef/itemBuffLeft) change the serialize
+ *            layout (all state hashes shift even for item-less matches:
+ *            goldens re-blessed), and pinned drinks scale strike() damage.
  */
-const ENGINE_VERSION = 'af-core-2';
+const ENGINE_VERSION = 'af-core-3';
 const TUNING = {
     roundsToWin: 2, // best of 3
     preRoundTicks: 60,
@@ -619,14 +623,40 @@ const setCharacters = (c0, c1) => {
     characters[0] = c0;
     characters[1] = c1;
 };
+/**
+ * CONSUMABLES (ADR 0007 Phase 2): the per-side drink carried into the next
+ * match. Same contract as setCharacters — install between matches, never
+ * mid-sim, identical on every simulating peer (client, server verifier,
+ * rollback re-sim). The pinned effect comes from SMatch and is applied at
+ * spawn/round-reset; `[null, null]` (the default) is the pre-item behavior.
+ *
+ * Values are CLAMPED here (audit lesson: bound data at the boundary) — a
+ * hostile pin can't mint a 10× damage drink or an hour-long buff.
+ */
+const matchItems = [null, null];
+const setMatchItems = (i0, i1) => {
+    const clampEffect = (e) => {
+        if (!e)
+            return null;
+        const amount = Math.max(0, Math.min(500, Math.trunc(e.amount)));
+        const durationTicks = Math.max(0, Math.min(7200, Math.trunc(e.durationTicks)));
+        return { kind: e.kind, amount, durationTicks };
+    };
+    matchItems[0] = clampEffect(i0);
+    matchItems[1] = clampEffect(i1);
+};
 const SPAWN_OFFSET = 180;
-const spawnFighter = (x, facing, ch) => ({
+const spawnFighter = (x, facing, ch, side) => ({
     x: fp(x),
     y: fp(STAGE.floorYPx),
     velX: 0,
     velY: 0,
     facing,
-    health: ch.b.maxHealth,
+    // PATCH drinks: start each round with bonus health (per-mille of max —
+    // an over-max head start that drains normally; the bar clamps at 100%).
+    health: matchItems[side]?.kind === 'heal'
+        ? Math.trunc((ch.b.maxHealth * (1000 + matchItems[side].amount)) / 1000)
+        : ch.b.maxHealth,
     meter: 0,
     action: 0 /* Action.Idle */,
     actionFrame: 0,
@@ -657,6 +687,12 @@ const spawnFighter = (x, facing, ch) => ({
     wantThrow: 0,
     histIdx: 0,
     prevInput: 0,
+    // OVERCLOCK / FIREWALL drinks: the buff re-arms at every round start
+    // (spawnFighter runs for round 1 AND resetRound) for its durationTicks.
+    itemDmg: matchItems[side]?.kind === 'damageMult' ? matchItems[side].amount : 0,
+    itemDef: matchItems[side]?.kind === 'defenseMult' ? matchItems[side].amount : 0,
+    itemBuffLeft: (matchItems[side]?.kind === 'damageMult' || matchItems[side]?.kind === 'defenseMult')
+        ? matchItems[side].durationTicks : 0,
     dirHist: new Array(HIST_LEN).fill(5),
 });
 const emptyProjectile = () => ({
@@ -676,17 +712,27 @@ const createGameState = (seed) => ({
     hitstopLeft: 0,
     superFlashLeft: 0,
     fighters: [
-        spawnFighter(STAGE.widthPx / 2 - SPAWN_OFFSET, 1, characters[0]),
-        spawnFighter(STAGE.widthPx / 2 + SPAWN_OFFSET, -1, characters[1]),
+        spawnItemFighter(0),
+        spawnItemFighter(1),
     ],
     projectiles: Array.from({ length: PROJECTILE_SLOTS }, emptyProjectile),
 });
+/** Spawn side `i` at its corner, with VOLT meter granted at MATCH start only. */
+const spawnItemFighter = (i) => {
+    const f = spawnFighter(STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET), i === 0 ? 1 : -1, characters[i], i);
+    // VOLT drinks: instant meter, once per MATCH (meter persists across
+    // rounds, so resetRound must not re-grant — it keeps the live meter).
+    if (matchItems[i]?.kind === 'meterGain') {
+        f.meter = Math.min(TUNING.meterMax, matchItems[i].amount);
+    }
+    return f;
+};
 /** Between rounds: reset positions/health/actions; meter and score persist. */
 const resetRound = (s) => {
     for (const i of [0, 1]) {
         const keepMeter = s.fighters[i].meter;
-        const fresh = spawnFighter(STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET), i === 0 ? 1 : -1, characters[i]);
-        fresh.meter = keepMeter;
+        const fresh = spawnFighter(STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET), i === 0 ? 1 : -1, characters[i], i);
+        fresh.meter = keepMeter; // meter persists; VOLT is match-start only
         s.fighters[i] = fresh;
     }
     for (let i = 0; i < PROJECTILE_SLOTS; i++)
@@ -729,6 +775,7 @@ const FIGHTER_FIELDS = [
     'tapDir', 'tapTimer', 'dashBuf', 'dashBufLeft',
     'pushblocked', 'techLeft', 'throwBack', 'launchJC', 'wantThrow',
     'histIdx', 'prevInput',
+    'itemDmg', 'itemDef', 'itemBuffLeft',
 ];
 const PROJECTILE_FIELDS = [
     'active', 'owner', 'moveIdx', 'x', 'y', 'velX', 'life', 'hasHit',
@@ -1264,6 +1311,17 @@ const canBlock = (vic, threatX, guard) => {
         return !crouching;
     return true;
 };
+/** Item-buff damage pipeline: attacker's OVERCLOCK, then victim's FIREWALL. */
+const itemScaled = (dmg, src, vic, floor) => {
+    let d = dmg;
+    if (src.buff.itemBuffLeft > 0 && src.buff.itemDmg > 0) {
+        d = Math.trunc((d * (1000 + src.buff.itemDmg)) / 1000);
+    }
+    if (vic.itemBuffLeft > 0 && vic.itemDef > 0) {
+        d = Math.trunc((d * (1000 - vic.itemDef)) / 1000);
+    }
+    return Math.max(floor, d);
+};
 /** Apply one hit/block. Returns 0 none, 1 hit, 2 block. */
 const strike = (s, src, vic, hb) => {
     if (vic.action === 19 /* Action.KO */ || vic.action === 15 /* Action.Knockdown */
@@ -1276,7 +1334,7 @@ const strike = (s, src, vic, hb) => {
         return 0;
     const dir = src.facing;
     if (canBlock(vic, src.x, hb.guard)) {
-        vic.health = Math.max(0, vic.health - hb.chip);
+        vic.health = Math.max(0, vic.health - (hb.chip > 0 ? itemScaled(hb.chip, src, vic, 0) : 0));
         vic.blockstunLeft = hb.blockstun;
         vic.velX = dir * fp(hb.pushbackBlock);
         vic.pushblocked = 0;
@@ -1299,7 +1357,7 @@ const strike = (s, src, vic, hb) => {
         vic.juggleBudget = TUNING.juggleBudget;
     }
     vic.comboHits++;
-    const dmg = Math.max(Math.trunc((hb.damage * Math.max(vic.comboScaling, TUNING.scalingFloor)) / 1000), 1);
+    const dmg = itemScaled(Math.max(Math.trunc((hb.damage * Math.max(vic.comboScaling, TUNING.scalingFloor)) / 1000), 1), src, vic, 1);
     vic.comboScaling = Math.max(Math.trunc((vic.comboScaling * TUNING.scalingMult) / 1000), TUNING.scalingFloor);
     if (vicAir)
         vic.juggleBudget -= hb.juggleCost;
@@ -1523,6 +1581,12 @@ const step = (s, inputs) => {
         return;
     }
     autoFace(f0, f1);
+    // Item buffs (ADR 0007) burn only during live fighting — pre-round,
+    // round-over, hitstop and super flash all return before this line.
+    if (f0.itemBuffLeft > 0)
+        f0.itemBuffLeft--;
+    if (f1.itemBuffLeft > 0)
+        f1.itemBuffLeft--;
     updateFighter(s, f0, f1, c0, io0);
     updateFighter(s, f1, f0, c1, io1);
     resolveThrows(s);
@@ -1557,7 +1621,7 @@ const step = (s, inputs) => {
             const hbw = worldRect(f.x, f.y, f.facing, hb.rect);
             for (const vb of vicBoxes) {
                 if (overlaps(hbw, worldRect(other.x, other.y, other.facing, vb))) {
-                    hitPlan.push({ src: { facing: f.facing, x: f.x, attacker: f, move }, vic: other, hb, stepIdx: si });
+                    hitPlan.push({ src: { facing: f.facing, x: f.x, attacker: f, buff: f, move }, vic: other, hb, stepIdx: si });
                     break outer;
                 }
             }
@@ -1582,7 +1646,7 @@ const step = (s, inputs) => {
         for (const vb of hurtboxesOf(vic, vicCh)) {
             if (overlaps(rectW, worldRect(vic.x, vic.y, vic.facing, vb))) {
                 const owner = s.fighters[p.owner];
-                const result = strike(s, { facing: p.velX >= 0 ? 1 : -1, x: p.x, attacker: null, move }, vic, pd.hit);
+                const result = strike(s, { facing: p.velX >= 0 ? 1 : -1, x: p.x, attacker: null, buff: owner, move }, vic, pd.hit);
                 if (result !== 0) {
                     p.hasHit = 1;
                     p.active = 0;
@@ -3219,6 +3283,10 @@ const HASH_EVERY = 60;
 const SNAP_RING = 128;
 /** Client-initiated RTT probe cadence (connection-quality overlay). */
 const PING_MS = 2_000;
+/** Install a setup's pinned drinks into core — part of match construction. */
+const installSetupItems = (s) => {
+    setMatchItems(s.items?.[0]?.effect ?? null, s.items?.[1]?.effect ?? null);
+};
 /** Resume retry policy: a handful of quick attempts inside the server's
  * FORFEIT_GRACE window (20s) — 6 × ~1.6s covers a router blip with room. */
 const RESUME_ATTEMPTS = 6;
@@ -3473,6 +3541,7 @@ class NetSession {
     /** Call after installing characters for the pinned setup. */
     begin() {
         const s = this.setup;
+        installSetupItems(s);
         this.game = createGameState(s.seed);
         // First `delay` ticks are neutral by convention — symmetric with the peer.
         for (let k = 0; k < s.delay; k++) {
@@ -3500,6 +3569,7 @@ class NetSession {
         this.oppInputs = asSparse(s.side === 0 ? s.inputs[1] : s.inputs[0]);
         this.usedOpp = [];
         this.snaps = new Array(SNAP_RING).fill(null);
+        installSetupItems(s);
         this.game = createGameState(s.seed);
         let t = 0;
         while (this.myInputs[t] !== undefined && this.oppInputs[t] !== undefined
@@ -3623,6 +3693,7 @@ class SoloSession {
     ref;
     arcadeQueue;
     agentOf;
+    itemRow;
     status = 'connecting';
     error = '';
     setup = null;
@@ -3665,7 +3736,13 @@ class SoloSession {
      * this dare/ref code instead of the house AI (your own code = sparring).
      * Solo mode only — ignored when arcadeQueue is set.
      */
-    agentOf) {
+    agentOf, 
+    /**
+     * CONSUMABLES (ADR 0007 Phase 2): inventory rowId of ONE drink to carry
+     * into this match. The buff only applies if the server echoes it back in
+     * setup.items (an old server silently yields an item-less match).
+     */
+    itemRow) {
         this.url = url;
         this.name = name;
         this.character = character;
@@ -3675,6 +3752,7 @@ class SoloSession {
         this.ref = ref;
         this.arcadeQueue = arcadeQueue;
         this.agentOf = agentOf;
+        this.itemRow = itemRow;
         this.connect(false);
     }
     connect(resume) {
@@ -3691,6 +3769,7 @@ class SoloSession {
                     mode: this.arcadeQueue ? 'arcade' : 'solo',
                     runToken: this.arcadeQueue?.runToken || undefined,
                     agentOf: this.arcadeQueue ? undefined : this.agentOf || undefined,
+                    item: this.itemRow || undefined,
                 });
                 this.status = 'queued';
             }
@@ -3758,6 +3837,7 @@ class SoloSession {
      */
     rebuildFrom(s) {
         this.setup = s;
+        installSetupItems(s);
         this.game = createGameState(s.seed);
         this.houseAi = createAi(1, s.solo.skill, s.solo.aiSeed, s.solo.personality);
         const mine = s.inputs[0];
@@ -3819,6 +3899,7 @@ class SoloSession {
     /** Call after installing characters for the pinned setup. */
     begin() {
         const s = this.setup;
+        installSetupItems(s);
         this.game = createGameState(s.seed);
         this.houseAi = createAi(1, s.solo.skill, s.solo.aiSeed, s.solo.personality);
         // Same throttled-tab race as NetSession.begin(): a result that landed
@@ -5721,7 +5802,9 @@ ids) => {
     for (const i of [0, 1]) {
         const f = g.fighters[i];
         const max = rosters[i].ch.b.maxHealth;
-        const ratio = Math.max(0, f.health) / max;
+        // PATCH drinks spawn ABOVE max health — the bar clamps full and simply
+        // doesn't drain until the overheal is chewed through.
+        const ratio = Math.min(1, Math.max(0, f.health) / max);
         drawHealthBar(ctx, i, ratio, fx.flash[i], g.tick);
         drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
         drawNameplate(ctx, i, rosters[i].bundle.name + (tags?.[i] ? ` · ${tags[i]}` : ''));
@@ -5729,6 +5812,17 @@ ids) => {
         drawMeter(ctx, i, f.meter, g.tick);
         if (ids?.[i])
             drawPlayerId(ctx, i, ids[i]);
+        // Item buff chip (ADR 0007): a live drink shows its can + countdown just
+        // inside the health bar's end; expiry blinks the last 3 seconds.
+        if (f.itemBuffLeft > 0) {
+            const secs = Math.ceil(f.itemBuffLeft / TICKS_PER_SEC);
+            const blink = secs <= 3 && g.tick % 24 < 14;
+            const bx = i === 0 ? HUD.edge + HUD.barW + 10 : VW - HUD.edge - HUD.barW - 26;
+            if (!blink) {
+                drawCan(ctx, bx, HUD.barY + 2, 16, 30, f.itemDmg > 0 ? '#ff9d6b' : '#6fd3ff', 6);
+                label(ctx, `${secs}`, bx + 8, HUD.barY + 46, 12, '#ffffffdd');
+            }
+        }
     }
     drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
     // Combo counter: punches in on each new hit (re-triggered via comboAge
@@ -9012,6 +9106,8 @@ let shopPending = null;
 // (found live twice; the enterShop re-fetch alone didn't close the race).
 let shopHeaders = null;
 let shopCredits = null;
+/** Select-screen drink pick: index into shopInv, -1 = fight empty-handed. */
+let carryIdx = -1;
 const mapOwned = (it) => ({
     rowId: Number(it.rowId ?? 0),
     name: it.def?.name ?? 'UNKNOWN CAN',
@@ -9344,6 +9440,15 @@ const startOnline = (m, runToken, agentOf) => {
     localStorage.setItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
     queuedMode = m;
     queuedAgentOf = m === 'solo' ? agentOf ?? '' : ''; // rematch re-queues the same agent
+    // CONSUMABLES (ADR 0007 Phase 2): capture the drink pick NOW (the token
+    // fetch below is async) and spend it — one drink, one match. The entry
+    // leaves the local stash optimistically; the server is the truth and a
+    // failed claim just means an item-less match. Rematches start empty-handed.
+    const itemRow = (m === 'solo' || m === 'arcade') && carryIdx >= 0
+        ? shopInv[carryIdx]?.rowId : undefined;
+    if (itemRow)
+        shopInv = shopInv.filter((it) => it.rowId !== itemRow);
+    carryIdx = -1;
     practiceFree = false;
     netInstalled = false;
     screen = 'online';
@@ -9360,7 +9465,7 @@ const startOnline = (m, runToken, agentOf) => {
         // solo house AI for the trained agent behind a dare code.
         net = m === 'wager' || m === 'friendly'
             ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(), m === 'friendly' ? friendlyRoom : undefined)
-            : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(), m === 'arcade' ? { runToken } : undefined, m === 'solo' ? agentOf : undefined);
+            : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(), m === 'arcade' ? { runToken } : undefined, m === 'solo' ? agentOf : undefined, itemRow);
     });
 };
 /**
@@ -9448,6 +9553,11 @@ const installOnlineMatch = () => {
             : s.mode === 'friendly'
                 ? ['FRIENDLY CHALLENGE      NO FEE · NO POT · NO RECORDS', 'BRAGGING RIGHTS ONLY · SERVER-VERIFIED']
                 : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
+    // CONSUMABLES: the pinned drink is part of the stakes — show what's
+    // being drunk (server echo = the truth, not what the player asked for).
+    const drink = s.items?.[s.side];
+    if (drink)
+        vsStakes.push(`🥤 ${drink.name} · LV ${drink.tier} IS IN PLAY`);
     const newChallenger = s.mode === 'arcade' && (s.arcade?.battle ?? 0) > 0;
     void audio.playStinger(newChallenger ? 'here_comes_a_new_challenger' : 'vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
@@ -9818,6 +9928,9 @@ const renderFight = (g) => {
     drawFx(ctx, 'screen');
 };
 // ---------------------------------------------------------------- screens
+/** Drinks ride into ranked PvE only for now: arcade (cpu-mode select) + solo. */
+const carryEligible = () => shopInv.length > 0 && !selectingFriendly
+    && (mode === 'cpu' || Boolean(selectingAgentOf));
 const tickSelect = () => {
     const n = allRosters.length;
     const enabled = (i) => !allRosters[i]?.disabled;
@@ -9897,6 +10010,13 @@ const tickSelect = () => {
             move(1, -1);
         if (pressedThisFrame.has('ArrowRight'))
             move(1, 1);
+    }
+    // CONSUMABLES: cycle the carried drink (I / tap the strip) for ranked
+    // arena modes — NONE → newest…oldest → NONE. Friendly/wager stay dry
+    // (open-carry wager is ADR 0007 Phase 4).
+    if (carryEligible() && (pressedThisFrame.has('KeyI') || taps.has('item:cycle'))) {
+        carryIdx = carryIdx + 1 >= Math.min(shopInv.length, 8) ? -1 : carryIdx + 1;
+        audio.blip();
     }
     // A disabled fighter under the cursor cannot be confirmed.
     if (!locked[0] && enabled(picks[0]) && (tapConfirm || CONFIRM[0].some((k) => pressedThisFrame.has(k)))) {
@@ -10054,6 +10174,11 @@ const frame = () => {
             if (fe < 0)
                 fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
             picks = [fe, fe];
+            // CONSUMABLES: refresh the stash so the drink strip offers the truth;
+            // start empty-handed each visit (carrying is a per-match decision).
+            carryIdx = -1;
+            if (signedIn)
+                void fetchShop();
             void audio.playBgm('player_select', { fadeInSec: 0.5 });
         };
         /**
@@ -10300,6 +10425,26 @@ const frame = () => {
             : undefined;
         drawSelect(ctx, allRosters, picks, locked, uiTick, badge, mode === 'cpu' ? Math.max(1, allRosters.filter((r) => !r.disabled).length - 1) : undefined, selectingFriendly);
         drawWalletStrip();
+        // CONSUMABLES: the drink strip (drawn inline, AUTO-chip style — ui.ts is
+        // for durable screens). Bottom-left, above the controls hint band.
+        if (carryEligible()) {
+            const it = carryIdx >= 0 ? shopInv[carryIdx] : undefined;
+            const label2 = it ? `🥤 ${it.name} · LV ${it.tier} — ${it.desc}` : '🥤 NO DRINK — FIGHT CLEAN';
+            const w = 340, h = 30, x = 14, y = VH - 78;
+            tapZone(x, y, w, h, 'item:cycle');
+            ctx.fillStyle = it ? 'rgba(24,44,26,0.88)' : 'rgba(12,10,24,0.8)';
+            ctx.fillRect(x, y, w, h);
+            ctx.strokeStyle = it ? '#7ddf8a' : 'rgba(255,255,255,0.25)';
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+            ctx.fillStyle = it ? '#c8ffd0' : '#ffffff99';
+            ctx.font = '600 12px system-ui, sans-serif';
+            ctx.textAlign = 'left';
+            ctx.fillText(label2, x + 10, y + 19, w - 20);
+            ctx.fillStyle = '#ffffff66';
+            ctx.fillText('I / TAP TO CHANGE', x + w + 10, y + 19);
+            ctx.textAlign = 'center';
+        }
     }
     else if (screen === 'stageSelect') {
         tickStageSelect();

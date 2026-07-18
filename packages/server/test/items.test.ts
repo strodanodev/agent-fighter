@@ -11,11 +11,20 @@
  */
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
-import { ITEMS, ITEM_COST } from '@af/core';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { ENGINE_VERSION, ITEMS, ITEM_COST } from '@af/core';
+import { WebSocket } from 'ws';
 import { createMatchServer } from '../src/server.js';
 import type { MatchServer } from '../src/server.js';
 import { memoryPersistence, DAILY_CREDITS } from '../src/persist.js';
 import type { Persistence } from '../src/persist.js';
+import { PROTOCOL_VERSION } from '../src/protocol.js';
+import type { ServerMsg } from '../src/protocol.js';
+import { playOneMatch } from '../src/agent-session.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const charactersDir = join(here, '..', '..', '..', 'characters');
 
 describe('vending machine (ADR 0007 Phase 1)', () => {
   let server: MatchServer;
@@ -121,3 +130,117 @@ describe('vending machine (ADR 0007 Phase 1)', () => {
     assert.equal(list.length, 2, 'the failed pull granted nothing');
   });
 });
+
+/**
+ * PHASE 2 — drinks in matches: consume at pair time, pin into the setup,
+ * verify the buffed sim end-to-end, release on a no-contest.
+ */
+describe('consumables in matches (ADR 0007 Phase 2)', () => {
+  let server: MatchServer;
+  let mem: Persistence;
+  let http = '';
+  // Each case plays a FRESH dev identity: the daily 10 buys one 5 CR drink
+  // plus fees with room to spare, so no case can bankrupt the next.
+  const hdr = (who: string): Record<string, string> =>
+    ({ 'X-Dev-Name': who, 'Content-Type': 'application/json' });
+
+  const buy = async (who: string, nonce: string): Promise<{ rowId: number; itemId: string }> => {
+    await fetch(`${http}/me`, { headers: hdr(who) }); // profile + daily 10
+    const res = await fetch(`${http}/items/buy`, {
+      method: 'POST', headers: hdr(who), body: JSON.stringify({ nonce }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { rowId: number; item: { id: string } };
+    return { rowId: body.rowId, itemId: body.item.id };
+  };
+
+  const inventory = async (who: string): Promise<number[]> => {
+    const res = await fetch(`${http}/items`, { headers: hdr(who) });
+    return (await res.json() as { items: Array<{ rowId: number }> }).items.map((i) => i.rowId);
+  };
+
+  before(async () => {
+    mem = memoryPersistence();
+    // Short idle window: the no-contest release test goes silent on purpose.
+    server = await createMatchServer({ port: 0, persistence: mem, noPaceCheck: true, idleForfeitMs: 700 });
+    http = `http://localhost:${server.port}`;
+  });
+  after(() => server.close());
+
+  it('a solo match with a drink pins it, verifies end-to-end, and consumes it', async () => {
+    const drink = await buy('Drinker', 'phase2-pull-1');
+    assert.deepEqual(await inventory('Drinker'), [drink.rowId]);
+
+    // The reference client sims the match itself — it applies the pinned
+    // items from the setup echo, so a VERIFIED result here proves both ends
+    // (client sim + server re-sim) agreed on the BUFFED simulation. If the
+    // verifier forgot installItems, the hashes/outcome would diverge.
+    const r = await playOneMatch({
+      url: `ws://localhost:${server.port}`,
+      name: 'Drinker', character: 'analog', skill: 60,
+      charactersDir, aiSeed: 41, paceMs: 1, mode: 'solo',
+      item: drink.rowId,
+    });
+    assert.equal(r.result.reason, 'verified');
+    assert.equal(r.result.deviator, undefined, 'no side flagged — both simmed the same buffed match');
+    assert.equal(r.result.hash, r.localHash, 'client and verifier agree bit-for-bit');
+
+    assert.deepEqual(await inventory('Drinker'), [], 'the drink was consumed by playing');
+  });
+
+  it('the setup echoes the pinned drink (and a bogus rowId yields an item-less match)', async () => {
+    const drink = await buy('Echoer', 'phase2-pull-2');
+    const setupWith = await rawSolo(server.port, 'Echoer', drink.rowId);
+    const items = setupWith.items as Array<{ id: string } | null> | undefined;
+    assert.ok(items?.[0], 'side 0 carries the drink');
+    assert.equal(items[0]!.id, drink.itemId);
+    assert.equal(items[1], null, 'the house drinks nothing');
+
+    // The abandoned socket settles as forfeit/incomplete eventually; either
+    // way the NEXT queue with a bogus row must be clean and item-less.
+    const setupBogus = await rawSolo(server.port, 'Echoer', 999999);
+    assert.equal(setupBogus.items, undefined, 'bogus rowId → no pin, match still starts');
+  });
+
+  it('a silent no-contest hands the drink back', async () => {
+    const drink = await buy('Ghost', 'phase2-pull-3');
+    const ws = new WebSocket(`ws://localhost:${server.port}`);
+    const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => { ws.close(); reject(new Error('no result before timeout')); }, 15_000);
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ t: 'hello', v: PROTOCOL_VERSION, name: 'Ghost', engine: ENGINE_VERSION }));
+        ws.send(JSON.stringify({ t: 'queue', character: 'analog', mode: 'solo', item: drink.rowId }));
+      });
+      ws.on('message', (d) => {
+        const m = JSON.parse(String(d)) as ServerMsg & Record<string, unknown>;
+        if (m.t === 'match') {
+          // A few honest ticks, then total silence WITHOUT closing — the
+          // idle sweep must settle this as a no-contest (nobody to blame in
+          // PvE) and the drink must come home.
+          for (let k = 0; k < 20; k++) ws.send(JSON.stringify({ t: 'i', k, v: 0 }));
+        }
+        if (m.t === 'result') { clearTimeout(timer); ws.close(); resolve(m); }
+        if (m.t === 'error') { clearTimeout(timer); ws.close(); reject(new Error(String(m.msg))); }
+      });
+    });
+    assert.equal(result.reason, 'incomplete', 'silence in PvE is a no-contest');
+    await new Promise((r) => setTimeout(r, 300)); // releaseItems is fire-and-forget
+    assert.ok((await inventory('Ghost')).includes(drink.rowId), 'the un-drunk drink is back in the stash');
+  });
+});
+
+/** Raw solo queue → resolve the SMatch setup (then abandon the socket). */
+const rawSolo = (port: number, name: string, item: number): Promise<Record<string, unknown>> =>
+  new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://localhost:${port}`);
+    const timer = setTimeout(() => { ws.close(); reject(new Error('no setup before timeout')); }, 8_000);
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ t: 'hello', v: PROTOCOL_VERSION, name, engine: ENGINE_VERSION }));
+      ws.send(JSON.stringify({ t: 'queue', character: 'analog', mode: 'solo', item }));
+    });
+    ws.on('message', (d) => {
+      const m = JSON.parse(String(d)) as Record<string, unknown>;
+      if (m.t === 'match') { clearTimeout(timer); ws.close(); resolve(m); }
+      if (m.t === 'error') { clearTimeout(timer); ws.close(); reject(new Error(String(m.msg))); }
+    });
+  });

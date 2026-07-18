@@ -546,6 +546,8 @@ let shopPending: { reveal: ShopReveal; entry: ShopInventoryEntry } | null = null
 // (found live twice; the enterShop re-fetch alone didn't close the race).
 let shopHeaders: Record<string, string> | null = null;
 let shopCredits: number | null = null;
+/** Select-screen drink pick: index into shopInv, -1 = fight empty-handed. */
+let carryIdx = -1;
 
 const mapOwned = (
   it: { rowId?: number; tier?: number; def?: ShopCatalogDef | null },
@@ -911,6 +913,14 @@ const startOnline = (m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: str
   localStorage.setItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
   queuedMode = m;
   queuedAgentOf = m === 'solo' ? agentOf ?? '' : ''; // rematch re-queues the same agent
+  // CONSUMABLES (ADR 0007 Phase 2): capture the drink pick NOW (the token
+  // fetch below is async) and spend it — one drink, one match. The entry
+  // leaves the local stash optimistically; the server is the truth and a
+  // failed claim just means an item-less match. Rematches start empty-handed.
+  const itemRow = (m === 'solo' || m === 'arcade') && carryIdx >= 0
+    ? shopInv[carryIdx]?.rowId : undefined;
+  if (itemRow) shopInv = shopInv.filter((it) => it.rowId !== itemRow);
+  carryIdx = -1;
   practiceFree = false;
   netInstalled = false;
   screen = 'online';
@@ -929,7 +939,8 @@ const startOnline = (m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: str
         m === 'friendly' ? friendlyRoom : undefined)
       : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(),
         m === 'arcade' ? { runToken } : undefined,
-        m === 'solo' ? agentOf : undefined);
+        m === 'solo' ? agentOf : undefined,
+        itemRow);
   });
 };
 
@@ -1017,6 +1028,10 @@ const installOnlineMatch = (): void => {
       : s.mode === 'friendly'
         ? ['FRIENDLY CHALLENGE      NO FEE · NO POT · NO RECORDS', 'BRAGGING RIGHTS ONLY · SERVER-VERIFIED']
         : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
+  // CONSUMABLES: the pinned drink is part of the stakes — show what's
+  // being drunk (server echo = the truth, not what the player asked for).
+  const drink = s.items?.[s.side];
+  if (drink) vsStakes.push(`🥤 ${drink.name} · LV ${drink.tier} IS IN PLAY`);
   const newChallenger = s.mode === 'arcade' && (s.arcade?.battle ?? 0) > 0;
   void audio.playStinger(newChallenger ? 'here_comes_a_new_challenger' : 'vs',
     { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
@@ -1402,6 +1417,11 @@ const renderFight = (g: GameState): void => {
 };
 
 // ---------------------------------------------------------------- screens
+/** Drinks ride into ranked PvE only for now: arcade (cpu-mode select) + solo. */
+const carryEligible = (): boolean =>
+  shopInv.length > 0 && !selectingFriendly
+  && (mode === 'cpu' || Boolean(selectingAgentOf));
+
 const tickSelect = (): void => {
   const n = allRosters.length;
   const enabled = (i: number): boolean => !allRosters[i]?.disabled;
@@ -1461,6 +1481,14 @@ const tickSelect = (): void => {
   } else {
     if (pressedThisFrame.has('ArrowLeft')) move(1, -1);
     if (pressedThisFrame.has('ArrowRight')) move(1, 1);
+  }
+
+  // CONSUMABLES: cycle the carried drink (I / tap the strip) for ranked
+  // arena modes — NONE → newest…oldest → NONE. Friendly/wager stay dry
+  // (open-carry wager is ADR 0007 Phase 4).
+  if (carryEligible() && (pressedThisFrame.has('KeyI') || taps.has('item:cycle'))) {
+    carryIdx = carryIdx + 1 >= Math.min(shopInv.length, 8) ? -1 : carryIdx + 1;
+    audio.blip();
   }
 
   // A disabled fighter under the cursor cannot be confirmed.
@@ -1596,6 +1624,10 @@ const frame = (): void => {
       let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
       if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
       picks = [fe, fe];
+      // CONSUMABLES: refresh the stash so the drink strip offers the truth;
+      // start empty-handed each visit (carrying is a per-match decision).
+      carryIdx = -1;
+      if (signedIn) void fetchShop();
       void audio.playBgm('player_select', { fadeInSec: 0.5 });
     };
     /**
@@ -1804,6 +1836,26 @@ const frame = (): void => {
       mode === 'cpu' ? Math.max(1, allRosters.filter((r) => !r.disabled).length - 1) : undefined,
       selectingFriendly);
     drawWalletStrip();
+    // CONSUMABLES: the drink strip (drawn inline, AUTO-chip style — ui.ts is
+    // for durable screens). Bottom-left, above the controls hint band.
+    if (carryEligible()) {
+      const it = carryIdx >= 0 ? shopInv[carryIdx] : undefined;
+      const label2 = it ? `🥤 ${it.name} · LV ${it.tier} — ${it.desc}` : '🥤 NO DRINK — FIGHT CLEAN';
+      const w = 340, h = 30, x = 14, y = VH - 78;
+      tapZone(x, y, w, h, 'item:cycle');
+      ctx.fillStyle = it ? 'rgba(24,44,26,0.88)' : 'rgba(12,10,24,0.8)';
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = it ? '#7ddf8a' : 'rgba(255,255,255,0.25)';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+      ctx.fillStyle = it ? '#c8ffd0' : '#ffffff99';
+      ctx.font = '600 12px system-ui, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(label2, x + 10, y + 19, w - 20);
+      ctx.fillStyle = '#ffffff66';
+      ctx.fillText('I / TAP TO CHANGE', x + w + 10, y + 19);
+      ctx.textAlign = 'center';
+    }
   } else if (screen === 'stageSelect') {
     tickStageSelect();
     drawStageSelect(ctx, stageIds, stageCursor, uiTick);

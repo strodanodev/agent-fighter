@@ -177,6 +177,17 @@ export interface CQueue {
    * asked for it, so no protocol bump is needed.
    */
   agentOf?: string;
+  /**
+   * CONSUMABLES (ADR 0007 Phase 2, solo/arcade only): the inventory rowId of
+   * ONE unconsumed energy drink to carry into this match. The server
+   * validates ownership, marks it consumed (idempotent by match id; released
+   * again if the match settles as a no-contest), and pins its effect into
+   * `SMatch.items` — the client must apply items ONLY from that echo, never
+   * from its own request (an old server that ignores this field then simply
+   * yields an item-less match, not a desync). Ignored for wager/friendly
+   * until the open-carry rollout (ADR 0007 Phase 4).
+   */
+  item?: number;
 }
 export interface CInput { t: 'i'; k: number; v: number }
 export interface CHash { t: 'h'; k: number; x: number }
@@ -245,8 +256,25 @@ export interface SMatch {
    * (the `solo` field above is set too).
    */
   arcade?: { battle: number; total: number; token: string };
+  /**
+   * CONSUMABLES (ADR 0007 Phase 2): the pinned per-side drink effects, or
+   * null for an empty hand. BOTH simulating ends (client + verifier + any
+   * rollback peer) must install this via core `setMatchItems` BEFORE
+   * createGameState — the pin is part of the deterministic contract exactly
+   * like characters and `solo.personality`. Values are re-clamped in core.
+   * Absent = item-less match (pre-item servers/clients behavior).
+   */
+  items?: [ItemPin | null, ItemPin | null];
   /** This side's resume token (bearer secret — never shown to the opponent). */
   resume?: string;
+}
+
+/** One pinned drink as it rides SMatch (display fields + the sim effect). */
+export interface ItemPin {
+  id: string;
+  name: string;
+  tier: number;
+  effect: { kind: string; amount: number; durationTicks: number };
 }
 export interface SInput { t: 'i'; k: number; v: number }
 /**
@@ -319,6 +347,13 @@ export interface SXp {
   losses: number;
   creditsDelta: number;
   credits: number;
+  /**
+   * Free vending-machine pulls earned by levelling up THIS match (one per
+   * level gained). Server-rolled and already persisted to inventory — the
+   * client only reveals them. Absent/empty when no level-up (or agent-class,
+   * which never earns pulls). Each entry is the granted item's id + tier.
+   */
+  freePulls?: { itemId: string; tier: number }[];
 }
 /** Server-side RTT probe / echo — same shape and rules as CPing/CPong. */
 export interface SPing { t: 'ping'; ts: number }

@@ -17,16 +17,16 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
   AI_PERSONALITY_RANGES, ENGINE_VERSION, ITEMS, ITEM_COST, ITEM_TIER_ODDS,
-  Phase, aiPoll, createAi, createGameState,
-  loadCharacter, setCharacters, stateHash, step,
+  Phase, aiPoll, createAi, createGameState, itemById,
+  loadCharacter, setCharacters, setMatchItems, stateHash, step,
 } from '@af/core';
-import type { CharacterBundle, ItemDef } from '@af/core';
+import type { CharacterBundle, ItemDef, ItemEffect } from '@af/core';
 import {
   ARCADE_NEXT_GRACE_MS, DEFAULT_PORT, FORFEIT_GRACE_MS, IDLE_FORFEIT_MS, INPUT_DELAY,
   INPUT_DELAY_MAX, INPUT_DELAY_MIN, PING_INTERVAL_MS, PROTOCOL_VERSION,
   SOLO_PACE_MAX, SOLO_PACE_MIN, SOLO_PACE_SLACK_MS, TICK_MS,
 } from './protocol.js';
-import type { ClientMsg, SMatch, SResult, ServerMsg } from './protocol.js';
+import type { ClientMsg, ItemPin, SMatch, SResult, ServerMsg } from './protocol.js';
 import { verifyAirToken } from './airjwt.js';
 import type { AirIdentity } from './airjwt.js';
 import {
@@ -154,6 +154,9 @@ interface Match {
   solo: { skill: number; aiSeed: number; personality?: Record<string, number> } | null;
   /** AGENT ARCADE: the run this battle belongs to (null = not an arcade battle). */
   arcadeRun: ArcadeRun | null;
+  /** CONSUMABLES (ADR 0007 Phase 2): pinned per-side drinks (null = none).
+   *  Consumed at pair time (the escrow pattern); released on no-contest. */
+  items: [ItemPin | null, ItemPin | null];
   startedAt: number; // wall clock — solo pace sanity (SOLO_PACE_*)
   /** Per-side bearer secrets for CResume — only their owners ever see them. */
   resumeTokens: [string, string];
@@ -237,6 +240,24 @@ export const defaultArcadeSkill = (battle: number, total: number): number =>
     + (ARCADE_SKILL_MAX - ARCADE_SKILL_MIN) * (total <= 1 ? 1 : battle / (total - 1)));
 
 // ---------------------------------------------------------------- verify
+/** The pinned per-side drinks, as stored on a Match / sent in SMatch. */
+type MatchItems = [ItemPin | null, ItemPin | null];
+
+/**
+ * Install a match's pinned drinks into the core module slot (the
+ * setCharacters pattern). EVERY re-sim path must run this — including the
+ * item-less default, which CLEARS the slot so one verification can never
+ * leak drinks into the next.
+ */
+const installItems = (items: MatchItems): void => {
+  // The pin's effect shape is validated at queue time (it comes from the
+  // core ITEMS registry) and core re-clamps values — the cast is safe.
+  setMatchItems(
+    (items[0]?.effect as ItemEffect | undefined) ?? null,
+    (items[1]?.effect as ItemEffect | undefined) ?? null,
+  );
+};
+
 interface VerifyOutcome {
   winner: number;
   rounds: [number, number];
@@ -254,8 +275,10 @@ const verifyLedger = (
   bundles: [CharacterBundle, CharacterBundle],
   seed: number,
   inputs: [number[], number[]],
+  items: MatchItems = [null, null],
 ): VerifyOutcome => {
   setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
+  installItems(items);
   const g = createGameState(seed);
   const n = Math.min(inputs[0].length, inputs[1].length);
   let t = 0;
@@ -284,8 +307,10 @@ const verifySoloLedger = (
   seed: number,
   playerInputs: number[],
   solo: { skill: number; aiSeed: number; personality?: Record<string, number> },
+  items: MatchItems = [null, null],
 ): VerifyOutcome => {
   setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
+  installItems(items);
   const g = createGameState(seed);
   // Trained-agent opponents (ADR 0006) pin a personality too — same
   // re-derivation, so a coached agent can't be puppeteered either.
@@ -407,8 +432,8 @@ export const createMatchServer = (opts: {
 
     const bundles: [CharacterBundle, CharacterBundle] = [bundleOf(m.chars[0]), bundleOf(m.chars[1])];
     const verify = (): VerifyOutcome => (m.solo
-      ? verifySoloLedger(bundles, m.seed, m.inputs[0], m.solo)
-      : verifyLedger(bundles, m.seed, m.inputs));
+      ? verifySoloLedger(bundles, m.seed, m.inputs[0], m.solo, m.items)
+      : verifyLedger(bundles, m.seed, m.inputs, m.items));
 
     const v = verify();
     // Desync forensics: whose reported hashes diverge from the re-sim?
@@ -490,6 +515,13 @@ export const createMatchServer = (opts: {
       c.match = null;
     }
     console.log(`[match ${m.id}] ${result.reason}: winner=${result.winner} ticks=${result.endTick}`);
+    // Consumables ride the fee pattern: a NO-CONTEST hands the drink back
+    // (nothing was contested); any decided outcome — win, loss, draw,
+    // forfeit — leaves it drunk. Idempotent: release matches by match id.
+    if (persistence && result.winner === -1 && (m.items[0] || m.items[1])) {
+      void persistence.releaseItems(m.id).catch((e) =>
+        console.log(`[items] release failed for ${m.id}: ${String(e)}`));
+    }
     // Persist + award XP AFTER the result is out — progression is async and
     // must never delay or gate the verdict. record_match is idempotent by
     // match id, so a crash-retry can't double-award.
@@ -618,6 +650,7 @@ export const createMatchServer = (opts: {
     ticks.sort((a, b) => a - b);
 
     setCharacters(loadCharacter(bundleOf(m.chars[0])), loadCharacter(bundleOf(m.chars[1])));
+    installItems(m.items); // forensics must re-sim the SAME buffed match
     const g = createGameState(m.seed);
     const ai = m.solo ? createAi(1, m.solo.skill, m.solo.aiSeed, m.solo.personality) : null;
     let t = 0;
@@ -655,6 +688,7 @@ export const createMatchServer = (opts: {
     c0: Client, c1: Client | null, mode: MatchMode | 'friendly', fee: number, id?: string,
     solo?: SoloPin,
     arcadeRun?: ArcadeRun,
+    items: [ItemPin | null, ItemPin | null] = [null, null],
   ): void => {
     // Arcade battles bill as the character, not "HOUSE": the run IS the mode.
     // Trained-agent opponents (dare/spar) bill as their owner's agent.
@@ -671,6 +705,7 @@ export const createMatchServer = (opts: {
       names: [c0.name, c1?.name ?? houseName],
       solo: solo ? { skill: solo.skill, aiSeed: solo.aiSeed, personality: solo.personality } : null,
       arcadeRun: arcadeRun ?? null,
+      items,
       // Local-sim solo has NO input scheduling at all — zero added latency.
       // PvP sizes the delay from both sides' measured RTT (fallback: fixed).
       delay: solo ? 0 : c1 ? adaptiveDelay(c0, c1) : INPUT_DELAY,
@@ -704,6 +739,7 @@ export const createMatchServer = (opts: {
         arcade: arcadeRun
           ? { battle: arcadeRun.battle, total: arcadeRun.opponents.length, token: arcadeRun.token }
           : undefined,
+        items: m.items[0] || m.items[1] ? m.items : undefined,
         resume: m.resumeTokens[c.side],
       };
       send(c, setup);
@@ -781,7 +817,33 @@ export const createMatchServer = (opts: {
    * pace check, ledger re-sim, settlement — is exactly ranked solo: the
    * agent's owner is not a party to the match and earns nothing.
    */
-  const startSolo = async (c: Client, pin?: SoloPin): Promise<void> => {
+  /**
+   * CONSUMABLES (ADR 0007 Phase 2): atomically claim the drink the player
+   * queued with and build its per-side pin. A failed claim (not yours,
+   * already drunk, raced another match) NEVER kills the match — the fee is
+   * already escrowed, so the match simply runs item-less and the client
+   * learns from the missing SMatch.items echo.
+   */
+  const claimItem = async (c: Client, itemRow: number, matchId: string):
+    Promise<[ItemPin | null, ItemPin | null]> => {
+    if (!itemRow || !persistence || !c.identity?.sub || isAgentClassSub(c.identity.sub)) {
+      return [null, null];
+    }
+    try {
+      const claimed = await persistence.consumeItem(c.identity.sub, itemRow, matchId);
+      const def = claimed ? itemById(claimed.itemId) : undefined;
+      if (claimed && def) {
+        console.log(`[items] ${c.name} drinks ${def.id} (T${def.tier}) in ${matchId}`);
+        return [{ id: def.id, name: def.name, tier: def.tier, effect: def.effect }, null];
+      }
+      console.log(`[items] ${c.name} queued item row ${itemRow} but it wasn't consumable — match runs without it`);
+    } catch (e) {
+      console.log(`[items] claim failed in ${matchId}: ${String(e)}`);
+    }
+    return [null, null];
+  };
+
+  const startSolo = async (c: Client, pin?: SoloPin, itemRow = 0): Promise<void> => {
     const fee = persistence ? SOLO_FEE : 0;
     const matchId = newMatchId();
     if (fee > 0) {
@@ -795,12 +857,13 @@ export const createMatchServer = (opts: {
     // Resolve AFTER escrow so a slow roster lookup can't race fee refunds,
     // and so dare-vs-agent pins (already resolved) skip another round-trip.
     const resolved = pin ?? await soloOpts(c);
+    const items = await claimItem(c, itemRow, matchId);
     if (c.ws.readyState !== WebSocket.OPEN) {
       // Vanished after escrow → settle as incomplete so the fee refunds.
-      startMatch(c, null, 'solo', fee, matchId, resolved);
+      startMatch(c, null, 'solo', fee, matchId, resolved, undefined, items);
       return finishMatch(c.match!, null);
     }
-    startMatch(c, null, 'solo', fee, matchId, resolved);
+    startMatch(c, null, 'solo', fee, matchId, resolved, undefined, items);
   };
 
   /**
@@ -909,7 +972,7 @@ export const createMatchServer = (opts: {
    * mechanically a local-sim solo match (pinned AI, ledger re-sim) — only
    * the fee, the opponent sequencing, and the payouts differ.
    */
-  const startArcadeBattle = async (c: Client, run: ArcadeRun): Promise<void> => {
+  const startArcadeBattle = async (c: Client, run: ArcadeRun, itemRow = 0): Promise<void> => {
     // Agent-class runs are FREE (inert economy — XP/rank only).
     const fee = run.battle === 0 && persistence && !isAgentClassSub(run.sub) ? ARCADE_FEE : 0;
     const matchId = newMatchId();
@@ -930,13 +993,14 @@ export const createMatchServer = (opts: {
       character: run.opponents[run.battle]!,
       aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
     };
+    const items = await claimItem(c, itemRow, matchId);
     if (c.ws.readyState !== WebSocket.OPEN) {
       // Vanished after escrow → settle as incomplete so the fee refunds
       // (the run stays retryable until it expires).
-      startMatch(c, null, 'arcade', fee, matchId, opts, run);
+      startMatch(c, null, 'arcade', fee, matchId, opts, run, items);
       return finishMatch(c.match!, null);
     }
-    startMatch(c, null, 'arcade', fee, matchId, opts, run);
+    startMatch(c, null, 'arcade', fee, matchId, opts, run, items);
   };
 
   const onMessage = (c: Client, raw: string): void => {
@@ -1029,6 +1093,11 @@ export const createMatchServer = (opts: {
           : msg.mode === 'friendly' ? 'friendly'
           : 'wager';
         const runToken = typeof msg.runToken === 'string' ? msg.runToken : '';
+        // CONSUMABLES (ADR 0007 Phase 2): solo/arcade only for now — wager
+        // waits for the open-carry rollout (Phase 4) behind the P1 CI gate.
+        const itemRow = (mode === 'solo' || mode === 'arcade')
+          && typeof msg.item === 'number' && Number.isInteger(msg.item) && msg.item > 0
+          ? msg.item : 0;
         void (async () => {
           await c.identityReady;
           if (c.state !== 'lobby' || c.ws.readyState !== WebSocket.OPEN) return;
@@ -1081,7 +1150,7 @@ export const createMatchServer = (opts: {
               }
               c.state = 'queued';
               send(c, { t: 'queued' });
-              return startArcadeBattle(c, run);
+              return startArcadeBattle(c, run, itemRow);
             }
             // New run: 1 credit buys the whole gauntlet — except for the
             // inert AGENT CLASS, which plays FREE (XP/rank only) under a
@@ -1111,7 +1180,7 @@ export const createMatchServer = (opts: {
             arcadeRuns.set(fresh.token, fresh);
             c.state = 'queued';
             send(c, { t: 'queued' });
-            return startArcadeBattle(c, fresh);
+            return startArcadeBattle(c, fresh, itemRow);
           }
           // Fast pre-check for a friendly error; escrow re-checks atomically.
           const fee = mode === 'solo' ? SOLO_FEE : WAGER_FEE;
@@ -1126,11 +1195,11 @@ export const createMatchServer = (opts: {
             if (typeof pin === 'string') return send(c, { t: 'error', msg: pin });
             c.state = 'queued';
             send(c, { t: 'queued' });
-            return startSolo(c, pin);
+            return startSolo(c, pin, itemRow);
           }
           c.state = 'queued';
           send(c, { t: 'queued' });
-          if (mode === 'solo') await startSolo(c);
+          if (mode === 'solo') await startSolo(c, undefined, itemRow);
           else { queue.push(c); void tryPair(); }
         })();
         return;
@@ -1188,6 +1257,7 @@ export const createMatchServer = (opts: {
           agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
           mode: m.mode, fee: m.fee,
           solo: m.solo ?? undefined,
+          items: m.items[0] || m.items[1] ? m.items : undefined,
           resume: m.resumeTokens[side],
           inputs: [toNullable(m.inputs[0]), toNullable(m.inputs[1])],
         });
