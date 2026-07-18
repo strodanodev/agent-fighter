@@ -24,8 +24,9 @@ after(() => server?.close());
 describe('online match: two agents through the real server', () => {
   it('plays a full verified match; server hash == both local hashes', async () => {
     // persistence: null — tests must NEVER write to a real Supabase project,
-    // even when the developer's .env carries live keys.
-    server = await createMatchServer({ port: 0, persistence: null });
+    // even when the developer's .env carries live keys. noPaceCheck: agents
+    // at paceMs 1 outrun the wall-clock input plausibility cap.
+    server = await createMatchServer({ port: 0, persistence: null, noPaceCheck: true });
     const url = `ws://localhost:${server.port}`;
 
     const [a, b] = await Promise.all([
@@ -89,7 +90,7 @@ describe('persistence hook (Phase B)', () => {
       createAgentAccount: async () => false,
       recentMatches: async () => [],
     };
-    const s2 = await createMatchServer({ port: 0, persistence: mock });
+    const s2 = await createMatchServer({ port: 0, persistence: mock, noPaceCheck: true });
     try {
       const url = `ws://localhost:${s2.port}`;
       const [a] = await Promise.all([

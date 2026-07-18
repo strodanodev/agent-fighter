@@ -238,13 +238,12 @@ const verifySoloLedger = (
   seed: number,
   playerInputs: number[],
   solo: { skill: number; aiSeed: number },
-  stopAtTick = Number.MAX_SAFE_INTEGER,
 ): VerifyOutcome => {
   setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
   const g = createGameState(seed);
   const ai = createAi(1, solo.skill, solo.aiSeed);
   let t = 0;
-  while (g.phase !== Phase.MatchOver && t < playerInputs.length && t < stopAtTick) {
+  while (g.phase !== Phase.MatchOver && t < playerInputs.length) {
     const opp = aiPoll(ai, g);
     step(g, [playerInputs[t]! | 0, opp]);
     t++;
@@ -264,7 +263,8 @@ export const createMatchServer = (opts: {
   root?: string;
   /** Test hook: overrides the Supabase-backed persistence (null = off). */
   persistence?: Persistence | null;
-  /** Test hook: skip the solo wall-clock pace sanity (tests sim >>realtime). */
+  /** Test hook: skip the wall-clock pace sanities — the solo settlement
+   *  check AND the per-input tick plausibility cap (tests sim >>realtime). */
   noPaceCheck?: boolean;
   /** Test hook: overrides the env-configured AIR issuer (null = off). */
   airIssuer?: AirIssuer | null;
@@ -362,19 +362,7 @@ export const createMatchServer = (opts: {
     const v = verify();
     // Desync forensics: whose reported hashes diverge from the re-sim?
     // Solo has one human side; the opponent is the server's own AI.
-    let deviator: 0 | 1 | undefined;
-    outer:
-    for (const side of (m.solo ? [0] : [0, 1]) as (0 | 1)[]) {
-      for (const [tick, h] of m.hashes[side]) {
-        if (tick > v.endTick) continue;
-        const truth = replayHashAt(m, tick);
-        if (truth !== null && truth !== h) {
-          console.log(`[match ${m.id}] hash mismatch side=${side} tick=${tick} reported=${h} truth=${truth}`);
-          deviator = side;
-          break outer;
-        }
-      }
-    }
+    const deviator = findDeviator(m, v.endTick);
 
     // THE SETTLEMENT LADDER (ADR 0003/0005). The input ledger is the truth;
     // a dropped socket never overrules it:
@@ -525,22 +513,49 @@ export const createMatchServer = (opts: {
     }
   };
 
-  /** Ground-truth hash at a tick (re-sim prefix) — only used on suspicion. */
-  const replayHashAt = (m: Match, tick: number): number | null => {
-    if (m.solo) {
-      if (tick > m.inputs[0].length) return null;
-      return verifySoloLedger(
-        [bundleOf(m.chars[0]), bundleOf(m.chars[1])], m.seed, m.inputs[0], m.solo, tick,
-      ).hash;
+  /**
+   * Desync forensics: which side's reported hashes diverge from ground truth?
+   * ONE forward re-sim from tick 0, checking every reported hash as the sim
+   * passes it — O(ledger), NOT O(hashes × ledger). The per-hash prefix
+   * replay this replaces was a synchronous DoS: 400 reported hashes × a
+   * full-length ledger ≈ tens of millions of sim steps (plus two bundle
+   * loads per hash) inside one finishMatch, freezing the event loop for
+   * every match and socket on the server (audit 2026-07-18, finding 2).
+   * When both sides diverge, the EARLIEST diverging tick names the deviator.
+   */
+  const findDeviator = (m: Match, endTick: number): 0 | 1 | undefined => {
+    const checks = new Map<number, [0 | 1, number][]>();
+    const ticks: number[] = [];
+    for (const side of (m.solo ? [0] : [0, 1]) as (0 | 1)[]) {
+      for (const [tick, h] of m.hashes[side]) {
+        if (tick < 0 || tick > endTick) continue;
+        let at = checks.get(tick);
+        if (!at) { checks.set(tick, at = []); ticks.push(tick); }
+        at.push([side, h]);
+      }
     }
-    const n = Math.min(m.inputs[0].length, m.inputs[1].length);
-    if (tick > n) return null;
+    if (ticks.length === 0) return undefined;
+    ticks.sort((a, b) => a - b);
+
     setCharacters(loadCharacter(bundleOf(m.chars[0])), loadCharacter(bundleOf(m.chars[1])));
     const g = createGameState(m.seed);
-    for (let t = 0; t < tick && g.phase !== Phase.MatchOver; t++) {
-      step(g, [m.inputs[0][t]! | 0, m.inputs[1][t]! | 0]);
+    const ai = m.solo ? createAi(1, m.solo.skill, m.solo.aiSeed) : null;
+    let t = 0;
+    for (const tick of ticks) {
+      while (t < tick && g.phase !== Phase.MatchOver) {
+        const p1 = ai ? aiPoll(ai, g) : m.inputs[1][t]! | 0;
+        step(g, [m.inputs[0][t]! | 0, p1]);
+        t++;
+      }
+      const truth = stateHash(g);
+      for (const [side, h] of checks.get(tick)!) {
+        if (truth !== h) {
+          console.log(`[match ${m.id}] hash mismatch side=${side} tick=${tick} reported=${h} truth=${truth}`);
+          return side;
+        }
+      }
     }
-    return stateHash(g);
+    return undefined;
   };
 
   const startMatch = (
@@ -999,7 +1014,21 @@ export const createMatchServer = (opts: {
         if (!m || m.finished) return;
         const k = msg.k | 0;
         // Sanity caps: no negative ticks, no absurd future, first write wins.
-        if (k < 0 || k > 60 * 60 * 30 || m.inputs[c.side][k] !== undefined) return;
+        // WALL-CLOCK PLAUSIBILITY (DoS guard): verification cost is O(ledger
+        // length), so high ticks must be EARNED with real elapsed time —
+        // without this, one connection ledgers 108,000 ticks in a second and
+        // buys a maximal synchronous re-sim per match. Solo mirrors the
+        // settlement pace check (a ledger past SOLO_PACE_MIN pace settles
+        // 'incomplete' anyway, so nothing legitimate is lost); PvP is
+        // lockstep-paced but agent-vs-agent runs faster than realtime, so it
+        // gets a generous 20× bound instead.
+        const elapsed = Date.now() - m.startedAt;
+        const maxTick = opts.noPaceCheck ? Infinity : Math.ceil(
+          (m.solo
+            ? (elapsed + SOLO_PACE_SLACK_MS) / SOLO_PACE_MIN
+            : elapsed * 20 + SOLO_PACE_SLACK_MS) * 60 / 1000,
+        );
+        if (k < 0 || k > 60 * 60 * 30 || k > maxTick || m.inputs[c.side][k] !== undefined) return;
         m.inputs[c.side][k] = msg.v | 0;
         m.lastInputAt[c.side] = Date.now(); // proof of life (anti lag-switch)
         // Solo: nothing to relay — the opponent lives in the verifier.
@@ -1316,7 +1345,11 @@ export const createMatchServer = (opts: {
       persistence: !!persistence,
     });
   });
-  const wss = new WebSocketServer({ server: http });
+  // maxPayload: the ws default is 100 MiB PER FRAME, fully buffered then
+  // JSON.parsed. The largest legitimate client message is a hello carrying
+  // an AIR JWT (~2 KB); 16 KiB leaves generous headroom and turns a
+  // memory-pressure frame into an immediate 1009 close.
+  const wss = new WebSocketServer({ server: http, maxPayload: 16 * 1024 });
 
   wss.on('connection', (ws, req) => {
     const c: Client = {
