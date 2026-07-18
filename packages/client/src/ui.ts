@@ -1451,10 +1451,15 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
   // ---- The machine (left column) -----------------------------------------
   const mx = 92, my = 108, mw = 250, mh = 320;
   if (vendingImg && vendingImg.naturalWidth > 0) {
-    // Authored art (assets/shop/) — contain-fit over the same layout box so
-    // the PULL button/reveal geometry is identical to the procedural path.
+    // Authored art (assets/shop/) — the machine BODY sits right-of-center in
+    // the image (its neon cable trails off to the left), so geometric
+    // centering looks lopsided. Anchor the body's visual center (≈0.69 of
+    // the width, measured from the alpha matte) over the PULL button's
+    // center, bottom-aligned just above the button.
+    const BODY_CX = 0.69;
     const dw = 290, dh = dw * (vendingImg.naturalHeight / vendingImg.naturalWidth);
-    const ix = mx + (mw - dw) / 2, iy = my + (mh - dh) / 2;
+    const ix = (mx + mw / 2) - dw * BODY_CX;
+    const iy = (my + mh + 14) - 8 - dh; // 8px gap above the button at my+mh+14
     ctx.save();
     ctx.shadowColor = v.pullBusy
       ? `rgba(255,209,102,${0.5 + 0.3 * Math.sin(tick / 4)})`
