@@ -249,6 +249,13 @@ export interface Persistence {
   buyItem: (sub: string, cost: number, itemId: string, tier: number, nonce: string) => Promise<PurchaseResult>;
   /** Unconsumed inventory for `sub`, newest first. */
   listItems: (sub: string, limit?: number) => Promise<OwnedItem[]>;
+  /**
+   * Current balance, or null if the profile doesn't exist yet. A plain read —
+   * no upsert, no daily grant. The shop reports THIS with its catalog so the
+   * balance the player sees is the balance of the identity that will be
+   * charged (the /me wallet can be a different identity mid-AIR-rehydration).
+   */
+  getCredits: (sub: string) => Promise<number | null>;
 }
 
 /** One granted (not yet consumed) consumable in a player's inventory. */
@@ -585,6 +592,7 @@ export const memoryPersistence = (): Persistence => {
         .filter((i) => i.sub === sub)
         .slice(0, limit)
         .map(({ rowId, itemId, tier, createdAt }) => ({ rowId, itemId, tier, createdAt })),
+    getCredits: async (sub) => (profiles.has(sub) ? prof(sub).credits : null),
   };
 };
 
@@ -803,6 +811,13 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         tier: Number(r.tier ?? 1),
         createdAt: String(r.created_at ?? ''),
       }));
+    },
+    getCredits: async (sub) => {
+      const rows = (await call(
+        `/rest/v1/profiles?id=eq.${encodeURIComponent(sub)}&select=credits&limit=1`,
+        { method: 'GET' },
+      )) as Array<Record<string, unknown>>;
+      return rows?.[0] ? Number(rows[0].credits ?? 0) : null;
     },
   };
 };

@@ -1405,6 +1405,9 @@ export interface ShopInventoryEntry {
 
 export interface ShopReveal { name: string; tier: number; desc: string; flavor: string }
 
+/** One catalog drink (name + tier is all the slot reel needs). */
+export interface ShopReelEntry { name: string; tier: number }
+
 export interface ShopView {
   status: 'idle' | 'busy' | 'done' | 'fail';
   /** Balance (null = unknown / server offline). */
@@ -1420,7 +1423,16 @@ export interface ShopView {
   /** Error line (e.g. insufficient credits); -1 age = hidden. */
   err: string;
   errAge: number;
+  /** True = the yes/no purchase confirm modal is up. */
+  confirm: boolean;
+  /** Ticks into the slot-machine spin; -1 = not spinning. */
+  spinAge: number;
+  /** Full drink catalog — the slot reel cycles through it. */
+  catalog: ShopReelEntry[];
 }
+
+/** Spin length: 3 seconds at 60 ticks/sec (main.ts lands the reveal here). */
+export const SHOP_SPIN_TICKS = 180;
 
 /** The vending-machine screen: machine + PULL + reveal card + stash shelf. */
 export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopView): void => {
@@ -1504,9 +1516,10 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
 
   // ---- PULL button (under the machine) -----------------------------------
   const canAfford = v.credits === null || v.credits >= v.cost;
+  const spinning = v.spinAge >= 0;
   const bw = 250, bh = 44, bx = mx, by = my + mh + 14;
-  tapZone(bx, by, bw, bh, 'shop:pull');
-  const armed = !v.pullBusy && canAfford;
+  if (!v.confirm) tapZone(bx, by, bw, bh, 'shop:pull');
+  const armed = !v.pullBusy && canAfford && !spinning && !v.confirm;
   ctx.fillStyle = armed ? 'rgba(58,38,10,0.9)' : 'rgba(20,16,28,0.8)';
   ctx.fillRect(bx, by, bw, bh);
   ctx.strokeStyle = armed ? GOLD : 'rgba(255,255,255,0.2)';
@@ -1517,8 +1530,8 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
     display(ctx, `INSERT ${v.cost} CR · PULL`, bx + bw / 2, by + 29, 19,
       { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
   } else {
-    label(ctx, v.pullBusy ? 'DISPENSING…' : `INSERT ${v.cost} CR · PULL`, bx + bw / 2, by + 27, 15,
-      '#ffffff66');
+    label(ctx, spinning || v.pullBusy ? 'DISPENSING…' : `INSERT ${v.cost} CR · PULL`,
+      bx + bw / 2, by + 27, 15, '#ffffff66');
   }
   if (!canAfford) {
     label(ctx, 'NOT ENOUGH CREDITS — WIN MATCHES OR CLAIM THE DAILY +10', bx + bw / 2, by + bh + 16, 10, '#ff9d9d');
@@ -1549,7 +1562,7 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
         : { from: '#ffffff', mid: '#cfd8e3', to: '#6b7686', outline: '#101318', align: 'left' });
     label(ctx, v.reveal.desc, rx + 118, ry + 104, 14, '#ffffffdd', 'left');
     label(ctx, `“${v.reveal.flavor}”`, rx + 118, ry + 126, 11, '#ffffff88', 'left');
-    label(ctx, 'USABLE IN RANKED MODES SOON — PHASE 2', rx + 118, ry + 158, 10, '#8fd0ff', 'left');
+    label(ctx, 'PICK IT AT FIGHTER SELECT — ONE DRINK PER FIGHT', rx + 118, ry + 158, 10, '#8fd0ff', 'left');
     ctx.restore();
     // Sparkle ring on a fresh LV3.
     if (tier === 3 && v.revealAge < 40) {
@@ -1562,10 +1575,88 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
       ctx.stroke();
       ctx.restore();
     }
+  } else if (spinning) {
+    // ---- SLOT REEL: fast vertical blur → deceleration; main.ts swaps in the
+    // reveal card (easeOutBack pop) when the spin lands — the pop + flash
+    // masks the reel-to-result snap, arcade-style.
+    const ry = 108, rh = 224;
+    const rowH = 56;
+    ctx.save();
+    ctx.shadowColor = 'rgba(255,209,102,0.45)';
+    ctx.shadowBlur = 20 + 10 * Math.sin(tick / 5);
+    bevel(ctx, rx, ry, rw, rh, PANEL, GOLD_LT, GOLD_DK, 3);
+    ctx.shadowBlur = 0;
+    // Payline arrows either side of the center row.
+    const cyMid = ry + rh / 2;
+    ctx.fillStyle = GOLD;
+    ctx.beginPath();
+    ctx.moveTo(rx + 6, cyMid - 9); ctx.lineTo(rx + 20, cyMid); ctx.lineTo(rx + 6, cyMid + 9);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(rx + rw - 6, cyMid - 9); ctx.lineTo(rx + rw - 20, cyMid); ctx.lineTo(rx + rw - 6, cyMid + 9);
+    ctx.closePath(); ctx.fill();
+    // Reel window (clipped) — position decelerates over SHOP_SPIN_TICKS.
+    ctx.beginPath();
+    ctx.rect(rx + 26, ry + 8, rw - 52, rh - 16);
+    ctx.clip();
+    const t = clamp01(v.spinAge / SHOP_SPIN_TICKS);
+    const speed = 0.9 * (1 - t) * (1 - t) + 0.02;   // rows/tick, eases out
+    // Integrated distance: s(t) of the eased speed — monotonic scroll pos.
+    const pos = (0.9 * (v.spinAge - v.spinAge * t + (v.spinAge * t * t) / 3) + 0.02 * v.spinAge);
+    const n = Math.max(1, v.catalog.length);
+    const frac = pos % 1;
+    for (let k = -3; k <= 3; k++) {
+      const idx = ((Math.floor(pos) + k) % n + n) % n;
+      const entry = v.catalog[idx]!;
+      const tier = Math.max(1, Math.min(3, entry.tier));
+      const y = cyMid + (k - frac) * rowH;
+      const centered = Math.abs(y - cyMid) < rowH / 2;
+      ctx.globalAlpha = centered ? 1 : 0.35;
+      drawCan(ctx, rx + 44, y - 21, 24, 42, TIER_COLORS[tier]!, centered && tier === 3 ? 8 : 0);
+      label(ctx, entry.name, rx + 84, y + 6, centered ? 18 : 14,
+        centered ? '#ffffff' : '#ffffff88', 'left');
+      label(ctx, TIER_LABELS[tier]!, rx + rw - 66, y + 6, 12, TIER_COLORS[tier]!, 'left');
+    }
+    ctx.restore();
+    // Motion blur streaks while the reel is fast.
+    if (speed > 0.25) {
+      ctx.save();
+      ctx.globalAlpha = Math.min(0.5, speed);
+      ctx.fillStyle = '#ffffff22';
+      for (let s = 0; s < 5; s++) {
+        ctx.fillRect(rx + 30 + s * ((rw - 60) / 5), ry + 12, 2, rh - 24);
+      }
+      ctx.restore();
+    }
+    label(ctx, 'THE MACHINE IS CHOOSING…', rx + rw / 2, ry + rh + 22, 12,
+      tick % 30 < 22 ? '#ffd166' : '#ffe9a3');
   } else {
-    label(ctx, v.status === 'busy' ? 'STOCKING THE MACHINE…' : 'FEELING LUCKY?', rx + rw / 2, 170, 16, '#ffffff77');
-    label(ctx, `LV 1 COMMON · LV 2 UNCOMMON · LV 3 RARE`, rx + rw / 2, 194, 11, '#ffffff55');
-    label(ctx, 'HEAL · DAMAGE UP · DEFENSE UP · SUPER METER', rx + rw / 2, 212, 11, '#ffffff55');
+    // ---- HOW IT WORKS (idle right column) — the gacha rules, big and clear.
+    const ry = 108, rh = 224;
+    bevel(ctx, rx, ry, rw, rh, 'rgba(12,8,24,0.82)', 'rgba(255,255,255,0.22)', 'rgba(0,0,0,0.5)', 2);
+    display(ctx, v.status === 'busy' ? 'STOCKING…' : 'HOW IT WORKS', rx + rw / 2, ry + 34, 22,
+      { glow: 'rgba(255,209,102,0.4)' });
+    const lx = rx + 22;
+    label(ctx, `1 · INSERT ${v.cost} CR — THE MACHINE PICKS YOUR DRINK AT RANDOM`, lx, ry + 64, 12, '#ffffffdd', 'left');
+    label(ctx, '2 · RANDOM EFFECT — HEAL · DAMAGE UP · DEFENSE UP · SUPER METER', lx, ry + 86, 12, '#ffffffdd', 'left');
+    label(ctx, '3 · RANDOM TIER — HIGHER TIER, STRONGER DRINK:', lx, ry + 108, 12, '#ffffffdd', 'left');
+    // Odds bar: three segments sized by the real 70/25/5 odds, tier-colored.
+    const obX = lx + 14, obW = rw - 72, obY = ry + 120, obH = 18;
+    const segs: Array<[number, number, string]> = [[70, 1, 'LV 1 · 70%'], [25, 2, 'LV 2 · 25%'], [5, 3, 'LV 3 · 5%']];
+    let sx = obX;
+    for (const [pct, tier, tag] of segs) {
+      const sw = (obW * pct) / 100;
+      ctx.fillStyle = TIER_COLORS[tier]!;
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(sx, obY, sw - 2, obH);
+      ctx.globalAlpha = 1;
+      if (sw > 70) label(ctx, tag, sx + sw / 2, obY + 13, 10, '#10131b');
+      sx += sw;
+    }
+    // Narrow segments get their tags to the right of the bar.
+    label(ctx, 'LV 2 · 25%   LV 3 · 5%', obX + obW * 0.7 + 6, obY + 31, 9, '#ffffff88', 'left');
+    label(ctx, '4 · ONE DRINK RIDES INTO YOUR NEXT ARENA / WAGER FIGHT —', lx, ry + 178, 12, '#8fd0ff', 'left');
+    label(ctx, 'PICK IT AT FIGHTER SELECT. USED = GONE.', lx + 14, ry + 196, 12, '#8fd0ff', 'left');
   }
 
   // ---- Stash (inventory shelf, right-bottom) -----------------------------
@@ -1590,7 +1681,42 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
   if (v.err && v.errAge >= 0 && v.errAge % 30 < 22) {
     label(ctx, `⚠ ${v.err}`, cx, VH - 30, 14, '#ff5d7e');
   }
-  label(ctx, 'ENTER / TAP PULL · ESC BACK', cx, VH - 8, 10, '#ffffff55');
+  label(ctx, v.confirm ? 'ENTER / Y CONFIRM · ESC / N CANCEL' : 'ENTER / TAP PULL · ESC BACK',
+    cx, VH - 8, 10, '#ffffff55');
+
+  // ---- Purchase confirm modal (topmost — its tap zones must win) ----------
+  if (v.confirm) {
+    ctx.fillStyle = 'rgba(4,2,10,0.72)';
+    ctx.fillRect(0, 0, VW, VH);
+    const pw = 430, ph = 190, px = cx - pw / 2, py = VH / 2 - ph / 2 - 20;
+    ctx.save();
+    ctx.shadowColor = 'rgba(255,209,102,0.5)';
+    ctx.shadowBlur = 26;
+    bevel(ctx, px, py, pw, ph, PANEL, GOLD_LT, GOLD_DK, 3);
+    ctx.restore();
+    display(ctx, `INSERT ${v.cost} CR?`, cx, py + 46, 28, { glow: 'rgba(255,209,102,0.55)' });
+    label(ctx, 'ONE RANDOM ENERGY DRINK — NO REFUNDS, NO RE-ROLLS', cx, py + 74, 11, '#ffffffcc');
+    if (v.credits !== null) {
+      label(ctx, `BALANCE AFTER: ${v.credits - v.cost} CR`, cx, py + 94, 12, GOLD_LT);
+    }
+    const btnW = 180, btnH = 48, gap = 26;
+    const yesX = cx - btnW - gap / 2, noX = cx + gap / 2, btnY = py + ph - 68;
+    tapZone(yesX, btnY, btnW, btnH, 'shop:yes');
+    ctx.fillStyle = 'rgba(28,66,30,0.95)';
+    ctx.fillRect(yesX, btnY, btnW, btnH);
+    ctx.strokeStyle = '#7ddf8a';
+    ctx.lineWidth = 2.5;
+    ctx.strokeRect(yesX + 0.5, btnY + 0.5, btnW - 1, btnH - 1);
+    display(ctx, 'YES · PULL', yesX + btnW / 2, btnY + 32, 19,
+      { from: '#eaffe9', mid: '#8dfF9a', to: '#2c7c3a', outline: '#0a2010' });
+    tapZone(noX, btnY, btnW, btnH, 'shop:no');
+    ctx.fillStyle = 'rgba(66,24,28,0.95)';
+    ctx.fillRect(noX, btnY, btnW, btnH);
+    ctx.strokeStyle = '#ff8d9d';
+    ctx.lineWidth = 2.5;
+    ctx.strokeRect(noX + 0.5, btnY + 0.5, btnW - 1, btnH - 1);
+    display(ctx, 'NO · KEEP IT', noX + btnW / 2, btnY + 32, 19, DARE_OPTS);
+  }
   ctx.lineWidth = 1;
 };
 
@@ -2426,6 +2552,11 @@ export interface XpInfo {
   creditsDelta?: number;
   /** Balance after settlement. */
   credits?: number;
+  /** Free vending pulls earned by levelling up this match — revealed here. */
+  freePulls?: ShopReveal[];
+  /** Local offline "TRAINING LV" (no server, no credits, no pulls) — the
+   *  banner reads as practice progress + a sign-in nudge, not the account. */
+  training?: boolean;
 }
 
 export const drawResults = (
@@ -2471,9 +2602,10 @@ export const drawResults = (
     ctx.save();
     ctx.globalAlpha = xpPop;
     let y = boxY + boxH + 30;
+    const lvWord = xp.training ? 'TRAINING LV' : 'LV';
     if (xp.levelsUp > 0) {
       const flash = tick % 40 < 28;
-      if (flash) display(ctx, `LEVEL UP!  LV ${xp.level}`, VW / 2, y, 26, { glow: 'rgba(255,209,102,0.6)' });
+      if (flash) display(ctx, `LEVEL UP!  ${lvWord} ${xp.level}`, VW / 2, y, 26, { glow: 'rgba(255,209,102,0.6)' });
       y += 32;
     }
     const xpTxt = `${xp.gained >= 0 ? '+' : ''}${xp.gained} XP`;
@@ -2496,7 +2628,24 @@ export const drawResults = (
     ctx.fillStyle = '#6fd3ff';
     ctx.fillRect(bx, y, Math.round((barW * Math.min(xp.xp, xp.xpNeed)) / Math.max(1, xp.xpNeed)), barH);
     y += 28;
-    label(ctx, `LV ${xp.level}  ·  ${xp.xp}/${xp.xpNeed} XP  ·  ${xp.wins}W ${xp.losses}L`, VW / 2, y, 13, '#ffffffcc');
+    label(ctx, `${lvWord} ${xp.level}  ·  ${xp.xp}/${xp.xpNeed} XP  ·  ${xp.wins}W ${xp.losses}L`, VW / 2, y, 13, '#ffffffcc');
+    // FREE PULL(S): the tangible level-up reward — a gold callout naming each
+    // drink the machine coughed up (already granted server-side; this reveals).
+    if (xp.freePulls && xp.freePulls.length > 0) {
+      y += 26;
+      const glow = tick % 44 < 30;
+      display(ctx, `★ FREE PULL${xp.freePulls.length > 1 ? ` ×${xp.freePulls.length}` : ''}! ★`, VW / 2, y, 18,
+        glow ? { glow: 'rgba(255,209,102,0.7)' } : {});
+      xp.freePulls.forEach((it, k) => {
+        const col = TIER_COLORS[it.tier] ?? '#fff';
+        label(ctx, `${it.name}  ·  ${TIER_LABELS[it.tier] ?? ''}  —  ${it.desc}`, VW / 2, y + 20 + k * 17, 12, col);
+      });
+      y += 20 + xp.freePulls.length * 17;
+    } else if (xp.training && xp.levelsUp > 0) {
+      // Offline level-ups can't grant real rewards — nudge toward the account.
+      y += 22;
+      label(ctx, 'SIGN IN TO EARN ACCOUNT LEVELS + FREE VENDING PULLS', VW / 2, y, 12, '#ffd166cc');
+    }
     ctx.restore();
   }
 
@@ -2979,6 +3128,7 @@ export const drawVsCard = (
   names: [string, string],
   stakes: string[], // 1-3 short lines, most important first
   age: number, // ticks since the card appeared — drives pop-in
+  levels?: [number | null, number | null], // per-fighter LV chip (null = hide)
 ): void => {
   const inT = easeOutBack(clamp01(age / 14));
   const wipe = clamp01(age / 18);
@@ -3132,6 +3282,16 @@ export const drawVsCard = (
     ctx.save();
     ctx.globalAlpha = inT;
     label(ctx, names[i].toUpperCase().slice(0, 20), nx, VH - 26, 16, i === 0 ? '#8fe8a0' : '#ff9d9d');
+    // LV chip: the matchup stat that frames the fight (higher = expected win).
+    const lv = levels?.[i];
+    if (lv != null) {
+      const txt = `LV ${lv}`;
+      ctx.font = '700 12px ' + DISPLAY_FONT_STACK;
+      const cw = ctx.measureText(txt).width + 16;
+      const cy = VH - 12, chH = 15;
+      bevel(ctx, nx - cw / 2, cy - chH + 3, cw, chH, '#1a1526e0', GOLD, GOLD_DK, 1);
+      label(ctx, txt, nx, cy - 1, 11, GOLD_LT);
+    }
     ctx.restore();
   });
 

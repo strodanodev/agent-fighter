@@ -513,7 +513,7 @@ export const createMatchServer = (opts: {
         rounds: result.rounds, endTick: result.endTick, hash: result.hash,
         deviator: result.deviator,
         engine: ENGINE_VERSION,
-      }).then((awards) => {
+      }).then(async (awards) => {
         for (const a of awards) {
           const cl = m.clients[a.side];
           if (!cl) continue; // the house side never has an account
@@ -525,10 +525,35 @@ export const createMatchServer = (opts: {
               xp: a.xp, wins: a.wins, losses: a.losses,
             };
           }
+          // LEVEL-UP REWARD: one free vending pull per level gained (the
+          // "levelling matters" hook). Server-rolled + persisted via the
+          // normal idempotent buyItem path at cost 0 — no credit movement,
+          // and a DETERMINISTIC nonce means a settlement retry re-reveals the
+          // same drop instead of minting a second. Agent-class accounts are
+          // economically inert (bot-farm valve), so they never earn pulls.
+          // Best-effort, exactly like the AIR/referral write-backs below: a
+          // crash between record_match committing and this grant loses the
+          // pull rather than blocking or double-awarding the verdict.
+          const sub = cl.identity?.sub;
+          const freePulls: { itemId: string; tier: number }[] = [];
+          if (sub && !isAgentClassSub(sub) && a.levelsUp > 0) {
+            for (let lp = 0; lp < a.levelsUp; lp++) {
+              try {
+                const rolled = rollItem();
+                const r = await persistence.buyItem(
+                  sub, 0, rolled.id, rolled.tier, `lvlup:${m.id}:${a.side}:${lp}`,
+                );
+                const def = ITEMS.find((i) => i.id === r.itemId) ?? rolled;
+                freePulls.push({ itemId: def.id, tier: def.tier });
+                if (!r.duplicate) console.log(`[shop] ${sub} FREE pull ${def.id} (T${def.tier}) — level ${a.level}`);
+              } catch { /* a lost free pull never blocks settlement */ }
+            }
+          }
           send(cl, {
             t: 'xp', gained: a.gained, levelsUp: a.levelsUp,
             level: a.level, xp: a.xp, wins: a.wins, losses: a.losses,
             creditsDelta: a.creditsDelta, credits: a.credits,
+            ...(freePulls.length ? { freePulls } : {}),
           });
           // AIR reputation write-back (ADR 0004): best-effort, post-award,
           // real identities only (dev accounts have no AIR side), addressed
@@ -1452,6 +1477,10 @@ export const createMatchServer = (opts: {
         return json(res, 200, {
           cost: ITEM_COST,
           catalog: ITEMS,
+          // The SHOP identity's balance (plain read, may be null for a
+          // never-seen profile) — the client shows THIS in the shop, not the
+          // /me wallet, so the number on screen is the wallet being charged.
+          credits: await persistence.getCredits(identity.sub),
           items: items.map((it) => ({
             ...it, def: ITEMS.find((d) => d.id === it.itemId) ?? null,
           })),

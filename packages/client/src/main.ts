@@ -8,11 +8,11 @@
  */
 import {
   Action, Btn, Phase, STAGE, TICKS_PER_SEC, TUNING,
-  aiPoll, createAi, createGameState, debugBoxes, setCharacters, step,
+  aiPoll, createAi, createGameState, debugBoxes, itemById, setCharacters, step,
 } from '@af/core';
 import type { AiState, GameState, InputFrame } from '@af/core';
 import {
-  cpuLevelFor, loadLever, loadProfile, saveLever, skillForCpuLevel, xpForNext,
+  awardXp, cpuLevelFor, loadLever, loadProfile, saveLever, skillForCpuLevel, xpForNext,
 } from './progress.js';
 import type { Profile } from './progress.js';
 import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './atlas.js';
@@ -21,8 +21,8 @@ import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
   currentStageCamLimits, drawAgent, drawGameOver, drawHud, drawInvite, drawLoading, drawNetError, drawOpponentGone,
   drawRanks, drawReconnecting, drawResults, drawSelect, drawShop, drawStage, drawStageSelect, drawTitle,
-  drawVsCard, drawWallet, resetTaps, setBgVideo, setGameLogo, setLogo, setStageAsset, setUiKit,
-  setVendingArt, tapHit, tapZone, worldTransform,
+  drawVsCard, drawWallet, resetTaps, SHOP_SPIN_TICKS, setBgVideo, setGameLogo, setLogo,
+  setStageAsset, setUiKit, setVendingArt, tapHit, tapZone, worldTransform,
 } from './ui.js';
 import type { AgentOpponent, Cam, HudFx, HudId, Mode, RankRow, ShopInventoryEntry, ShopReveal, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit, loadVendingArt } from './chrome.js';
@@ -228,9 +228,12 @@ const enterInvite = (from: 'title' | 'results'): void => {
 const shareDare = (): void => {
   if (!account?.refCode) return;
   const link = dareLink();
+  // Level flex: the account level is the bragging-rights stat, so it rides the
+  // share text (the one place progression can actually spread).
+  const lv = account?.level;
   const text = dareVsAgent
-    ? `${currentTaunt()} — MY AGENT FIGHTS FOR ME. Beat it and prove something. +25 credits when you sign in.`
-    : `${currentTaunt()} — I DARE YOU TO FIGHT. +25 credits if you can take one round.`;
+    ? `${currentTaunt()} — MY LV ${lv ?? '??'} AGENT FIGHTS FOR ME. Beat it and prove something. +25 credits when you sign in.`
+    : `${currentTaunt()}${lv ? ` I'M LV ${lv}.` : ''} I DARE YOU TO FIGHT. +25 credits if you can take one round.`;
   const done = (): void => { inviteCopiedAge = 0; };
   const copyFallback = (): void => {
     void navigator.clipboard?.writeText(`${text}\n${link}`).then(done)
@@ -523,12 +526,26 @@ const enterAgentScreen = (): void => {
 interface ShopCatalogDef { id: string; name: string; tier: number; desc: string; flavor: string }
 let shopFetch: 'idle' | 'busy' | 'done' | 'fail' = 'idle';
 let shopInv: ShopInventoryEntry[] = [];
+let shopCatalog: ShopCatalogDef[] = [];
 let shopCost = 5; // server-confirmed on fetch (core ITEM_COST)
 let shopPullBusy = false;
 let shopReveal: ShopReveal | null = null;
 let shopRevealAge = -1;
 let shopErr = '';
 let shopErrAge = -1;
+// Purchase-flow state: PULL → confirm modal → slot-machine spin → reveal.
+let shopConfirm = false;
+let shopSpinAge = -1; // ticks into the reel spin; -1 = not spinning
+// The buy response, held back until the reel finishes its 3s spin — the
+// item is decided server-side instantly; the suspense is pure theater.
+let shopPending: { reveal: ShopReveal; entry: ShopInventoryEntry } | null = null;
+// The shop's OWN identity + balance. Headers are resolved once per shop visit
+// and reused for the pull; the balance comes from GET /items. Both exist so
+// the number on screen is always the wallet that a pull will charge — the
+// /me account can be a DIFFERENT identity while the AIR session rehydrates
+// (found live twice; the enterShop re-fetch alone didn't close the race).
+let shopHeaders: Record<string, string> | null = null;
+let shopCredits: number | null = null;
 
 const mapOwned = (
   it: { rowId?: number; tier?: number; def?: ShopCatalogDef | null },
@@ -542,15 +559,23 @@ const mapOwned = (
 const fetchShop = async (): Promise<void> => {
   shopFetch = 'busy';
   try {
-    const headers = await agentAuthHeaders();
-    if (!headers) { shopFetch = 'fail'; return; }
-    const res = await fetch(`${matchHttpUrl()}/items`, { headers });
+    // Resolve auth ONCE for this shop visit; the pull reuses these exact
+    // headers so the balance shown and the wallet charged cannot diverge.
+    shopHeaders = await agentAuthHeaders();
+    if (!shopHeaders) { shopFetch = 'fail'; return; }
+    const res = await fetch(`${matchHttpUrl()}/items`, { headers: shopHeaders });
     if (!res.ok) { shopFetch = 'fail'; return; }
     const body = (await res.json()) as {
       cost?: number;
+      credits?: number | null;
+      catalog?: ShopCatalogDef[];
       items?: Array<{ rowId?: number; tier?: number; def?: ShopCatalogDef | null }>;
     };
     shopCost = Number(body.cost ?? 5);
+    // null/undefined = profile unseen or old server — fall back to the /me
+    // wallet (pre-credits servers never reach prod, this is dev leniency).
+    shopCredits = typeof body.credits === 'number' ? body.credits : null;
+    shopCatalog = body.catalog ?? [];
     shopInv = (body.items ?? []).map(mapOwned);
     shopFetch = 'done';
   } catch {
@@ -558,13 +583,17 @@ const fetchShop = async (): Promise<void> => {
   }
 };
 
+/** The balance the SHOP trusts: its own identity's read, else the /me wallet. */
+const shopBalance = (): number | null =>
+  shopCredits !== null ? shopCredits : (account ? account.credits : null);
+
 const pullShop = async (): Promise<void> => {
   if (shopPullBusy) return;
   shopPullBusy = true;
   shopErr = '';
   shopErrAge = -1;
   try {
-    const headers = await agentAuthHeaders();
+    const headers = shopHeaders ?? await agentAuthHeaders();
     if (!headers) return;
     // Client purchase id — the server's idempotency key for THIS pull.
     const nonce = `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
@@ -579,24 +608,44 @@ const pullShop = async (): Promise<void> => {
         ? `NOT ENOUGH CREDITS — A PULL COSTS ${shopCost}`
         : (body.error ?? 'THE MACHINE ATE YOUR COIN — TRY AGAIN').toUpperCase().slice(0, 64);
       shopErrAge = 0;
+      shopSpinAge = -1; // stop the reel dead — no result is coming
       return;
     }
     if (body.item) {
-      shopReveal = {
-        name: body.item.name, tier: body.item.tier,
-        desc: body.item.desc, flavor: body.item.flavor,
+      // Hold the result until the reel lands (the frame loop swaps it in);
+      // if the spin somehow isn't running, reveal immediately.
+      shopPending = {
+        reveal: {
+          name: body.item.name, tier: body.item.tier,
+          desc: body.item.desc, flavor: body.item.flavor,
+        },
+        entry: mapOwned({ rowId: body.rowId, def: body.item }),
       };
-      shopRevealAge = 0;
-      shopInv.unshift(mapOwned({ rowId: body.rowId, def: body.item }));
+      if (shopSpinAge < 0) landShopSpin();
     }
-    // The purchase changed the balance — keep the wallet chip honest.
-    if (account && typeof body.credits === 'number') account.credits = body.credits;
+    // The purchase changed the balance — keep both wallets honest.
+    if (typeof body.credits === 'number') {
+      shopCredits = body.credits;
+      if (account) account.credits = body.credits;
+    }
   } catch {
     shopErr = 'SERVER UNREACHABLE — NOTHING WAS CHARGED';
     shopErrAge = 0;
+    shopSpinAge = -1;
   } finally {
     shopPullBusy = false;
   }
+};
+
+/** Reel finished (or was never running): swap the held result into the reveal. */
+const landShopSpin = (): void => {
+  shopSpinAge = -1;
+  if (!shopPending) return;
+  shopReveal = shopPending.reveal;
+  shopRevealAge = 0;
+  shopInv.unshift(shopPending.entry);
+  shopPending = null;
+  audio.blip({ freq: 1560, volume: 0.5 }); // the "clunk" of the can landing
 };
 
 const enterShop = (): void => {
@@ -606,6 +655,11 @@ const enterShop = (): void => {
   shopRevealAge = -1;
   shopErr = '';
   shopErrAge = -1;
+  shopConfirm = false;
+  shopSpinAge = -1;
+  shopPending = null;
+  shopHeaders = null;
+  shopCredits = null;
   // Re-sync the account alongside the shop fetch: both resolve auth NOW, so
   // the wallet shown is the wallet charged. (Without this, a boot-time /me
   // that raced AIR-session rehydration can display one profile while the
@@ -1630,9 +1684,21 @@ const frame = (): void => {
   } else if (screen === 'shop') {
     if (shopRevealAge >= 0) shopRevealAge++;
     if (shopErrAge >= 0 && ++shopErrAge > 240) { shopErrAge = -1; shopErr = ''; }
+    // Slot reel: advance; land the held result once the 3s spin completes.
+    // (Spin overruns SHOP_SPIN_TICKS only if the server response is late.)
+    if (shopSpinAge >= 0) {
+      shopSpinAge++;
+      // Reel tick-tick-tick that slows with the reel (pure theater).
+      const spinT = Math.min(1, shopSpinAge / SHOP_SPIN_TICKS);
+      const tickEvery = 3 + Math.round(spinT * spinT * 21); // 3f → 24f apart
+      if (shopSpinAge % tickEvery === 0) {
+        audio.blip({ freq: 620 + 240 * (1 - spinT), volume: 0.18 });
+      }
+      if (shopSpinAge >= SHOP_SPIN_TICKS && shopPending) landShopSpin();
+    }
     drawShop(ctx, uiTick, {
       status: shopFetch,
-      credits: account ? account.credits : null,
+      credits: shopBalance(),
       cost: shopCost,
       items: shopInv,
       pullBusy: shopPullBusy,
@@ -1640,11 +1706,26 @@ const frame = (): void => {
       revealAge: shopRevealAge,
       err: shopErr,
       errAge: shopErrAge,
+      confirm: shopConfirm,
+      spinAge: shopSpinAge,
+      catalog: shopCatalog.map((d) => ({ name: d.name, tier: d.tier })),
     });
-    if (!shopPullBusy && shopFetch !== 'fail'
+    if (shopConfirm) {
+      // Modal owns the input: YES pulls, NO/ESC backs out. Nothing else.
+      if (pressedThisFrame.has('Enter') || pressedThisFrame.has('KeyY') || taps.has('shop:yes')) {
+        shopConfirm = false;
+        shopReveal = null;
+        shopRevealAge = -1;
+        shopSpinAge = 0; // reel starts NOW; the buy races it and always wins
+        void pullShop();
+      } else if (pressedThisFrame.has('Escape') || pressedThisFrame.has('KeyN') || taps.has('shop:no')) {
+        shopConfirm = false;
+      }
+    } else if (!shopPullBusy && shopSpinAge < 0 && shopFetch !== 'fail'
+      && (shopBalance() === null || shopBalance()! >= shopCost)
       && (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('shop:pull'))) {
-      void pullShop();
-    } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
+      shopConfirm = true; // ask before taking the money
+    } else if (shopSpinAge < 0 && (pressedThisFrame.has('Escape') || taps.has('back'))) {
       screen = 'title';
     }
   } else if (screen === 'ranks') {
@@ -1873,12 +1954,24 @@ const frame = (): void => {
     updateCamera(game);
     renderFight(game);
     if (cardUp && fighters && !netDead) {
+      // LV chips (match-side order, matching names[]): my account/training
+      // level always; the opponent's when we know it — offline CPU scales to
+      // `cpuLevelFor`, online solo pins the house/agent to my account level.
+      const myLv = account?.level ?? profile.level;
+      const vsLevels: [number | null, number | null] = [null, null];
+      if (net?.setup) {
+        vsLevels[net.setup.side] = myLv;
+        if (net.setup.mode === 'solo') vsLevels[1 - net.setup.side] = myLv;
+      } else {
+        vsLevels[0] = myLv;
+        if (cpuAi && !arcade) vsLevels[1] = cpuLevelFor(profile, lever);
+      }
       drawVsCard(ctx, fighters,
         net?.setup
           ? net.setup.names
           : [fighters[0].bundle.name,
             cpuAi && !arcade ? `AGENT LV ${cpuLevelFor(profile, lever)}` : fighters[1].bundle.name],
-        vsStakes.filter((s) => s), vsCardAge);
+        vsStakes.filter((s) => s), vsCardAge, vsLevels);
       vsCardAge++;
     } else if (vsCardAge >= 0 && !netDead) {
       vsCardAge = -1;
@@ -2014,6 +2107,22 @@ const frame = (): void => {
         // Progression is SERVER-AWARDED (M5): ranked/wager XP + credits
         // arrive in the post-result xp message. Free practice pays nothing.
         screen = 'results';
+        // OFFLINE TRAINING LV: a purely LOCAL progression track for vs-CPU
+        // play (no server, no credits, no free pulls — localStorage is
+        // editable, so it can never feed the trustworthy account economy).
+        // It moves the same `profile` that scales CPU difficulty and shows a
+        // "sign in for the real thing" nudge. Online matches never hit this —
+        // `net` is set — so the server award stays authoritative.
+        if (!net && cpuAi && !practiceFree) {
+          const s = awardXp(profile, {
+            won: game.winner === 0, damageDealt: statDmg, bestCombo: statBestCombo,
+          });
+          xpBanner = {
+            gained: s.gained, levelsUp: s.levelsUp,
+            level: profile.level, xp: profile.xp, xpNeed: xpForNext(profile.level),
+            wins: profile.wins, losses: profile.losses, training: true,
+          };
+        }
         // CPU beat the human → arcade "Game Over" stinger; anything else
         // (human win, 2P vs 2P, a draw) gets the victory jingle.
         const lostToCpu = Boolean(cpuAi) && game.winner === 1;
@@ -2028,12 +2137,22 @@ const frame = (): void => {
     // Online progression is SERVER-AWARDED (Phase B): the xp message lands
     // after the verified result, only for signed-in players.
     if (net?.xp && !xpBanner) {
+      // Resolve each server-granted free pull id → its full item def so the
+      // results banner can name the drink (server already added it to inventory).
+      const freePulls = (net.xp.freePulls ?? [])
+        .map((p) => itemById(p.itemId))
+        .filter((d): d is NonNullable<typeof d> => !!d)
+        .map((d) => ({ name: d.name, tier: d.tier, desc: d.desc, flavor: d.flavor }));
       xpBanner = {
         gained: net.xp.gained, levelsUp: net.xp.levelsUp,
         level: net.xp.level, xp: net.xp.xp, xpNeed: xpForNext(net.xp.level),
         wins: net.xp.wins, losses: net.xp.losses,
         creditsDelta: net.xp.creditsDelta, credits: net.xp.credits,
+        freePulls,
       };
+      // A fresh pull is now in inventory — refresh the shop list lazily so the
+      // vending screen shows it without a manual re-fetch.
+      if (freePulls.length) void fetchShop();
       // Keep the title-screen chip in sync without a refetch.
       if (account) {
         account = {

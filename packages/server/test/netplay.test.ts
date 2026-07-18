@@ -95,6 +95,7 @@ describe('persistence hook (Phase B)', () => {
         rowId: 0, itemId: 'patch1', tier: 1, createdAt: '', credits: 100, duplicate: false,
       }),
       listItems: async () => [],
+      getCredits: async () => 100,
     };
     const s2 = await createMatchServer({ port: 0, persistence: mock, noPaceCheck: true });
     try {

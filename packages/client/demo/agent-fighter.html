@@ -6214,6 +6214,8 @@ const drawVendingIcon = (ctx, tick) => {
     ctx.fillRect(x + 6, y + h - 20, w - 12, 12);
     label(ctx, 'B · SHOP', x + w / 2, y + h + 14, 11, tick % 44 < 36 ? '#ffd166' : '#ffe9a3');
 };
+/** Spin length: 3 seconds at 60 ticks/sec (main.ts lands the reveal here). */
+const SHOP_SPIN_TICKS = 180;
 /** The vending-machine screen: machine + PULL + reveal card + stash shelf. */
 const drawShop = (ctx, tick, v) => {
     drawMenuBackdrop(ctx);
@@ -6291,9 +6293,11 @@ const drawShop = (ctx, tick, v) => {
     }
     // ---- PULL button (under the machine) -----------------------------------
     const canAfford = v.credits === null || v.credits >= v.cost;
+    const spinning = v.spinAge >= 0;
     const bw = 250, bh = 44, bx = mx, by = my + mh + 14;
-    tapZone(bx, by, bw, bh, 'shop:pull');
-    const armed = !v.pullBusy && canAfford;
+    if (!v.confirm)
+        tapZone(bx, by, bw, bh, 'shop:pull');
+    const armed = !v.pullBusy && canAfford && !spinning && !v.confirm;
     ctx.fillStyle = armed ? 'rgba(58,38,10,0.9)' : 'rgba(20,16,28,0.8)';
     ctx.fillRect(bx, by, bw, bh);
     ctx.strokeStyle = armed ? GOLD : 'rgba(255,255,255,0.2)';
@@ -6304,7 +6308,7 @@ const drawShop = (ctx, tick, v) => {
         display(ctx, `INSERT ${v.cost} CR · PULL`, bx + bw / 2, by + 29, 19, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
     }
     else {
-        label(ctx, v.pullBusy ? 'DISPENSING…' : `INSERT ${v.cost} CR · PULL`, bx + bw / 2, by + 27, 15, '#ffffff66');
+        label(ctx, spinning || v.pullBusy ? 'DISPENSING…' : `INSERT ${v.cost} CR · PULL`, bx + bw / 2, by + 27, 15, '#ffffff66');
     }
     if (!canAfford) {
         label(ctx, 'NOT ENOUGH CREDITS — WIN MATCHES OR CLAIM THE DAILY +10', bx + bw / 2, by + bh + 16, 10, '#ff9d9d');
@@ -6333,7 +6337,7 @@ const drawShop = (ctx, tick, v) => {
                 : { from: '#ffffff', mid: '#cfd8e3', to: '#6b7686', outline: '#101318', align: 'left' });
         label(ctx, v.reveal.desc, rx + 118, ry + 104, 14, '#ffffffdd', 'left');
         label(ctx, `“${v.reveal.flavor}”`, rx + 118, ry + 126, 11, '#ffffff88', 'left');
-        label(ctx, 'USABLE IN RANKED MODES SOON — PHASE 2', rx + 118, ry + 158, 10, '#8fd0ff', 'left');
+        label(ctx, 'PICK IT AT FIGHTER SELECT — ONE DRINK PER FIGHT', rx + 118, ry + 158, 10, '#8fd0ff', 'left');
         ctx.restore();
         // Sparkle ring on a fresh LV3.
         if (tier === 3 && v.revealAge < 40) {
@@ -6347,10 +6351,93 @@ const drawShop = (ctx, tick, v) => {
             ctx.restore();
         }
     }
+    else if (spinning) {
+        // ---- SLOT REEL: fast vertical blur → deceleration; main.ts swaps in the
+        // reveal card (easeOutBack pop) when the spin lands — the pop + flash
+        // masks the reel-to-result snap, arcade-style.
+        const ry = 108, rh = 224;
+        const rowH = 56;
+        ctx.save();
+        ctx.shadowColor = 'rgba(255,209,102,0.45)';
+        ctx.shadowBlur = 20 + 10 * Math.sin(tick / 5);
+        bevel(ctx, rx, ry, rw, rh, PANEL, GOLD_LT, GOLD_DK, 3);
+        ctx.shadowBlur = 0;
+        // Payline arrows either side of the center row.
+        const cyMid = ry + rh / 2;
+        ctx.fillStyle = GOLD;
+        ctx.beginPath();
+        ctx.moveTo(rx + 6, cyMid - 9);
+        ctx.lineTo(rx + 20, cyMid);
+        ctx.lineTo(rx + 6, cyMid + 9);
+        ctx.closePath();
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(rx + rw - 6, cyMid - 9);
+        ctx.lineTo(rx + rw - 20, cyMid);
+        ctx.lineTo(rx + rw - 6, cyMid + 9);
+        ctx.closePath();
+        ctx.fill();
+        // Reel window (clipped) — position decelerates over SHOP_SPIN_TICKS.
+        ctx.beginPath();
+        ctx.rect(rx + 26, ry + 8, rw - 52, rh - 16);
+        ctx.clip();
+        const t = clamp01(v.spinAge / SHOP_SPIN_TICKS);
+        const speed = 0.9 * (1 - t) * (1 - t) + 0.02; // rows/tick, eases out
+        // Integrated distance: s(t) of the eased speed — monotonic scroll pos.
+        const pos = (0.9 * (v.spinAge - v.spinAge * t + (v.spinAge * t * t) / 3) + 0.02 * v.spinAge);
+        const n = Math.max(1, v.catalog.length);
+        const frac = pos % 1;
+        for (let k = -3; k <= 3; k++) {
+            const idx = ((Math.floor(pos) + k) % n + n) % n;
+            const entry = v.catalog[idx];
+            const tier = Math.max(1, Math.min(3, entry.tier));
+            const y = cyMid + (k - frac) * rowH;
+            const centered = Math.abs(y - cyMid) < rowH / 2;
+            ctx.globalAlpha = centered ? 1 : 0.35;
+            drawCan(ctx, rx + 44, y - 21, 24, 42, TIER_COLORS[tier], centered && tier === 3 ? 8 : 0);
+            label(ctx, entry.name, rx + 84, y + 6, centered ? 18 : 14, centered ? '#ffffff' : '#ffffff88', 'left');
+            label(ctx, TIER_LABELS[tier], rx + rw - 66, y + 6, 12, TIER_COLORS[tier], 'left');
+        }
+        ctx.restore();
+        // Motion blur streaks while the reel is fast.
+        if (speed > 0.25) {
+            ctx.save();
+            ctx.globalAlpha = Math.min(0.5, speed);
+            ctx.fillStyle = '#ffffff22';
+            for (let s = 0; s < 5; s++) {
+                ctx.fillRect(rx + 30 + s * ((rw - 60) / 5), ry + 12, 2, rh - 24);
+            }
+            ctx.restore();
+        }
+        label(ctx, 'THE MACHINE IS CHOOSING…', rx + rw / 2, ry + rh + 22, 12, tick % 30 < 22 ? '#ffd166' : '#ffe9a3');
+    }
     else {
-        label(ctx, v.status === 'busy' ? 'STOCKING THE MACHINE…' : 'FEELING LUCKY?', rx + rw / 2, 170, 16, '#ffffff77');
-        label(ctx, `LV 1 COMMON · LV 2 UNCOMMON · LV 3 RARE`, rx + rw / 2, 194, 11, '#ffffff55');
-        label(ctx, 'HEAL · DAMAGE UP · DEFENSE UP · SUPER METER', rx + rw / 2, 212, 11, '#ffffff55');
+        // ---- HOW IT WORKS (idle right column) — the gacha rules, big and clear.
+        const ry = 108, rh = 224;
+        bevel(ctx, rx, ry, rw, rh, 'rgba(12,8,24,0.82)', 'rgba(255,255,255,0.22)', 'rgba(0,0,0,0.5)', 2);
+        display(ctx, v.status === 'busy' ? 'STOCKING…' : 'HOW IT WORKS', rx + rw / 2, ry + 34, 22, { glow: 'rgba(255,209,102,0.4)' });
+        const lx = rx + 22;
+        label(ctx, `1 · INSERT ${v.cost} CR — THE MACHINE PICKS YOUR DRINK AT RANDOM`, lx, ry + 64, 12, '#ffffffdd', 'left');
+        label(ctx, '2 · RANDOM EFFECT — HEAL · DAMAGE UP · DEFENSE UP · SUPER METER', lx, ry + 86, 12, '#ffffffdd', 'left');
+        label(ctx, '3 · RANDOM TIER — HIGHER TIER, STRONGER DRINK:', lx, ry + 108, 12, '#ffffffdd', 'left');
+        // Odds bar: three segments sized by the real 70/25/5 odds, tier-colored.
+        const obX = lx + 14, obW = rw - 72, obY = ry + 120, obH = 18;
+        const segs = [[70, 1, 'LV 1 · 70%'], [25, 2, 'LV 2 · 25%'], [5, 3, 'LV 3 · 5%']];
+        let sx = obX;
+        for (const [pct, tier, tag] of segs) {
+            const sw = (obW * pct) / 100;
+            ctx.fillStyle = TIER_COLORS[tier];
+            ctx.globalAlpha = 0.85;
+            ctx.fillRect(sx, obY, sw - 2, obH);
+            ctx.globalAlpha = 1;
+            if (sw > 70)
+                label(ctx, tag, sx + sw / 2, obY + 13, 10, '#10131b');
+            sx += sw;
+        }
+        // Narrow segments get their tags to the right of the bar.
+        label(ctx, 'LV 2 · 25%   LV 3 · 5%', obX + obW * 0.7 + 6, obY + 31, 9, '#ffffff88', 'left');
+        label(ctx, '4 · ONE DRINK RIDES INTO YOUR NEXT ARENA / WAGER FIGHT —', lx, ry + 178, 12, '#8fd0ff', 'left');
+        label(ctx, 'PICK IT AT FIGHTER SELECT. USED = GONE.', lx + 14, ry + 196, 12, '#8fd0ff', 'left');
     }
     // ---- Stash (inventory shelf, right-bottom) -----------------------------
     const sy = 348;
@@ -6373,7 +6460,39 @@ const drawShop = (ctx, tick, v) => {
     if (v.err && v.errAge >= 0 && v.errAge % 30 < 22) {
         label(ctx, `⚠ ${v.err}`, cx, VH - 30, 14, '#ff5d7e');
     }
-    label(ctx, 'ENTER / TAP PULL · ESC BACK', cx, VH - 8, 10, '#ffffff55');
+    label(ctx, v.confirm ? 'ENTER / Y CONFIRM · ESC / N CANCEL' : 'ENTER / TAP PULL · ESC BACK', cx, VH - 8, 10, '#ffffff55');
+    // ---- Purchase confirm modal (topmost — its tap zones must win) ----------
+    if (v.confirm) {
+        ctx.fillStyle = 'rgba(4,2,10,0.72)';
+        ctx.fillRect(0, 0, VW, VH);
+        const pw = 430, ph = 190, px = cx - pw / 2, py = VH / 2 - ph / 2 - 20;
+        ctx.save();
+        ctx.shadowColor = 'rgba(255,209,102,0.5)';
+        ctx.shadowBlur = 26;
+        bevel(ctx, px, py, pw, ph, PANEL, GOLD_LT, GOLD_DK, 3);
+        ctx.restore();
+        display(ctx, `INSERT ${v.cost} CR?`, cx, py + 46, 28, { glow: 'rgba(255,209,102,0.55)' });
+        label(ctx, 'ONE RANDOM ENERGY DRINK — NO REFUNDS, NO RE-ROLLS', cx, py + 74, 11, '#ffffffcc');
+        if (v.credits !== null) {
+            label(ctx, `BALANCE AFTER: ${v.credits - v.cost} CR`, cx, py + 94, 12, GOLD_LT);
+        }
+        const btnW = 180, btnH = 48, gap = 26;
+        const yesX = cx - btnW - gap / 2, noX = cx + gap / 2, btnY = py + ph - 68;
+        tapZone(yesX, btnY, btnW, btnH, 'shop:yes');
+        ctx.fillStyle = 'rgba(28,66,30,0.95)';
+        ctx.fillRect(yesX, btnY, btnW, btnH);
+        ctx.strokeStyle = '#7ddf8a';
+        ctx.lineWidth = 2.5;
+        ctx.strokeRect(yesX + 0.5, btnY + 0.5, btnW - 1, btnH - 1);
+        display(ctx, 'YES · PULL', yesX + btnW / 2, btnY + 32, 19, { from: '#eaffe9', mid: '#8dfF9a', to: '#2c7c3a', outline: '#0a2010' });
+        tapZone(noX, btnY, btnW, btnH, 'shop:no');
+        ctx.fillStyle = 'rgba(66,24,28,0.95)';
+        ctx.fillRect(noX, btnY, btnW, btnH);
+        ctx.strokeStyle = '#ff8d9d';
+        ctx.lineWidth = 2.5;
+        ctx.strokeRect(noX + 0.5, btnY + 0.5, btnW - 1, btnH - 1);
+        display(ctx, 'NO · KEEP IT', noX + btnW / 2, btnY + 32, 19, DARE_OPTS);
+    }
     ctx.lineWidth = 1;
 };
 // ---------------------------------------------------------------- invite
@@ -7088,10 +7207,11 @@ serverWinner) => {
         ctx.save();
         ctx.globalAlpha = xpPop;
         let y = boxY + boxH + 30;
+        const lvWord = xp.training ? 'TRAINING LV' : 'LV';
         if (xp.levelsUp > 0) {
             const flash = tick % 40 < 28;
             if (flash)
-                display(ctx, `LEVEL UP!  LV ${xp.level}`, VW / 2, y, 26, { glow: 'rgba(255,209,102,0.6)' });
+                display(ctx, `LEVEL UP!  ${lvWord} ${xp.level}`, VW / 2, y, 26, { glow: 'rgba(255,209,102,0.6)' });
             y += 32;
         }
         const xpTxt = `${xp.gained >= 0 ? '+' : ''}${xp.gained} XP`;
@@ -7114,7 +7234,24 @@ serverWinner) => {
         ctx.fillStyle = '#6fd3ff';
         ctx.fillRect(bx, y, Math.round((barW * Math.min(xp.xp, xp.xpNeed)) / Math.max(1, xp.xpNeed)), barH);
         y += 28;
-        label(ctx, `LV ${xp.level}  ·  ${xp.xp}/${xp.xpNeed} XP  ·  ${xp.wins}W ${xp.losses}L`, VW / 2, y, 13, '#ffffffcc');
+        label(ctx, `${lvWord} ${xp.level}  ·  ${xp.xp}/${xp.xpNeed} XP  ·  ${xp.wins}W ${xp.losses}L`, VW / 2, y, 13, '#ffffffcc');
+        // FREE PULL(S): the tangible level-up reward — a gold callout naming each
+        // drink the machine coughed up (already granted server-side; this reveals).
+        if (xp.freePulls && xp.freePulls.length > 0) {
+            y += 26;
+            const glow = tick % 44 < 30;
+            display(ctx, `★ FREE PULL${xp.freePulls.length > 1 ? ` ×${xp.freePulls.length}` : ''}! ★`, VW / 2, y, 18, glow ? { glow: 'rgba(255,209,102,0.7)' } : {});
+            xp.freePulls.forEach((it, k) => {
+                const col = TIER_COLORS[it.tier] ?? '#fff';
+                label(ctx, `${it.name}  ·  ${TIER_LABELS[it.tier] ?? ''}  —  ${it.desc}`, VW / 2, y + 20 + k * 17, 12, col);
+            });
+            y += 20 + xp.freePulls.length * 17;
+        }
+        else if (xp.training && xp.levelsUp > 0) {
+            // Offline level-ups can't grant real rewards — nudge toward the account.
+            y += 22;
+            label(ctx, 'SIGN IN TO EARN ACCOUNT LEVELS + FREE VENDING PULLS', VW / 2, y, 12, '#ffd166cc');
+        }
         ctx.restore();
     }
     if (tick % 60 < 42) {
@@ -7503,7 +7640,8 @@ const drawVsFighter = (ctx, roster, side, slide, tick) => {
  * dozen strokes per frame, no per-pixel work.
  */
 const drawVsCard = (ctx, rosters, names, stakes, // 1-3 short lines, most important first
-age) => {
+age, // ticks since the card appeared — drives pop-in
+levels) => {
     const inT = easeOutBack(clamp01(age / 14));
     const wipe = clamp01(age / 18);
     // ---- backdrop: the menu video, heavily darkened so fighters/text pop.
@@ -7659,6 +7797,16 @@ age) => {
         ctx.save();
         ctx.globalAlpha = inT;
         label(ctx, names[i].toUpperCase().slice(0, 20), nx, VH - 26, 16, i === 0 ? '#8fe8a0' : '#ff9d9d');
+        // LV chip: the matchup stat that frames the fight (higher = expected win).
+        const lv = levels?.[i];
+        if (lv != null) {
+            const txt = `LV ${lv}`;
+            ctx.font = '700 12px ' + DISPLAY_FONT_STACK;
+            const cw = ctx.measureText(txt).width + 16;
+            const cy = VH - 12, chH = 15;
+            bevel(ctx, nx - cw / 2, cy - chH + 3, cw, chH, '#1a1526e0', GOLD, GOLD_DK, 1);
+            label(ctx, txt, nx, cy - 1, 11, GOLD_LT);
+        }
         ctx.restore();
     });
     // ---- scanlines + vignette: cheap CRT-ish polish.
@@ -8553,9 +8701,12 @@ const shareDare = () => {
     if (!account?.refCode)
         return;
     const link = dareLink();
+    // Level flex: the account level is the bragging-rights stat, so it rides the
+    // share text (the one place progression can actually spread).
+    const lv = account?.level;
     const text = dareVsAgent
-        ? `${currentTaunt()} — MY AGENT FIGHTS FOR ME. Beat it and prove something. +25 credits when you sign in.`
-        : `${currentTaunt()} — I DARE YOU TO FIGHT. +25 credits if you can take one round.`;
+        ? `${currentTaunt()} — MY LV ${lv ?? '??'} AGENT FIGHTS FOR ME. Beat it and prove something. +25 credits when you sign in.`
+        : `${currentTaunt()}${lv ? ` I'M LV ${lv}.` : ''} I DARE YOU TO FIGHT. +25 credits if you can take one round.`;
     const done = () => { inviteCopiedAge = 0; };
     const copyFallback = () => {
         void navigator.clipboard?.writeText(`${text}\n${link}`).then(done)
@@ -8841,12 +8992,26 @@ const enterAgentScreen = () => {
 };
 let shopFetch = 'idle';
 let shopInv = [];
+let shopCatalog = [];
 let shopCost = 5; // server-confirmed on fetch (core ITEM_COST)
 let shopPullBusy = false;
 let shopReveal = null;
 let shopRevealAge = -1;
 let shopErr = '';
 let shopErrAge = -1;
+// Purchase-flow state: PULL → confirm modal → slot-machine spin → reveal.
+let shopConfirm = false;
+let shopSpinAge = -1; // ticks into the reel spin; -1 = not spinning
+// The buy response, held back until the reel finishes its 3s spin — the
+// item is decided server-side instantly; the suspense is pure theater.
+let shopPending = null;
+// The shop's OWN identity + balance. Headers are resolved once per shop visit
+// and reused for the pull; the balance comes from GET /items. Both exist so
+// the number on screen is always the wallet that a pull will charge — the
+// /me account can be a DIFFERENT identity while the AIR session rehydrates
+// (found live twice; the enterShop re-fetch alone didn't close the race).
+let shopHeaders = null;
+let shopCredits = null;
 const mapOwned = (it) => ({
     rowId: Number(it.rowId ?? 0),
     name: it.def?.name ?? 'UNKNOWN CAN',
@@ -8856,18 +9021,24 @@ const mapOwned = (it) => ({
 const fetchShop = async () => {
     shopFetch = 'busy';
     try {
-        const headers = await agentAuthHeaders();
-        if (!headers) {
+        // Resolve auth ONCE for this shop visit; the pull reuses these exact
+        // headers so the balance shown and the wallet charged cannot diverge.
+        shopHeaders = await agentAuthHeaders();
+        if (!shopHeaders) {
             shopFetch = 'fail';
             return;
         }
-        const res = await fetch(`${matchHttpUrl()}/items`, { headers });
+        const res = await fetch(`${matchHttpUrl()}/items`, { headers: shopHeaders });
         if (!res.ok) {
             shopFetch = 'fail';
             return;
         }
         const body = (await res.json());
         shopCost = Number(body.cost ?? 5);
+        // null/undefined = profile unseen or old server — fall back to the /me
+        // wallet (pre-credits servers never reach prod, this is dev leniency).
+        shopCredits = typeof body.credits === 'number' ? body.credits : null;
+        shopCatalog = body.catalog ?? [];
         shopInv = (body.items ?? []).map(mapOwned);
         shopFetch = 'done';
     }
@@ -8875,6 +9046,8 @@ const fetchShop = async () => {
         shopFetch = 'fail';
     }
 };
+/** The balance the SHOP trusts: its own identity's read, else the /me wallet. */
+const shopBalance = () => shopCredits !== null ? shopCredits : (account ? account.credits : null);
 const pullShop = async () => {
     if (shopPullBusy)
         return;
@@ -8882,7 +9055,7 @@ const pullShop = async () => {
     shopErr = '';
     shopErrAge = -1;
     try {
-        const headers = await agentAuthHeaders();
+        const headers = shopHeaders ?? await agentAuthHeaders();
         if (!headers)
             return;
         // Client purchase id — the server's idempotency key for THIS pull.
@@ -8896,27 +9069,48 @@ const pullShop = async () => {
                 ? `NOT ENOUGH CREDITS — A PULL COSTS ${shopCost}`
                 : (body.error ?? 'THE MACHINE ATE YOUR COIN — TRY AGAIN').toUpperCase().slice(0, 64);
             shopErrAge = 0;
+            shopSpinAge = -1; // stop the reel dead — no result is coming
             return;
         }
         if (body.item) {
-            shopReveal = {
-                name: body.item.name, tier: body.item.tier,
-                desc: body.item.desc, flavor: body.item.flavor,
+            // Hold the result until the reel lands (the frame loop swaps it in);
+            // if the spin somehow isn't running, reveal immediately.
+            shopPending = {
+                reveal: {
+                    name: body.item.name, tier: body.item.tier,
+                    desc: body.item.desc, flavor: body.item.flavor,
+                },
+                entry: mapOwned({ rowId: body.rowId, def: body.item }),
             };
-            shopRevealAge = 0;
-            shopInv.unshift(mapOwned({ rowId: body.rowId, def: body.item }));
+            if (shopSpinAge < 0)
+                landShopSpin();
         }
-        // The purchase changed the balance — keep the wallet chip honest.
-        if (account && typeof body.credits === 'number')
-            account.credits = body.credits;
+        // The purchase changed the balance — keep both wallets honest.
+        if (typeof body.credits === 'number') {
+            shopCredits = body.credits;
+            if (account)
+                account.credits = body.credits;
+        }
     }
     catch {
         shopErr = 'SERVER UNREACHABLE — NOTHING WAS CHARGED';
         shopErrAge = 0;
+        shopSpinAge = -1;
     }
     finally {
         shopPullBusy = false;
     }
+};
+/** Reel finished (or was never running): swap the held result into the reveal. */
+const landShopSpin = () => {
+    shopSpinAge = -1;
+    if (!shopPending)
+        return;
+    shopReveal = shopPending.reveal;
+    shopRevealAge = 0;
+    shopInv.unshift(shopPending.entry);
+    shopPending = null;
+    audio.blip({ freq: 1560, volume: 0.5 }); // the "clunk" of the can landing
 };
 const enterShop = () => {
     audioMenuOpen = false;
@@ -8925,6 +9119,11 @@ const enterShop = () => {
     shopRevealAge = -1;
     shopErr = '';
     shopErrAge = -1;
+    shopConfirm = false;
+    shopSpinAge = -1;
+    shopPending = null;
+    shopHeaders = null;
+    shopCredits = null;
     // Re-sync the account alongside the shop fetch: both resolve auth NOW, so
     // the wallet shown is the wallet charged. (Without this, a boot-time /me
     // that raced AIR-session rehydration can display one profile while the
@@ -9966,9 +10165,22 @@ const frame = () => {
             shopErrAge = -1;
             shopErr = '';
         }
+        // Slot reel: advance; land the held result once the 3s spin completes.
+        // (Spin overruns SHOP_SPIN_TICKS only if the server response is late.)
+        if (shopSpinAge >= 0) {
+            shopSpinAge++;
+            // Reel tick-tick-tick that slows with the reel (pure theater).
+            const spinT = Math.min(1, shopSpinAge / SHOP_SPIN_TICKS);
+            const tickEvery = 3 + Math.round(spinT * spinT * 21); // 3f → 24f apart
+            if (shopSpinAge % tickEvery === 0) {
+                audio.blip({ freq: 620 + 240 * (1 - spinT), volume: 0.18 });
+            }
+            if (shopSpinAge >= SHOP_SPIN_TICKS && shopPending)
+                landShopSpin();
+        }
         drawShop(ctx, uiTick, {
             status: shopFetch,
-            credits: account ? account.credits : null,
+            credits: shopBalance(),
             cost: shopCost,
             items: shopInv,
             pullBusy: shopPullBusy,
@@ -9976,12 +10188,29 @@ const frame = () => {
             revealAge: shopRevealAge,
             err: shopErr,
             errAge: shopErrAge,
+            confirm: shopConfirm,
+            spinAge: shopSpinAge,
+            catalog: shopCatalog.map((d) => ({ name: d.name, tier: d.tier })),
         });
-        if (!shopPullBusy && shopFetch !== 'fail'
-            && (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('shop:pull'))) {
-            void pullShop();
+        if (shopConfirm) {
+            // Modal owns the input: YES pulls, NO/ESC backs out. Nothing else.
+            if (pressedThisFrame.has('Enter') || pressedThisFrame.has('KeyY') || taps.has('shop:yes')) {
+                shopConfirm = false;
+                shopReveal = null;
+                shopRevealAge = -1;
+                shopSpinAge = 0; // reel starts NOW; the buy races it and always wins
+                void pullShop();
+            }
+            else if (pressedThisFrame.has('Escape') || pressedThisFrame.has('KeyN') || taps.has('shop:no')) {
+                shopConfirm = false;
+            }
         }
-        else if (pressedThisFrame.has('Escape') || taps.has('back')) {
+        else if (!shopPullBusy && shopSpinAge < 0 && shopFetch !== 'fail'
+            && (shopBalance() === null || shopBalance() >= shopCost)
+            && (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('shop:pull'))) {
+            shopConfirm = true; // ask before taking the money
+        }
+        else if (shopSpinAge < 0 && (pressedThisFrame.has('Escape') || taps.has('back'))) {
             screen = 'title';
         }
     }
@@ -10236,10 +10465,25 @@ const frame = () => {
         updateCamera(game);
         renderFight(game);
         if (cardUp && fighters && !netDead) {
+            // LV chips (match-side order, matching names[]): my account/training
+            // level always; the opponent's when we know it — offline CPU scales to
+            // `cpuLevelFor`, online solo pins the house/agent to my account level.
+            const myLv = account?.level ?? profile.level;
+            const vsLevels = [null, null];
+            if (net?.setup) {
+                vsLevels[net.setup.side] = myLv;
+                if (net.setup.mode === 'solo')
+                    vsLevels[1 - net.setup.side] = myLv;
+            }
+            else {
+                vsLevels[0] = myLv;
+                if (cpuAi && !arcade)
+                    vsLevels[1] = cpuLevelFor(profile, lever);
+            }
             drawVsCard(ctx, fighters, net?.setup
                 ? net.setup.names
                 : [fighters[0].bundle.name,
-                    cpuAi && !arcade ? `AGENT LV ${cpuLevelFor(profile, lever)}` : fighters[1].bundle.name], vsStakes.filter((s) => s), vsCardAge);
+                    cpuAi && !arcade ? `AGENT LV ${cpuLevelFor(profile, lever)}` : fighters[1].bundle.name], vsStakes.filter((s) => s), vsCardAge, vsLevels);
             vsCardAge++;
         }
         else if (vsCardAge >= 0 && !netDead) {
@@ -10381,6 +10625,22 @@ const frame = () => {
                 // Progression is SERVER-AWARDED (M5): ranked/wager XP + credits
                 // arrive in the post-result xp message. Free practice pays nothing.
                 screen = 'results';
+                // OFFLINE TRAINING LV: a purely LOCAL progression track for vs-CPU
+                // play (no server, no credits, no free pulls — localStorage is
+                // editable, so it can never feed the trustworthy account economy).
+                // It moves the same `profile` that scales CPU difficulty and shows a
+                // "sign in for the real thing" nudge. Online matches never hit this —
+                // `net` is set — so the server award stays authoritative.
+                if (!net && cpuAi && !practiceFree) {
+                    const s = awardXp(profile, {
+                        won: game.winner === 0, damageDealt: statDmg, bestCombo: statBestCombo,
+                    });
+                    xpBanner = {
+                        gained: s.gained, levelsUp: s.levelsUp,
+                        level: profile.level, xp: profile.xp, xpNeed: xpForNext(profile.level),
+                        wins: profile.wins, losses: profile.losses, training: true,
+                    };
+                }
                 // CPU beat the human → arcade "Game Over" stinger; anything else
                 // (human win, 2P vs 2P, a draw) gets the victory jingle.
                 const lostToCpu = Boolean(cpuAi) && game.winner === 1;
@@ -10397,12 +10657,23 @@ const frame = () => {
         // Online progression is SERVER-AWARDED (Phase B): the xp message lands
         // after the verified result, only for signed-in players.
         if (net?.xp && !xpBanner) {
+            // Resolve each server-granted free pull id → its full item def so the
+            // results banner can name the drink (server already added it to inventory).
+            const freePulls = (net.xp.freePulls ?? [])
+                .map((p) => itemById(p.itemId))
+                .filter((d) => !!d)
+                .map((d) => ({ name: d.name, tier: d.tier, desc: d.desc, flavor: d.flavor }));
             xpBanner = {
                 gained: net.xp.gained, levelsUp: net.xp.levelsUp,
                 level: net.xp.level, xp: net.xp.xp, xpNeed: xpForNext(net.xp.level),
                 wins: net.xp.wins, losses: net.xp.losses,
                 creditsDelta: net.xp.creditsDelta, credits: net.xp.credits,
+                freePulls,
             };
+            // A fresh pull is now in inventory — refresh the shop list lazily so the
+            // vending screen shows it without a manual re-fetch.
+            if (freePulls.length)
+                void fetchShop();
             // Keep the title-screen chip in sync without a refetch.
             if (account) {
                 account = {
