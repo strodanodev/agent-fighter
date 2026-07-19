@@ -24,10 +24,10 @@ import {
 } from '@af/core';
 import type { CharacterBundle } from '@af/core';
 import {
-  ARCADE_CLEAR_CREDITS, ARCADE_FEE, ARCADE_MILESTONE_CREDITS, DAILY_CREDITS,
+  ARCADE_CLEAR_CREDITS, ARCADE_FEE, DAILY_CREDITS,
   memoryPersistence,
 } from '../src/persist.js';
-import { arcadeMilestonePayout, createMatchServer } from '../src/server.js';
+import { arcadeWinPayout, createMatchServer } from '../src/server.js';
 import { PROTOCOL_VERSION } from '../src/protocol.js';
 import type { SMatch, ServerMsg } from '../src/protocol.js';
 
@@ -139,8 +139,9 @@ test('ARCADE RUN: one entry fee, milestone + clear payouts, ranked W per battle'
     assert.equal(res.winner, 0);
     const xp = await c.next<Extract<ServerMsg, { t: 'xp' }>>('xp');
     assert.equal(xp.gained, 60, 'every battle pays ranked XP');
-    // Credits move ONLY via the entry fee and the milestone schedule.
-    const expected = arcadeMilestonePayout(b + 1, total) - (b === 0 ? ARCADE_FEE : 0);
+    // ADR 0007 credits rework: +1 EVERY win (+ clear bonus on the last),
+    // minus the legacy battle-1 escrow on this old-client path.
+    const expected = arcadeWinPayout(b + 1, total) - (b === 0 ? ARCADE_FEE : 0);
     assert.equal(xp.creditsDelta, expected, `battle ${b + 1} creditsDelta`);
 
     if (b + 1 < total) c.send({ t: 'queue', character: player, mode: 'arcade', runToken: token });
@@ -151,14 +152,83 @@ test('ARCADE RUN: one entry fee, milestone + clear payouts, ranked W per battle'
   assert.equal(acc.losses, 0);
   assert.equal(
     acc.credits,
-    DAILY_CREDITS - ARCADE_FEE + 2 * ARCADE_MILESTONE_CREDITS + ARCADE_CLEAR_CREDITS,
-    'net = daily − entry + two milestones + clear bonus',
+    DAILY_CREDITS - ARCADE_FEE + total + ARCADE_CLEAR_CREDITS,
+    'net = daily − entry + one credit per win + clear bonus',
   );
 
   // The cleared run's token is spent — no free re-entry.
   c.send({ t: 'queue', character: player, mode: 'arcade', runToken: token });
   const err = await c.next<Extract<ServerMsg, { t: 'error' }>>('error');
   assert.match(err.msg, /over/i);
+  c.close();
+});
+
+test('PRE-PAID ENTRY (ADR 0007): /arcade/enter debits upfront, battle 1 is fee-free, a loss refunds NOTHING', async (t) => {
+  const persistence = memoryPersistence();
+  // Battle 1 vs skill 0 (winning lines found immediately); battle 2 vs
+  // skill 80 (an idle player is guaranteed to LOSE, not draw out the clock).
+  const server = await createMatchServer({
+    port: 0, persistence, noPaceCheck: true,
+    arcadeSkill: (battle) => (battle === 0 ? 0 : 80),
+  });
+  t.after(() => server.close());
+  const http = `http://localhost:${server.port}`;
+  const H = { 'X-Dev-Name': 'Prepaid', 'Content-Type': 'application/json' };
+
+  await fetch(`${http}/me`, { headers: H }); // profile + daily 10
+
+  // Entry is debited BEFORE any battle — and the nonce makes retries safe.
+  const enter = await fetch(`${http}/arcade/enter`, {
+    method: 'POST', headers: H, body: JSON.stringify({ nonce: 'entry-001' }),
+  });
+  assert.equal(enter.status, 200);
+  const e1 = await enter.json() as { token: string; credits: number };
+  assert.equal(e1.credits, DAILY_CREDITS - ARCADE_FEE, 'charged at enter, not at battle 1');
+
+  const replay = await fetch(`${http}/arcade/enter`, {
+    method: 'POST', headers: H, body: JSON.stringify({ nonce: 'entry-001' }),
+  });
+  const e2 = await (replay.json() as Promise<{ token: string; credits: number }>);
+  assert.equal(e2.credits, DAILY_CREDITS - ARCADE_FEE, 'replayed nonce charges nothing');
+
+  // Broke wallet: a fresh account with 0 credits gets a clean 402.
+  const brokeH = { 'X-Dev-Name': 'BrokeEntry', 'Content-Type': 'application/json' };
+  await fetch(`${http}/me`, { headers: brokeH });
+  const acctB = await persistence.getAccount({ sub: 'dev:BrokeEntry' }, 'BrokeEntry', false);
+  await persistence.debitCredits('dev:BrokeEntry', acctB.credits, 'test', 'drain'); // drain to 0
+  const broke = await fetch(`${http}/arcade/enter`, {
+    method: 'POST', headers: brokeH, body: JSON.stringify({ nonce: 'entry-poor' }),
+  });
+  assert.equal(broke.status, 402);
+
+  // First battle queues WITH the token: the fighter locks now, fee is 0.
+  const player = enabledIds()[0]!;
+  const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Prepaid');
+  await c.ready;
+  c.send({ t: 'queue', character: player, mode: 'arcade', runToken: e1.token });
+  const setup = await c.next<SMatch>('match');
+  assert.equal(setup.fee, 0, 'pre-paid run: battle 1 carries NO fee');
+  assert.equal(setup.arcade!.battle, 0);
+  assert.equal(setup.chars[0].id, player, 'fighter locked at first queue');
+
+  // Win battle 1 → +1 credit, clean (no fee riding the settlement).
+  submit(c, winningLine(setup));
+  const res = await c.next<Extract<ServerMsg, { t: 'result' }>>('result');
+  assert.equal(res.winner, 0);
+  const xp = await c.next<Extract<ServerMsg, { t: 'xp' }>>('xp');
+  assert.equal(xp.creditsDelta, 1, 'every arcade win pays +1');
+
+  // LOSE battle 2 → run dead, and the pre-paid entry is NOT refunded.
+  c.send({ t: 'queue', character: player, mode: 'arcade', runToken: setup.arcade!.token });
+  const setup2 = await c.next<SMatch>('match');
+  const lost = simBattle(setup2, -1, 0); // idle punching bag vs the house
+  submit(c, lost.inputs);
+  const res2 = await c.next<Extract<ServerMsg, { t: 'result' }>>('result');
+  assert.equal(res2.winner, 1, 'the house wins');
+  await c.next<Extract<ServerMsg, { t: 'xp' }>>('xp');
+  const acc = await persistence.getAccount({ sub: 'dev:Prepaid' }, 'Prepaid', false);
+  assert.equal(acc.credits, DAILY_CREDITS - ARCADE_FEE + 1,
+    'entry stays spent on a loss — only the battle-1 win credit remains');
   c.close();
 });
 

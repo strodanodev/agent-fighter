@@ -30,7 +30,7 @@ import type { ClientMsg, ItemPin, SMatch, SResult, ServerMsg } from './protocol.
 import { verifyAirToken } from './airjwt.js';
 import type { AirIdentity } from './airjwt.js';
 import {
-  ARCADE_CLEAR_CREDITS, ARCADE_FEE, ARCADE_MILESTONE_CREDITS,
+  ARCADE_CLEAR_CREDITS, ARCADE_FEE,
   InsufficientCredits, SOLO_FEE, WAGER_FEE, createPersistence, loadDotEnv,
 } from './persist.js';
 import type { Account, MatchMode, Persistence } from './persist.js';
@@ -213,27 +213,33 @@ interface ArcadeRun {
   token: string;
   /** Owner identity sub ('' when persistence is off — tests). */
   sub: string;
-  /** The fighter locked for the whole run (no switching, server-enforced). */
+  /** The fighter locked for the whole run. '' = paid via /arcade/enter but
+   *  not yet at character select — locked by the first battle's queue. */
   charId: string;
-  /** Shuffled opponent character ids — the whole gauntlet, in order. */
+  /** Shuffled opponent character ids — built when the fighter locks. */
   opponents: string[];
   /** 0-based index of the battle currently being played (or up next). */
   battle: number;
   /** True between a verified win and the next battle's queue. */
   awaitingNext: boolean;
+  /**
+   * Entry PRE-PAID via POST /arcade/enter (ADR 0007 credits rework): a
+   * consented, NON-refundable debit taken BEFORE character select. Paid
+   * runs never escrow at battle 0. Legacy clients (and free agent-class
+   * runs) still take the old inline path with paid=false.
+   */
+  paid: boolean;
   lastActive: number;
 }
 
-/** Battles cleared → credits due AT that clear (milestones + full-clear). */
-export const arcadeMilestonePayout = (cleared: number, total: number): number => {
-  const m1 = Math.ceil(total / 3);
-  const m2 = Math.ceil((2 * total) / 3);
-  let pay = 0;
-  if (cleared === m1 && m1 < total) pay += ARCADE_MILESTONE_CREDITS;
-  if (cleared === m2 && m2 < total && m2 !== m1) pay += ARCADE_MILESTONE_CREDITS;
-  if (cleared === total) pay += ARCADE_CLEAR_CREDITS;
-  return pay;
-};
+/**
+ * Credits due for a verified battle win (ADR 0007 credits rework):
+ * +1 EVERY win, +ARCADE_CLEAR_CREDITS bonus on the full clear. Replaces the
+ * old ceil(N/3)/ceil(2N/3) milestone drip — a 10-battle clear now pays
+ * 10 + 5 against the 1-credit non-refundable entry.
+ */
+export const arcadeWinPayout = (cleared: number, total: number): number =>
+  1 + (cleared === total ? ARCADE_CLEAR_CREDITS : 0);
 
 /**
  * The gauntlet difficulty ramp: battle 1 is winnable by a newcomer, the last
@@ -487,7 +493,7 @@ export const createMatchServer = (opts: {
     }
 
     // AGENT ARCADE run bookkeeping — decided BEFORE the async persistence so
-    // the milestone payout rides the same record_match settlement.
+    // the per-win payout rides the same record_match settlement.
     let arcadePayout = 0;
     const run = m.arcadeRun;
     if (run) {
@@ -497,7 +503,7 @@ export const createMatchServer = (opts: {
         run.battle++;
         // Agent-class runs never pay credits — the rank IS the prize.
         arcadePayout = isAgentClassSub(run.sub) ? 0
-          : arcadeMilestonePayout(run.battle, run.opponents.length);
+          : arcadeWinPayout(run.battle, run.opponents.length);
         if (run.battle >= run.opponents.length) {
           arcadeRuns.delete(run.token); // FULL CLEAR — the run is complete
           console.log(`[arcade] ${m.clients[0].name} CLEARED the gauntlet (${run.opponents.length} battles)`);
@@ -980,14 +986,17 @@ export const createMatchServer = (opts: {
   };
 
   /**
-   * AGENT ARCADE (v4): start the run's CURRENT battle. Battle 1 escrows the
-   * run's single entry fee; battles 2+ are already paid for. Each battle is
-   * mechanically a local-sim solo match (pinned AI, ledger re-sim) — only
-   * the fee, the opponent sequencing, and the payouts differ.
+   * AGENT ARCADE (v4): start the run's CURRENT battle. PRE-PAID runs
+   * (POST /arcade/enter, ADR 0007 credits rework) never escrow — the
+   * non-refundable entry was debited before character select. Legacy runs
+   * (old clients) still escrow battle 1's fee here; battles 2+ are always
+   * free. Each battle is mechanically a local-sim solo match (pinned AI,
+   * ledger re-sim) — only the fee, opponent sequencing, and payouts differ.
    */
   const startArcadeBattle = async (c: Client, run: ArcadeRun, itemRow = 0): Promise<void> => {
     // Agent-class runs are FREE (inert economy — XP/rank only).
-    const fee = run.battle === 0 && persistence && !isAgentClassSub(run.sub) ? ARCADE_FEE : 0;
+    const fee = run.battle === 0 && !run.paid && persistence && !isAgentClassSub(run.sub)
+      ? ARCADE_FEE : 0;
     const matchId = newMatchId();
     if (fee > 0) {
       try {
@@ -1152,11 +1161,25 @@ export const createMatchServer = (opts: {
               if (run.sub !== (c.identity?.sub ?? '')) {
                 return send(c, { t: 'error', code: 'auth', msg: 'not your arcade run' });
               }
-              if (!run.awaitingNext) {
-                return send(c, { t: 'error', msg: 'arcade run is not awaiting a battle' });
-              }
-              if (run.charId !== c.character) {
-                return send(c, { t: 'error', msg: 'your fighter is locked for the whole arcade run' });
+              // PRE-PAID run's FIRST battle (ADR 0007): the fighter locks
+              // NOW — /arcade/enter charged before character select, so the
+              // run exists with charId '' until this queue.
+              if (run.charId === '' && run.battle === 0) {
+                run.charId = c.character;
+                const opps = enabledCharacterIds.filter((id) => id !== c.character);
+                for (let i = opps.length - 1; i > 0; i--) {
+                  const j = Math.floor(Math.random() * (i + 1));
+                  [opps[i], opps[j]] = [opps[j]!, opps[i]!];
+                }
+                if (opps.length === 0) opps.push(c.character); // roster of 1 → mirror
+                run.opponents = opps;
+              } else {
+                if (!run.awaitingNext) {
+                  return send(c, { t: 'error', msg: 'arcade run is not awaiting a battle' });
+                }
+                if (run.charId !== c.character) {
+                  return send(c, { t: 'error', msg: 'your fighter is locked for the whole arcade run' });
+                }
               }
               if (isAgentClassSub(c.identity?.sub)
                 && !agentBattleCap.bump(c.identity!.sub, AGENT_BATTLES_PER_DAY)) {
@@ -1166,9 +1189,9 @@ export const createMatchServer = (opts: {
               send(c, { t: 'queued' });
               return startArcadeBattle(c, run, itemRow);
             }
-            // New run: 1 credit buys the whole gauntlet — except for the
-            // inert AGENT CLASS, which plays FREE (XP/rank only) under a
-            // per-day battle cap (compute is the resource being protected).
+            // LEGACY new run (old clients / free agent-class): 1 credit
+            // escrows with battle 1. New clients pre-pay via /arcade/enter
+            // and always arrive here WITH a runToken.
             const agentClass = isAgentClassSub(c.identity?.sub);
             if (agentClass && !agentBattleCap.bump(c.identity!.sub, AGENT_BATTLES_PER_DAY)) {
               return send(c, { t: 'error', msg: `agent accounts get ${AGENT_BATTLES_PER_DAY} arcade battles/day — come back tomorrow` });
@@ -1189,6 +1212,7 @@ export const createMatchServer = (opts: {
               opponents,
               battle: 0,
               awaitingNext: false,
+              paid: false, // legacy path — battle 1 escrows the fee
               lastActive: Date.now(),
             };
             arcadeRuns.set(fresh.token, fresh);
@@ -1503,6 +1527,61 @@ export const createMatchServer = (opts: {
         // ?ref=<dare code> — the title screen redeems a stashed referral here.
         const ref = q.get('ref')?.slice(0, 40) ?? undefined;
         return json(res, 200, await persistence.getAccount(identity, name, false, ref));
+      })().catch((e) => json(res, 502, { error: String(e) }));
+      return;
+    }
+    // ---- ARCADE ENTRY (ADR 0007 credits rework). Owner auth only. The
+    // consented, NON-refundable 1-credit entry is debited HERE — before
+    // character select — via debit_credits (idempotent by the client nonce;
+    // a network retry never double-charges, it just mints a fresh run
+    // token). The run is created UNLOCKED (charId '') and the fighter locks
+    // at the first battle's queue. Losing, disconnecting, or abandoning the
+    // run never refunds the entry: the reason is 'arcade', which the escrow
+    // sweeper's ghost query (reason 'fee') deliberately does not match.
+    // Agent-class accounts enter FREE (their battle cap applies at queue).
+    if (path === '/arcade/enter') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'POST {nonce} to enter' });
+      const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '')?.[1];
+      const devName = persistence?.dev ? String(req.headers['x-dev-name'] ?? '') : '';
+      void (async () => {
+        const identity = bearer ? await verifyAirToken(bearer)
+          : devName ? { sub: `dev:${devName.slice(0, 24)}` }
+          : null;
+        if (!identity) return json(res, 401, { error: 'sign in required' });
+        let body = '';
+        for await (const chunk of req) body += chunk;
+        let nonce = '';
+        try { nonce = String((JSON.parse(body || '{}') as Record<string, unknown>).nonce ?? ''); }
+        catch { return json(res, 400, { error: 'bad json' }); }
+        nonce = nonce.trim();
+        if (nonce.length < 8 || nonce.length > 64) {
+          return json(res, 400, { error: 'nonce: 8-64 characters (client entry id)' });
+        }
+        let credits: number | null = null;
+        if (persistence && !isAgentClassSub(identity.sub)) {
+          try {
+            const r = await persistence.debitCredits(identity.sub, ARCADE_FEE, 'arcade', nonce);
+            credits = r.credits;
+          } catch (e) {
+            if (e instanceof InsufficientCredits) {
+              return json(res, 402, { error: `AGENT ARCADE needs ${ARCADE_FEE} credit`, code: 'credits' });
+            }
+            throw e;
+          }
+        }
+        const run: ArcadeRun = {
+          token: randomUUID(),
+          sub: identity.sub,
+          charId: '', // locks at the first battle's queue (post-select)
+          opponents: [],
+          battle: 0,
+          awaitingNext: false,
+          paid: true,
+          lastActive: Date.now(),
+        };
+        arcadeRuns.set(run.token, run);
+        console.log(`[arcade] ${identity.sub} paid entry (nonce ${nonce.slice(0, 12)}…) → run ${run.token.slice(0, 8)}`);
+        return json(res, 200, { token: run.token, fee: ARCADE_FEE, credits });
       })().catch((e) => json(res, 502, { error: String(e) }));
       return;
     }

@@ -87,11 +87,13 @@ export const IDLE_FORFEIT_MS = 30_000;
 
 /**
  * AGENT ARCADE (v4): how long a run may sit between battles (the results
- * interstitial) before its token expires. Nothing is escrowed between battles
- * — the entry fee settles with battle 1 — so expiry never strands credits;
- * it only forces a fresh (paid) run.
+ * interstitial) before its token expires. Raised 2min → 5min with the
+ * ADR 0007 credits rework: entries are now PRE-PAID and non-refundable, and
+ * the client persists its run token so a crashed PWA can relaunch and
+ * RESUME the run — the window has to survive an app restart, not just a
+ * results-screen pause. Expiry forces a fresh (paid) run.
  */
-export const ARCADE_NEXT_GRACE_MS = 120_000;
+export const ARCADE_NEXT_GRACE_MS = 300_000;
 
 // ---- client → server
 export interface CHello {

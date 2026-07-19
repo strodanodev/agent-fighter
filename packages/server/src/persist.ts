@@ -266,6 +266,16 @@ export interface Persistence {
   consumeItem: (sub: string, rowId: number, matchId: string) => Promise<OwnedItem | null>;
   /** Un-consume every item claimed by `matchId` (refund path). */
   releaseItems: (matchId: string) => Promise<void>;
+  /**
+   * Plain NON-REFUNDABLE debit (arcade entry, ADR 0007 credits rework):
+   * unlike escrow_match there is NO refund path and NO sweeper interest —
+   * the credit is spent the moment this returns. Idempotent by
+   * (reason, key): a replayed call charges nothing and returns the current
+   * balance with duplicate:true. Throws InsufficientCredits(0) when the
+   * balance can't cover it.
+   */
+  debitCredits: (sub: string, amount: number, reason: string, key: string) =>
+    Promise<{ credits: number; duplicate: boolean }>;
 }
 
 /** One granted (not yet consumed) consumable in a player's inventory. */
@@ -375,6 +385,8 @@ export const memoryPersistence = (): Persistence => {
   /** Granted consumables, newest first (ADR 0007). Nonce = idempotency key. */
   const ownedItems: (OwnedItem & { sub: string; nonce: string; consumedMatchId?: string })[] = [];
   let nextItemRow = 1;
+  /** Idempotency keys of non-refundable debits (`sub|reason|key`) — ADR 0007. */
+  const debits = new Set<string>();
   /** Newest-first ring of settled matches (GET /agent/matches food). */
   const matchRows: MatchRow[] = [];
   const agentOf = (sub: string): { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null } => {
@@ -614,6 +626,16 @@ export const memoryPersistence = (): Persistence => {
       for (const row of ownedItems) {
         if (row.consumedMatchId === matchId) row.consumedMatchId = undefined;
       }
+    },
+    // Mirrors 0015_arcade_entry.sql debit_credits — keep in sync.
+    debitCredits: async (sub, amount, reason, key) => {
+      const dedup = `${sub}|${reason}|${key}`;
+      const p = prof(sub);
+      if (debits.has(dedup)) return { credits: p.credits, duplicate: true };
+      if (p.credits < amount) throw new InsufficientCredits(0);
+      p.credits -= amount;
+      debits.add(dedup);
+      return { credits: p.credits, duplicate: false };
     },
   };
 };
@@ -877,6 +899,14 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         `/rest/v1/items?consumed_match_id=eq.${encodeURIComponent(matchId)}`,
         { method: 'PATCH', body: JSON.stringify({ consumed_match_id: null, consumed_at: null }) },
       );
+    },
+    debitCredits: async (sub, amount, reason, key) => {
+      const rows = (await call('/rest/v1/rpc/debit_credits', {
+        method: 'POST',
+        body: JSON.stringify({ _profile: sub, _amount: amount | 0, _reason: reason, _key: key }),
+      })) as Array<Record<string, unknown>>;
+      const row = rows?.[0] ?? {};
+      return { credits: Number(row.credits ?? 0), duplicate: Boolean(row.duplicate) };
     },
   };
 };

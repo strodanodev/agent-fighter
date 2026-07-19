@@ -710,6 +710,99 @@ interface ArcadeRun {
 let arcade: ArcadeRun | null = null;
 let gameOverAge = 0; // ticks on the GAME OVER screen — drives its countdown
 
+// ---- ARCADE ENTRY (ADR 0007 credits rework): pay-before-select + resume.
+// The 1-credit entry is a consented, NON-refundable debit taken by
+// POST /arcade/enter BEFORE character select; the returned run token queues
+// battle 1 with fee 0. The token is ALSO persisted (af-arcade-run) so a
+// crashed PWA can relaunch and RESUME the run inside the server's 5-minute
+// grace instead of silently eating the credit (observed live in prod logs).
+let arcadeEntryConfirm = false; // the ENTER ARCADE? modal is up on the title
+let arcadeEntryBusy = false; // POST /arcade/enter in flight
+let pendingArcadeToken = ''; // paid-but-unstarted run (consumed by select lock)
+
+const ARCADE_RUN_KEY = 'af-arcade-run';
+interface StoredArcadeRun { token: string; charId: string; battle: number; total: number; ts: number }
+const storeArcadeRun = (r: StoredArcadeRun | null): void => {
+  try {
+    if (r) localStorage.setItem(ARCADE_RUN_KEY, JSON.stringify(r));
+    else localStorage.removeItem(ARCADE_RUN_KEY);
+  } catch { /* private mode — resume is best-effort */ }
+};
+/** The stored run, if it's fresh enough for the server to still hold it. */
+const storedArcadeRun = (): StoredArcadeRun | null => {
+  try {
+    const raw = localStorage.getItem(ARCADE_RUN_KEY);
+    if (!raw) return null;
+    const r = JSON.parse(raw) as StoredArcadeRun;
+    if (!r.token || !r.charId || Date.now() - r.ts > 4 * 60_000) return null;
+    return r;
+  } catch {
+    return null;
+  }
+};
+
+/** Small title-screen toast for arcade-entry outcomes (drawn inline). */
+let titleToast = '';
+let titleToastAge = -1;
+const showToast = (msg: string): void => { titleToast = msg; titleToastAge = 0; };
+
+/**
+ * Module-scope twin of the title branch's local enterSelect() — needed
+ * because payArcadeEntry resolves async, after that frame's closure is gone.
+ * mode is already 'cpu' (the arcade row) when this runs.
+ */
+const enterSelectForArcade = (): void => {
+  audioMenuOpen = false;
+  screen = 'select';
+  locked = [false, false];
+  selectingFriendly = false;
+  selectingAgentOf = '';
+  let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
+  if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+  picks = [fe, fe];
+  carryIdx = -1;
+  if (auth.status === 'in' || DEV_GUEST) void fetchShop();
+  void audio.playBgm('player_select', { fadeInSec: 0.5 });
+};
+
+/** Pay the arcade entry (idempotent by nonce) and move on to fighter select. */
+const payArcadeEntry = async (): Promise<void> => {
+  if (arcadeEntryBusy) return;
+  arcadeEntryBusy = true;
+  try {
+    const headers = await agentAuthHeaders();
+    if (!headers) return;
+    const nonce = `a_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    const res = await fetch(`${matchHttpUrl()}/arcade/enter`, {
+      method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce }),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      token?: string; credits?: number | null; error?: string;
+    };
+    if (!res.ok || !body.token) {
+      showToast(res.status === 402
+        ? 'NOT ENOUGH CREDITS — AGENT ARCADE COSTS 1'
+        : (body.error ?? 'ARCADE ENTRY FAILED — TRY AGAIN').toUpperCase().slice(0, 56));
+      arcadeEntryConfirm = false;
+      return;
+    }
+    pendingArcadeToken = body.token;
+    // The credit left the wallet NOW — show it now (this is the whole point
+    // of the rework: no more surprise −1 after the first battle).
+    if (typeof body.credits === 'number' && account) {
+      account = { ...account, credits: body.credits };
+    }
+    arcadeEntryConfirm = false;
+    enterSelectForArcade();
+  } catch {
+    showToast('SERVER UNREACHABLE — NOTHING WAS CHARGED');
+    arcadeEntryConfirm = false;
+  } finally {
+    arcadeEntryBusy = false;
+  }
+};
+
 // Progression + the CPU difficulty lever.
 const profile: Profile = loadProfile();
 let lever = loadLever();
@@ -1027,6 +1120,18 @@ const installOnlineMatch = (): void => {
       opponents: [],
       runToken: s.arcade.token,
     };
+    // Crash insurance (ADR 0007): entries are non-refundable now, so the run
+    // token must survive a killed PWA — the title offers RESUME within the
+    // server's grace window instead of silently eating the credit.
+    storeArcadeRun({
+      token: s.arcade.token,
+      charId: s.chars[0].id,
+      battle: s.arcade.battle,
+      total: s.arcade.total,
+      ts: Date.now(),
+    });
+  } else {
+    storeArcadeRun(null); // any non-arcade match invalidates a stashed run
   }
   // Stakes card (P0): what this match costs and pays, up front.
   vsCardAge = 0;
@@ -1141,6 +1246,7 @@ const endArcade = (): void => {
   net = null;
   arcade = null;
   cpuAi = null;
+  storeArcadeRun(null); // the run is over — nothing to resume
   screen = 'title';
   void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
 };
@@ -1522,7 +1628,14 @@ const tickSelect = (): void => {
     // switching until the run ends — and queues the RANKED run (1 credit).
     if (locked[0]) {
       if (selectingAgentOf) startOnline('solo', undefined, selectingAgentOf);
-      else startOnline(selectingFriendly ? 'friendly' : mode === 'cpu' ? 'arcade' : 'wager');
+      else if (selectingFriendly) startOnline('friendly');
+      else if (mode === 'cpu') {
+        // ADR 0007: a pre-paid run token queues battle 1 (fee already taken
+        // at /arcade/enter). No token = legacy path (escrow at battle 1).
+        const token = pendingArcadeToken || undefined;
+        pendingArcadeToken = '';
+        startOnline('arcade', token);
+      } else startOnline('wager');
     }
     return;
   }
@@ -1655,9 +1768,110 @@ const frame = (): void => {
      * blind quick-queue was a footgun; AGENT ARCADE locks the pick for the
      * whole run). Select's lock handler does the actual queue.
      */
-    const launchMode = (): void => { enterSelect(); };
+    const launchMode = (): void => {
+      // AGENT ARCADE (ADR 0007 credits rework): ask for the 1-credit entry
+      // BEFORE character select. Only when the live economy is reachable —
+      // otherwise the legacy select→queue path still handles server-down
+      // (practice fallback) and dev servers without persistence.
+      if (mode === 'cpu' && accountFetch === 'done' && account) {
+        if (pendingArcadeToken) { enterSelectForArcade(); return; } // already paid
+        arcadeEntryConfirm = true;
+        return;
+      }
+      enterSelect();
+    };
     // A tapped mode row picks the mode AND launches — one tap to a match.
     const tappedMode = MODES.find((m) => taps.has(`mode:${m}`));
+
+    // ---- ARCADE ENTRY modal + crash-resume pill (drawn over drawTitle) ----
+    if (titleToastAge >= 0 && ++titleToastAge > 240) { titleToastAge = -1; titleToast = ''; }
+    if (titleToast && titleToastAge >= 0 && titleToastAge % 30 < 22) {
+      ctx.save();
+      ctx.font = 'bold 14px system-ui, sans-serif';
+      ctx.fillStyle = '#ff5d7e';
+      ctx.textAlign = 'center';
+      ctx.fillText(`⚠ ${titleToast}`, VW / 2, VH - 40);
+      ctx.restore();
+    }
+    const resumable = signedIn && !arcadeEntryConfirm ? storedArcadeRun() : null;
+    if (resumable) {
+      const w = 320, h = 34, x = VW / 2 - w / 2, y = VH - 254;
+      tapZone(x, y, w, h, 'arcade:resume');
+      ctx.save();
+      ctx.fillStyle = 'rgba(58,38,10,0.92)';
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = '#ffd166';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+      ctx.font = 'bold 13px system-ui, sans-serif';
+      ctx.fillStyle = uiTick % 44 < 34 ? '#ffe9a3' : '#ffd166';
+      ctx.textAlign = 'center';
+      ctx.fillText(`▶ RESUME ARCADE RUN · BATTLE ${resumable.battle + 1}/${resumable.total}`, x + w / 2, y + 22);
+      ctx.restore();
+    }
+    if (arcadeEntryConfirm) {
+      // Modal owns the input (like the shop's purchase confirm).
+      ctx.save();
+      ctx.fillStyle = 'rgba(4,2,10,0.72)';
+      ctx.fillRect(0, 0, VW, VH);
+      const pw = 430, ph = 180, px = VW / 2 - pw / 2, py = VH / 2 - ph / 2 - 10;
+      ctx.fillStyle = 'rgba(16,12,28,0.97)';
+      ctx.fillRect(px, py, pw, ph);
+      ctx.strokeStyle = '#ffd166';
+      ctx.lineWidth = 2.5;
+      ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 24px system-ui, sans-serif';
+      ctx.fillStyle = '#ffd166';
+      ctx.fillText('ENTER AGENT ARCADE — 1 CREDIT?', px + pw / 2, py + 44);
+      ctx.font = '600 12px system-ui, sans-serif';
+      ctx.fillStyle = '#ffffffcc';
+      ctx.fillText('ONE CREDIT BUYS THE WHOLE GAUNTLET · NON-REFUNDABLE', px + pw / 2, py + 72);
+      ctx.fillText(`BALANCE AFTER: ${Math.max(0, (account?.credits ?? 0) - 1)} CR · EVERY WIN PAYS +1`, px + pw / 2, py + 92);
+      const btnW = 180, btnH = 44, gap = 26, btnY = py + ph - 62;
+      const yesX = px + pw / 2 - btnW - gap / 2, noX = px + pw / 2 + gap / 2;
+      tapZone(yesX, btnY, btnW, btnH, 'arcadeentry:yes');
+      ctx.fillStyle = 'rgba(28,66,30,0.95)';
+      ctx.fillRect(yesX, btnY, btnW, btnH);
+      ctx.strokeStyle = '#7ddf8a';
+      ctx.strokeRect(yesX + 0.5, btnY + 0.5, btnW - 1, btnH - 1);
+      ctx.font = 'bold 17px system-ui, sans-serif';
+      ctx.fillStyle = '#c8ffd0';
+      ctx.fillText(arcadeEntryBusy ? 'PAYING…' : 'YES · ENTER', yesX + btnW / 2, btnY + 28);
+      tapZone(noX, btnY, btnW, btnH, 'arcadeentry:no');
+      ctx.fillStyle = 'rgba(66,24,28,0.95)';
+      ctx.fillRect(noX, btnY, btnW, btnH);
+      ctx.strokeStyle = '#ff8d9d';
+      ctx.strokeRect(noX + 0.5, btnY + 0.5, btnW - 1, btnH - 1);
+      ctx.fillStyle = '#ffd6dd';
+      ctx.fillText('NO · BACK', noX + btnW / 2, btnY + 28);
+      ctx.restore();
+      if (!arcadeEntryBusy
+        && (pressedThisFrame.has('Enter') || pressedThisFrame.has('KeyY') || taps.has('arcadeentry:yes'))) {
+        void payArcadeEntry();
+      } else if (pressedThisFrame.has('Escape') || pressedThisFrame.has('KeyN') || taps.has('arcadeentry:no')) {
+        arcadeEntryConfirm = false;
+      }
+      pressedThisFrame.clear();
+      taps.clear();
+      return;
+    }
+    if (resumable && taps.has('arcade:resume')) {
+      // Crash/relaunch recovery: rejoin the paid run inside the server's
+      // grace window. The fighter is locked server-side — restore the pick.
+      const idx = allRosters.findIndex((r) => r.id === resumable.charId && !r.disabled);
+      if (idx >= 0) {
+        picks = [idx, idx];
+        mode = 'cpu';
+        startOnline('arcade', resumable.token);
+      } else {
+        storeArcadeRun(null);
+      }
+      pressedThisFrame.clear();
+      taps.clear();
+      return;
+    }
+
     // Audio chip — works on the sign-in gate too (music is already playing).
     const audioTap = (['music', 'sfx', 'hits'] as const)
       .find((ch) => taps.has(`audio:${ch}`)) as AudioChannel | undefined;

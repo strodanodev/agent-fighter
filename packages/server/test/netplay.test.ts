@@ -98,6 +98,7 @@ describe('persistence hook (Phase B)', () => {
       getCredits: async () => 100,
       consumeItem: async () => null,
       releaseItems: async () => {},
+      debitCredits: async () => ({ credits: 100, duplicate: false }),
     };
     const s2 = await createMatchServer({ port: 0, persistence: mock, noPaceCheck: true });
     try {
