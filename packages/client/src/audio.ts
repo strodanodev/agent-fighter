@@ -95,6 +95,13 @@ export const ROTATION: MusicId[] = [
   'ending_after_the_battle', 'ending_gambit', 'ending_grief', 'ending_megaman1',
 ];
 
+/**
+ * Short music-typed clips (a few seconds each) that fire mid-flow — worth
+ * keeping decoded so stingers stay instant. The LONG tracks are everything
+ * else in MUSIC_FILES and are decode-on-play + evicted (see preload()).
+ */
+const BGM_STINGERS: MusicId[] = ['vs', 'here_comes_a_new_challenger', 'hurry_up', 'win'];
+
 /** Every button's normal-hit weight class → which impact clip(s) to draw from. */
 const PUNCH: Record<'L' | 'M' | 'H', SfxId[]> = {
   L: ['punch_light'], M: ['punch_medium'], H: ['punch_heavy_a', 'punch_heavy_b'],
@@ -310,9 +317,31 @@ class AudioManager {
     return p;
   }
 
-  /** Warm the decode cache for every track/clip — total payload is ~6MB. */
+  /**
+   * Warm the decode cache for the SMALL clips only: sfx/voice + the short
+   * BGM stingers. The full-length tracks are deliberately NOT preloaded —
+   * decoded PCM is ~2MB/second, so eagerly decoding all 13 BGM tracks held
+   * 300-400MB resident, which is past the iOS PWA jetsam threshold: the
+   * game "crashed after a few arcade matches" exactly as the rotation
+   * filled this cache. Long tracks decode on first play and are EVICTED
+   * when the next one starts (see evictLongMusic).
+   */
   preload(): void {
-    for (const id of Object.keys(FILES) as SoundId[]) void this.load(id);
+    for (const id of Object.keys(SFX_FILES) as SoundId[]) void this.load(id);
+    for (const id of BGM_STINGERS) void this.load(id);
+  }
+
+  /**
+   * Drop every decoded LONG music buffer except `keep`. Duration-keyed
+   * (>30s = a full track), so the short stingers stay warm and cheap while
+   * at most ONE full track's PCM is ever resident. Called whenever a new
+   * BGM loop starts.
+   */
+  private evictLongMusic(keep: MusicId | null): void {
+    for (const [id, buf] of this.buffers) {
+      if (id === keep) continue;
+      if ((id as string) in MUSIC_FILES && buf.duration > 30) this.buffers.delete(id);
+    }
   }
 
   /** Next track in the shared title/stage rotation pool. */
@@ -355,6 +384,8 @@ class AudioManager {
       src.start();
       this.bgmSource = src;
       this.bgmId = id;
+      // Keep at most ONE full track's decoded PCM resident (iOS jetsam guard).
+      this.evictLongMusic(id);
     } catch {
       /* iOS without a playable BGM codec, or offline — game stays silent */
     }

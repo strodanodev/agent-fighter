@@ -26,7 +26,7 @@ import {
 } from './ui.js';
 import type { AgentOpponent, Cam, HudFx, HudId, Mode, RankRow, ShopInventoryEntry, ShopReveal, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit, loadVendingArt } from './chrome.js';
-import type { StageAsset } from './chrome.js';
+import type { BgVideo, StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
 import type { AudioChannel, SfxId } from './audio.js';
 import { auth, authLogin, authLogout, authName, authRehydrate, authToken } from './auth.js';
@@ -146,6 +146,9 @@ const LAST_FIGHTER_KEY = 'af-last-fighter';
 let lastFighter = localStorage.getItem(LAST_FIGHTER_KEY) ?? '';
 /** Title-screen Music/SFX/Hits dropdown (speaker chip always visible). */
 let audioMenuOpen = false;
+/** Ambient menu video — paused during fights to free its decoder (iOS memory). */
+let bgVideoRef: BgVideo | null = null;
+let bgVideoPlaying = true;
 
 /**
  * AIR sign-in / sign-out toggle. This MUST be reachable straight from a pointer
@@ -777,7 +780,8 @@ const boot = async (): Promise<void> => {
     // first paint for seconds on a slow connection.
     void loadLogo().then(setLogo);
     void loadVendingArt().then(setVendingArt); // shop art — procedural fallback until it lands
-    setBgVideo(loadBgVideo('/assets/video/bg_video_main_af.mp4'));
+    bgVideoRef = loadBgVideo('/assets/video/bg_video_main_af.mp4');
+    setBgVideo(bgVideoRef);
     stageIds = await listStages();
     setLoadProgress(0.28);
     stageAssets = [];
@@ -2361,6 +2365,18 @@ const frame = (): void => {
   // The arcade overlay belongs to the match only — push the screen this frame
   // ended on, so it appears/disappears in lockstep with what was just drawn.
   setTouchScreen(screen);
+
+  // The ambient menu video is invisible during fights but its decoder keeps
+  // running — on a memory-tight phone that headroom matters (iOS jetsam guard,
+  // same fix family as the audio-cache eviction). Pause in-fight, resume on
+  // menus. Edge-triggered; play() is a promise that can reject on iOS, hence
+  // the silent catch (a paused backdrop just falls back to the static stage).
+  const wantVideo = screen !== 'fight';
+  if (bgVideoRef && wantVideo !== bgVideoPlaying) {
+    bgVideoPlaying = wantVideo;
+    if (wantVideo) bgVideoRef.el.play().catch(() => { /* gesture-gated — retried by chrome.ts */ });
+    else bgVideoRef.el.pause();
+  }
 
   pressedThisFrame.clear();
   taps.clear();

@@ -4835,6 +4835,12 @@ const FILES = { ...MUSIC_FILES, ...SFX_FILES };
 const ROTATION = [
     'ending_after_the_battle', 'ending_gambit', 'ending_grief', 'ending_megaman1',
 ];
+/**
+ * Short music-typed clips (a few seconds each) that fire mid-flow — worth
+ * keeping decoded so stingers stay instant. The LONG tracks are everything
+ * else in MUSIC_FILES and are decode-on-play + evicted (see preload()).
+ */
+const BGM_STINGERS = ['vs', 'here_comes_a_new_challenger', 'hurry_up', 'win'];
 /** Every button's normal-hit weight class → which impact clip(s) to draw from. */
 const PUNCH = {
     L: ['punch_light'], M: ['punch_medium'], H: ['punch_heavy_a', 'punch_heavy_b'],
@@ -5033,10 +5039,34 @@ class AudioManager {
         this.loading.set(id, p);
         return p;
     }
-    /** Warm the decode cache for every track/clip — total payload is ~6MB. */
+    /**
+     * Warm the decode cache for the SMALL clips only: sfx/voice + the short
+     * BGM stingers. The full-length tracks are deliberately NOT preloaded —
+     * decoded PCM is ~2MB/second, so eagerly decoding all 13 BGM tracks held
+     * 300-400MB resident, which is past the iOS PWA jetsam threshold: the
+     * game "crashed after a few arcade matches" exactly as the rotation
+     * filled this cache. Long tracks decode on first play and are EVICTED
+     * when the next one starts (see evictLongMusic).
+     */
     preload() {
-        for (const id of Object.keys(FILES))
+        for (const id of Object.keys(SFX_FILES))
             void this.load(id);
+        for (const id of BGM_STINGERS)
+            void this.load(id);
+    }
+    /**
+     * Drop every decoded LONG music buffer except `keep`. Duration-keyed
+     * (>30s = a full track), so the short stingers stay warm and cheap while
+     * at most ONE full track's PCM is ever resident. Called whenever a new
+     * BGM loop starts.
+     */
+    evictLongMusic(keep) {
+        for (const [id, buf] of this.buffers) {
+            if (id === keep)
+                continue;
+            if (id in MUSIC_FILES && buf.duration > 30)
+                this.buffers.delete(id);
+        }
     }
     /** Next track in the shared title/stage rotation pool. */
     nextRotationTrack() {
@@ -5081,6 +5111,8 @@ class AudioManager {
             src.start();
             this.bgmSource = src;
             this.bgmId = id;
+            // Keep at most ONE full track's decoded PCM resident (iOS jetsam guard).
+            this.evictLongMusic(id);
         }
         catch {
             /* iOS without a playable BGM codec, or offline — game stays silent */
@@ -8826,6 +8858,9 @@ const LAST_FIGHTER_KEY = 'af-last-fighter';
 let lastFighter = localStorage.getItem(LAST_FIGHTER_KEY) ?? '';
 /** Title-screen Music/SFX/Hits dropdown (speaker chip always visible). */
 let audioMenuOpen = false;
+/** Ambient menu video — paused during fights to free its decoder (iOS memory). */
+let bgVideoRef = null;
+let bgVideoPlaying = true;
 /**
  * AIR sign-in / sign-out toggle. This MUST be reachable straight from a pointer
  * event's own call stack: AIR's `login()` opens an OAuth surface (popup /
@@ -9417,7 +9452,8 @@ const boot = async () => {
         // first paint for seconds on a slow connection.
         void loadLogo().then(setLogo);
         void loadVendingArt().then(setVendingArt); // shop art — procedural fallback until it lands
-        setBgVideo(loadBgVideo('/assets/video/bg_video_main_af.mp4'));
+        bgVideoRef = loadBgVideo('/assets/video/bg_video_main_af.mp4');
+        setBgVideo(bgVideoRef);
         stageIds = await listStages();
         setLoadProgress(0.28);
         stageAssets = [];
@@ -11093,6 +11129,19 @@ const frame = () => {
     // The arcade overlay belongs to the match only — push the screen this frame
     // ended on, so it appears/disappears in lockstep with what was just drawn.
     setTouchScreen(screen);
+    // The ambient menu video is invisible during fights but its decoder keeps
+    // running — on a memory-tight phone that headroom matters (iOS jetsam guard,
+    // same fix family as the audio-cache eviction). Pause in-fight, resume on
+    // menus. Edge-triggered; play() is a promise that can reject on iOS, hence
+    // the silent catch (a paused backdrop just falls back to the static stage).
+    const wantVideo = screen !== 'fight';
+    if (bgVideoRef && wantVideo !== bgVideoPlaying) {
+        bgVideoPlaying = wantVideo;
+        if (wantVideo)
+            bgVideoRef.el.play().catch(() => { });
+        else
+            bgVideoRef.el.pause();
+    }
     pressedThisFrame.clear();
     taps.clear();
 };
