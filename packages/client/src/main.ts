@@ -95,7 +95,10 @@ const localSlotKinds = (g: GameState): [number, number, number] => {
 const pollLocal = (g: GameState): InputFrame => {
   let f = autoSpecialActive() ? pollAutoSpecial(g.fighters[localSide()]) : pollPad(P0_MAP);
   let mask = itemUseMask;
-  if (keys.has('KeyR')) {
+  // Press edge, NOT held (`keys.has`): while held, the "first carried" slot
+  // re-targets the frame after a can empties, minting a fresh rising edge
+  // per slot — one held R chugged the whole rack at a can per frame.
+  if (pressedThisFrame.has('KeyR')) {
     // R = drink the next un-drunk can (slot order).
     const kinds = localSlotKinds(g);
     const s = kinds.findIndex((k) => k !== 0);
