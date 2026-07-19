@@ -33,10 +33,12 @@ if (dirty.length > 0) {
 }
 
 const head = execSync('git log -1 --format="%h %s"', { cwd: root, encoding: 'utf8' }).trim();
-const run = (label, cmd, args) => {
+const run = (label, cmd, args, { tolerate } = {}) => {
   console.log(`→ ${label}: ${cmd} ${args.join(' ')}`);
-  const r = spawnSync(cmd, args, { cwd: root, stdio: 'inherit', shell: true });
-  if (r.status !== 0) {
+  const r = spawnSync(cmd, args, { cwd: root, encoding: 'utf8', shell: true });
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  process.stdout.write(out);
+  if (r.status !== 0 && !(tolerate && tolerate.test(out))) {
     console.error(`✗ ${label} deploy failed (exit ${r.status})`);
     process.exit(r.status ?? 1);
   }
@@ -44,7 +46,12 @@ const run = (label, cmd, args) => {
 
 console.log(`deploying ${target} from ${head}`);
 if (target === 'server' || target === 'both') {
-  run('server (Railway)', 'railway', ['up', '-s', 'match-server', '--ci']);
+  // The Railway CLI often exits non-zero on "Failed to stream build logs"
+  // even though the upload was accepted and the build runs server-side.
+  // "Build Logs:" in the output means the deploy was scheduled — confirm
+  // the result via the health endpoint, not the CLI exit code.
+  run('server (Railway)', 'railway', ['up', '-s', 'match-server', '--ci'],
+    { tolerate: /Build Logs:/ });
 }
 if (target === 'client' || target === 'both') {
   run('client (Vercel)', 'vercel', ['deploy', '--prod', '--yes']);
