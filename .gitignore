@@ -19,6 +19,7 @@ packages/client/demo/vendor/
 /sounds/
 
 .vercel
+supabase/.temp/
 air/partner_rs256.pem
 
 # headless agent self-signup credentials (plaintext key — never commit)
