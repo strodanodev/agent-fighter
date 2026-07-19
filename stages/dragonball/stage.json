@@ -1,0 +1,26 @@
+{
+  "name": "dragonball",
+  "imageW": 1024,
+  "imageH": 572,
+  "floorY": 502,
+  "skyColor": "#2b1b4d",
+  "deckColor": "#3a3644",
+  "layers": [
+    {
+      "file": "layer-mid.png",
+      "depth": 0.45,
+      "stretch": false,
+      "scale": 1.20313493956743,
+      "offsetX": 386,
+      "offsetY": -556
+    },
+    {
+      "file": "layer-fg.png",
+      "depth": 0.75,
+      "stretch": false,
+      "scale": 1.086963079150579,
+      "offsetX": -32,
+      "offsetY": -322
+    }
+  ]
+}

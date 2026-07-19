@@ -966,6 +966,56 @@ export const createMatchServer = (opts: {
     Math.max(40, Math.min(100, Math.round((level * 100) / 40)));
 
   /**
+   * RANKED-SOLO COMFORT BAND (server-only, out-of-sim — no engine bump).
+   *
+   * `skillForLevel` pins the house AI to your account level, which only ever
+   * ratchets UP (losses still pay XP). Two felt problems fall out: difficulty
+   * rises exactly while a player is tilting, and you never get to feel
+   * stronger than the house — it always tracks you toward a coin-flip.
+   *
+   * This EASES the house a few points when the player is on a losing run and
+   * shaves a small flat offset so improvement reads as ~55% wins, not 50/50.
+   * It only ever LOWERS skill (never stiffens above the level calibration),
+   * it's floored at 40 like skillForLevel (so low levels are unaffected — the
+   * offset can't push below the floor), and it touches RANKED SOLO ONLY:
+   * wager is PvP, arcade keeps its own gauntlet ramp, and dare-vs-agent fights
+   * keep their pinned owner-level skill (they never reach soloOpts).
+   *
+   * No abuse vector: deliberately losing to soften the AI costs the fee + XP
+   * each time and only eases you toward winning back the +1 you already paid.
+   */
+  const MASTERY_OFFSET = 4;        // aim ~55% player win-rate vs the flat coin-flip
+  const STREAK_EASE_PER_LOSS = 5;  // skill shed per consecutive ranked-solo loss
+  const STREAK_EASE_MAX = 12;      // ...capped so a rough run never trivialises it
+
+  /** Trailing consecutive losses across the player's recent RANKED-SOLO games
+   *  (other modes are skipped, not counted; a win/draw/incomplete ends the run).
+   *  Derived from recentMatches — no new storage, survives reconnects. */
+  const soloLossStreak = async (sub: string | undefined): Promise<number> => {
+    if (!sub || !persistence) return 0;
+    try {
+      const recent = await persistence.recentMatches(sub, 6);
+      let streak = 0;
+      for (const m of recent) {
+        if (m.mode !== 'solo') continue; // house-agent context only
+        const side = m.p0 === sub ? 0 : m.p1 === sub ? 1 : -1;
+        if (side < 0) continue;
+        const lost = m.reason !== 'incomplete' && m.winner === (1 - side);
+        if (!lost) break; // most recent decided solo wasn't a loss → not tilting
+        streak++;
+      }
+      return streak;
+    } catch {
+      return 0; // progression signal is best-effort; never block the match
+    }
+  };
+
+  const easedSoloSkill = (level: number, lossStreak: number): number => {
+    const ease = MASTERY_OFFSET + Math.min(STREAK_EASE_MAX, lossStreak * STREAK_EASE_PER_LOSS);
+    return Math.max(40, Math.min(100, skillForLevel(level) - ease));
+  };
+
+  /**
    * Default ranked-solo opponent: prefer a LIVE agent-class account from the
    * public roster (fleet / headless grinders) nearest the player's level so
    * the select badge, queue copy, nameplate, and match history all share one
@@ -974,9 +1024,16 @@ export const createMatchServer = (opts: {
    */
   const soloOpts = async (c: Client): Promise<SoloPin> => {
     const level = c.account?.level ?? 1;
+    // Ease the house AI for a player on a losing run (ranked solo only) — one
+    // extra read, computed ONCE here so the fallback and the roster pick agree.
+    const lossStreak = await soloLossStreak(c.identity?.sub);
+    const skill = easedSoloSkill(level, lossStreak);
+    if (lossStreak > 0 && skill < skillForLevel(level)) {
+      console.log(`[solo] ${c.name} on a ${lossStreak}-loss run → house skill eased ${skillForLevel(level)}→${skill}`);
+    }
     const fallback: SoloPin = {
       level,
-      skill: skillForLevel(level),
+      skill,
       character: characterIds[Math.floor(Math.random() * characterIds.length)]!,
       aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
     };
@@ -997,10 +1054,11 @@ export const createMatchServer = (opts: {
         ? info.config.character
         : fallback.character;
       return {
-        // Skill stays on the PLAYER's level (fair calibrated fight); the
-        // nameplate/badge carry the live agent's identity + their W-L.
+        // Skill stays on the PLAYER's level (fair calibrated fight), eased when
+        // they're on a losing run; the nameplate/badge carry the live agent's
+        // identity + their W-L.
         level: pick.level,
-        skill: skillForLevel(level),
+        skill,
         character: char,
         aiSeed: fallback.aiSeed,
         agentName: pick.name.toUpperCase(),
