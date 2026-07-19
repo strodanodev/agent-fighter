@@ -1921,7 +1921,19 @@ export const createMatchServer = (opts: {
       rtt: -1,
     };
     clients.add(c);
-    ws.on('message', (data) => onMessage(c, String(data)));
+    // BLAST-RADIUS GUARD: onMessage runs finishMatch (verification, item
+    // settlement) SYNCHRONOUSLY — an uncaught throw here would take down the
+    // whole process and strand every live match mid-"VERIFYING WITH SERVER"
+    // (seen live 2026-07-20 when a deploy restarted the container). A bad
+    // message/settle must cost ONE client an error, never the server.
+    ws.on('message', (data) => {
+      try {
+        onMessage(c, String(data));
+      } catch (e) {
+        console.error(`[ws] handler error (client ${c.id} ${c.name}):`, e);
+        send(c, { t: 'error', msg: 'internal error — the match settles by the disconnect ladder' });
+      }
+    });
     ws.on('close', () => onClose(c));
     ws.on('error', () => { /* close follows */ });
   });

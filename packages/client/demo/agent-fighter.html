@@ -3472,6 +3472,8 @@ class NetSession {
     oppKnown = 0; // opponent inputs contiguous from 0 up to (exclusive)
     resimFrom = -1;
     overSent = false;
+    /** Wall-clock when 'over' went out — arms the verification watchdog. */
+    overSentAt = 0;
     nextHashTick = 0; // last CONFIRMED checkpoint reported to the server
     intentionalClose = false;
     resumeAttempts = 0;
@@ -3722,6 +3724,7 @@ class NetSession {
         this.oppKnown = k;
         this.resimFrom = -1;
         this.overSent = false; // replay may re-reach MatchOver; 'over' is idempotent
+        this.overSentAt = 0;
         this.nextHashTick = Math.floor(Math.max(0, this.localTick - 1) / HASH_EVERY) * HASH_EVERY;
         this.resumeAttempts = 0;
         this.status = 'playing';
@@ -3742,6 +3745,7 @@ class NetSession {
     frame(pad) {
         if (!this.game || this.status !== 'playing')
             return false;
+        this.checkVerifyWatchdog(); // runs even when MatchOver halts stepping
         const s = this.setup;
         // Apply pending rollback before stepping forward.
         if (this.resimFrom >= 0 && this.resimFrom < this.localTick) {
@@ -3799,9 +3803,25 @@ class NetSession {
         this.localTick++;
         if (this.game.phase === 3 /* Phase.MatchOver */ && !this.overSent) {
             this.overSent = true;
+            this.overSentAt = Date.now();
             this.send({ t: 'over', k: this.localTick });
         }
+        this.checkVerifyWatchdog();
         return true;
+    }
+    /**
+     * VERIFICATION WATCHDOG: 'over' was sent but no result arrived. Seen live
+     * when a server deploy/restart stranded a match mid-verification — the
+     * proxied socket never closes cleanly, so without this the client sits on
+     * "VERIFYING WITH SERVER…" forever. Money is safe either way (the escrow
+     * sweeper settles stranded fees server-side); this just tells the human.
+     */
+    checkVerifyWatchdog() {
+        if (this.overSentAt && !this.result && this.status === 'playing'
+            && Date.now() - this.overSentAt > 25_000) {
+            this.status = 'error';
+            this.error = 'the server stopped answering mid-verification — stranded fees refund automatically';
+        }
     }
 }
 // ---------------------------------------------------------- local-sim solo
@@ -3855,6 +3875,8 @@ class SoloSession {
     autoAi = null;
     tick = 0;
     overSent = false;
+    /** Wall-clock when 'over' went out — arms the verification watchdog. */
+    overSentAt = 0;
     intentionalClose = false;
     resumeAttempts = 0;
     retryTimer = null;
@@ -3975,6 +3997,7 @@ class SoloSession {
         }
         this.tick = t;
         this.overSent = false; // 'over' is idempotent server-side
+        this.overSentAt = 0;
         this.resumeAttempts = 0;
         this.status = 'playing';
     }
@@ -4041,8 +4064,10 @@ class SoloSession {
         if (g.phase === 3 /* Phase.MatchOver */) {
             if (!this.overSent) {
                 this.overSent = true;
+                this.overSentAt = Date.now();
                 this.send({ t: 'over', k: this.tick });
             }
+            this.checkVerifyWatchdog();
             return false;
         }
         // AUTO: the coached agent's decision replaces the pad wholesale (poll
@@ -4057,9 +4082,24 @@ class SoloSession {
         // step() mutates phase — TS's narrowing from the guard above is stale.
         if (g.phase === 3 /* Phase.MatchOver */ && !this.overSent) {
             this.overSent = true;
+            this.overSentAt = Date.now();
             this.send({ t: 'over', k: this.tick });
         }
         return true;
+    }
+    /**
+     * VERIFICATION WATCHDOG (mirrors NetSession): 'over' sent, no result.
+     * Seen live: a prod deploy restarted the server mid-verification and the
+     * proxied socket never closed — the client sat on "VERIFYING WITH
+     * SERVER…" forever. Surface the existing net-error overlay instead;
+     * stranded fees refund via the server's escrow sweeper.
+     */
+    checkVerifyWatchdog() {
+        if (this.overSentAt && !this.result && this.status === 'playing'
+            && Date.now() - this.overSentAt > 25_000) {
+            this.status = 'error';
+            this.error = 'the server stopped answering mid-verification — stranded fees refund automatically';
+        }
     }
 }
 
@@ -4830,10 +4870,12 @@ Object.assign(globalThis, {
  *
  * Music (MusicId): the MvC: Clash of Super Heroes BRSTM rips, one file per
  * arcade-mode screen, plus `credits` (a non-canon victory jingle that rolls
- * after an AGENT ARCADE full clear). There's no dedicated stage BGM yet, so
- * the 4 "Ending" themes double as the title-screen loop AND the in-match
- * stage loop (ROTATION), picked round-robin so neither screen repeats the
- * same track back-to-back.
+ * after an AGENT ARCADE full clear), `home_screen`/`home_screen_alt` (the
+ * title-screen pool, exclusive — title never draws from ROTATION; one is
+ * picked at random per title-screen entry, see `nextHomeTrack`), and 6
+ * dedicated stage tracks (`stage_1`..`stage_6`, sounds/7. Stage Music/)
+ * that make up ROTATION, the in-match stage-BGM pool — also picked at
+ * random per battle (`nextRotationTrack`), not round-robin.
  *
  * SFX (SfxId): impact/block/combo clips (weight-classed by button, see
  * `hitSfxFor`), menu stingers (select_confirm, you_lose), the announcer's
@@ -4845,10 +4887,6 @@ Object.assign(globalThis, {
  */
 const MUSIC_FILES = {
     continue: '/assets/audio/bgm/continue.ogg',
-    ending_after_the_battle: '/assets/audio/bgm/ending_after_the_battle.ogg',
-    ending_gambit: '/assets/audio/bgm/ending_gambit.ogg',
-    ending_grief: '/assets/audio/bgm/ending_grief.ogg',
-    ending_megaman1: '/assets/audio/bgm/ending_megaman1.ogg',
     game_over: '/assets/audio/bgm/game_over.ogg',
     here_comes_a_new_challenger: '/assets/audio/bgm/here_comes_a_new_challenger.ogg',
     hurry_up: '/assets/audio/bgm/hurry_up.ogg',
@@ -4860,6 +4898,16 @@ const MUSIC_FILES = {
     // urlsFor() fallback logic only kicks in for `.ogg` primaries so this is
     // served as-is everywhere.
     credits: '/assets/audio/bgm/credits.mp3',
+    // The dedicated title-screen pool — mp3-only, same fallback note as credits.
+    home_screen: '/assets/audio/bgm/home_screen.mp3',
+    home_screen_alt: '/assets/audio/bgm/home_screen_alt.mp3',
+    // In-match stage BGM pool (sounds/7. Stage Music/) — mp3-only.
+    stage_1: '/assets/audio/bgm/stage_1.mp3',
+    stage_2: '/assets/audio/bgm/stage_2.mp3',
+    stage_3: '/assets/audio/bgm/stage_3.mp3',
+    stage_4: '/assets/audio/bgm/stage_4.mp3',
+    stage_5: '/assets/audio/bgm/stage_5.mp3',
+    stage_6: '/assets/audio/bgm/stage_6.mp3',
 };
 const SFX_FILES = {
     swing_a: '/assets/audio/sfx/swing_a.mp3',
@@ -4892,15 +4940,15 @@ const SFX_FILES = {
 };
 const FILES = { ...MUSIC_FILES, ...SFX_FILES };
 /**
- * Shared title-screen / stage-BGM pool. Only 3 of the 4 "Ending" themes:
- * `ending_megaman1` is a ~5s victory-fanfare stinger, not a real loopable
- * track (the others run 45-86s) — looping it as stage/title BGM meant a
- * short triumphant jingle repeating every few seconds mid-fight, easily
- * (and reasonably) mistaken for the "You Win" cue looping during a match.
+ * In-match stage-BGM pool ONLY (see the module doc — title screen uses the
+ * dedicated `home_screen` track, not this). `nextRotationTrack` shuffles
+ * this, so array order doesn't matter.
  */
 const ROTATION = [
-    'ending_after_the_battle', 'ending_gambit', 'ending_grief',
+    'stage_1', 'stage_2', 'stage_3', 'stage_4', 'stage_5', 'stage_6',
 ];
+/** Title-screen pool. `nextHomeTrack` shuffles this, so order doesn't matter. */
+const HOME_ROTATION = ['home_screen', 'home_screen_alt'];
 /**
  * Short music-typed clips (a few seconds each) that fire mid-flow — worth
  * keeping decoded so stingers stay instant. The LONG tracks are everything
@@ -4974,7 +5022,8 @@ class AudioManager {
     loading = new Map();
     bgmSource = null;
     bgmId = null;
-    rotationIndex = 0;
+    lastRotationTrack = null;
+    lastHomeTrack = null;
     unlocked = false;
     prefs = loadMutePrefs();
     ctxOf() {
@@ -5134,10 +5183,26 @@ class AudioManager {
                 this.buffers.delete(id);
         }
     }
-    /** Next track in the shared title/stage rotation pool. */
+    /** Random pick from `pool`, never repeating `last` back-to-back (skipped if the pool has ≤1 entry). */
+    static pickNoRepeat(pool, last) {
+        if (pool.length <= 1)
+            return pool[0];
+        let id;
+        do {
+            id = pool[Math.floor(Math.random() * pool.length)];
+        } while (id === last);
+        return id;
+    }
+    /** Random pick from the stage-BGM pool — never the same track twice in a row. */
     nextRotationTrack() {
-        const id = ROTATION[this.rotationIndex % ROTATION.length];
-        this.rotationIndex++;
+        const id = AudioManager.pickNoRepeat(ROTATION, this.lastRotationTrack);
+        this.lastRotationTrack = id;
+        return id;
+    }
+    /** Random pick from the title-screen pool — never the same track twice in a row. */
+    nextHomeTrack() {
+        const id = AudioManager.pickNoRepeat(HOME_ROTATION, this.lastHomeTrack);
+        this.lastHomeTrack = id;
         return id;
     }
     stopBgm() {
@@ -9857,7 +9922,7 @@ const boot = async () => {
         // Landing / share deep-links: ?screen=title|select|ranks|play &mode=cpu|online &char=<id>
         applyBootDeepLink();
         if (screen === 'title') {
-            void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1.5 });
+            void audio.playBgm(audio.nextHomeTrack(), { fadeInSec: 1.5 });
         }
         // Restore a previous AIR session silently (30-day sessions) — never blocks
         // boot, and offline play works identically if it fails or is skipped.
@@ -10188,7 +10253,7 @@ const endArcade = () => {
     cpuAi = null;
     storeArcadeRun(null); // the run is over — nothing to resume
     screen = 'title';
-    void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
+    void audio.playBgm(audio.nextHomeTrack(), { fadeInSec: 1 });
 };
 /**
  * World px a fighter's body occupies. Sprites are authored supersampled (2x)
@@ -10556,12 +10621,12 @@ const tickSelect = () => {
             // until they follow the link again.
             selectingAgentOf = '';
             screen = 'title';
-            void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
+            void audio.playBgm(audio.nextHomeTrack(), { fadeInSec: 1 });
             return;
         }
         else {
             screen = 'title';
-            void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
+            void audio.playBgm(audio.nextHomeTrack(), { fadeInSec: 1 });
             return;
         }
     }

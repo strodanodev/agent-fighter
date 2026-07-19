@@ -162,6 +162,8 @@ export class NetSession {
   private oppKnown = 0; // opponent inputs contiguous from 0 up to (exclusive)
   private resimFrom = -1;
   private overSent = false;
+  /** Wall-clock when 'over' went out — arms the verification watchdog. */
+  private overSentAt = 0;
   private nextHashTick = 0; // last CONFIRMED checkpoint reported to the server
   private intentionalClose = false;
   private resumeAttempts = 0;
@@ -407,6 +409,7 @@ export class NetSession {
     this.oppKnown = k;
     this.resimFrom = -1;
     this.overSent = false; // replay may re-reach MatchOver; 'over' is idempotent
+    this.overSentAt = 0;
     this.nextHashTick = Math.floor(Math.max(0, this.localTick - 1) / HASH_EVERY) * HASH_EVERY;
     this.resumeAttempts = 0;
     this.status = 'playing';
@@ -430,6 +433,7 @@ export class NetSession {
    */
   frame(pad: InputFrame): boolean {
     if (!this.game || this.status !== 'playing') return false;
+    this.checkVerifyWatchdog(); // runs even when MatchOver halts stepping
     const s = this.setup!;
 
     // Apply pending rollback before stepping forward.
@@ -492,9 +496,26 @@ export class NetSession {
 
     if (this.game.phase === Phase.MatchOver && !this.overSent) {
       this.overSent = true;
+      this.overSentAt = Date.now();
       this.send({ t: 'over', k: this.localTick });
     }
+    this.checkVerifyWatchdog();
     return true;
+  }
+
+  /**
+   * VERIFICATION WATCHDOG: 'over' was sent but no result arrived. Seen live
+   * when a server deploy/restart stranded a match mid-verification — the
+   * proxied socket never closes cleanly, so without this the client sits on
+   * "VERIFYING WITH SERVER…" forever. Money is safe either way (the escrow
+   * sweeper settles stranded fees server-side); this just tells the human.
+   */
+  private checkVerifyWatchdog(): void {
+    if (this.overSentAt && !this.result && this.status === 'playing'
+      && Date.now() - this.overSentAt > 25_000) {
+      this.status = 'error';
+      this.error = 'the server stopped answering mid-verification — stranded fees refund automatically';
+    }
   }
 }
 
@@ -541,6 +562,8 @@ export class SoloSession {
   private autoAi: AiState | null = null;
   private tick = 0;
   private overSent = false;
+  /** Wall-clock when 'over' went out — arms the verification watchdog. */
+  private overSentAt = 0;
   private intentionalClose = false;
   private resumeAttempts = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -667,6 +690,7 @@ export class SoloSession {
     }
     this.tick = t;
     this.overSent = false; // 'over' is idempotent server-side
+    this.overSentAt = 0;
     this.resumeAttempts = 0;
     this.status = 'playing';
   }
@@ -724,7 +748,8 @@ export class SoloSession {
     if (!this.game || !this.houseAi || this.status !== 'playing') return false;
     const g = this.game;
     if (g.phase === Phase.MatchOver) {
-      if (!this.overSent) { this.overSent = true; this.send({ t: 'over', k: this.tick }); }
+      if (!this.overSent) { this.overSent = true; this.overSentAt = Date.now(); this.send({ t: 'over', k: this.tick }); }
+      this.checkVerifyWatchdog();
       return false;
     }
     // AUTO: the coached agent's decision replaces the pad wholesale (poll
@@ -738,9 +763,25 @@ export class SoloSession {
     // step() mutates phase — TS's narrowing from the guard above is stale.
     if ((g.phase as Phase) === Phase.MatchOver && !this.overSent) {
       this.overSent = true;
+      this.overSentAt = Date.now();
       this.send({ t: 'over', k: this.tick });
     }
     return true;
+  }
+
+  /**
+   * VERIFICATION WATCHDOG (mirrors NetSession): 'over' sent, no result.
+   * Seen live: a prod deploy restarted the server mid-verification and the
+   * proxied socket never closed — the client sat on "VERIFYING WITH
+   * SERVER…" forever. Surface the existing net-error overlay instead;
+   * stranded fees refund via the server's escrow sweeper.
+   */
+  private checkVerifyWatchdog(): void {
+    if (this.overSentAt && !this.result && this.status === 'playing'
+      && Date.now() - this.overSentAt > 25_000) {
+      this.status = 'error';
+      this.error = 'the server stopped answering mid-verification — stranded fees refund automatically';
+    }
   }
 }
 
