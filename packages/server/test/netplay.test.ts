@@ -79,6 +79,7 @@ describe('persistence hook (Phase B)', () => {
       escrowMatch: async () => {},
       recordMatch: async (r) => { records.push(r); return []; },
       sweepOrphanedEscrow: async () => 0,
+      sweepOrphanedItems: async () => 0,
       releaseReferral: async () => 0,
       leaderboard: async () => [],
       agentRoster: async () => [],

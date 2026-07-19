@@ -184,6 +184,15 @@ interface Match {
 export interface MatchServer {
   port: number;
   close: () => void;
+  /**
+   * Graceful drain (deploy/SIGTERM): refuse new queues, settle every live
+   * match through the normal ladder (a finished ledger still pays the
+   * winner; an undecided one is a no-contest that refunds fees and
+   * releases items), give the fire-and-forget persistence writes a moment
+   * to land, then close. Every deploy used to strand live matches at
+   * "VERIFYING WITH SERVER…" — this is the root fix.
+   */
+  shutdown: () => Promise<void>;
 }
 
 /**
@@ -428,6 +437,8 @@ export const createMatchServer = (opts: {
   const rooms = new Map<string, Client>();
   /** In-flight matches by id — the CResume lookup. */
   const liveMatches = new Map<string, Match>();
+  /** True once shutdown() starts — new queues/entries are refused. */
+  let draining = false;
   /** AGENT ARCADE runs by token (v4). */
   const arcadeRuns = new Map<string, ArcadeRun>();
   // Free-tier abuse valves (agent class): per-sub battles, per-IP signups.
@@ -1147,6 +1158,9 @@ export const createMatchServer = (opts: {
       }
       case 'queue': {
         if (c.state !== 'lobby') return;
+        if (draining) {
+          return send(c, { t: 'error', msg: 'server is restarting for an update — back in under a minute, nothing was charged' });
+        }
         if (!characterIds.includes(msg.character)) {
           return send(c, { t: 'error', msg: `unknown character "${msg.character}"` });
         }
@@ -1456,6 +1470,9 @@ export const createMatchServer = (opts: {
     void persistence.sweepOrphanedEscrow()
       .then((n) => { if (n > 0) console.log(`[sweep] refunded ${n} orphaned escrow fee(s)`); })
       .catch((e) => console.log(`[sweep] failed: ${String((e as Error).message ?? e)}`));
+    void persistence.sweepOrphanedItems()
+      .then((n) => { if (n > 0) console.log(`[sweep] released ${n} item(s) stranded by a crash`); })
+      .catch((e) => console.log(`[sweep] items failed: ${String((e as Error).message ?? e)}`));
   };
   sweepEscrow();
   const escrowSweep = setInterval(sweepEscrow, 60 * 60 * 1000);
@@ -1586,6 +1603,7 @@ export const createMatchServer = (opts: {
     // Agent-class accounts enter FREE (their battle cap applies at queue).
     if (path === '/arcade/enter') {
       if (req.method !== 'POST') return json(res, 405, { error: 'POST {nonce} to enter' });
+      if (draining) return json(res, 503, { error: 'server is restarting for an update — try again in a minute' });
       const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '')?.[1];
       const devName = persistence?.dev ? String(req.headers['x-dev-name'] ?? '') : '';
       void (async () => {
@@ -1938,14 +1956,34 @@ export const createMatchServer = (opts: {
     ws.on('error', () => { /* close follows */ });
   });
 
+  const close = (): void => {
+    clearInterval(idleSweep); clearInterval(escrowSweep); clearInterval(pingSweep);
+    wss.close(); http.close();
+  };
+
+  const shutdown = async (): Promise<void> => {
+    if (draining) return;
+    draining = true;
+    const live = [...liveMatches.values()];
+    console.log(`[shutdown] draining — settling ${live.length} live match(es) by the ladder`);
+    for (const m of live) {
+      // finishMatch verifies the ledger: a fight the player already won
+      // settles VERIFIED (payout lands); anything undecided is a no-contest
+      // refund. Clients get the result before their socket dies, so nobody
+      // is left staring at "VERIFYING WITH SERVER…".
+      try { finishMatch(m, null); } catch (e) { console.error(`[shutdown] settle failed for ${m.id}:`, e); }
+    }
+    // Settlement persistence is fire-and-forget — give it a moment to land.
+    if (live.length > 0) await new Promise((r) => setTimeout(r, 2500));
+    console.log('[shutdown] drained, closing');
+    close();
+  };
+
   return new Promise((resolve) => {
     http.listen(opts.port ?? DEFAULT_PORT, () => {
       const address = http.address();
       const port = typeof address === 'object' && address ? address.port : DEFAULT_PORT;
-      resolve({
-        port,
-        close: () => { clearInterval(idleSweep); clearInterval(escrowSweep); clearInterval(pingSweep); wss.close(); http.close(); },
-      });
+      resolve({ port, close, shutdown });
     });
   });
 };
@@ -1970,4 +2008,16 @@ if (isMain) {
   });
   console.log(`Agent Fighter match server → ws://localhost:${server.port}`);
   console.log(`engine ${ENGINE_VERSION} · protocol v${PROTOCOL_VERSION} · humans and agents welcome`);
+
+  // Deploys send SIGTERM (Railway waits RAILWAY_DEPLOYMENT_DRAINING_SECONDS
+  // before SIGKILL) — drain instead of dying mid-verification. The fallback
+  // exit covers a drain that itself hangs; unref'd so it never holds the
+  // process open after a clean drain.
+  const bail = (sig: string): void => {
+    console.log(`[shutdown] ${sig} received`);
+    void server.shutdown().then(() => process.exit(0));
+    setTimeout(() => process.exit(0), 10_000).unref();
+  };
+  process.on('SIGTERM', () => bail('SIGTERM'));
+  process.on('SIGINT', () => bail('SIGINT'));
 }

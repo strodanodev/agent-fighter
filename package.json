@@ -20,7 +20,10 @@
     "server": "npm run start -w @af/server",
     "agent": "npm run agent -w @af/server",
     "fleet": "npm run fleet -w @af/server",
-    "studio": "npm run start -w @af/studio"
+    "studio": "npm run start -w @af/studio",
+    "deploy": "node tools/deploy.mjs",
+    "deploy:server": "node tools/deploy.mjs server",
+    "deploy:client": "node tools/deploy.mjs client"
   },
   "devDependencies": {
     "tsx": "^4.23.1",

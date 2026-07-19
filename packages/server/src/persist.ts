@@ -199,6 +199,15 @@ export interface Persistence {
    */
   sweepOrphanedEscrow: (olderThanMinutes?: number) => Promise<number>;
   /**
+   * Items twin of sweepOrphanedEscrow: hand back drinks claimed for a match
+   * that NEVER settled (server died between claimEquipped and settleItems /
+   * releaseItems — the graceful drain covers deploys, this covers crashes).
+   * A row is stranded when its claim is older than the cutoff and no
+   * matches row exists for its match id; settled matches keep their drunk
+   * cans consumed forever. Returns the number of rows released.
+   */
+  sweepOrphanedItems: (olderThanMinutes?: number) => Promise<number>;
+  /**
    * Pay the inviter of _invitee's referral if it just became due (invitee
    * finished a first decided match). Idempotent; returns credits granted.
    * Call AFTER recordMatch settles — the check reads the matches table.
@@ -391,6 +400,8 @@ const settleSide = (
 export const memoryPersistence = (): Persistence => {
   const profiles = new Map<string, ProfileRow & { lastDaily: string }>();
   const settled = new Set<string>(); // match ids
+  /** Subset of `settled` claimed synthetically by sweepOrphanedEscrow. */
+  const ghosts = new Set<string>();
   /** matchId → who was charged what, and when (the sweeper's cutoff clock). */
   const escrows = new Map<string, { subs: Set<string>; fee: number; at: number }>();
   const names = new Map<string, { name: string; agent: boolean }>();
@@ -402,7 +413,8 @@ export const memoryPersistence = (): Persistence => {
   const owners = new Map<string, string>();
   /** Granted consumables, newest first (ADR 0007). Nonce = idempotency key. */
   const ownedItems: (OwnedItem & {
-    sub: string; nonce: string; consumedMatchId?: string; slot?: number | null;
+    sub: string; nonce: string; consumedMatchId?: string; consumedAt?: number;
+    slot?: number | null;
   })[] = [];
   let nextItemRow = 1;
   /** Idempotency keys of non-refundable debits (`sub|reason|key`) — ADR 0007. */
@@ -522,12 +534,28 @@ export const memoryPersistence = (): Persistence => {
         // Settle the ghost as a no-contest FIRST — a late recordMatch then
         // finds the id taken and awards nothing (no refund-then-payout).
         settled.add(matchId);
+        ghosts.add(matchId); // items of a ghost are still releasable (see sweepOrphanedItems)
         for (const sub of e.subs) {
           prof(sub).credits += e.fee;
           refunded++;
         }
       }
       return refunded;
+    },
+    sweepOrphanedItems: async (olderThanMinutes = 30) => {
+      const cutoff = Date.now() - olderThanMinutes * 60_000;
+      let released = 0;
+      for (const row of ownedItems) {
+        // A ghost claimed by the ESCROW sweeper counts as unsettled here:
+        // releaseItems never ran for it (mirrors 0018's engine <> filter).
+        if (!row.consumedMatchId) continue;
+        if (settled.has(row.consumedMatchId) && !ghosts.has(row.consumedMatchId)) continue;
+        if ((row.consumedAt ?? 0) > cutoff) continue;
+        row.consumedMatchId = undefined;
+        row.consumedAt = undefined;
+        released++;
+      }
+      return released;
     },
     releaseReferral: async (inviteeSub) => {
       const r = referrals.get(inviteeSub);
@@ -650,6 +678,7 @@ export const memoryPersistence = (): Persistence => {
       if (!row) return null;
       if (row.consumedMatchId && row.consumedMatchId !== matchId) return null;
       row.consumedMatchId = matchId;
+      row.consumedAt = Date.now();
       return { rowId: row.rowId, itemId: row.itemId, tier: row.tier, createdAt: row.createdAt };
     },
     releaseItems: async (matchId) => {
@@ -791,6 +820,13 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
     },
     sweepOrphanedEscrow: async (olderThanMinutes = 30) => {
       const n = (await call('/rest/v1/rpc/sweep_orphaned_escrow', {
+        method: 'POST',
+        body: JSON.stringify({ _older_than_minutes: olderThanMinutes | 0 }),
+      })) as number;
+      return n | 0;
+    },
+    sweepOrphanedItems: async (olderThanMinutes = 30) => {
+      const n = (await call('/rest/v1/rpc/sweep_orphaned_items', {
         method: 'POST',
         body: JSON.stringify({ _older_than_minutes: olderThanMinutes | 0 }),
       })) as number;
