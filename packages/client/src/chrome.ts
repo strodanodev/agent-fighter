@@ -474,6 +474,19 @@ export const drawStageLayers = (
   }
 
   ctx.imageSmoothingEnabled = false;
+
+  // Plain `background.png` as the backdrop, drawn BEHIND the parallax planes —
+  // but only when no layer is itself a stretched backdrop (`stretch:true`).
+  // The Studio composes stages as a full-scene background.png + isolated
+  // object planes (layer-mid/fg) and its preview draws the background first
+  // (see studio main.ts `paint()`); without this the game ignored stage.image
+  // whenever ANY layer existed, so those stages rendered as bare skyColor —
+  // a black screen. Stages that DO carry a stretched layer-bg (rooftop,
+  // school) already have their backdrop and are left untouched.
+  if (stage.image && !stage.layers.some((l) => l.stretch)) {
+    ctx.drawImage(stage.image, 0, topY, STAGE.widthPx, drawH);
+  }
+
   for (const layer of stage.layers) {
     // Every plane draws its WHOLE source image (never cropped, so soft
     // edges/fades stay intact). Backdrops stretch to the shared bg-fit

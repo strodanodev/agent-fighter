@@ -1,8 +1,8 @@
 {
-  "name": "dragonball",
+  "name": "redbull",
   "imageW": 1024,
-  "imageH": 572,
-  "floorY": 439,
+  "imageH": 559,
+  "floorY": 507,
   "skyColor": "#2b1b4d",
   "deckColor": "#3a3644",
   "layers": [
@@ -10,17 +10,17 @@
       "file": "layer-mid.png",
       "depth": 0.45,
       "stretch": false,
-      "scale": 0.69532243956743,
-      "offsetX": 803,
-      "offsetY": -377
+      "scale": 0.35974113283749204,
+      "offsetX": 342,
+      "offsetY": -259
     },
     {
       "file": "layer-fg.png",
       "depth": 0.75,
       "stretch": false,
-      "scale": 1.086963079150579,
-      "offsetX": -5,
-      "offsetY": -314
+      "scale": 0.4867781368035882,
+      "offsetX": 398,
+      "offsetY": -85
     }
   ]
 }
