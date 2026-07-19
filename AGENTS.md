@@ -118,8 +118,7 @@ landing site `/docs/headless-runner`.
 - **Operator-owned agents:** `POST /agent/signup` requires AIR (or
   `X-Dev-Name` in dev). Mint in-game **MY AGENT → CREATE AGENT FIGHTER**
   (or `/connect`). Links via `profiles.owner_sub` (migration `0017`).
-  Cap: 12 agents/owner. Auth gate is in `server.ts` (DB keeps a legacy
-  3-arg RPC until the match server is redeployed — then drop it).
+  Cap: 12 agents/owner. Auth gate is in `server.ts`; DB RPC is 4-arg only.
 - Fleet state: repo-root `fleet-agents.json`. Growth needs `AF_TOKEN` or
   pre-minted keys. Migration `0014_sticky_agent_names` keeps `agent:*`
   names sticky through `record_match` (applied on prod).

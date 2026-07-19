@@ -188,6 +188,14 @@ test('the honest path still settles: a normal solo match pays out', async (t) =>
   assert.equal(result.reason, 'verified');
   await new Promise((r) => setTimeout(r, 400));
   const acc = await persistence.getAccount({ sub: 'dev:Honest' }, 'Honest', true);
-  assert.equal(acc.wins + acc.losses, 1);
-  assert.notEqual(acc.credits, DAILY_CREDITS - SOLO_FEE, 'a decided match settles, not just burns the fee');
+  assert.equal(acc.wins + acc.losses, 1, 'a verified solo match books a W or L');
+  // Loss burns the fee (credits stay at DAILY - FEE); win pays out above that.
+  // Either outcome is a settle — do not require a win (skill/seed can lose).
+  if (result.winner === 0) {
+    assert.ok(acc.credits > DAILY_CREDITS - SOLO_FEE, 'solo win pays out');
+    assert.equal(acc.wins, 1);
+  } else {
+    assert.equal(acc.credits, DAILY_CREDITS - SOLO_FEE, 'solo loss burns the fee');
+    assert.equal(acc.losses, 1);
+  }
 });
