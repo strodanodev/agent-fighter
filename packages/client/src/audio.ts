@@ -6,10 +6,12 @@
  *
  * Music (MusicId): the MvC: Clash of Super Heroes BRSTM rips, one file per
  * arcade-mode screen, plus `credits` (a non-canon victory jingle that rolls
- * after an AGENT ARCADE full clear). There's no dedicated stage BGM yet, so
- * the 4 "Ending" themes double as the title-screen loop AND the in-match
- * stage loop (ROTATION), picked round-robin so neither screen repeats the
- * same track back-to-back.
+ * after an AGENT ARCADE full clear), `home_screen`/`home_screen_alt` (the
+ * title-screen pool, exclusive — title never draws from ROTATION; one is
+ * picked at random per title-screen entry, see `nextHomeTrack`), and 6
+ * dedicated stage tracks (`stage_1`..`stage_6`, sounds/7. Stage Music/)
+ * that make up ROTATION, the in-match stage-BGM pool — also picked at
+ * random per battle (`nextRotationTrack`), not round-robin.
  *
  * SFX (SfxId): impact/block/combo clips (weight-classed by button, see
  * `hitSfxFor`), menu stingers (select_confirm, you_lose), the announcer's
@@ -21,9 +23,9 @@
  */
 
 export type MusicId =
-  | 'continue' | 'ending_after_the_battle' | 'ending_gambit' | 'ending_grief' | 'ending_megaman1'
-  | 'game_over' | 'here_comes_a_new_challenger' | 'hurry_up' | 'player_select' | 'ranking' | 'vs' | 'win'
-  | 'credits';
+  | 'continue' | 'game_over' | 'here_comes_a_new_challenger' | 'hurry_up' | 'player_select' | 'ranking'
+  | 'vs' | 'win' | 'credits' | 'home_screen' | 'home_screen_alt'
+  | 'stage_1' | 'stage_2' | 'stage_3' | 'stage_4' | 'stage_5' | 'stage_6';
 
 export type SfxId =
   | 'swing_a' | 'swing_b'
@@ -41,10 +43,6 @@ type SoundId = MusicId | SfxId;
 
 const MUSIC_FILES: Record<MusicId, string> = {
   continue: '/assets/audio/bgm/continue.ogg',
-  ending_after_the_battle: '/assets/audio/bgm/ending_after_the_battle.ogg',
-  ending_gambit: '/assets/audio/bgm/ending_gambit.ogg',
-  ending_grief: '/assets/audio/bgm/ending_grief.ogg',
-  ending_megaman1: '/assets/audio/bgm/ending_megaman1.ogg',
   game_over: '/assets/audio/bgm/game_over.ogg',
   here_comes_a_new_challenger: '/assets/audio/bgm/here_comes_a_new_challenger.ogg',
   hurry_up: '/assets/audio/bgm/hurry_up.ogg',
@@ -56,6 +54,16 @@ const MUSIC_FILES: Record<MusicId, string> = {
   // urlsFor() fallback logic only kicks in for `.ogg` primaries so this is
   // served as-is everywhere.
   credits: '/assets/audio/bgm/credits.mp3',
+  // The dedicated title-screen pool — mp3-only, same fallback note as credits.
+  home_screen: '/assets/audio/bgm/home_screen.mp3',
+  home_screen_alt: '/assets/audio/bgm/home_screen_alt.mp3',
+  // In-match stage BGM pool (sounds/7. Stage Music/) — mp3-only.
+  stage_1: '/assets/audio/bgm/stage_1.mp3',
+  stage_2: '/assets/audio/bgm/stage_2.mp3',
+  stage_3: '/assets/audio/bgm/stage_3.mp3',
+  stage_4: '/assets/audio/bgm/stage_4.mp3',
+  stage_5: '/assets/audio/bgm/stage_5.mp3',
+  stage_6: '/assets/audio/bgm/stage_6.mp3',
 };
 
 const SFX_FILES: Record<SfxId, string> = {
@@ -91,15 +99,16 @@ const SFX_FILES: Record<SfxId, string> = {
 const FILES: Record<SoundId, string> = { ...MUSIC_FILES, ...SFX_FILES };
 
 /**
- * Shared title-screen / stage-BGM pool. Only 3 of the 4 "Ending" themes:
- * `ending_megaman1` is a ~5s victory-fanfare stinger, not a real loopable
- * track (the others run 45-86s) — looping it as stage/title BGM meant a
- * short triumphant jingle repeating every few seconds mid-fight, easily
- * (and reasonably) mistaken for the "You Win" cue looping during a match.
+ * In-match stage-BGM pool ONLY (see the module doc — title screen uses the
+ * dedicated `home_screen` track, not this). `nextRotationTrack` shuffles
+ * this, so array order doesn't matter.
  */
 export const ROTATION: MusicId[] = [
-  'ending_after_the_battle', 'ending_gambit', 'ending_grief',
+  'stage_1', 'stage_2', 'stage_3', 'stage_4', 'stage_5', 'stage_6',
 ];
+
+/** Title-screen pool. `nextHomeTrack` shuffles this, so order doesn't matter. */
+export const HOME_ROTATION: MusicId[] = ['home_screen', 'home_screen_alt'];
 
 /**
  * Short music-typed clips (a few seconds each) that fire mid-flow — worth
@@ -189,7 +198,8 @@ class AudioManager {
   private loading = new Map<SoundId, Promise<AudioBuffer>>();
   private bgmSource: AudioBufferSourceNode | null = null;
   private bgmId: MusicId | null = null;
-  private rotationIndex = 0;
+  private lastRotationTrack: MusicId | null = null;
+  private lastHomeTrack: MusicId | null = null;
   private unlocked = false;
   private prefs = loadMutePrefs();
 
@@ -350,10 +360,27 @@ class AudioManager {
     }
   }
 
-  /** Next track in the shared title/stage rotation pool. */
+  /** Random pick from `pool`, never repeating `last` back-to-back (skipped if the pool has ≤1 entry). */
+  private static pickNoRepeat(pool: MusicId[], last: MusicId | null): MusicId {
+    if (pool.length <= 1) return pool[0]!;
+    let id: MusicId;
+    do {
+      id = pool[Math.floor(Math.random() * pool.length)]!;
+    } while (id === last);
+    return id;
+  }
+
+  /** Random pick from the stage-BGM pool — never the same track twice in a row. */
   nextRotationTrack(): MusicId {
-    const id = ROTATION[this.rotationIndex % ROTATION.length]!;
-    this.rotationIndex++;
+    const id = AudioManager.pickNoRepeat(ROTATION, this.lastRotationTrack);
+    this.lastRotationTrack = id;
+    return id;
+  }
+
+  /** Random pick from the title-screen pool — never the same track twice in a row. */
+  nextHomeTrack(): MusicId {
+    const id = AudioManager.pickNoRepeat(HOME_ROTATION, this.lastHomeTrack);
+    this.lastHomeTrack = id;
     return id;
   }
 

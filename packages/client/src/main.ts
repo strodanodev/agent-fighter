@@ -992,7 +992,7 @@ const boot = async (): Promise<void> => {
     // Landing / share deep-links: ?screen=title|select|ranks|play &mode=cpu|online &char=<id>
     applyBootDeepLink();
     if (screen === 'title') {
-      void audio.playBgm('home_screen', { fadeInSec: 1.5 });
+      void audio.playBgm(audio.nextHomeTrack(), { fadeInSec: 1.5 });
     }
     // Restore a previous AIR session silently (30-day sessions) — never blocks
     // boot, and offline play works identically if it fails or is skipped.
@@ -1336,7 +1336,7 @@ const endArcade = (): void => {
   cpuAi = null;
   storeArcadeRun(null); // the run is over — nothing to resume
   screen = 'title';
-  void audio.playBgm('home_screen', { fadeInSec: 1 });
+  void audio.playBgm(audio.nextHomeTrack(), { fadeInSec: 1 });
 };
 
 /**
@@ -1715,11 +1715,11 @@ const tickSelect = (): void => {
       // until they follow the link again.
       selectingAgentOf = '';
       screen = 'title';
-      void audio.playBgm('home_screen', { fadeInSec: 1 });
+      void audio.playBgm(audio.nextHomeTrack(), { fadeInSec: 1 });
       return;
     } else {
       screen = 'title';
-      void audio.playBgm('home_screen', { fadeInSec: 1 });
+      void audio.playBgm(audio.nextHomeTrack(), { fadeInSec: 1 });
       return;
     }
   }

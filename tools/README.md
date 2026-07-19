@@ -29,7 +29,12 @@ map for re-running the conversion.
 - **`1. BGM/`** — `.brstm` rips → `packages/client/assets/audio/bgm/*.ogg`
   (vgmstream + ffmpeg, same pipeline as above). One arcade-mode screen each:
   Continue screen, Game Over, Here Comes a New Challenger, Hurry Up, Player
-  Select, Ranking, Versus → `vs`, You Win → `win`.
+  Select, Ranking, Versus → `vs`, You Win → `win`. Plus **`Home Sceen.mp3`**
+  (sic — source typo) → `home_screen.mp3` and **`Home Screen Alternate.mp3`**
+  → `home_screen_alt.mp3` (both copied as-is, mp3) — `HOME_ROTATION`, the
+  title-screen pool. Title does not draw from `ROTATION` (the in-match stage
+  pool); `nextHomeTrack()` picks one of the two at random per title-screen
+  entry (never the same track twice in a row), same pattern as stage BGM.
 - **`2. SFX HITS/`** — mostly already-shipped mp3s (Swoosh 01_02/02_01 →
   `swing_a`/`swing_b`, swooth & hit 1/2/3 → `punch_light`/`medium`/
   `heavy_a`, Hit 1 → `punch_heavy_b`, Hit 2x → `combo_accent`, Kick 1/2 →
@@ -58,3 +63,10 @@ map for re-running the conversion.
   swing; kick special shoryuken → voice callout on any move with
   `motion === 623` (the DP-motion uppercut); projectile hadouken → voice
   callout on any move with `motion === 236` (the fireball-motion special).
+- **`7. Stage Music/`** → `stage music (1..6).mp3` → `bgm/stage_1..6.mp3`
+  (copied as-is, mp3) — `ROTATION`, the in-match stage-BGM pool.
+  `nextRotationTrack()` picks one at RANDOM per battle (never the same track
+  twice in a row), not round-robin. This replaced the original 3 "Ending"
+  themes that used to double as stage music (now removed from the library
+  entirely — asset files deleted, `ending_*` ids dropped from `MusicId`,
+  `ending_megaman1` included, since nothing else referenced any of them).
