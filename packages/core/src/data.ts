@@ -245,8 +245,13 @@ export const ROUND_SECONDS = 99;
  *            fields (itemDmg/itemDef/itemBuffLeft) change the serialize
  *            layout (all state hashes shift even for item-less matches:
  *            goldens re-blessed), and pinned drinks scale strike() damage.
+ * af-core-4: consumables become IN-MATCH activated (ADR 0007 Phase 3) — the
+ *            Btn.Item input bit drinks the can on demand; three more
+ *            FighterState fields (itemKind/itemAmount/itemDur) carry the
+ *            un-drunk drink. Serialize layout shifts again (goldens
+ *            re-blessed); no drink pressed = still bit-identical to pre-item.
  */
-export const ENGINE_VERSION = 'af-core-3';
+export const ENGINE_VERSION = 'af-core-4';
 
 export const TUNING = {
   roundsToWin: 2, // best of 3

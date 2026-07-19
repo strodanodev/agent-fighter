@@ -16,6 +16,12 @@ export const enum Btn {
   LK = 1 << 7,
   MK = 1 << 8,
   HK = 1 << 9,
+  // CONSUMABLES (ADR 0007 Phase 3): "drink my energy can". A free input bit
+  // (10..30 were unused) so activation rides the SAME ledger + rollback +
+  // re-sim path as every button — the only rollback-correct way to trigger
+  // a mid-match effect. The sim acts on the RISING edge and no-ops once the
+  // carried drink is spent, so a held key drinks exactly once.
+  Item = 1 << 10,
 }
 
 export type InputFrame = number;

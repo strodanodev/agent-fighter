@@ -819,6 +819,65 @@ const drawPlayerId = (ctx: CanvasRenderingContext2D, i: 0 | 1, id: HudId): void 
   }
 };
 
+/** Item-effect kind code (state.ts) → HUD accent + tiny label. */
+const ITEM_KIND_UI: Record<number, { color: string; tag: string }> = {
+  1: { color: '#7ddf8a', tag: 'HEAL' },
+  2: { color: '#ff9d6b', tag: 'PWR' },
+  3: { color: '#6fd3ff', tag: 'DEF' },
+  4: { color: '#ffd166', tag: 'MTR' },
+};
+
+/**
+ * CONSUMABLES (ADR 0007 Phase 3): the energy-drink slot below each health
+ * bar. A CARRIED (un-drunk) can shows tappable for the local player — click
+ * it or press R to drink. Once drunk, a timed buff shows its countdown; an
+ * instant drink (heal/meter) just vanishes. Sits in the clear band right of
+ * the nameplate, below the health bar. `isLocal` = the human's own can.
+ */
+const drawItemSlot = (
+  ctx: CanvasRenderingContext2D, i: 0 | 1, f: GameState['fighters'][0],
+  tick: number, isLocal: boolean,
+): void => {
+  const w = 20, h = 28;
+  const x = i === 0 ? HUD.edge + HUD.nameW + 22 : VW - HUD.edge - HUD.nameW - 22 - w;
+  const y = HUD.barY + HUD.barH + 4;
+
+  if (f.itemKind !== 0) {
+    // Carried, un-drunk.
+    const ui = ITEM_KIND_UI[f.itemKind] ?? { color: '#cfd8e3', tag: 'CAN' };
+    if (isLocal) {
+      // Yours: pulse, prompt, and make the whole slot a tap target.
+      tapZone(x - 8, y - 6, w + 16, h + 24, 'item:use');
+      const pulse = 0.5 + 0.5 * Math.abs(Math.sin(tick / 14));
+      ctx.save();
+      ctx.shadowColor = ui.color;
+      ctx.shadowBlur = 6 + 10 * pulse;
+      drawCan(ctx, x, y, w, h, ui.color, 4);
+      ctx.restore();
+      label(ctx, ui.tag, x + w / 2, y + h + 10, 9, ui.color);
+      label(ctx, 'R', x + w / 2, y - 3, 10, tick % 40 < 30 ? '#ffffff' : ui.color);
+    } else {
+      // Opponent's carried drink — informational, dimmer, no tap zone.
+      ctx.save();
+      ctx.globalAlpha = 0.7;
+      drawCan(ctx, x, y, w, h, ui.color, 0);
+      ctx.restore();
+      label(ctx, ui.tag, x + w / 2, y + h + 10, 9, `${ui.color}aa`);
+    }
+    return;
+  }
+
+  // Drunk: show the active timed buff's countdown, blinking the last 3s.
+  if (f.itemBuffLeft > 0) {
+    const secs = Math.ceil(f.itemBuffLeft / TICKS_PER_SEC);
+    const color = f.itemDmg > 0 ? '#ff9d6b' : '#6fd3ff';
+    if (!(secs <= 3 && tick % 24 < 12)) {
+      drawCan(ctx, x, y, w, h, color, 6);
+      label(ctx, `${secs}s`, x + w / 2, y + h + 10, 10, '#ffffffdd');
+    }
+  }
+};
+
 export const drawHud = (
   ctx: CanvasRenderingContext2D,
   g: GameState,
@@ -827,12 +886,12 @@ export const drawHud = (
   tags?: [string, string], // per-player nameplate suffix (e.g. "AGENT LV 12")
   autoSpecialCharged = false, // local player has ≥1 bar → logo badge glows red
   ids?: [HudId | null, HudId | null], // wallet + stats strip under each HUD block
+  localSide: number = -1, // which side is the human's (their can is tappable); -1 none
 ): void => {
   for (const i of [0, 1] as const) {
     const f = g.fighters[i];
     const max = rosters[i].ch.b.maxHealth;
-    // PATCH drinks spawn ABOVE max health — the bar clamps full and simply
-    // doesn't drain until the overheal is chewed through.
+    // A mid-match HEAL is capped at max, so the bar never exceeds full.
     const ratio = Math.min(1, Math.max(0, f.health) / max);
     drawHealthBar(ctx, i, ratio, fx.flash[i], g.tick);
     drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
@@ -840,17 +899,7 @@ export const drawHud = (
     drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
     drawMeter(ctx, i, f.meter, g.tick);
     if (ids?.[i]) drawPlayerId(ctx, i, ids[i]!);
-    // Item buff chip (ADR 0007): a live drink shows its can + countdown just
-    // inside the health bar's end; expiry blinks the last 3 seconds.
-    if (f.itemBuffLeft > 0) {
-      const secs = Math.ceil(f.itemBuffLeft / TICKS_PER_SEC);
-      const blink = secs <= 3 && g.tick % 24 < 14;
-      const bx = i === 0 ? HUD.edge + HUD.barW + 10 : VW - HUD.edge - HUD.barW - 26;
-      if (!blink) {
-        drawCan(ctx, bx, HUD.barY + 2, 16, 30, f.itemDmg > 0 ? '#ff9d6b' : '#6fd3ff', 6);
-        label(ctx, `${secs}`, bx + 8, HUD.barY + 46, 12, '#ffffffdd');
-      }
-    }
+    drawItemSlot(ctx, i, f, g.tick, i === localSide);
   }
   drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
 
@@ -1575,7 +1624,7 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
         : { from: '#ffffff', mid: '#cfd8e3', to: '#6b7686', outline: '#101318', align: 'left' });
     label(ctx, v.reveal.desc, rx + 118, ry + 104, 14, '#ffffffdd', 'left');
     label(ctx, `“${v.reveal.flavor}”`, rx + 118, ry + 126, 11, '#ffffff88', 'left');
-    label(ctx, 'PICK IT AT FIGHTER SELECT — ONE DRINK PER FIGHT', rx + 118, ry + 158, 10, '#8fd0ff', 'left');
+    label(ctx, 'CARRY IT INTO ARENA OR WAGER · DRINK IT MID-FIGHT (TAP / R)', rx + 118, ry + 158, 10, '#8fd0ff', 'left');
     ctx.restore();
     // Sparkle ring on a fresh LV3.
     if (tier === 3 && v.revealAge < 40) {
@@ -1668,8 +1717,8 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
     }
     // Narrow segments get their tags to the right of the bar.
     label(ctx, 'LV 2 · 25%   LV 3 · 5%', obX + obW * 0.7 + 6, obY + 31, 9, '#ffffff88', 'left');
-    label(ctx, '4 · ONE DRINK RIDES INTO YOUR NEXT ARENA / WAGER FIGHT —', lx, ry + 178, 12, '#8fd0ff', 'left');
-    label(ctx, 'PICK IT AT FIGHTER SELECT. USED = GONE.', lx + 14, ry + 196, 12, '#8fd0ff', 'left');
+    label(ctx, '4 · CARRY ONE INTO ARENA OR WAGER, THEN TAP THE CAN', lx, ry + 178, 12, '#8fd0ff', 'left');
+    label(ctx, '(OR PRESS R) TO DRINK IT MID-FIGHT. USED = GONE.', lx + 14, ry + 196, 12, '#8fd0ff', 'left');
   }
 
   // ---- Stash (inventory shelf, right-bottom) -----------------------------

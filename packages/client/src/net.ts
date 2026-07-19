@@ -177,6 +177,7 @@ export class NetSession {
     private email?: string, // AIR-account email — reputation write-back target only
     private ref?: string, // stashed dare code (?ref=) — redeemed server-side once
     private room?: string, // friendly rendezvous code (mode 'friendly' only)
+    private itemRow?: number, // CONSUMABLES (ADR 0007 Phase 4): drink to carry (wager)
   ) {
     this.connect(false);
   }
@@ -190,7 +191,7 @@ export class NetSession {
       if (resume && this.setup?.resume) {
         this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
       } else {
-        this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode, room: this.room });
+        this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode, room: this.room, item: this.itemRow || undefined });
         this.status = 'queued';
       }
       // RTT probe loop (additive to protocol 6 — an old server just never

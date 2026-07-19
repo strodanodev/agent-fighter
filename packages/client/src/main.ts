@@ -58,6 +58,7 @@ const P0_MAP: [string, number][] = [
   ['KeyA', Btn.Left], ['KeyD', Btn.Right], ['KeyW', Btn.Up], ['KeyS', Btn.Down],
   ['KeyT', Btn.LP], ['KeyY', Btn.MP], ['KeyU', Btn.HP],
   ['KeyG', Btn.LK], ['KeyH', Btn.MK], ['KeyJ', Btn.HK],
+  ['KeyR', Btn.Item], // drink the energy can (ADR 0007 Phase 3)
 ];
 const P1_MAP: [string, number][] = [
   ['ArrowLeft', Btn.Left], ['ArrowRight', Btn.Right], ['ArrowUp', Btn.Up], ['ArrowDown', Btn.Down],
@@ -65,6 +66,7 @@ const P1_MAP: [string, number][] = [
   ['KeyK', Btn.LK], ['KeyL', Btn.MK], ['Semicolon', Btn.HK],
   ['Numpad4', Btn.LP], ['Numpad5', Btn.MP], ['Numpad6', Btn.HP],
   ['Numpad1', Btn.LK], ['Numpad2', Btn.MK], ['Numpad3', Btn.HK],
+  ['ShiftRight', Btn.Item],
 ];
 const CONFIRM = [['KeyT', 'KeyY', 'KeyU', 'KeyG', 'KeyH', 'KeyJ'], ['KeyI', 'KeyO', 'KeyP', 'KeyK', 'KeyL', 'Semicolon']];
 
@@ -82,8 +84,15 @@ const localSide = (): 0 | 1 => (net ? net.side : 0);
  * The two must NEVER merge — the player's own stick would corrupt the motion
  * halfway through and turn a fireball into a random normal.
  */
-const pollLocal = (g: GameState): InputFrame =>
-  (autoSpecialActive() ? pollAutoSpecial(g.fighters[localSide()]) : pollPad(P0_MAP));
+/** Set for one fight-frame by a tap/click on the HUD can — OR'd into the
+ *  local input as Btn.Item (the keyboard 'R' rides P0_MAP directly). */
+let itemUseArmed = false;
+
+const pollLocal = (g: GameState): InputFrame => {
+  let f = autoSpecialActive() ? pollAutoSpecial(g.fighters[localSide()]) : pollPad(P0_MAP);
+  if (itemUseArmed) f |= Btn.Item;
+  return f;
+};
 
 /**
  * Menu taps. The draw functions register their tappable rects every frame
@@ -913,11 +922,12 @@ const startOnline = (m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: str
   localStorage.setItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
   queuedMode = m;
   queuedAgentOf = m === 'solo' ? agentOf ?? '' : ''; // rematch re-queues the same agent
-  // CONSUMABLES (ADR 0007 Phase 2): capture the drink pick NOW (the token
-  // fetch below is async) and spend it — one drink, one match. The entry
-  // leaves the local stash optimistically; the server is the truth and a
+  // CONSUMABLES (ADR 0007 Phase 3/4): capture the drink pick NOW (the token
+  // fetch below is async) and spend it — one drink, one match, drunk mid-fight
+  // with the Item button. Solo/arcade AND wager carry (open carry); friendly
+  // is dry. The stash leaves optimistically; the server is the truth and a
   // failed claim just means an item-less match. Rematches start empty-handed.
-  const itemRow = (m === 'solo' || m === 'arcade') && carryIdx >= 0
+  const itemRow = m !== 'friendly' && carryIdx >= 0
     ? shopInv[carryIdx]?.rowId : undefined;
   if (itemRow) shopInv = shopInv.filter((it) => it.rowId !== itemRow);
   carryIdx = -1;
@@ -936,7 +946,7 @@ const startOnline = (m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: str
     // solo house AI for the trained agent behind a dare code.
     net = m === 'wager' || m === 'friendly'
       ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(),
-        m === 'friendly' ? friendlyRoom : undefined)
+        m === 'friendly' ? friendlyRoom : undefined, m === 'wager' ? itemRow : undefined)
       : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(),
         m === 'arcade' ? { runToken } : undefined,
         m === 'solo' ? agentOf : undefined,
@@ -1031,7 +1041,7 @@ const installOnlineMatch = (): void => {
   // CONSUMABLES: the pinned drink is part of the stakes — show what's
   // being drunk (server echo = the truth, not what the player asked for).
   const drink = s.items?.[s.side];
-  if (drink) vsStakes.push(`🥤 ${drink.name} · LV ${drink.tier} IS IN PLAY`);
+  if (drink) vsStakes.push(`🥤 ${drink.name} · TAP THE CAN OR PRESS R TO DRINK`);
   const newChallenger = s.mode === 'arcade' && (s.arcade?.battle ?? 0) > 0;
   void audio.playStinger(newChallenger ? 'here_comes_a_new_challenger' : 'vs',
     { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
@@ -1409,7 +1419,11 @@ const renderFight = (g: GameState): void => {
           : `AGENT LV ${cpuLevelFor(profile, lever)}`]
         : undefined,
     autoSpecialCharged(g.fighters[localSide()]),
-    hudIds());
+    hudIds(),
+    // CONSUMABLES: which side is the human's, so drawHud makes only YOUR can
+    // tappable ('item:use') and prompts it. -1 for local 2P (both are human,
+    // no online item flow — practice mode carries nothing).
+    net ? localSide() : (mode === 'cpu' ? 0 : -1));
 
   // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
   // sweeps across the whole frame.
@@ -1417,10 +1431,11 @@ const renderFight = (g: GameState): void => {
 };
 
 // ---------------------------------------------------------------- screens
-/** Drinks ride into ranked PvE only for now: arcade (cpu-mode select) + solo. */
+/** Drinks ride into ranked modes: arcade (cpu select), solo dare, and wager
+ *  (online) — open carry (ADR 0007 Phase 4). Friendly stays dry. */
 const carryEligible = (): boolean =>
   shopInv.length > 0 && !selectingFriendly
-  && (mode === 'cpu' || Boolean(selectingAgentOf));
+  && (mode === 'cpu' || mode === 'online' || Boolean(selectingAgentOf));
 
 const tickSelect = (): void => {
   const n = allRosters.length;
@@ -1840,8 +1855,8 @@ const frame = (): void => {
     // for durable screens). Bottom-left, above the controls hint band.
     if (carryEligible()) {
       const it = carryIdx >= 0 ? shopInv[carryIdx] : undefined;
-      const label2 = it ? `🥤 ${it.name} · LV ${it.tier} — ${it.desc}` : '🥤 NO DRINK — FIGHT CLEAN';
-      const w = 340, h = 30, x = 14, y = VH - 78;
+      const label2 = it ? `🥤 CARRY ${it.name} · LV ${it.tier} — ${it.desc}` : '🥤 NO DRINK — FIGHT CLEAN';
+      const w = 360, h = 30, x = 14, y = VH - 78;
       tapZone(x, y, w, h, 'item:cycle');
       ctx.fillStyle = it ? 'rgba(24,44,26,0.88)' : 'rgba(12,10,24,0.8)';
       ctx.fillRect(x, y, w, h);
@@ -1995,6 +2010,10 @@ const frame = (): void => {
     if (taps.has('special') && fighters && !holdSim && !netDead) {
       startAutoSpecial(game, localSide(), fighters[localSide()].ch);
     }
+    // CONSUMABLES (ADR 0007 Phase 3): a tap/click on the HUD can arms Btn.Item
+    // for this frame's step(s). The keyboard 'R' rides P0_MAP on its own; both
+    // reach the sim as one input bit, which acts on the rising edge only.
+    itemUseArmed = taps.has('item:use') && !holdSim && !netDead;
     if (net && !holdSim && !netDead) {
       net.frame(pollLocal(game)); // session owns stepping (rollback or local-sim)
     } else if (!net && !holdSim) {
@@ -2002,6 +2021,7 @@ const frame = (): void => {
       const p2: InputFrame = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
       step(game, [pollLocal(game), p2]);
     }
+    itemUseArmed = false;
     updateJuice(game);
     updateCamera(game);
     renderFight(game);

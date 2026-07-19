@@ -123,6 +123,13 @@ interface Client {
   /** AIR-account email — only the reputation write-back target (ADR 0004). */
   email: string;
   /**
+   * CONSUMABLES (ADR 0007): the inventory rowId this client queued with, for
+   * WAGER — solo/arcade claim inline in their own start path, but wager pairs
+   * later in tryPair, so the pick is parked here between queue and pairing.
+   * 0 = fight dry. Cleared once claimed.
+   */
+  pendingItem: number;
+  /**
    * Measured round-trip to this client in ms (EMA; -1 = unknown). Fed by
    * the lobby ping loop's pong echoes; read once at pair time to size the
    * adaptive input delay. Client-supplied timing, so it is only ever used
@@ -798,7 +805,13 @@ export const createMatchServer = (opts: {
             continue;
           }
         }
-        startMatch(c0, c1, 'wager', fee, matchId);
+        // CONSUMABLES (ADR 0007 Phase 4): open carry — each side drinks its
+        // own. Claim both after escrow (a failed claim runs that side dry).
+        const p0 = await claimOne(c0, c0.pendingItem, matchId);
+        const p1 = await claimOne(c1, c1.pendingItem, matchId);
+        c0.pendingItem = 0;
+        c1.pendingItem = 0;
+        startMatch(c0, c1, 'wager', fee, matchId, undefined, undefined, [p0, p1]);
       }
     } finally {
       pairing = false;
@@ -818,30 +831,30 @@ export const createMatchServer = (opts: {
    * agent's owner is not a party to the match and earns nothing.
    */
   /**
-   * CONSUMABLES (ADR 0007 Phase 2): atomically claim the drink the player
-   * queued with and build its per-side pin. A failed claim (not yours,
-   * already drunk, raced another match) NEVER kills the match — the fee is
-   * already escrowed, so the match simply runs item-less and the client
-   * learns from the missing SMatch.items echo.
+   * CONSUMABLES (ADR 0007): atomically claim ONE client's queued drink and
+   * build its pin. A failed claim (not yours, already drunk, raced another
+   * match) NEVER kills the match — the fee is already escrowed, so it simply
+   * runs without that drink and the client learns from the SMatch.items echo.
    */
-  const claimItem = async (c: Client, itemRow: number, matchId: string):
-    Promise<[ItemPin | null, ItemPin | null]> => {
-    if (!itemRow || !persistence || !c.identity?.sub || isAgentClassSub(c.identity.sub)) {
-      return [null, null];
-    }
+  const claimOne = async (c: Client, itemRow: number, matchId: string): Promise<ItemPin | null> => {
+    if (!itemRow || !persistence || !c.identity?.sub || isAgentClassSub(c.identity.sub)) return null;
     try {
       const claimed = await persistence.consumeItem(c.identity.sub, itemRow, matchId);
       const def = claimed ? itemById(claimed.itemId) : undefined;
       if (claimed && def) {
         console.log(`[items] ${c.name} drinks ${def.id} (T${def.tier}) in ${matchId}`);
-        return [{ id: def.id, name: def.name, tier: def.tier, effect: def.effect }, null];
+        return { id: def.id, name: def.name, tier: def.tier, effect: def.effect };
       }
-      console.log(`[items] ${c.name} queued item row ${itemRow} but it wasn't consumable — match runs without it`);
+      console.log(`[items] ${c.name} queued item row ${itemRow} but it wasn't consumable — runs without it`);
     } catch (e) {
       console.log(`[items] claim failed in ${matchId}: ${String(e)}`);
     }
-    return [null, null];
+    return null;
   };
+
+  /** Solo/arcade: the human is side 0, the house has no inventory. */
+  const claimItem = async (c: Client, itemRow: number, matchId: string):
+    Promise<[ItemPin | null, ItemPin | null]> => [await claimOne(c, itemRow, matchId), null];
 
   const startSolo = async (c: Client, pin?: SoloPin, itemRow = 0): Promise<void> => {
     const fee = persistence ? SOLO_FEE : 0;
@@ -1093,9 +1106,10 @@ export const createMatchServer = (opts: {
           : msg.mode === 'friendly' ? 'friendly'
           : 'wager';
         const runToken = typeof msg.runToken === 'string' ? msg.runToken : '';
-        // CONSUMABLES (ADR 0007 Phase 2): solo/arcade only for now — wager
-        // waits for the open-carry rollout (Phase 4) behind the P1 CI gate.
-        const itemRow = (mode === 'solo' || mode === 'arcade')
+        // CONSUMABLES (ADR 0007 Phase 3/4): drinks ride solo/arcade AND wager
+        // (open carry — each player brings and drinks their own, at their own
+        // discretion). Friendly stays dry (unranked, anti-collusion).
+        const itemRow = mode !== 'friendly'
           && typeof msg.item === 'number' && Number.isInteger(msg.item) && msg.item > 0
           ? msg.item : 0;
         void (async () => {
@@ -1200,7 +1214,7 @@ export const createMatchServer = (opts: {
           c.state = 'queued';
           send(c, { t: 'queued' });
           if (mode === 'solo') await startSolo(c, undefined, itemRow);
-          else { queue.push(c); void tryPair(); }
+          else { c.pendingItem = itemRow; queue.push(c); void tryPair(); }
         })();
         return;
       }
@@ -1733,6 +1747,7 @@ export const createMatchServer = (opts: {
       identityReady: Promise.resolve(),
       account: null,
       email: '',
+      pendingItem: 0,
       rtt: -1,
     };
     clients.add(c);

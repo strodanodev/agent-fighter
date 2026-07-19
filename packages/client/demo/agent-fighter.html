@@ -189,8 +189,13 @@ const ROUND_SECONDS = 99;
  *            fields (itemDmg/itemDef/itemBuffLeft) change the serialize
  *            layout (all state hashes shift even for item-less matches:
  *            goldens re-blessed), and pinned drinks scale strike() damage.
+ * af-core-4: consumables become IN-MATCH activated (ADR 0007 Phase 3) — the
+ *            Btn.Item input bit drinks the can on demand; three more
+ *            FighterState fields (itemKind/itemAmount/itemDur) carry the
+ *            un-drunk drink. Serialize layout shifts again (goldens
+ *            re-blessed); no drink pressed = still bit-identical to pre-item.
  */
-const ENGINE_VERSION = 'af-core-3';
+const ENGINE_VERSION = 'af-core-4';
 const TUNING = {
     roundsToWin: 2, // best of 3
     preRoundTicks: 60,
@@ -624,11 +629,12 @@ const setCharacters = (c0, c1) => {
     characters[1] = c1;
 };
 /**
- * CONSUMABLES (ADR 0007 Phase 2): the per-side drink carried into the next
- * match. Same contract as setCharacters — install between matches, never
- * mid-sim, identical on every simulating peer (client, server verifier,
- * rollback re-sim). The pinned effect comes from SMatch and is applied at
- * spawn/round-reset; `[null, null]` (the default) is the pre-item behavior.
+ * CONSUMABLES (ADR 0007): the per-side drink CARRIED into the next match.
+ * Same contract as setCharacters — install between matches, never mid-sim,
+ * identical on every simulating peer (client, server verifier, rollback
+ * re-sim). The pinned effect comes from SMatch and is loaded into each
+ * fighter's carried slot at spawn (Phase 3: drunk on the Btn.Item press, not
+ * auto-applied). `[null, null]` (the default) is the pre-item behavior.
  *
  * Values are CLAMPED here (audit lesson: bound data at the boundary) — a
  * hostile pin can't mint a 10× damage drink or an hour-long buff.
@@ -645,18 +651,25 @@ const setMatchItems = (i0, i1) => {
     matchItems[0] = clampEffect(i0);
     matchItems[1] = clampEffect(i1);
 };
+/** Effect kind → the small integer stored in FighterState.itemKind (serialized). */
+const ITEM_KIND_CODE = {
+    heal: 1, damageMult: 2, defenseMult: 3, meterGain: 4,
+};
+/** The carried-drink trio for side `i` from the pinned loadout (0/0/0 = none). */
+const carriedItem = (i) => {
+    const e = matchItems[i];
+    return e
+        ? { kind: ITEM_KIND_CODE[e.kind], amount: e.amount, dur: e.durationTicks }
+        : { kind: 0, amount: 0, dur: 0 };
+};
 const SPAWN_OFFSET = 180;
-const spawnFighter = (x, facing, ch, side) => ({
+const spawnFighter = (x, facing, ch, _side) => ({
     x: fp(x),
     y: fp(STAGE.floorYPx),
     velX: 0,
     velY: 0,
     facing,
-    // PATCH drinks: start each round with bonus health (per-mille of max —
-    // an over-max head start that drains normally; the bar clamps at 100%).
-    health: matchItems[side]?.kind === 'heal'
-        ? Math.trunc((ch.b.maxHealth * (1000 + matchItems[side].amount)) / 1000)
-        : ch.b.maxHealth,
+    health: ch.b.maxHealth, // drinks are drunk mid-match now (Phase 3), not at spawn
     meter: 0,
     action: 0 /* Action.Idle */,
     actionFrame: 0,
@@ -687,12 +700,15 @@ const spawnFighter = (x, facing, ch, side) => ({
     wantThrow: 0,
     histIdx: 0,
     prevInput: 0,
-    // OVERCLOCK / FIREWALL drinks: the buff re-arms at every round start
-    // (spawnFighter runs for round 1 AND resetRound) for its durationTicks.
-    itemDmg: matchItems[side]?.kind === 'damageMult' ? matchItems[side].amount : 0,
-    itemDef: matchItems[side]?.kind === 'defenseMult' ? matchItems[side].amount : 0,
-    itemBuffLeft: (matchItems[side]?.kind === 'damageMult' || matchItems[side]?.kind === 'defenseMult')
-        ? matchItems[side].durationTicks : 0,
+    // Carried drink + active buff are set by the callers (match start loads
+    // from the pinned loadout; round reset carries the trio over like meter).
+    // Defaulting to empty here keeps spawnFighter side-effect-free.
+    itemKind: 0,
+    itemAmount: 0,
+    itemDur: 0,
+    itemDmg: 0,
+    itemDef: 0,
+    itemBuffLeft: 0,
     dirHist: new Array(HIST_LEN).fill(5),
 });
 const emptyProjectile = () => ({
@@ -717,22 +733,26 @@ const createGameState = (seed) => ({
     ],
     projectiles: Array.from({ length: PROJECTILE_SLOTS }, emptyProjectile),
 });
-/** Spawn side `i` at its corner, with VOLT meter granted at MATCH start only. */
+/** Spawn side `i` at match start, loading its carried drink from the pin. */
 const spawnItemFighter = (i) => {
     const f = spawnFighter(STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET), i === 0 ? 1 : -1, characters[i], i);
-    // VOLT drinks: instant meter, once per MATCH (meter persists across
-    // rounds, so resetRound must not re-grant — it keeps the live meter).
-    if (matchItems[i]?.kind === 'meterGain') {
-        f.meter = Math.min(TUNING.meterMax, matchItems[i].amount);
-    }
+    const it = carriedItem(i);
+    f.itemKind = it.kind;
+    f.itemAmount = it.amount;
+    f.itemDur = it.dur;
     return f;
 };
 /** Between rounds: reset positions/health/actions; meter and score persist. */
 const resetRound = (s) => {
     for (const i of [0, 1]) {
-        const keepMeter = s.fighters[i].meter;
+        const prev = s.fighters[i];
         const fresh = spawnFighter(STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET), i === 0 ? 1 : -1, characters[i], i);
-        fresh.meter = keepMeter; // meter persists; VOLT is match-start only
+        fresh.meter = prev.meter; // meter persists across rounds
+        // The carried drink persists too — one can per MATCH, drink it any round.
+        // The ACTIVE buff does NOT carry (a fresh round, fresh health/positions).
+        fresh.itemKind = prev.itemKind;
+        fresh.itemAmount = prev.itemAmount;
+        fresh.itemDur = prev.itemDur;
         s.fighters[i] = fresh;
     }
     for (let i = 0; i < PROJECTILE_SLOTS; i++)
@@ -775,7 +795,7 @@ const FIGHTER_FIELDS = [
     'tapDir', 'tapTimer', 'dashBuf', 'dashBufLeft',
     'pushblocked', 'techLeft', 'throwBack', 'launchJC', 'wantThrow',
     'histIdx', 'prevInput',
-    'itemDmg', 'itemDef', 'itemBuffLeft',
+    'itemKind', 'itemAmount', 'itemDur', 'itemDmg', 'itemDef', 'itemBuffLeft',
 ];
 const PROJECTILE_FIELDS = [
     'active', 'owner', 'moveIdx', 'x', 'y', 'velX', 'life', 'hasHit',
@@ -884,6 +904,7 @@ const hurtboxesOf = (f, ch) => {
 const gatherInputs = (f, input) => {
     const prev = f.prevInput;
     const upEdge = held(input, 4 /* Btn.Up */) && !held(prev, 4 /* Btn.Up */);
+    const itemEdge = held(input, 1024 /* Btn.Item */) && !held(prev, 1024 /* Btn.Item */);
     // Direction history (numpad, facing-relative).
     f.histIdx = (f.histIdx + 1) % 16;
     f.dirHist[f.histIdx] = numpadDir(input, f.facing);
@@ -915,7 +936,7 @@ const gatherInputs = (f, input) => {
     if (f.dashBufLeft > 0 && --f.dashBufLeft === 0)
         f.dashBuf = 0;
     f.prevInput = input;
-    return { input, edges, upEdge };
+    return { input, edges, upEdge, itemEdge };
 };
 // ---------------------------------------------------------------------------
 // Attack startup — buffer consumption, move selection, cancels
@@ -1311,6 +1332,42 @@ const canBlock = (vic, threatX, guard) => {
         return !crouching;
     return true;
 };
+/**
+ * CONSUMABLES (ADR 0007 Phase 3): drink the carried can. Only fires on the
+ * Btn.Item rising edge, only when the fighter is FREE on the ground (idle /
+ * walking / crouching — never mid-attack, mid-air, in a combo, or blocking,
+ * so it can't be a mid-combo escape). Spends the drink (kind → 0) and either
+ * heals / grants meter instantly or arms a timed damage/defense buff.
+ */
+const useItem = (f, ch) => {
+    if (f.itemKind === 0)
+        return;
+    const free = f.action === 0 /* Action.Idle */ || f.action === 1 /* Action.WalkF */
+        || f.action === 2 /* Action.WalkB */ || f.action === 3 /* Action.Crouch */;
+    if (!free)
+        return;
+    switch (f.itemKind) {
+        case 1: // heal: restore per-mille of max, capped at full (no mid-fight overheal)
+            f.health = Math.min(ch.b.maxHealth, f.health + Math.trunc((ch.b.maxHealth * f.itemAmount) / 1000));
+            break;
+        case 2: // damage up: arm the timed OVERCLOCK buff
+            f.itemDmg = f.itemAmount;
+            f.itemBuffLeft = f.itemDur;
+            break;
+        case 3: // defense up: arm the timed FIREWALL buff
+            f.itemDef = f.itemAmount;
+            f.itemBuffLeft = f.itemDur;
+            break;
+        case 4: // meter: instant, clamped to the bar cap
+            f.meter = Math.min(TUNING.meterMax, f.meter + f.itemAmount);
+            break;
+        default:
+            break;
+    }
+    f.itemKind = 0; // one can per match — spent
+    f.itemAmount = 0;
+    f.itemDur = 0;
+};
 /** Item-buff damage pipeline: attacker's OVERCLOCK, then victim's FIREWALL. */
 const itemScaled = (dmg, src, vic, floor) => {
     let d = dmg;
@@ -1581,6 +1638,12 @@ const step = (s, inputs) => {
         return;
     }
     autoFace(f0, f1);
+    // Drink the can (ADR 0007 Phase 3) BEFORE this tick's actions resolve, so
+    // an armed OVERCLOCK/heal applies to what happens this frame.
+    if (io0.itemEdge)
+        useItem(f0, c0);
+    if (io1.itemEdge)
+        useItem(f1, c1);
     // Item buffs (ADR 0007) burn only during live fighting — pre-round,
     // round-over, hitstop and super flash all return before this line.
     if (f0.itemBuffLeft > 0)
@@ -3301,6 +3364,7 @@ class NetSession {
     email;
     ref;
     room;
+    itemRow;
     status = 'connecting';
     error = '';
     setup = null;
@@ -3343,7 +3407,8 @@ class NetSession {
     retryTimer = null;
     constructor(url, name, character, bundleHash, authToken, mode = 'wager', email, // AIR-account email — reputation write-back target only
     ref, // stashed dare code (?ref=) — redeemed server-side once
-    room) {
+    room, // friendly rendezvous code (mode 'friendly' only)
+    itemRow) {
         this.url = url;
         this.name = name;
         this.character = character;
@@ -3353,6 +3418,7 @@ class NetSession {
         this.email = email;
         this.ref = ref;
         this.room = room;
+        this.itemRow = itemRow;
         this.connect(false);
     }
     /** Open a socket — either the initial queue or a resume of a live match. */
@@ -3365,7 +3431,7 @@ class NetSession {
                 this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
             }
             else {
-                this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode, room: this.room });
+                this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode, room: this.room, item: this.itemRow || undefined });
                 this.status = 'queued';
             }
             // RTT probe loop (additive to protocol 6 — an old server just never
@@ -5796,14 +5862,67 @@ const drawPlayerId = (ctx, i, id) => {
         label(ctx, parts.join('  ·  '), ax, y + 13, 11, gold ? '#ffd23a' : '#cfe0ef', align, true);
     }
 };
+/** Item-effect kind code (state.ts) → HUD accent + tiny label. */
+const ITEM_KIND_UI = {
+    1: { color: '#7ddf8a', tag: 'HEAL' },
+    2: { color: '#ff9d6b', tag: 'PWR' },
+    3: { color: '#6fd3ff', tag: 'DEF' },
+    4: { color: '#ffd166', tag: 'MTR' },
+};
+/**
+ * CONSUMABLES (ADR 0007 Phase 3): the energy-drink slot below each health
+ * bar. A CARRIED (un-drunk) can shows tappable for the local player — click
+ * it or press R to drink. Once drunk, a timed buff shows its countdown; an
+ * instant drink (heal/meter) just vanishes. Sits in the clear band right of
+ * the nameplate, below the health bar. `isLocal` = the human's own can.
+ */
+const drawItemSlot = (ctx, i, f, tick, isLocal) => {
+    const w = 20, h = 28;
+    const x = i === 0 ? HUD.edge + HUD.nameW + 22 : VW - HUD.edge - HUD.nameW - 22 - w;
+    const y = HUD.barY + HUD.barH + 4;
+    if (f.itemKind !== 0) {
+        // Carried, un-drunk.
+        const ui = ITEM_KIND_UI[f.itemKind] ?? { color: '#cfd8e3', tag: 'CAN' };
+        if (isLocal) {
+            // Yours: pulse, prompt, and make the whole slot a tap target.
+            tapZone(x - 8, y - 6, w + 16, h + 24, 'item:use');
+            const pulse = 0.5 + 0.5 * Math.abs(Math.sin(tick / 14));
+            ctx.save();
+            ctx.shadowColor = ui.color;
+            ctx.shadowBlur = 6 + 10 * pulse;
+            drawCan(ctx, x, y, w, h, ui.color, 4);
+            ctx.restore();
+            label(ctx, ui.tag, x + w / 2, y + h + 10, 9, ui.color);
+            label(ctx, 'R', x + w / 2, y - 3, 10, tick % 40 < 30 ? '#ffffff' : ui.color);
+        }
+        else {
+            // Opponent's carried drink — informational, dimmer, no tap zone.
+            ctx.save();
+            ctx.globalAlpha = 0.7;
+            drawCan(ctx, x, y, w, h, ui.color, 0);
+            ctx.restore();
+            label(ctx, ui.tag, x + w / 2, y + h + 10, 9, `${ui.color}aa`);
+        }
+        return;
+    }
+    // Drunk: show the active timed buff's countdown, blinking the last 3s.
+    if (f.itemBuffLeft > 0) {
+        const secs = Math.ceil(f.itemBuffLeft / TICKS_PER_SEC);
+        const color = f.itemDmg > 0 ? '#ff9d6b' : '#6fd3ff';
+        if (!(secs <= 3 && tick % 24 < 12)) {
+            drawCan(ctx, x, y, w, h, color, 6);
+            label(ctx, `${secs}s`, x + w / 2, y + h + 10, 10, '#ffffffdd');
+        }
+    }
+};
 const drawHud = (ctx, g, rosters, fx, tags, // per-player nameplate suffix (e.g. "AGENT LV 12")
 autoSpecialCharged = false, // local player has ≥1 bar → logo badge glows red
-ids) => {
+ids, // wallet + stats strip under each HUD block
+localSide = -1) => {
     for (const i of [0, 1]) {
         const f = g.fighters[i];
         const max = rosters[i].ch.b.maxHealth;
-        // PATCH drinks spawn ABOVE max health — the bar clamps full and simply
-        // doesn't drain until the overheal is chewed through.
+        // A mid-match HEAL is capped at max, so the bar never exceeds full.
         const ratio = Math.min(1, Math.max(0, f.health) / max);
         drawHealthBar(ctx, i, ratio, fx.flash[i], g.tick);
         drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
@@ -5812,17 +5931,7 @@ ids) => {
         drawMeter(ctx, i, f.meter, g.tick);
         if (ids?.[i])
             drawPlayerId(ctx, i, ids[i]);
-        // Item buff chip (ADR 0007): a live drink shows its can + countdown just
-        // inside the health bar's end; expiry blinks the last 3 seconds.
-        if (f.itemBuffLeft > 0) {
-            const secs = Math.ceil(f.itemBuffLeft / TICKS_PER_SEC);
-            const blink = secs <= 3 && g.tick % 24 < 14;
-            const bx = i === 0 ? HUD.edge + HUD.barW + 10 : VW - HUD.edge - HUD.barW - 26;
-            if (!blink) {
-                drawCan(ctx, bx, HUD.barY + 2, 16, 30, f.itemDmg > 0 ? '#ff9d6b' : '#6fd3ff', 6);
-                label(ctx, `${secs}`, bx + 8, HUD.barY + 46, 12, '#ffffffdd');
-            }
-        }
+        drawItemSlot(ctx, i, f, g.tick, i === localSide);
     }
     drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
     // Combo counter: punches in on each new hit (re-triggered via comboAge
@@ -6431,7 +6540,7 @@ const drawShop = (ctx, tick, v) => {
                 : { from: '#ffffff', mid: '#cfd8e3', to: '#6b7686', outline: '#101318', align: 'left' });
         label(ctx, v.reveal.desc, rx + 118, ry + 104, 14, '#ffffffdd', 'left');
         label(ctx, `“${v.reveal.flavor}”`, rx + 118, ry + 126, 11, '#ffffff88', 'left');
-        label(ctx, 'PICK IT AT FIGHTER SELECT — ONE DRINK PER FIGHT', rx + 118, ry + 158, 10, '#8fd0ff', 'left');
+        label(ctx, 'CARRY IT INTO ARENA OR WAGER · DRINK IT MID-FIGHT (TAP / R)', rx + 118, ry + 158, 10, '#8fd0ff', 'left');
         ctx.restore();
         // Sparkle ring on a fresh LV3.
         if (tier === 3 && v.revealAge < 40) {
@@ -6530,8 +6639,8 @@ const drawShop = (ctx, tick, v) => {
         }
         // Narrow segments get their tags to the right of the bar.
         label(ctx, 'LV 2 · 25%   LV 3 · 5%', obX + obW * 0.7 + 6, obY + 31, 9, '#ffffff88', 'left');
-        label(ctx, '4 · ONE DRINK RIDES INTO YOUR NEXT ARENA / WAGER FIGHT —', lx, ry + 178, 12, '#8fd0ff', 'left');
-        label(ctx, 'PICK IT AT FIGHTER SELECT. USED = GONE.', lx + 14, ry + 196, 12, '#8fd0ff', 'left');
+        label(ctx, '4 · CARRY ONE INTO ARENA OR WAGER, THEN TAP THE CAN', lx, ry + 178, 12, '#8fd0ff', 'left');
+        label(ctx, '(OR PRESS R) TO DRINK IT MID-FIGHT. USED = GONE.', lx + 14, ry + 196, 12, '#8fd0ff', 'left');
     }
     // ---- Stash (inventory shelf, right-bottom) -----------------------------
     const sy = 348;
@@ -8637,6 +8746,7 @@ const P0_MAP = [
     ['KeyA', 1 /* Btn.Left */], ['KeyD', 2 /* Btn.Right */], ['KeyW', 4 /* Btn.Up */], ['KeyS', 8 /* Btn.Down */],
     ['KeyT', 16 /* Btn.LP */], ['KeyY', 32 /* Btn.MP */], ['KeyU', 64 /* Btn.HP */],
     ['KeyG', 128 /* Btn.LK */], ['KeyH', 256 /* Btn.MK */], ['KeyJ', 512 /* Btn.HK */],
+    ['KeyR', 1024 /* Btn.Item */], // drink the energy can (ADR 0007 Phase 3)
 ];
 const P1_MAP = [
     ['ArrowLeft', 1 /* Btn.Left */], ['ArrowRight', 2 /* Btn.Right */], ['ArrowUp', 4 /* Btn.Up */], ['ArrowDown', 8 /* Btn.Down */],
@@ -8644,6 +8754,7 @@ const P1_MAP = [
     ['KeyK', 128 /* Btn.LK */], ['KeyL', 256 /* Btn.MK */], ['Semicolon', 512 /* Btn.HK */],
     ['Numpad4', 16 /* Btn.LP */], ['Numpad5', 32 /* Btn.MP */], ['Numpad6', 64 /* Btn.HP */],
     ['Numpad1', 128 /* Btn.LK */], ['Numpad2', 256 /* Btn.MK */], ['Numpad3', 512 /* Btn.HK */],
+    ['ShiftRight', 1024 /* Btn.Item */],
 ];
 const CONFIRM = [['KeyT', 'KeyY', 'KeyU', 'KeyG', 'KeyH', 'KeyJ'], ['KeyI', 'KeyO', 'KeyP', 'KeyK', 'KeyL', 'Semicolon']];
 const pollPad = (map) => {
@@ -8660,7 +8771,15 @@ const localSide = () => (net ? net.side : 0);
  * The two must NEVER merge — the player's own stick would corrupt the motion
  * halfway through and turn a fireball into a random normal.
  */
-const pollLocal = (g) => (autoSpecialActive() ? pollAutoSpecial(g.fighters[localSide()]) : pollPad(P0_MAP));
+/** Set for one fight-frame by a tap/click on the HUD can — OR'd into the
+ *  local input as Btn.Item (the keyboard 'R' rides P0_MAP directly). */
+let itemUseArmed = false;
+const pollLocal = (g) => {
+    let f = autoSpecialActive() ? pollAutoSpecial(g.fighters[localSide()]) : pollPad(P0_MAP);
+    if (itemUseArmed)
+        f |= 1024 /* Btn.Item */;
+    return f;
+};
 /**
  * Menu taps. The draw functions register their tappable rects every frame
  * (ui.ts tapZone), so a pointer press just hit-tests the CURRENT layout and
@@ -9440,11 +9559,12 @@ const startOnline = (m, runToken, agentOf) => {
     localStorage.setItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
     queuedMode = m;
     queuedAgentOf = m === 'solo' ? agentOf ?? '' : ''; // rematch re-queues the same agent
-    // CONSUMABLES (ADR 0007 Phase 2): capture the drink pick NOW (the token
-    // fetch below is async) and spend it — one drink, one match. The entry
-    // leaves the local stash optimistically; the server is the truth and a
+    // CONSUMABLES (ADR 0007 Phase 3/4): capture the drink pick NOW (the token
+    // fetch below is async) and spend it — one drink, one match, drunk mid-fight
+    // with the Item button. Solo/arcade AND wager carry (open carry); friendly
+    // is dry. The stash leaves optimistically; the server is the truth and a
     // failed claim just means an item-less match. Rematches start empty-handed.
-    const itemRow = (m === 'solo' || m === 'arcade') && carryIdx >= 0
+    const itemRow = m !== 'friendly' && carryIdx >= 0
         ? shopInv[carryIdx]?.rowId : undefined;
     if (itemRow)
         shopInv = shopInv.filter((it) => it.rowId !== itemRow);
@@ -9464,7 +9584,7 @@ const startOnline = (m, runToken, agentOf) => {
         // friendly: rollback PvP over the relay. `agentOf` (ADR 0006) swaps the
         // solo house AI for the trained agent behind a dare code.
         net = m === 'wager' || m === 'friendly'
-            ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(), m === 'friendly' ? friendlyRoom : undefined)
+            ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(), m === 'friendly' ? friendlyRoom : undefined, m === 'wager' ? itemRow : undefined)
             : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(), m === 'arcade' ? { runToken } : undefined, m === 'solo' ? agentOf : undefined, itemRow);
     });
 };
@@ -9557,7 +9677,7 @@ const installOnlineMatch = () => {
     // being drunk (server echo = the truth, not what the player asked for).
     const drink = s.items?.[s.side];
     if (drink)
-        vsStakes.push(`🥤 ${drink.name} · LV ${drink.tier} IS IN PLAY`);
+        vsStakes.push(`🥤 ${drink.name} · TAP THE CAN OR PRESS R TO DRINK`);
     const newChallenger = s.mode === 'arcade' && (s.arcade?.battle ?? 0) > 0;
     void audio.playStinger(newChallenger ? 'here_comes_a_new_challenger' : 'vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
@@ -9922,15 +10042,20 @@ const renderFight = (g) => {
             ? ['', arcade
                     ? `BATTLE ${arcade.stage + 1}/${arcade.total}`
                     : `AGENT LV ${cpuLevelFor(profile, lever)}`]
-            : undefined, autoSpecialCharged(g.fighters[localSide()]), hudIds());
+            : undefined, autoSpecialCharged(g.fighters[localSide()]), hudIds(), 
+    // CONSUMABLES: which side is the human's, so drawHud makes only YOUR can
+    // tappable ('item:use') and prompts it. -1 for local 2P (both are human,
+    // no online item flow — practice mode carries nothing).
+    net ? localSide() : (mode === 'cpu' ? 0 : -1));
     // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
     // sweeps across the whole frame.
     drawFx(ctx, 'screen');
 };
 // ---------------------------------------------------------------- screens
-/** Drinks ride into ranked PvE only for now: arcade (cpu-mode select) + solo. */
+/** Drinks ride into ranked modes: arcade (cpu select), solo dare, and wager
+ *  (online) — open carry (ADR 0007 Phase 4). Friendly stays dry. */
 const carryEligible = () => shopInv.length > 0 && !selectingFriendly
-    && (mode === 'cpu' || Boolean(selectingAgentOf));
+    && (mode === 'cpu' || mode === 'online' || Boolean(selectingAgentOf));
 const tickSelect = () => {
     const n = allRosters.length;
     const enabled = (i) => !allRosters[i]?.disabled;
@@ -10429,8 +10554,8 @@ const frame = () => {
         // for durable screens). Bottom-left, above the controls hint band.
         if (carryEligible()) {
             const it = carryIdx >= 0 ? shopInv[carryIdx] : undefined;
-            const label2 = it ? `🥤 ${it.name} · LV ${it.tier} — ${it.desc}` : '🥤 NO DRINK — FIGHT CLEAN';
-            const w = 340, h = 30, x = 14, y = VH - 78;
+            const label2 = it ? `🥤 CARRY ${it.name} · LV ${it.tier} — ${it.desc}` : '🥤 NO DRINK — FIGHT CLEAN';
+            const w = 360, h = 30, x = 14, y = VH - 78;
             tapZone(x, y, w, h, 'item:cycle');
             ctx.fillStyle = it ? 'rgba(24,44,26,0.88)' : 'rgba(12,10,24,0.8)';
             ctx.fillRect(x, y, w, h);
@@ -10598,6 +10723,10 @@ const frame = () => {
         if (taps.has('special') && fighters && !holdSim && !netDead) {
             startAutoSpecial(game, localSide(), fighters[localSide()].ch);
         }
+        // CONSUMABLES (ADR 0007 Phase 3): a tap/click on the HUD can arms Btn.Item
+        // for this frame's step(s). The keyboard 'R' rides P0_MAP on its own; both
+        // reach the sim as one input bit, which acts on the rising edge only.
+        itemUseArmed = taps.has('item:use') && !holdSim && !netDead;
         if (net && !holdSim && !netDead) {
             net.frame(pollLocal(game)); // session owns stepping (rollback or local-sim)
         }
@@ -10606,6 +10735,7 @@ const frame = () => {
             const p2 = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
             step(game, [pollLocal(game), p2]);
         }
+        itemUseArmed = false;
         updateJuice(game);
         updateCamera(game);
         renderFight(game);

@@ -72,12 +72,18 @@ export interface FighterState {
   wantThrow: number; // within-tick throw intent: 0/1 fwd/2 back (cleared each tick)
   histIdx: number;
   prevInput: number;
-  // CONSUMABLES (ADR 0007 Phase 2) — set at spawn from the pinned match
-  // loadout, all zero when no drink was carried (strictly additive: a
-  // no-item match behaves bit-identically to pre-item builds).
-  itemDmg: number; // per-mille damage bonus while itemBuffLeft > 0
-  itemDef: number; // per-mille damage-taken reduction while itemBuffLeft > 0
-  itemBuffLeft: number; // buff ticks remaining (counts down in step)
+  // CONSUMABLES (ADR 0007 Phase 3) — an energy drink is now CARRIED into the
+  // match and DRUNK on demand (the Btn.Item press), not auto-applied at spawn.
+  // The carried trio is match-scoped (survives round resets, like meter);
+  // pressing Item spends it (kind → 0) and either heals/grants meter instantly
+  // or starts a timed buff. All zero when no drink was carried, so an
+  // item-less match is bit-identical to pre-item builds.
+  itemKind: number; // carried drink: 0 none/spent, 1 heal, 2 dmg, 3 def, 4 meter
+  itemAmount: number; // carried drink strength (per-mille or raw meter)
+  itemDur: number; // carried drink buff duration in ticks (timed kinds only)
+  itemDmg: number; // ACTIVE: per-mille damage bonus while itemBuffLeft > 0
+  itemDef: number; // ACTIVE: per-mille damage-taken reduction while itemBuffLeft > 0
+  itemBuffLeft: number; // ACTIVE buff ticks remaining (counts down in step)
   dirHist: number[]; // ring buffer of numpad dirs, length HIST_LEN
 }
 
@@ -129,11 +135,12 @@ export const setCharacters = (c0: LoadedCharacter, c1: LoadedCharacter): void =>
 };
 
 /**
- * CONSUMABLES (ADR 0007 Phase 2): the per-side drink carried into the next
- * match. Same contract as setCharacters — install between matches, never
- * mid-sim, identical on every simulating peer (client, server verifier,
- * rollback re-sim). The pinned effect comes from SMatch and is applied at
- * spawn/round-reset; `[null, null]` (the default) is the pre-item behavior.
+ * CONSUMABLES (ADR 0007): the per-side drink CARRIED into the next match.
+ * Same contract as setCharacters — install between matches, never mid-sim,
+ * identical on every simulating peer (client, server verifier, rollback
+ * re-sim). The pinned effect comes from SMatch and is loaded into each
+ * fighter's carried slot at spawn (Phase 3: drunk on the Btn.Item press, not
+ * auto-applied). `[null, null]` (the default) is the pre-item behavior.
  *
  * Values are CLAMPED here (audit lesson: bound data at the boundary) — a
  * hostile pin can't mint a 10× damage drink or an hour-long buff.
@@ -151,21 +158,30 @@ export const setMatchItems = (i0: ItemEffect | null, i1: ItemEffect | null): voi
   matchItems[1] = clampEffect(i1);
 };
 
+/** Effect kind → the small integer stored in FighterState.itemKind (serialized). */
+const ITEM_KIND_CODE: Record<ItemEffect['kind'], number> = {
+  heal: 1, damageMult: 2, defenseMult: 3, meterGain: 4,
+};
+
+/** The carried-drink trio for side `i` from the pinned loadout (0/0/0 = none). */
+const carriedItem = (i: 0 | 1): { kind: number; amount: number; dur: number } => {
+  const e = matchItems[i];
+  return e
+    ? { kind: ITEM_KIND_CODE[e.kind], amount: e.amount, dur: e.durationTicks }
+    : { kind: 0, amount: 0, dur: 0 };
+};
+
 const SPAWN_OFFSET = 180;
 
 const spawnFighter = (
-  x: number, facing: 1 | -1, ch: LoadedCharacter, side: 0 | 1,
+  x: number, facing: 1 | -1, ch: LoadedCharacter, _side: 0 | 1,
 ): FighterState => ({
   x: fp(x),
   y: fp(STAGE.floorYPx),
   velX: 0,
   velY: 0,
   facing,
-  // PATCH drinks: start each round with bonus health (per-mille of max —
-  // an over-max head start that drains normally; the bar clamps at 100%).
-  health: matchItems[side]?.kind === 'heal'
-    ? Math.trunc((ch.b.maxHealth * (1000 + matchItems[side]!.amount)) / 1000)
-    : ch.b.maxHealth,
+  health: ch.b.maxHealth, // drinks are drunk mid-match now (Phase 3), not at spawn
   meter: 0,
   action: Action.Idle,
   actionFrame: 0,
@@ -196,12 +212,15 @@ const spawnFighter = (
   wantThrow: 0,
   histIdx: 0,
   prevInput: 0,
-  // OVERCLOCK / FIREWALL drinks: the buff re-arms at every round start
-  // (spawnFighter runs for round 1 AND resetRound) for its durationTicks.
-  itemDmg: matchItems[side]?.kind === 'damageMult' ? matchItems[side]!.amount : 0,
-  itemDef: matchItems[side]?.kind === 'defenseMult' ? matchItems[side]!.amount : 0,
-  itemBuffLeft: (matchItems[side]?.kind === 'damageMult' || matchItems[side]?.kind === 'defenseMult')
-    ? matchItems[side]!.durationTicks : 0,
+  // Carried drink + active buff are set by the callers (match start loads
+  // from the pinned loadout; round reset carries the trio over like meter).
+  // Defaulting to empty here keeps spawnFighter side-effect-free.
+  itemKind: 0,
+  itemAmount: 0,
+  itemDur: 0,
+  itemDmg: 0,
+  itemDef: 0,
+  itemBuffLeft: 0,
   dirHist: new Array(HIST_LEN).fill(5),
 });
 
@@ -229,7 +248,7 @@ export const createGameState = (seed: number): GameState => ({
   projectiles: Array.from({ length: PROJECTILE_SLOTS }, emptyProjectile),
 });
 
-/** Spawn side `i` at its corner, with VOLT meter granted at MATCH start only. */
+/** Spawn side `i` at match start, loading its carried drink from the pin. */
 const spawnItemFighter = (i: 0 | 1): FighterState => {
   const f = spawnFighter(
     STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET),
@@ -237,25 +256,29 @@ const spawnItemFighter = (i: 0 | 1): FighterState => {
     characters[i],
     i,
   );
-  // VOLT drinks: instant meter, once per MATCH (meter persists across
-  // rounds, so resetRound must not re-grant — it keeps the live meter).
-  if (matchItems[i]?.kind === 'meterGain') {
-    f.meter = Math.min(TUNING.meterMax, matchItems[i]!.amount);
-  }
+  const it = carriedItem(i);
+  f.itemKind = it.kind;
+  f.itemAmount = it.amount;
+  f.itemDur = it.dur;
   return f;
 };
 
 /** Between rounds: reset positions/health/actions; meter and score persist. */
 export const resetRound = (s: GameState): void => {
   for (const i of [0, 1] as const) {
-    const keepMeter = s.fighters[i].meter;
+    const prev = s.fighters[i];
     const fresh = spawnFighter(
       STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET),
       i === 0 ? 1 : -1,
       characters[i],
       i,
     );
-    fresh.meter = keepMeter; // meter persists; VOLT is match-start only
+    fresh.meter = prev.meter; // meter persists across rounds
+    // The carried drink persists too — one can per MATCH, drink it any round.
+    // The ACTIVE buff does NOT carry (a fresh round, fresh health/positions).
+    fresh.itemKind = prev.itemKind;
+    fresh.itemAmount = prev.itemAmount;
+    fresh.itemDur = prev.itemDur;
     s.fighters[i] = fresh as GameState['fighters'][0];
   }
   for (let i = 0; i < PROJECTILE_SLOTS; i++) s.projectiles[i] = emptyProjectile();
@@ -299,7 +322,7 @@ const FIGHTER_FIELDS = [
   'tapDir', 'tapTimer', 'dashBuf', 'dashBufLeft',
   'pushblocked', 'techLeft', 'throwBack', 'launchJC', 'wantThrow',
   'histIdx', 'prevInput',
-  'itemDmg', 'itemDef', 'itemBuffLeft',
+  'itemKind', 'itemAmount', 'itemDur', 'itemDmg', 'itemDef', 'itemBuffLeft',
 ] as const;
 
 const PROJECTILE_FIELDS = [

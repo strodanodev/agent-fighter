@@ -165,7 +165,10 @@ describe('consumables in matches (ADR 0007 Phase 2)', () => {
     server = await createMatchServer({ port: 0, persistence: mem, noPaceCheck: true, idleForfeitMs: 700 });
     http = `http://localhost:${server.port}`;
   });
-  after(() => server.close());
+  after(() => {
+    for (const ws of wagerSockets) { try { ws.close(); } catch { /* already closed */ } }
+    server.close();
+  });
 
   it('a solo match with a drink pins it, verifies end-to-end, and consumes it', async () => {
     const drink = await buy('Drinker', 'phase2-pull-1');
@@ -227,7 +230,70 @@ describe('consumables in matches (ADR 0007 Phase 2)', () => {
     await new Promise((r) => setTimeout(r, 300)); // releaseItems is fire-and-forget
     assert.ok((await inventory('Ghost')).includes(drink.rowId), 'the un-drunk drink is back in the stash');
   });
+
+  // Bank +20 credits via a fabricated settled wager win (the memory impl pays
+  // fee*2 to the winner with no prior escrow) — a fresh account's daily 10
+  // can't cover both a 5-CR drink AND the 10-CR wager fee in one day.
+  const fund = async (who: string, matchId: string): Promise<void> => {
+    await mem.recordMatch({
+      matchId, mode: 'wager', fee: 10,
+      identities: [{ sub: `dev:${who}` } as never, { sub: 'dev:Loser' } as never],
+      names: [who, 'Loser'], agents: [false, false], chars: ['analog', 'analog'],
+      winner: 0, reason: 'verified', rounds: [2, 0], endTick: 1000, hash: 1,
+      engine: ENGINE_VERSION,
+    });
+  };
+
+  it('WAGER open carry: each side pins its OWN drink into the setup (Phase 4)', async () => {
+    await fund('WagerA', 'fund-a');
+    await fund('WagerB', 'fund-b');
+    const a = await buy('WagerA', 'phase4-a');
+    const b = await buy('WagerB', 'phase4-b');
+    // Two humans queue wager, each carrying their own can → paired, and each
+    // setup echoes items[thisSide] = my drink, items[otherSide] = theirs.
+    const setups = await Promise.all([
+      rawWager(server.port, 'WagerA', a.rowId),
+      rawWager(server.port, 'WagerB', b.rowId),
+    ]);
+    for (const setup of setups) {
+      const side = setup.side as number;
+      const items = setup.items as Array<{ id: string } | null> | undefined;
+      assert.ok(items, 'wager setup carries items');
+      assert.ok(items[side], 'this side has a drink');
+      assert.ok(items[1 - side], 'the opponent has a drink too (open carry)');
+    }
+    // Both drinks were consumed at pair time.
+    assert.deepEqual(await inventory('WagerA'), []);
+    assert.deepEqual(await inventory('WagerB'), []);
+  });
 });
+
+/**
+ * Wager sockets must stay OPEN until both sides pair (the setup arrives only
+ * after pairing), so they can't self-close on 'match' like the solo helper.
+ * They're parked here and closed in the describe's `after` hook — leaving a
+ * ws open keeps node's event loop alive and the whole test process never
+ * exits (the bug that made the suite look "hung"). Closing later triggers a
+ * harmless no-contest; the test's assertions already ran while they were open.
+ */
+const wagerSockets: WebSocket[] = [];
+
+/** Raw WAGER queue → resolve the SMatch setup (socket parked for cleanup). */
+const rawWager = (port: number, name: string, item: number): Promise<Record<string, unknown>> =>
+  new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://localhost:${port}`);
+    wagerSockets.push(ws);
+    const timer = setTimeout(() => { ws.close(); reject(new Error('no wager setup before timeout')); }, 8_000);
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ t: 'hello', v: PROTOCOL_VERSION, name, engine: ENGINE_VERSION }));
+      ws.send(JSON.stringify({ t: 'queue', character: 'analog', mode: 'wager', item }));
+    });
+    ws.on('message', (d) => {
+      const m = JSON.parse(String(d)) as Record<string, unknown>;
+      if (m.t === 'match') { clearTimeout(timer); resolve(m); } // keep socket for pairing
+      if (m.t === 'error') { clearTimeout(timer); ws.close(); reject(new Error(String(m.msg))); }
+    });
+  });
 
 /** Raw solo queue → resolve the SMatch setup (then abandon the socket). */
 const rawSolo = (port: number, name: string, item: number): Promise<Record<string, unknown>> =>

@@ -88,11 +88,13 @@ interface TickIO {
   input: InputFrame;
   edges: number; // attack buttons newly pressed
   upEdge: boolean;
+  itemEdge: boolean; // Btn.Item newly pressed this tick (drink-the-can rising edge)
 }
 
 const gatherInputs = (f: FighterState, input: InputFrame): TickIO => {
   const prev = f.prevInput;
   const upEdge = held(input, Btn.Up) && !held(prev, Btn.Up);
+  const itemEdge = held(input, Btn.Item) && !held(prev, Btn.Item);
 
   // Direction history (numpad, facing-relative).
   f.histIdx = (f.histIdx + 1) % 16;
@@ -125,7 +127,7 @@ const gatherInputs = (f: FighterState, input: InputFrame): TickIO => {
   if (f.dashBufLeft > 0 && --f.dashBufLeft === 0) f.dashBuf = 0;
 
   f.prevInput = input;
-  return { input, edges, upEdge };
+  return { input, edges, upEdge, itemEdge };
 };
 
 // ---------------------------------------------------------------------------
@@ -544,6 +546,42 @@ interface StrikeSource {
   move: MoveDef;
 }
 
+/**
+ * CONSUMABLES (ADR 0007 Phase 3): drink the carried can. Only fires on the
+ * Btn.Item rising edge, only when the fighter is FREE on the ground (idle /
+ * walking / crouching — never mid-attack, mid-air, in a combo, or blocking,
+ * so it can't be a mid-combo escape). Spends the drink (kind → 0) and either
+ * heals / grants meter instantly or arms a timed damage/defense buff.
+ */
+const useItem = (f: FighterState, ch: LoadedCharacter): void => {
+  if (f.itemKind === 0) return;
+  const free = f.action === Action.Idle || f.action === Action.WalkF
+    || f.action === Action.WalkB || f.action === Action.Crouch;
+  if (!free) return;
+  switch (f.itemKind) {
+    case 1: // heal: restore per-mille of max, capped at full (no mid-fight overheal)
+      f.health = Math.min(ch.b.maxHealth,
+        f.health + Math.trunc((ch.b.maxHealth * f.itemAmount) / 1000));
+      break;
+    case 2: // damage up: arm the timed OVERCLOCK buff
+      f.itemDmg = f.itemAmount;
+      f.itemBuffLeft = f.itemDur;
+      break;
+    case 3: // defense up: arm the timed FIREWALL buff
+      f.itemDef = f.itemAmount;
+      f.itemBuffLeft = f.itemDur;
+      break;
+    case 4: // meter: instant, clamped to the bar cap
+      f.meter = Math.min(TUNING.meterMax, f.meter + f.itemAmount);
+      break;
+    default:
+      break;
+  }
+  f.itemKind = 0; // one can per match — spent
+  f.itemAmount = 0;
+  f.itemDur = 0;
+};
+
 /** Item-buff damage pipeline: attacker's OVERCLOCK, then victim's FIREWALL. */
 const itemScaled = (dmg: number, src: StrikeSource, vic: FighterState, floor: number): number => {
   let d = dmg;
@@ -823,6 +861,11 @@ export const step = (s: GameState, inputs: [InputFrame, InputFrame]): void => {
   }
 
   autoFace(f0, f1);
+
+  // Drink the can (ADR 0007 Phase 3) BEFORE this tick's actions resolve, so
+  // an armed OVERCLOCK/heal applies to what happens this frame.
+  if (io0.itemEdge) useItem(f0, c0);
+  if (io1.itemEdge) useItem(f1, c1);
 
   // Item buffs (ADR 0007) burn only during live fighting — pre-round,
   // round-over, hitstop and super flash all return before this line.
