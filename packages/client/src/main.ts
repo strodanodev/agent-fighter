@@ -803,6 +803,11 @@ interface ArcadeRun {
 }
 let arcade: ArcadeRun | null = null;
 let gameOverAge = 0; // ticks on the GAME OVER screen — drives its countdown
+// ---- QUIT CONFIRM: leaving a LIVE match (desktop ESC, or the phone MATCH-MENU
+// QUIT which fires Escape) raises an "are you sure?" modal instead of dumping
+// straight to character select. Confirming returns to the HOME screen — never
+// select — and forfeits any online match. Reset on every match start.
+let quitConfirm = false;
 
 // ---- ARCADE ENTRY (ADR 0007 credits rework): pay-before-select + resume.
 // The 1-credit entry is a consented, NON-refundable debit taken by
@@ -1199,6 +1204,7 @@ const installOnlineMatch = (): void => {
   statBestCombo = 0;
   resetMatchFx(game!);
   netInstalled = true;
+  quitConfirm = false; // fresh match — clear any stale quit prompt
   screen = 'fight';
   // AGENT ARCADE: adopt the SERVER's run position — it owns the sequencing.
   if (s.mode === 'arcade' && s.arcade) {
@@ -1259,6 +1265,7 @@ const startFight = (): void => {
   xpBanner = null;
   net = null;
   resetMatchFx(game);
+  quitConfirm = false; // fresh match — clear any stale quit prompt
   screen = 'fight';
   vsCardAge = 0;
   vsStakes = mode === '2p'
@@ -1321,6 +1328,7 @@ const startArcadeFight = (): void => {
   xpBanner = null;
   net = null;
   resetMatchFx(game);
+  quitConfirm = false; // fresh match — clear any stale quit prompt
   screen = 'fight';
   vsCardAge = 0;
   vsStakes = [
@@ -1339,6 +1347,22 @@ const endArcade = (): void => {
   cpuAi = null;
   storeArcadeRun(null); // the run is over — nothing to resume
   screen = 'title';
+  void audio.playBgm(audio.nextHomeTrack(), { fadeInSec: 1 });
+};
+
+/**
+ * Abandon a LIVE match from the quit-confirm modal → HOME screen (never
+ * character select). Online play forfeits (ADR 0003: leaving = a loss); an
+ * arcade run is dropped via endArcade (which also clears the resume token).
+ */
+const quitMatch = (): void => {
+  quitConfirm = false;
+  if (arcade) { endArcade(); return; }
+  net?.close(); // online: leaving is a forfeit
+  net = null;
+  cpuAi = null;
+  screen = 'title';
+  locked = [false, false];
   void audio.playBgm(audio.nextHomeTrack(), { fadeInSec: 1 });
 };
 
@@ -2343,18 +2367,6 @@ const frame = (): void => {
         net.setAuto(!net.auto, skill, agentCfg.personality);
       }
     }
-    if (pressedThisFrame.has('Escape')) {
-      if (arcade) {
-        // Quitting mid-gauntlet abandons the run — back to the title, never
-        // to the select screen (no fighter switching once the run began).
-        endArcade();
-      } else {
-        net?.close(); // online: leaving is a forfeit (ADR 0003)
-        net = null;
-        screen = 'select'; locked = [false, false];
-        void audio.playBgm('player_select', { fadeInSec: 0.5 });
-      }
-    }
     // Stakes card: shown for the first ~2.5s; any key skips. Solo and local
     // matches HOLD the sim under it (nothing is waiting on us); wager keeps
     // stepping — the peer's card runs on the same clock and rollback absorbs
@@ -2364,11 +2376,27 @@ const frame = (): void => {
     if (cardUp && (pressedThisFrame.size > 0 || taps.size > 0) && vsCardAge > 20) {
       vsCardAge = VS_CARD_TICKS;
     }
-    const holdSim = cardUp && net?.setup?.mode !== 'wager';
     // The socket died mid-match: the sim CANNOT continue (its opponent inputs
     // are gone, and the server owns the verdict anyway). Freeze, explain, and
     // offer the exit — never silently stall on a live-looking frame.
     const netDead = !!net && net.status === 'error' && !net.result;
+    // QUIT CONFIRM (ADR 0003 leave = forfeit): ESC — or the phone MATCH-MENU's
+    // QUIT, which fires ESC — no longer bails straight to character select. It
+    // raises an "are you sure?" modal; confirming returns HOME. A dead match
+    // has its own exit overlay (below), so cancel any pending prompt and let
+    // that own the exit. `quitWasOpen` lets a SECOND ESC cancel the prompt
+    // without the same ESC that opened it also closing it.
+    if (netDead) quitConfirm = false;
+    const quitWasOpen = quitConfirm;
+    if (!netDead && pressedThisFrame.has('Escape')) quitConfirm = true;
+    // The quit prompt does NOT freeze the fight — same rule as the phone
+    // MATCH-MENU: a local pause of a live (solo-ledger / wager) match would
+    // strand its input stream and trip the server's idle-forfeit if the player
+    // dwells on the prompt. It's a quick decision, and leaving is a forfeit
+    // anyway, so there is no "safe pause" to protect. Only the fixed-length VS
+    // card holds the sim (nothing waits on us, and it can't outlast the idle
+    // window).
+    const holdSim = cardUp && net?.setup?.mode !== 'wager';
     // A resume rebuilds the session's GameState object — re-adopt it, or the
     // renderer keeps drawing the pre-drop snapshot forever.
     const netReconnecting = !!net && net.status === 'reconnecting';
@@ -2481,6 +2509,8 @@ const frame = (): void => {
     }
     if (netDead) {
       drawNetError(ctx, net!.error, queuedMode, uiTick);
+      // The match is already dead and its own overlay reads "BACK TO MENU" —
+      // no second confirmation; ENTER/ESC returns HOME (never select).
       if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('back')) {
         vsCardAge = -1;
         if (arcade) {
@@ -2488,10 +2518,58 @@ const frame = (): void => {
         } else {
           net!.close();
           net = null;
-          screen = 'select';
+          screen = 'title';
           locked = [false, false];
-          void audio.playBgm('player_select', { fadeInSec: 0.5 });
+          void audio.playBgm(audio.nextHomeTrack(), { fadeInSec: 1 });
         }
+      }
+    }
+    // QUIT CONFIRM modal — topmost, over the fight (which is frozen for
+    // non-wager via holdSim). Centered so its buttons stay clear of the phone
+    // touch pad / attack cluster anchored to the screen edges. Deliberately
+    // requires Y or a tap to confirm (never Enter) so a mash can't bail a match.
+    if (quitConfirm) {
+      ctx.save();
+      ctx.fillStyle = 'rgba(4,2,10,0.72)';
+      ctx.fillRect(0, 0, VW, VH);
+      const pw = 440, ph = 172, pxm = VW / 2 - pw / 2, pym = VH / 2 - ph / 2;
+      ctx.fillStyle = 'rgba(16,12,28,0.97)';
+      ctx.fillRect(pxm, pym, pw, ph);
+      ctx.strokeStyle = '#ffd166';
+      ctx.lineWidth = 2.5;
+      ctx.strokeRect(pxm + 0.5, pym + 0.5, pw - 1, ph - 1);
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 24px system-ui, sans-serif';
+      ctx.fillStyle = '#ffd166';
+      ctx.fillText('QUIT THIS MATCH?', pxm + pw / 2, pym + 46);
+      ctx.font = '600 12px system-ui, sans-serif';
+      ctx.fillStyle = '#ffffffcc';
+      ctx.fillText(net && queuedMode !== 'friendly'
+        ? 'LEAVING COUNTS AS A LOSS · YOU RETURN TO THE HOME SCREEN'
+        : 'YOU RETURN TO THE HOME SCREEN', pxm + pw / 2, pym + 76);
+      const btnW = 186, btnH = 44, gap = 24, btnY = pym + ph - 60;
+      const yesX = pxm + pw / 2 - btnW - gap / 2, noX = pxm + pw / 2 + gap / 2;
+      tapZone(yesX, btnY, btnW, btnH, 'quit:yes');
+      ctx.fillStyle = 'rgba(66,24,28,0.95)';
+      ctx.fillRect(yesX, btnY, btnW, btnH);
+      ctx.strokeStyle = '#ff8d9d';
+      ctx.strokeRect(yesX + 0.5, btnY + 0.5, btnW - 1, btnH - 1);
+      ctx.font = 'bold 17px system-ui, sans-serif';
+      ctx.fillStyle = '#ffd6dd';
+      ctx.fillText('Y · QUIT', yesX + btnW / 2, btnY + 28);
+      tapZone(noX, btnY, btnW, btnH, 'quit:no');
+      ctx.fillStyle = 'rgba(28,66,30,0.95)';
+      ctx.fillRect(noX, btnY, btnW, btnH);
+      ctx.strokeStyle = '#7ddf8a';
+      ctx.strokeRect(noX + 0.5, btnY + 0.5, btnW - 1, btnH - 1);
+      ctx.fillStyle = '#c8ffd0';
+      ctx.fillText('N · RESUME', noX + btnW / 2, btnY + 28);
+      ctx.restore();
+      if (pressedThisFrame.has('KeyY') || taps.has('quit:yes')) {
+        quitMatch();
+      } else if (pressedThisFrame.has('KeyN') || taps.has('quit:no')
+        || (quitWasOpen && pressedThisFrame.has('Escape'))) {
+        quitConfirm = false;
       }
     }
     if (game.phase === Phase.Fighting && !hurryPlayed && game.timerTicks <= HURRY_UP_TICKS) {
