@@ -6009,27 +6009,72 @@ const drawItemSlot = (ctx, i, f, tick, isLocal) => {
             label(ctx, ui.tag, x + w / 2, y + h + 10, 9, `${ui.color}aa`);
         }
     }
-    // Active buff countdown chips (after their cans are drunk) — sit right of
-    // the rack, blinking their last 3 seconds.
-    const chips = [];
-    if (f.itemDmgLeft > 0)
-        chips.push({ left: f.itemDmgLeft, color: '#ff9d6b' });
-    if (f.itemDefLeft > 0)
-        chips.push({ left: f.itemDefLeft, color: '#6fd3ff' });
-    chips.forEach((c, k) => {
-        const secs = Math.ceil(c.left / TICKS_PER_SEC);
-        if (secs <= 3 && tick % 24 < 12)
-            return;
-        const cx = i === 0
-            ? baseX + (w + gap) * 3 + 8 + k * 34
-            : baseX - 16 - k * 34;
+    // (Active-buff feedback lives in drawBuffState — glow, energy bars, and
+    // the XL countdown — so no tiny chips here anymore.)
+};
+/** Buff accents: [0] = OVERCLOCK (damage), [1] = FIREWALL (defense). */
+const BUFF_UI = [
+    { color: '#ff9d6b' },
+    { color: '#6fd3ff' },
+];
+/**
+ * Per-side buff TOTALS, edge-detected from the sim's countdown fields
+ * (cosmetic module state — the engine deliberately doesn't store the
+ * original duration once a can is drunk). A countdown INCREASING = a fresh
+ * drink armed/refreshed; capture that as the energy bar's 100% mark.
+ */
+const buffTotals = [[0, 0], [0, 0]];
+const prevBuffLeft = [[0, 0], [0, 0]];
+/**
+ * ACTIVE BUFF STATE (ADR 0007): everything a spectator needs at a glance,
+ * for BOTH players —
+ *  1. the health bar pulses a halo in the buff color (hard flash right as
+ *     the can is drunk, then a steady breathe),
+ *  2. depleting ENERGY BARS along the health bar's bottom edge show the
+ *     remaining duration (one strip per active buff, side-mirrored),
+ *  3. an XL countdown (seconds) under the HUD block, urgent-pulsing and
+ *     red-tinged in the last 3 seconds.
+ */
+const drawBuffState = (ctx, i, f, tick) => {
+    const lefts = [f.itemDmgLeft, f.itemDefLeft];
+    for (let b = 0; b < 2; b++) {
+        if (lefts[b] > prevBuffLeft[i][b])
+            buffTotals[i][b] = lefts[b];
+        prevBuffLeft[i][b] = lefts[b];
+    }
+    const active = [0, 1].filter((b) => lefts[b] > 0);
+    if (active.length === 0)
+        return;
+    const bx = i === 0 ? HUD.edge : VW - HUD.edge - HUD.barW;
+    const glowColor = active.length === 2 ? '#ffd166' : BUFF_UI[active[0]].color;
+    // 1. Health-bar halo: a hard pop for the first ~0.4s after drinking, then
+    // a steady breathe for the rest of the buff.
+    const elapsed = Math.min(...active.map((b) => buffTotals[i][b] - lefts[b]));
+    const pulse = fxPulse(tick, 0.5, 0.5, 1);
+    const fresh = elapsed < 24;
+    glowBar(ctx, bx - 2, HUD.barY - 2, HUD.barW + 4, HUD.barH + 4, glowColor, fresh ? 30 : 12 + 10 * pulse, fresh ? 1 : 0.45 + 0.35 * pulse);
+    // 2. Energy bars: deplete toward the screen edge (mirrored like the
+    // health bars themselves), stacked when both buffs run.
+    active.forEach((b, k) => {
+        const ratio = Math.min(1, lefts[b] / Math.max(1, buffTotals[i][b]));
+        const w = Math.max(2, Math.trunc((HUD.barW - 8) * ratio));
+        const y = HUD.barY + HUD.barH - 6 - k * 6;
+        const x = i === 0 ? bx + 4 : bx + HUD.barW - 4 - w;
         ctx.save();
-        ctx.fillStyle = c.color;
-        ctx.beginPath();
-        ctx.arc(cx, y + 10, 7, 0, Math.PI * 2);
-        ctx.fill();
+        ctx.globalAlpha = 0.9;
+        ctx.fillStyle = BUFF_UI[b].color;
+        ctx.fillRect(x, y, w, 4);
+        ctx.fillStyle = '#ffffff88';
+        ctx.fillRect(i === 0 ? x + w - 2 : x, y, 2, 4); // bright leading edge
         ctx.restore();
-        label(ctx, `${secs}s`, cx, y + 32, 10, '#ffffffdd');
+    });
+    // 3. XL countdown (shortest active buff) — big, both players, urgent tail.
+    const secs = Math.ceil(Math.min(...active.map((b) => lefts[b])) / TICKS_PER_SEC);
+    const urgent = secs <= 3;
+    display(ctx, `${secs}s`, bx + HUD.barW / 2, 172, urgent ? 46 : 38, {
+        glow: glowColor,
+        scale: 1 + (urgent ? 0.1 * Math.abs(Math.sin(tick / 5)) : 0.03 * Math.sin(tick / 9)),
+        ...(urgent ? DANGER_OPTS : {}),
     });
 };
 const drawHud = (ctx, g, rosters, fx, tags, // per-player nameplate suffix (e.g. "AGENT LV 12")
@@ -6049,6 +6094,7 @@ localSide = -1) => {
         if (ids?.[i])
             drawPlayerId(ctx, i, ids[i]);
         drawItemSlot(ctx, i, f, g.tick, i === localSide);
+        drawBuffState(ctx, i, f, g.tick);
     }
     drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
     // Combo counter: punches in on each new hit (re-triggered via comboAge
@@ -7840,15 +7886,21 @@ const drawAgent = (ctx, tick, v) => {
     }
     // ---- fresh key reveal (mint response, shown exactly once).
     const kb = py0 + ph + 14;
+    const fighterKey = v.mintedKeyKind === 'fighter';
     if (v.mintedKey) {
         const kw = 620, kx = cx - kw / 2, kh = 54;
         bevel(ctx, kx, kb, kw, kh, '#101a12', '#7ee85a', '#123018', 3);
-        label(ctx, 'YOUR COACH KEY — COPY IT NOW, IT IS NEVER SHOWN AGAIN', cx, kb + 18, 11, '#8fe8a0');
+        label(ctx, fighterKey
+            ? 'AGENT FIGHTER KEY — FOR HEADLESS / FLEET · NEVER SHOWN AGAIN'
+            : 'YOUR COACH KEY — COPY IT NOW, IT IS NEVER SHOWN AGAIN', cx, kb + 18, 11, '#8fe8a0');
         const copied = (v.keyCopiedAge ?? -1) >= 0;
-        label(ctx, copied ? '✓ COPIED — PASTE IT INTO MINDS › MY CONNECTIONS' : v.mintedKey, cx, kb + 40, copied ? 13 : v.mintedKey.length > 44 ? 12 : 14, copied ? '#8fe8a0' : '#eafff0');
+        const copiedMsg = fighterKey
+            ? '✓ COPIED — AF_AGENT_KEY=…  OR PASTE INTO fleet-agents.json'
+            : '✓ COPIED — PASTE IT INTO MINDS › MY CONNECTIONS';
+        label(ctx, copied ? copiedMsg : v.mintedKey, cx, kb + 40, copied ? 12 : v.mintedKey.length > 44 ? 12 : 14, copied ? '#8fe8a0' : '#eafff0');
         tapZone(kx, kb, kw, kh, 'agent:copykey');
     }
-    // ---- CTA row: spar (the training feedback loop) + mint/rotate.
+    // ---- CTA row: spar + mint coach key; second row creates an agent-class fighter.
     const bh = 46, by = v.mintedKey ? kb + 68 : kb + 10;
     const canSpar = v.status === 'done' && !!v.config;
     const sparW = 300, mintW = 300, gap = 16;
@@ -7870,13 +7922,22 @@ const drawAgent = (ctx, tick, v) => {
     }
     else {
         bevel(ctx, mx, by, mintW, bh, '#0e2438', '#5db8ff', '#163a5a', 3);
-        display(ctx, v.keyCreatedAt || v.mintedKey ? '↻ ROTATE COACH KEY' : '🔑 MINT COACH KEY', mx + mintW / 2, by + 31, 16, { from: '#eaf6ff', mid: '#8fd0ff', to: '#3a7ab0', outline: '#0a1a2a' });
+        display(ctx, v.keyCreatedAt || (v.mintedKey && !fighterKey) ? '↻ ROTATE COACH KEY' : '🔑 MINT COACH KEY', mx + mintW / 2, by + 31, 16, { from: '#eaf6ff', mid: '#8fd0ff', to: '#3a7ab0', outline: '#0a1a2a' });
     }
     tapZone(mx, by, mintW, bh, 'agent:mint');
-    if (v.keyCreatedAt && !v.mintedKey) {
-        label(ctx, 'ROTATING INVALIDATES THE OLD KEY — YOUR MIND NEEDS THE NEW ONE', cx, by + bh + 16, 10, '#ffffff66');
+    const by2 = by + bh + 12;
+    const fightW = sparW + gap + mintW;
+    if (v.mintBusy) {
+        bevel(ctx, rowX, by2, fightW, bh, '#191a20', '#3f414c', '#101116', 3);
+        label(ctx, 'CREATING…', cx, by2 + 29, 13, '#ffffff88');
     }
-    label(ctx, 'S  SPAR       K  MINT KEY       V IN-MATCH  HANDS-FREE AUTO       ESC / ‹ TITLE  BACK', cx, VH - 14, 11, '#ffffff99');
+    else {
+        bevel(ctx, rowX, by2, fightW, bh, '#1a1028', '#c49bff', '#2a1848', 3);
+        display(ctx, '🤖 CREATE AGENT FIGHTER · HEADLESS KEY', cx, by2 + 31, 15, { from: '#f5eaff', mid: '#c49bff', to: '#6a3a9a', outline: '#140a22' });
+    }
+    tapZone(rowX, by2, fightW, bh, 'agent:fighter');
+    label(ctx, 'CREATES A FREE AGENT-CLASS ACCOUNT YOU OWN · USE THE KEY WITH npm run agent / fleet', cx, by2 + bh + 14, 10, '#ffffff66');
+    label(ctx, 'S  SPAR       K  COACH KEY       F  AGENT FIGHTER       ESC / ‹ TITLE  BACK', cx, VH - 14, 11, '#ffffff99');
 };
 const drawWallet = (ctx, w, delta) => {
     if (!w)
@@ -9302,7 +9363,9 @@ const fetchAccount = async () => {
 };
 let agentScreenFetch = 'idle';
 let agentScreenInfo = null;
-let mintedKey = ''; // plaintext from POST /agent/key — shown once, never stored
+let mintedKey = ''; // plaintext from mint — shown once, never stored
+/** Which mint produced `mintedKey` (copy/reveal copy differs). */
+let mintedKeyKind = 'coach';
 let mintBusy = false;
 let keyCopiedAge = -1; // ≥0 → the "copied" flash is animating
 const agentAuthHeaders = async () => {
@@ -9352,7 +9415,7 @@ const mintAgentKey = async () => {
         const body = (await res.json());
         if (body.key) {
             mintedKey = body.key;
-            // The key's existence changes the screen copy — refresh the snapshot.
+            mintedKeyKind = 'coach';
             void fetchAgentScreen();
         }
     }
@@ -9362,9 +9425,39 @@ const mintAgentKey = async () => {
         mintBusy = false;
     }
 };
+/** Create an operator-owned agent-class fighter (POST /agent/signup + AIR). */
+const createAgentFighter = async () => {
+    if (mintBusy)
+        return;
+    mintBusy = true;
+    keyCopiedAge = -1;
+    try {
+        const headers = await agentAuthHeaders();
+        if (!headers)
+            return;
+        headers['Content-Type'] = 'application/json';
+        // Name omitted — server derives from the owner profile + tag.
+        const res = await fetch(`${matchHttpUrl()}/agent/signup`, {
+            method: 'POST', headers, body: '{}',
+        });
+        if (!res.ok)
+            return;
+        const body = (await res.json());
+        if (body.key) {
+            mintedKey = body.key;
+            mintedKeyKind = 'fighter';
+        }
+    }
+    catch { /* retry via tap */
+    }
+    finally {
+        mintBusy = false;
+    }
+};
 const enterAgentScreen = () => {
     screen = 'agent';
     mintedKey = '';
+    mintedKeyKind = 'coach';
     mintBusy = false;
     keyCopiedAge = -1;
     void fetchAgentScreen();
@@ -10233,6 +10326,12 @@ const updateJuice = (g) => {
         if (auraRate > 0) {
             emitAura(px(f.x), px(f.y) - 56, 20, 52, critical ? DANGER_RED : P_COLORS[i], auraRate);
         }
+        // ACTIVE BUFF (ADR 0007): a separate, denser mote stream in the buff's
+        // color — layered over (not replacing) the charged/critical aura, so a
+        // critical fighter still reads red underneath.
+        if (f.itemDmgLeft > 0 || f.itemDefLeft > 0) {
+            emitAura(px(f.x), px(f.y) - 56, 26, 58, f.itemDmgLeft > 0 ? '#ff9d6b' : '#6fd3ff', 0.9);
+        }
         // Progression stats: what the human (P1) dished out.
         if (i === 1 && f.health < prevHealth[1])
             statDmg += prevHealth[1] - f.health;
@@ -10320,6 +10419,13 @@ const renderFight = (g) => {
         const intensity = 0.12 + meterN * 0.4 + (critical ? 0.3 : 0);
         const breathe = fxPulse(g.tick, 0.12, 0.8, 1); // subtle living pulse
         auraGlow(ctx, px(f.x), px(f.y) - 52, 70, critical ? DANGER_RED : P_COLORS[i], intensity * breathe);
+        // ACTIVE BUFF (ADR 0007): an AGGRESSIVE second halo in the buff color —
+        // larger radius, hard intensity, fast pulse. Layered with 'lighter'
+        // compositing inside auraGlow, so it stacks over the base aura.
+        if (f.itemDmgLeft > 0 || f.itemDefLeft > 0) {
+            const throb = fxPulse(g.tick, 0.35, 0.6, 1); // fast, wide swing
+            auraGlow(ctx, px(f.x), px(f.y) - 52, 88, f.itemDmgLeft > 0 ? '#ff9d6b' : '#6fd3ff', 0.75 * throb);
+        }
     }
     // Fighters (draw the one in hitstun last so it reads on top).
     const order = g.fighters[0].action === 10 /* Action.Hitstun */ ? [1, 0] : [0, 1];
@@ -10870,6 +10976,7 @@ const frame = () => {
             keyCreatedAt: agentScreenInfo?.keyCreatedAt ?? null,
             roster: allRosters.find((r) => r.id === agentScreenInfo?.config?.character),
             mintedKey: mintedKey || undefined,
+            mintedKeyKind,
             mintBusy,
             keyCopiedAge,
             connectLabel: `${matchHttpUrl().replace(/^https?:\/\//, '')}/connect`,
@@ -10882,6 +10989,9 @@ const frame = () => {
         }
         else if (!mintBusy && (pressedThisFrame.has('KeyK') || taps.has('agent:mint'))) {
             void mintAgentKey();
+        }
+        else if (!mintBusy && (pressedThisFrame.has('KeyF') || taps.has('agent:fighter'))) {
+            void createAgentFighter();
         }
         else if (pressedThisFrame.has('Escape') || taps.has('back')) {
             screen = 'title';
@@ -11606,8 +11716,11 @@ let acc = 0;
 let perfShow = false;
 let perfFps = 60;
 let perfMs = 0;
-addEventListener('keydown', (e) => { if (e.code === 'KeyF')
-    perfShow = !perfShow; });
+// F toggles perf — except on MY AGENT, where F = CREATE AGENT FIGHTER.
+addEventListener('keydown', (e) => {
+    if (e.code === 'KeyF' && screen !== 'agent')
+        perfShow = !perfShow;
+});
 // Touch path to the same overlay (no keyboard on mobile): 3 quick taps in
 // the top-right corner of the canvas. Passive observer — game input never
 // routes through this, and the corner is dead HUD space during fights.

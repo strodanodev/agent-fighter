@@ -992,7 +992,7 @@ const boot = async (): Promise<void> => {
     // Landing / share deep-links: ?screen=title|select|ranks|play &mode=cpu|online &char=<id>
     applyBootDeepLink();
     if (screen === 'title') {
-      void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1.5 });
+      void audio.playBgm('home_screen', { fadeInSec: 1.5 });
     }
     // Restore a previous AIR session silently (30-day sessions) — never blocks
     // boot, and offline play works identically if it fails or is skipped.
@@ -1336,7 +1336,7 @@ const endArcade = (): void => {
   cpuAi = null;
   storeArcadeRun(null); // the run is over — nothing to resume
   screen = 'title';
-  void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
+  void audio.playBgm('home_screen', { fadeInSec: 1 });
 };
 
 /**
@@ -1482,6 +1482,13 @@ const updateJuice = (g: GameState): void => {
     if (auraRate > 0) {
       emitAura(px(f.x), px(f.y) - 56, 20, 52, critical ? DANGER_RED : P_COLORS[i], auraRate);
     }
+    // ACTIVE BUFF (ADR 0007): a separate, denser mote stream in the buff's
+    // color — layered over (not replacing) the charged/critical aura, so a
+    // critical fighter still reads red underneath.
+    if (f.itemDmgLeft > 0 || f.itemDefLeft > 0) {
+      emitAura(px(f.x), px(f.y) - 56, 26, 58,
+        f.itemDmgLeft > 0 ? '#ff9d6b' : '#6fd3ff', 0.9);
+    }
     // Progression stats: what the human (P1) dished out.
     if (i === 1 && f.health < prevHealth[1]) statDmg += prevHealth[1] - f.health;
     prevHealth[i] = f.health;
@@ -1562,6 +1569,14 @@ const renderFight = (g: GameState): void => {
     const breathe = fxPulse(g.tick, 0.12, 0.8, 1); // subtle living pulse
     auraGlow(ctx, px(f.x), px(f.y) - 52, 70,
       critical ? DANGER_RED : P_COLORS[i], intensity * breathe);
+    // ACTIVE BUFF (ADR 0007): an AGGRESSIVE second halo in the buff color —
+    // larger radius, hard intensity, fast pulse. Layered with 'lighter'
+    // compositing inside auraGlow, so it stacks over the base aura.
+    if (f.itemDmgLeft > 0 || f.itemDefLeft > 0) {
+      const throb = fxPulse(g.tick, 0.35, 0.6, 1); // fast, wide swing
+      auraGlow(ctx, px(f.x), px(f.y) - 52, 88,
+        f.itemDmgLeft > 0 ? '#ff9d6b' : '#6fd3ff', 0.75 * throb);
+    }
   }
 
   // Fighters (draw the one in hitstun last so it reads on top).
@@ -1700,11 +1715,11 @@ const tickSelect = (): void => {
       // until they follow the link again.
       selectingAgentOf = '';
       screen = 'title';
-      void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
+      void audio.playBgm('home_screen', { fadeInSec: 1 });
       return;
     } else {
       screen = 'title';
-      void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 });
+      void audio.playBgm('home_screen', { fadeInSec: 1 });
       return;
     }
   }

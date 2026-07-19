@@ -874,24 +874,80 @@ const drawItemSlot = (
     }
   }
 
-  // Active buff countdown chips (after their cans are drunk) — sit right of
-  // the rack, blinking their last 3 seconds.
-  const chips: Array<{ left: number; color: string }> = [];
-  if (f.itemDmgLeft > 0) chips.push({ left: f.itemDmgLeft, color: '#ff9d6b' });
-  if (f.itemDefLeft > 0) chips.push({ left: f.itemDefLeft, color: '#6fd3ff' });
-  chips.forEach((c, k) => {
-    const secs = Math.ceil(c.left / TICKS_PER_SEC);
-    if (secs <= 3 && tick % 24 < 12) return;
-    const cx = i === 0
-      ? baseX + (w + gap) * 3 + 8 + k * 34
-      : baseX - 16 - k * 34;
+  // (Active-buff feedback lives in drawBuffState — glow, energy bars, and
+  // the XL countdown — so no tiny chips here anymore.)
+};
+
+/** Buff accents: [0] = OVERCLOCK (damage), [1] = FIREWALL (defense). */
+const BUFF_UI = [
+  { color: '#ff9d6b' },
+  { color: '#6fd3ff' },
+] as const;
+
+/**
+ * Per-side buff TOTALS, edge-detected from the sim's countdown fields
+ * (cosmetic module state — the engine deliberately doesn't store the
+ * original duration once a can is drunk). A countdown INCREASING = a fresh
+ * drink armed/refreshed; capture that as the energy bar's 100% mark.
+ */
+const buffTotals: [[number, number], [number, number]] = [[0, 0], [0, 0]];
+const prevBuffLeft: [[number, number], [number, number]] = [[0, 0], [0, 0]];
+
+/**
+ * ACTIVE BUFF STATE (ADR 0007): everything a spectator needs at a glance,
+ * for BOTH players —
+ *  1. the health bar pulses a halo in the buff color (hard flash right as
+ *     the can is drunk, then a steady breathe),
+ *  2. depleting ENERGY BARS along the health bar's bottom edge show the
+ *     remaining duration (one strip per active buff, side-mirrored),
+ *  3. an XL countdown (seconds) under the HUD block, urgent-pulsing and
+ *     red-tinged in the last 3 seconds.
+ */
+const drawBuffState = (
+  ctx: CanvasRenderingContext2D, i: 0 | 1, f: GameState['fighters'][0], tick: number,
+): void => {
+  const lefts = [f.itemDmgLeft, f.itemDefLeft] as const;
+  for (let b = 0; b < 2; b++) {
+    if (lefts[b]! > prevBuffLeft[i][b]!) buffTotals[i][b] = lefts[b]!;
+    prevBuffLeft[i][b] = lefts[b]!;
+  }
+  const active = ([0, 1] as const).filter((b) => lefts[b] > 0);
+  if (active.length === 0) return;
+
+  const bx = i === 0 ? HUD.edge : VW - HUD.edge - HUD.barW;
+  const glowColor = active.length === 2 ? '#ffd166' : BUFF_UI[active[0]!].color;
+
+  // 1. Health-bar halo: a hard pop for the first ~0.4s after drinking, then
+  // a steady breathe for the rest of the buff.
+  const elapsed = Math.min(...active.map((b) => buffTotals[i][b]! - lefts[b]!));
+  const pulse = fxPulse(tick, 0.5, 0.5, 1);
+  const fresh = elapsed < 24;
+  glowBar(ctx, bx - 2, HUD.barY - 2, HUD.barW + 4, HUD.barH + 4, glowColor,
+    fresh ? 30 : 12 + 10 * pulse, fresh ? 1 : 0.45 + 0.35 * pulse);
+
+  // 2. Energy bars: deplete toward the screen edge (mirrored like the
+  // health bars themselves), stacked when both buffs run.
+  active.forEach((b, k) => {
+    const ratio = Math.min(1, lefts[b]! / Math.max(1, buffTotals[i][b]!));
+    const w = Math.max(2, Math.trunc((HUD.barW - 8) * ratio));
+    const y = HUD.barY + HUD.barH - 6 - k * 6;
+    const x = i === 0 ? bx + 4 : bx + HUD.barW - 4 - w;
     ctx.save();
-    ctx.fillStyle = c.color;
-    ctx.beginPath();
-    ctx.arc(cx, y + 10, 7, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = BUFF_UI[b].color;
+    ctx.fillRect(x, y, w, 4);
+    ctx.fillStyle = '#ffffff88';
+    ctx.fillRect(i === 0 ? x + w - 2 : x, y, 2, 4); // bright leading edge
     ctx.restore();
-    label(ctx, `${secs}s`, cx, y + 32, 10, '#ffffffdd');
+  });
+
+  // 3. XL countdown (shortest active buff) — big, both players, urgent tail.
+  const secs = Math.ceil(Math.min(...active.map((b) => lefts[b]!)) / TICKS_PER_SEC);
+  const urgent = secs <= 3;
+  display(ctx, `${secs}s`, bx + HUD.barW / 2, 172, urgent ? 46 : 38, {
+    glow: glowColor,
+    scale: 1 + (urgent ? 0.1 * Math.abs(Math.sin(tick / 5)) : 0.03 * Math.sin(tick / 9)),
+    ...(urgent ? DANGER_OPTS : {}),
   });
 };
 
@@ -917,6 +973,7 @@ export const drawHud = (
     drawMeter(ctx, i, f.meter, g.tick);
     if (ids?.[i]) drawPlayerId(ctx, i, ids[i]!);
     drawItemSlot(ctx, i, f, g.tick, i === localSide);
+    drawBuffState(ctx, i, f, g.tick);
   }
   drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
 
