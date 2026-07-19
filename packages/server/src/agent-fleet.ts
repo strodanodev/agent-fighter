@@ -1,25 +1,18 @@
 /**
  * Agent FLEET supervisor — the hosted-runner gap in docs/headless-agent.md,
- * closed the cheap way: ONE Node process keeps N self-signup agents playing
- * the ranked arcade around the clock, so the AGENTS leaderboard is a live
- * ecosystem instead of a ghost town.
+ * closed the cheap way: ONE Node process keeps N operator-owned agents
+ * playing the ranked arcade around the clock, so the AGENTS leaderboard is
+ * a live ecosystem instead of a ghost town.
  *
  *   AF_WS=wss://match-server-production.up.railway.app \
- *   AF_FLEET=3  npm run fleet -w @af/server
+ *   AF_TOKEN=<AIR JWT>  AF_FLEET=3  npm run fleet -w @af/server
  *
- * Everything it manages is ECONOMICALLY INERT by construction (agent-class
- * accounts: no credits, ever) — the only resources it spends are compute and
- * the server's 20-battles/day/account cap, which it respects by sleeping
- * until the next UTC day when the server says so.
+ * Agents are operator-owned (AIR). Mint keys in-game (MY AGENT → CREATE
+ * AGENT FIGHTER) and put them in fleet-agents.json, OR set AF_TOKEN so the
+ * fleet can call authenticated POST /agent/signup to grow to AF_FLEET.
  *
- * Each agent is a persisted PERSONA (name, fighter, style knobs, skill) that
- * coaches ITSELF through the same PUT /agent every Minds coach uses — the
- * fleet exercises the public API end to end and the leaderboard shows real
- * variety, not N copies of one bot. State lives in fleet-agents.json next to
- * the working directory (plaintext keys — same caveat as af-agent.json).
- *
- * This is deliberately orchestration ONLY: no game logic, no protocol
- * surface, nothing the verified reference client doesn't already do.
+ * Everything it manages is ECONOMICALLY INERT (agent-class: no credits) —
+ * compute + 20-battles/day/account. State: repo-root fleet-agents.json.
  */
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -122,10 +115,18 @@ const rosterOf = async (): Promise<string[]> => {
   return body.characters ?? ['vector'];
 };
 
+const operatorToken = process.env.AF_TOKEN?.trim();
+const operatorDev = process.env.AF_DEV_NAME?.trim();
+
 const signup = async (name: string, roster: string[]): Promise<FleetAgent> => {
+  if (!operatorToken && !operatorDev) {
+    throw new Error('mint keys in-game (MY AGENT → CREATE AGENT FIGHTER) or set AF_TOKEN');
+  }
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (operatorToken) headers.Authorization = `Bearer ${operatorToken}`;
+  else if (operatorDev) headers['X-Dev-Name'] = operatorDev;
   const res = await fetch(`${httpUrl}/agent/signup`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
+    method: 'POST', headers, body: JSON.stringify({ name }),
   });
   const body = await res.json() as { sub?: string; name?: string; key?: string; error?: string };
   if (!res.ok || !body.key) throw new Error(`signup ${name}: ${body.error ?? res.status}`);
@@ -211,7 +212,9 @@ while (state.agents.length < fleetSize) {
   }
 }
 if (state.agents.length === 0) {
-  console.error('fleet: no agents available (signup failed and no fleet-agents.json)');
+  console.error('fleet: no agents in fleet-agents.json');
+  console.error('mint in-game: MY AGENT → CREATE AGENT FIGHTER (copy afk_… into the file)');
+  console.error('or: AF_TOKEN=<AIR JWT> AF_FLEET=N npm run fleet');
   process.exit(1);
 }
 

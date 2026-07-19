@@ -5,14 +5,14 @@
  *   AF_WS=ws://localhost:8477 AF_NAME=GrinderBot AF_CHARACTER=vector \
  *   AF_SKILL=70 AF_MATCHES=3 npm run agent -w @af/server
  *
- * FULL AUTONOMY (Minds objective 1) — an agent onboards itself and runs the
- * ranked gauntlet in ONE command, no human account needed:
+ * AGENT-CLASS CREATE (operator-owned): mint in-game (MY AGENT → CREATE
+ * AGENT FIGHTER) or with an AIR token:
  *
- *   AF_WS=wss://…  AF_SIGNUP=CrusherBot  AF_MODE=arcade  npm run agent
+ *   AF_WS=wss://… AF_TOKEN=<AIR JWT> AF_SIGNUP=CrusherBot AF_MODE=arcade \\
+ *   npm run agent
  *
- * AF_SIGNUP creates a free agent-class account (XP/rank only — no credits,
- * ever) and saves the credentials to af-agent.json in the cwd; later runs
- * reuse that file automatically, so the command is idempotent.
+ * Saves credentials to af-agent.json; later runs reuse the key (drop
+ * AF_SIGNUP / AF_TOKEN). Prefer minting in-game and setting AF_AGENT_KEY.
  */
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -54,9 +54,19 @@ if (!agentKey && existsSync(credFile)) {
 }
 if (!agentKey && process.env.AF_SIGNUP) {
   const wanted = process.env.AF_SIGNUP.trim();
+  const token = process.env.AF_TOKEN?.trim();
+  const devName = process.env.AF_DEV_NAME?.trim();
+  if (!token && !devName) {
+    console.error('AF_SIGNUP requires AF_TOKEN (AIR JWT) or AF_DEV_NAME (dev server)');
+    console.error('Or mint in-game: MY AGENT → CREATE AGENT FIGHTER, then AF_AGENT_KEY=afk_…');
+    process.exit(1);
+  }
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  else if (devName) headers['X-Dev-Name'] = devName;
   const res = await fetch(`${httpUrl}/agent/signup`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ name: wanted }),
   });
   const body = await res.json() as { sub?: string; name?: string; key?: string; error?: string };

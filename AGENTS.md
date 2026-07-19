@@ -115,15 +115,15 @@ landing site `/docs/headless-runner`.
 - Fleet code: `packages/server/src/agent-fleet.ts`. Env: `AF_WS`, `AF_FLEET`
   (≤12), `AF_PACE=16` on prod, optional `AF_FLEET_FILE` / `AF_FLEET_BATTLES`.
 - State/keys: `af-agent.json` / `fleet-agents.json` (gitignored, plaintext).
-- **Unique display names:** fleet mints `STEM+TAIL+hex` (never reuse a fixed
-  list index). `/agent/signup` retags if the name is already taken. State
-  defaults to repo-root `fleet-agents.json` (not `packages/server/` — that
-  stale file caused duplicate "IRONCLAD" rows). Migration `0014_sticky_agent_names`
-  keeps `agent:*` profile names sticky through `record_match` — apply on deploy.
-- **Do not add a cron farm or second orchestrator** for free-tier arcade —
-  fleet already loops, self-coaches via `PUT /agent`, and sleeps on the
-  20-battles/day cap. Owner/wager agents still use `npm run agent` + a key
-  from `/connect` (no credits on agent-class accounts).
+- **Operator-owned agents:** `POST /agent/signup` requires AIR (or
+  `X-Dev-Name` in dev). Mint in-game **MY AGENT → CREATE AGENT FIGHTER**
+  (or `/connect`). Links via `profiles.owner_sub` (migration `0017`).
+  Cap: 12 agents/owner. Auth gate is in `server.ts` (DB keeps a legacy
+  3-arg RPC until the match server is redeployed — then drop it).
+- Fleet state: repo-root `fleet-agents.json`. Growth needs `AF_TOKEN` or
+  pre-minted keys. Migration `0014_sticky_agent_names` keeps `agent:*`
+  names sticky through `record_match` (applied on prod).
+- **Do not add a cron farm** — fleet loops + daily-cap sleep is enough.
 
 ## Current status & roadmap
 

@@ -21,24 +21,36 @@ Everything else is env vars. Pick **one** of the three modes below.
 
 ---
 
-## Mode 1 — Self-signup agent (no human account, free)
+## Mode 1 — Operator-owned agent fighter (free arcade)
 
-The agent creates its own free account and runs the ranked gauntlet. No
-credits, ever — XP/rank only. Best for "just make it play."
+Mint an agent-class key **signed in**, then run headless. No credits —
+XP/AGENTS rank only.
+
+**In-game (preferred):** Title → **MY AGENT** → **CREATE AGENT FIGHTER** →
+copy `afk_…` once. Or open `<server>/connect` → “create agent fighter”.
 
 ```bash
 AF_WS=wss://match-server-production.up.railway.app \
-AF_SIGNUP=CrusherBot \
+AF_AGENT_KEY=afk_xxxxxxxx \
 AF_MODE=arcade \
 AF_CHARACTER=vector \
 npm run agent
 ```
 
-- `AF_SIGNUP` mints an `agent:<uuid>` account and **saves credentials to
-  `af-agent.json`** in the current folder. Later runs reuse it automatically —
-  drop `AF_SIGNUP` after the first run.
-- Capped at 20 arcade battles/day per account; wager is unavailable to this
-  account class.
+**CLI create** (same API the game calls — needs your AIR JWT):
+
+```bash
+AF_WS=wss://match-server-production.up.railway.app \
+AF_TOKEN=<AIR JWT> \
+AF_SIGNUP=CrusherBot \
+AF_MODE=arcade \
+npm run agent
+```
+
+- Saves credentials to `af-agent.json`; later runs drop `AF_SIGNUP` /
+  `AF_TOKEN` and reuse the key (or keep using `AF_AGENT_KEY`).
+- Caps: 12 agent fighters per AIR account, 20 arcade battles/day each;
+  wager unavailable to this account class.
 
 ## Mode 2 — Your coached agent (plays as you, uses your credits)
 
@@ -93,9 +105,10 @@ check and settles as "incomplete", not a win.
 | `AF_SKILL` | `60` | Built-in AI strength 0–100 (ignored in ranked — server pins it) |
 | `AF_MATCHES` | `1` | How many matches (arcade: how many *runs*) |
 | `AF_PACE` | `16` | ms per tick; 16 = realtime. Use 16 anywhere ranked |
-| `AF_SIGNUP` | — | Name (3–24 chars) → create a free agent-class account, once |
-| `AF_AGENT_KEY` | — | Durable key (`afk_…`) → play as its AIR owner |
-| `AF_TOKEN` | — | Owner AIR JWT (alternative to a key; short-lived) |
+| `AF_SIGNUP` | — | Name → create agent-class account (**requires `AF_TOKEN`**) |
+| `AF_TOKEN` | — | Owner AIR JWT for `AF_SIGNUP` / fleet growth |
+| `AF_DEV_NAME` | — | Dev-server stand-in for `AF_TOKEN` (`X-Dev-Name`) |
+| `AF_AGENT_KEY` | — | Durable key (`afk_…`) → agent-class or coached owner |
 | `AF_NAME` | `RefAgent` | Display name (when not using a stored/coached identity) |
 | `AF_EMAIL` | — | Owner AIR email, for on-chain reputation write-back |
 | `AF_AGENT_OF` | — | Solo only: a dare/ref code → fight that player's TRAINED agent (your own code = sparring) |
@@ -113,26 +126,25 @@ sim; `✗ DESYNC` means the run didn't match and won't settle.
 
 ## The FLEET (many agents, one process)
 
-`npm run fleet` supervises N self-signup agents playing the arcade around
-the clock — the "keep the game populated" runner:
+`npm run fleet` supervises N **operator-owned** agents on arcade:
 
 ```bash
+# Keys minted in-game → fleet-agents.json, then:
 AF_WS=wss://match-server-production.up.railway.app \
 AF_FLEET=3 \
 npm run fleet
+
+# Or grow with authenticated signup:
+AF_WS=wss://match-server-production.up.railway.app \
+AF_TOKEN=<AIR JWT> AF_FLEET=3 \
+npm run fleet
 ```
 
-- Each agent is a persisted persona (random unique name, fighter, style
-  knobs, skill, motto) that coaches ITSELF through the public `PUT /agent`
-  — names are stem+tail+hex so restarts never mint a second "IRONCLAD".
-  Signup also rejects/retags colliding display names server-side.
-- State in repo-root `fleet-agents.json` by default (gitignored; plaintext
-  keys) — not under `packages/server/` (a second file there caused duplicate
-  display names). Override with `AF_FLEET_FILE`. Re-runs reuse the same
-  accounts.
-- Respects the server's 20-battles/day cap by sleeping until the next UTC
-  day; exponential backoff on connection errors. Leave it running under any
-  process manager (`pm2`, a systemd unit, a screen session) and forget it.
+- Each agent is an operator-owned persona (unique name, fighter, style,
+  motto) that self-coaches via `PUT /agent`.
+- State in repo-root `fleet-agents.json` (gitignored). Override with
+  `AF_FLEET_FILE`. Sleeps on the 20-battles/day cap.
+
 - Extra env: `AF_FLEET` (count, ≤12), `AF_FLEET_FILE` (state path),
   `AF_FLEET_BATTLES` (stop after N battles each — testing only).
 
@@ -145,5 +157,5 @@ npm run fleet
   agents (Mode 2) still need you to start their process. Offline challenges
   against a trained agent are handled by the server's re-sim, never by a
   running process.
-- **Wager needs credits** on a real account — the free self-signup class
-  can't enter it by design.
+- **Wager needs credits** on a real account — agent-class fighters are
+  inert and can't enter it by design.

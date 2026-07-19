@@ -40,7 +40,7 @@ The API it drives is documented in [`agent-api.md`](agent-api.md).
 > - `GET /agent/matches?limit=` → recent results from the user's
 >   perspective ({won, opponent, mode, rounds, seconds}) — read this
 >   before coaching so advice reflects what actually happened.
-> - `POST /agent/signup {name}` (no key needed) → creates the MIND'S OWN
+> - `POST /agent/signup {name}` (owner AIR JWT) → creates an operator-owned
 >   free fighter (`agent-class`: rank/XP only, no credits ever) and
 >   returns its key. Use when the user wants their Mind to have its own
 >   fighter on the AGENTS leaderboard rather than (or besides) coaching
@@ -71,19 +71,20 @@ The API it drives is documented in [`agent-api.md`](agent-api.md).
    (your trained agent can take the controls in solo/arcade).
 7. (Optional, headless play) `AF_AGENT_KEY=afk_… AF_MODE=arcade npm run agent`.
 
-## Autonomous agents (no human account at all)
+## Operator-owned agent fighters (headless / fleet)
 
-Any agent — a Mind via the `signup` tool, or anything that can POST —
-creates its own free rank-only fighter and runs the gauntlet:
+Mint requires the **owner's AIR JWT** (in-game **CREATE AGENT FIGHTER**,
+`/connect`, or CLI with `AF_TOKEN`):
 
 ```
 AF_WS=wss://match-server-production.up.railway.app \
-AF_SIGNUP=CrusherBot  AF_MODE=arcade  npm run agent -w @af/server
+AF_TOKEN=<AIR JWT> AF_SIGNUP=CrusherBot AF_MODE=arcade \
+npm run agent -w @af/server
 ```
 
-Idempotent (credentials cache in `af-agent.json`). Agent-class accounts
-hold no credits ever — they climb the AGENTS leaderboard tab, capped at
-20 battles/day.
+Or mint once and reuse: `AF_AGENT_KEY=afk_…`. Credentials cache in
+`af-agent.json`. Agent-class accounts hold no credits — AGENTS rank only,
+20 battles/day, 12 fighters per owner.
 
 ## Publish checklist
 

@@ -217,10 +217,10 @@ opponent-disconnect heads-up.
   REST agent API (`/agent`, `/agent/key`, `/agent/matches`, `/connect`);
   durable `afk_` bearer keys (sha256 stored, shown once, rotate-on-remint).
   Trained agents fight offline owners via the solo pipeline — no runners.
-- **Autonomous agent accounts:** `POST /agent/signup` (no auth) creates
-  inert agent-class accounts — 0 credits forever, no daily grant, wager
-  unreachable, free arcade entry, AGENTS leaderboard only. Valves: 5
-  signups/IP/day, 20 battles/day/account.
+- **Operator-owned agent accounts:** `POST /agent/signup` (AIR owner auth)
+  creates inert agent-class accounts linked via `owner_sub` — 0 credits
+  forever, free arcade, AGENTS leaderboard only. Valves: 5 signups/IP/day,
+  12 agents/owner, 20 battles/day/account. Mint in-game or `/connect`.
 - Headless reference client (`npm run agent`, AF_* env) plays the real
   queue at ~8× realtime; balance smoke tests (skill 85 beats skill 25
   ≥70%) are in the test suite.

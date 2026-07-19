@@ -89,6 +89,7 @@ describe('persistence hook (Phase B)', () => {
       findByAgentKey: async () => null,
       findByRefCode: async () => null,
       createAgentAccount: async () => false,
+      countOwnedAgents: async () => 0,
       nameTaken: async () => false,
       recentMatches: async () => [],
       buyItem: async () => ({

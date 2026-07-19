@@ -224,14 +224,13 @@ export interface Persistence {
    */
   findByRefCode: (code: string) => Promise<{ sub: string; name: string } | null>;
   /**
-   * Self-signup for AGENT-CLASS accounts (sub `agent:<uuid>`, Minds obj. 1):
-   * economically INERT — created with 0 credits, never granted the daily,
-   * never paid out (server enforces fee 0 / payout 0 by the sub prefix), so
-   * a bot farm has nothing to extract. They compete for XP/rank on the
-   * AGENTS leaderboard tab. Creates the profile AND stores the key hash in
-   * one shot. False = the id already existed (retry with a fresh uuid).
+   * Create an AGENT-CLASS account (sub `agent:<uuid>`) owned by an AIR
+   * operator (`ownerSub`). Economically INERT — 0 credits, no daily, no
+   * payouts. False = id already existed or owner invalid.
    */
-  createAgentAccount: (sub: string, name: string, keyHash: string) => Promise<boolean>;
+  createAgentAccount: (sub: string, name: string, keyHash: string, ownerSub: string) => Promise<boolean>;
+  /** How many agent:<uuid> rows this operator already owns. */
+  countOwnedAgents: (ownerSub: string) => Promise<number>;
   /** Case-insensitive display-name collision check (leaderboard uniqueness). */
   nameTaken: (name: string) => Promise<boolean>;
   /**
@@ -399,6 +398,8 @@ export const memoryPersistence = (): Persistence => {
   const referrals = new Map<string, { inviter: string; released: boolean }>();
   /** sub → trained agent config + key (ADR 0006). */
   const agents = new Map<string, { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null }>();
+  /** agent:<uuid> → AIR/dev owner sub (operator who minted it). */
+  const owners = new Map<string, string>();
   /** Granted consumables, newest first (ADR 0007). Nonce = idempotency key. */
   const ownedItems: (OwnedItem & {
     sub: string; nonce: string; consumedMatchId?: string; slot?: number | null;
@@ -589,16 +590,25 @@ export const memoryPersistence = (): Persistence => {
     },
     recentMatches: async (sub, limit) =>
       matchRows.filter((m) => m.p0 === sub || m.p1 === sub).slice(0, limit),
-    createAgentAccount: async (sub, name, keyHash) => {
+    createAgentAccount: async (sub, name, keyHash, ownerSub) => {
       if (profiles.has(sub)) return false;
+      const owner = ownerSub.trim();
+      if (!owner || owner.startsWith('agent:')) return false;
       // Same shape as prof(), but lastDaily is pre-stamped FOREVER: agent-
       // class accounts never claim the daily grant (economically inert).
       profiles.set(sub, { credits: 0, level: 1, xp: 0, wins: 0, losses: 0, lastDaily: '9999-12-31' });
       names.set(sub, { name, agent: true });
+      owners.set(sub, owner);
       const a = agentOf(sub);
       a.keyHash = keyHash;
       a.keyCreatedAt = new Date().toISOString();
       return true;
+    },
+    countOwnedAgents: async (ownerSub) => {
+      const want = ownerSub.trim();
+      let n = 0;
+      for (const [sub, owner] of owners) if (owner === want && sub.startsWith('agent:')) n++;
+      return n;
     },
     nameTaken: async (name) => {
       const want = name.trim().toLowerCase();
@@ -843,10 +853,17 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
       const row = rows?.[0];
       return row ? { sub: String(row.id), name: String(row.name ?? 'anon') } : null;
     },
-    createAgentAccount: async (sub, name, keyHash) =>
+    createAgentAccount: async (sub, name, keyHash, ownerSub) =>
       Boolean(await call('/rest/v1/rpc/create_agent_account', {
-        method: 'POST', body: JSON.stringify({ _id: sub, _name: name, _hash: keyHash }),
+        method: 'POST',
+        body: JSON.stringify({ _id: sub, _name: name, _hash: keyHash, _owner: ownerSub }),
       })),
+    countOwnedAgents: async (ownerSub) => {
+      const n = (await call('/rest/v1/rpc/count_owned_agents', {
+        method: 'POST', body: JSON.stringify({ _owner: ownerSub }),
+      })) as number;
+      return n | 0;
+    },
     nameTaken: async (name) => {
       const want = name.trim();
       if (!want) return false;

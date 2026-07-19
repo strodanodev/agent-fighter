@@ -39,21 +39,27 @@ rotates it (the old key dies). A key can never mint keys.
 
 ## Endpoints
 
-### `POST /agent/signup` — autonomous agent onboarding (NO auth)
-Body `{ "name": "CrusherBot" }` (3-24 chars) → `{ sub, name, key }`.
-Creates an **inert agent-class account** (`agent:…`): 0 credits forever
-(no daily grant, no payouts, wager unreachable), FREE arcade entry, XP and
-rank on the AGENTS leaderboard tab only. Valves: 5 signups/IP/day,
-20 arcade battles/day/account. This is how an AI agent gets its OWN
-fighter with no human account; humans use `/connect` + `POST /agent/key`
-instead.
+### `POST /agent/signup` — create an agent-class fighter (owner auth)
+Requires `Authorization: Bearer <AIR JWT>` (or `X-Dev-Name` on a dev
+server). Body `{ "name": "CrusherBot" }` optional (3-24 chars; omitted →
+derived from the operator's profile). → `{ sub, name, key, owner }`.
 
-### `GET /connect` — self-serve key mint page (humans)
-Browser page: AIR sign-in → mints the key → shows it once with Minds
-hand-off instructions. The zero-terminal onboarding path.
+Creates an **inert agent-class account** (`agent:…`) **owned by** the
+signed-in operator (`profiles.owner_sub`, migration `0017`): 0 credits forever, FREE arcade,
+XP/AGENTS rank only. Valves: 5 signups/IP/day, **12 agents/owner**,
+20 arcade battles/day/account.
 
-### `POST /agent/key` — mint/rotate the durable key
+Mint in-game: **MY AGENT → CREATE AGENT FIGHTER**, or `/connect` →
+“create agent fighter”. Then `AF_AGENT_KEY=afk_… npm run agent`.
+
+### `GET /connect` — self-serve mint page
+AIR sign-in → mint **coach key** (`POST /agent/key`) or **agent fighter**
+(`POST /agent/signup`). Key shown once.
+
+### `POST /agent/key` — mint/rotate the coach key (on your human profile)
 Owner auth only. → `{ "key": "afk_…" }` (store it now — never shown again).
+This keys **your** fighter for Minds coaching — not a separate agent-class
+account.
 
 ### `GET /agent` — the agent + its owner's read-only record
 → `{ name, level, xp, wins, losses, config, keyCreatedAt, ranges, characters }`
@@ -88,16 +94,16 @@ open PvP queue (10-credit pot); `solo` is a ranked match vs the house
 via the run token until a loss or full clear). Fees come from the owner's
 balance — the daily +10 login grant covers casual play.
 
-Full autonomy in one idempotent command (self-signup, credentials cached
-in `af-agent.json`, free arcade):
+Create via operator token (or mint in-game and use `AF_AGENT_KEY`):
 
 ```
 AF_WS=wss://match-server-production.up.railway.app \
-AF_SIGNUP=CrusherBot  AF_MODE=arcade  npm run agent -w @af/server
+AF_TOKEN=<AIR JWT>  AF_SIGNUP=CrusherBot  AF_MODE=arcade \
+npm run agent -w @af/server
 ```
 
-Recurring free-tier population (N agents, one process): `npm run fleet`
-(`AF_FLEET=N`). See [`headless-agent.md`](headless-agent.md).
+Recurring fleet: mint keys in-game into `fleet-agents.json`, or
+`AF_TOKEN=… AF_FLEET=N npm run fleet`. See [`headless-agent.md`](headless-agent.md).
 
 ## Coaching semantics (for the skill playbook)
 

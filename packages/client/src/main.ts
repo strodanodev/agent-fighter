@@ -487,7 +487,9 @@ interface AgentScreenInfo {
 }
 let agentScreenFetch: 'idle' | 'busy' | 'done' | 'fail' = 'idle';
 let agentScreenInfo: AgentScreenInfo | null = null;
-let mintedKey = ''; // plaintext from POST /agent/key — shown once, never stored
+let mintedKey = ''; // plaintext from mint — shown once, never stored
+/** Which mint produced `mintedKey` (copy/reveal copy differs). */
+let mintedKeyKind: 'coach' | 'fighter' = 'coach';
 let mintBusy = false;
 let keyCopiedAge = -1; // ≥0 → the "copied" flash is animating
 
@@ -527,7 +529,7 @@ const mintAgentKey = async (): Promise<void> => {
     const body = (await res.json()) as { key?: string };
     if (body.key) {
       mintedKey = body.key;
-      // The key's existence changes the screen copy — refresh the snapshot.
+      mintedKeyKind = 'coach';
       void fetchAgentScreen();
     }
   } catch { /* the screen keeps its MINT button — just tap again */
@@ -536,9 +538,35 @@ const mintAgentKey = async (): Promise<void> => {
   }
 };
 
+/** Create an operator-owned agent-class fighter (POST /agent/signup + AIR). */
+const createAgentFighter = async (): Promise<void> => {
+  if (mintBusy) return;
+  mintBusy = true;
+  keyCopiedAge = -1;
+  try {
+    const headers = await agentAuthHeaders();
+    if (!headers) return;
+    headers['Content-Type'] = 'application/json';
+    // Name omitted — server derives from the owner profile + tag.
+    const res = await fetch(`${matchHttpUrl()}/agent/signup`, {
+      method: 'POST', headers, body: '{}',
+    });
+    if (!res.ok) return;
+    const body = (await res.json()) as { key?: string };
+    if (body.key) {
+      mintedKey = body.key;
+      mintedKeyKind = 'fighter';
+    }
+  } catch { /* retry via tap */
+  } finally {
+    mintBusy = false;
+  }
+};
+
 const enterAgentScreen = (): void => {
   screen = 'agent';
   mintedKey = '';
+  mintedKeyKind = 'coach';
   mintBusy = false;
   keyCopiedAge = -1;
   void fetchAgentScreen();
@@ -2028,6 +2056,7 @@ const frame = (): void => {
       keyCreatedAt: agentScreenInfo?.keyCreatedAt ?? null,
       roster: allRosters.find((r) => r.id === agentScreenInfo?.config?.character),
       mintedKey: mintedKey || undefined,
+      mintedKeyKind,
       mintBusy,
       keyCopiedAge,
       connectLabel: `${matchHttpUrl().replace(/^https?:\/\//, '')}/connect`,
@@ -2039,6 +2068,8 @@ const frame = (): void => {
       startAgentDare(sparCode);
     } else if (!mintBusy && (pressedThisFrame.has('KeyK') || taps.has('agent:mint'))) {
       void mintAgentKey();
+    } else if (!mintBusy && (pressedThisFrame.has('KeyF') || taps.has('agent:fighter'))) {
+      void createAgentFighter();
     } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
       screen = 'title';
     }
@@ -2710,7 +2741,10 @@ let acc = 0;
 let perfShow = false;
 let perfFps = 60;
 let perfMs = 0;
-addEventListener('keydown', (e) => { if (e.code === 'KeyF') perfShow = !perfShow; });
+// F toggles perf — except on MY AGENT, where F = CREATE AGENT FIGHTER.
+addEventListener('keydown', (e) => {
+  if (e.code === 'KeyF' && screen !== 'agent') perfShow = !perfShow;
+});
 
 // Touch path to the same overlay (no keyboard on mobile): 3 quick taps in
 // the top-right corner of the canvas. Passive observer — game input never

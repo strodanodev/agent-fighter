@@ -45,7 +45,7 @@ const REPO_ROOT = join(here, '..', '..', '..');
 const sha256Hex = (s: string): string => createHash('sha256').update(s).digest('hex');
 
 /**
- * AGENT-CLASS accounts (self-signup, Minds obj. 1): sub `agent:<uuid>`.
+ * AGENT-CLASS accounts (operator-owned via POST /agent/signup): sub `agent:<uuid>`.
  * Economically inert — fee 0, payout 0, no daily grant, wager unreachable
  * (it needs credits they can never hold). XP/rank only. This prefix check
  * is the single switch the whole policy hangs on.
@@ -86,6 +86,8 @@ const dayCounter = (): { bump: (key: string, max: number) => boolean } => {
   };
 };
 const SIGNUPS_PER_IP_PER_DAY = 5;
+/** Max agent-class fighters one AIR operator may mint (matches AF_FLEET cap). */
+const AGENTS_PER_OWNER = 12;
 const AGENT_BATTLES_PER_DAY = 20;
 
 /**
@@ -1723,29 +1725,54 @@ export const createMatchServer = (opts: {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...CORS });
       return res.end(connectPageHtml());
     }
-    // ---- AGENT SELF-SIGNUP (Minds obj. 1): no auth — the whole point is
-    // that an agent can onboard itself. Safe because the account class it
-    // creates is economically inert (fee 0 / payout 0 / no daily), so the
-    // only thing being rationed is compute: per-IP signups + per-sub battles.
+    // ---- AGENT-CLASS CREATE (unified with in-game mint): AIR owner required.
+    // Creates an inert agent:<uuid> fighter owned by the signed-in operator.
+    // Same key shape (afk_…) as POST /agent/key, but a SEPARATE profile —
+    // coach keys stay on the human row; fleet/headless keys are agent-class.
     if (path === '/agent/signup') {
-      if (req.method !== 'POST') return json(res, 405, { error: 'POST {name} to sign up' });
+      if (req.method !== 'POST') return json(res, 405, { error: 'POST {name?} to create an agent fighter' });
       if (!persistence) return json(res, 503, { error: 'persistence not configured' });
+      const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '')?.[1];
+      const devName = persistence.dev ? String(req.headers['x-dev-name'] ?? '') : '';
       const ip = (String(req.headers['x-forwarded-for'] ?? '').split(',')[0] ?? '').trim()
         || req.socket.remoteAddress || 'unknown';
-      if (!signupCap.bump(`ip:${ip}`, SIGNUPS_PER_IP_PER_DAY)) {
-        return json(res, 429, { error: `signup limit: ${SIGNUPS_PER_IP_PER_DAY}/day per IP` });
-      }
       void (async () => {
+        let ownerSub: string | null = null;
+        if (bearer) {
+          const id = await verifyAirToken(bearer);
+          if (id) ownerSub = id.sub;
+        } else if (devName) {
+          ownerSub = `dev:${devName.slice(0, 24)}`;
+        }
+        if (!ownerSub) {
+          return json(res, 401, { error: 'sign in to create an agent fighter (in-game MY AGENT or /connect)' });
+        }
+        if (isAgentClassSub(ownerSub)) {
+          return json(res, 403, { error: 'agent-class keys cannot mint more agents' });
+        }
+        if (!signupCap.bump(`ip:${ip}`, SIGNUPS_PER_IP_PER_DAY)) {
+          return json(res, 429, { error: `signup limit: ${SIGNUPS_PER_IP_PER_DAY}/day per IP` });
+        }
+        if ((await persistence.countOwnedAgents(ownerSub)) >= AGENTS_PER_OWNER) {
+          return json(res, 429, { error: `agent limit: ${AGENTS_PER_OWNER} fighters per account` });
+        }
+        // Ensure the operator profile exists (same prerequisite as /agent/key).
+        // Empty name → get_account keeps any existing display name (0009).
+        await persistence.getAccount({ sub: ownerSub }, '', false);
+        const ownerInfo = await persistence.getAgent(ownerSub);
         let body = '';
         for await (const chunk of req) body += chunk;
         let name = '';
         try { name = String((JSON.parse(body || '{}') as Record<string, unknown>).name ?? ''); }
         catch { return json(res, 400, { error: 'bad json' }); }
         name = name.trim().slice(0, 24);
-        if (name.length < 3) return json(res, 400, { error: 'name: 3-24 characters' });
-        // Display names must be unique on the leaderboard (case-insensitive).
-        // If the requested stem is taken, append a short hex tag rather than
-        // minting a second "IRONCLAD".
+        if (name.length < 3) {
+          // Canvas UI has no text field → derive from the owner + short tag.
+          const tag = randomBytes(2).toString('hex').toUpperCase();
+          const stem = (ownerInfo?.name || devName || 'AGENT')
+            .replace(/[^A-Za-z0-9]/g, '').slice(0, 10).toUpperCase() || 'AGENT';
+          name = `${stem}${tag}`.slice(0, 24);
+        }
         for (let i = 0; i < 8 && await persistence.nameTaken(name); i++) {
           const tag = randomBytes(2).toString('hex').toUpperCase();
           name = `${name.replace(/[0-9A-F]{2,4}$/i, '').slice(0, 20)}${tag}`.slice(0, 24);
@@ -1755,16 +1782,15 @@ export const createMatchServer = (opts: {
         }
         const sub = `agent:${randomUUID()}`;
         const key = `afk_${randomBytes(24).toString('hex')}`;
-        if (!(await persistence.createAgentAccount(sub, name, sha256Hex(key)))) {
+        if (!(await persistence.createAgentAccount(sub, name, sha256Hex(key), ownerSub))) {
           return json(res, 500, { error: 'could not create account — try again' });
         }
-        console.log(`[signup] agent account ${name} = ${sub} (${ip})`);
-        // The key is shown ONCE. Rank-only account: no credits, ever.
+        console.log(`[signup] agent account ${name} = ${sub} owner=${ownerSub} (${ip})`);
         return json(res, 200, {
-          sub, name, key,
+          sub, name, key, owner: ownerSub,
           note: 'store the key now — it is never shown again',
           account: 'agent-class: free arcade/rank play, no credits, wager unavailable',
-          play: 'ws hello { agentKey } → queue { mode: "arcade" }',
+          play: 'ws hello { agentKey } → queue { mode: "arcade" } · or AF_AGENT_KEY=… npm run agent',
         });
       })().catch((e) => json(res, 502, { error: String(e) }));
       return;

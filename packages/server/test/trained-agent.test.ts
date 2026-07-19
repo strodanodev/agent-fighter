@@ -174,7 +174,7 @@ describe('match ids survive server restarts (settlement-drop regression)', () =>
   });
 });
 
-describe('agent self-signup (inert agent class)', () => {
+describe('agent-class signup (operator-owned, inert)', () => {
   let server: MatchServer;
   let mem: Persistence;
   let http = '';
@@ -186,15 +186,27 @@ describe('agent self-signup (inert agent class)', () => {
   });
   after(() => server.close());
 
-  it('POST /agent/signup creates a rank-only account and the key plays arcade FREE', async () => {
+  it('POST /agent/signup requires a signed-in operator', async () => {
     const res = await fetch(`${http}/agent/signup`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'NoAuthBot' }),
+    });
+    assert.equal(res.status, 401);
+  });
+
+  it('POST /agent/signup (owner auth) creates a rank-only account and the key plays arcade FREE', async () => {
+    // Operator profile must exist first (same prerequisite as /agent/key).
+    await fetch(`${http}/me`, { headers: { 'X-Dev-Name': 'OpCrusher' } });
+    const res = await fetch(`${http}/agent/signup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Dev-Name': 'OpCrusher' },
       body: JSON.stringify({ name: 'CrusherBot' }),
     });
     assert.equal(res.status, 200);
-    const body = await res.json() as { sub: string; name: string; key: string };
+    const body = await res.json() as { sub: string; name: string; key: string; owner: string };
     assert.match(body.sub, /^agent:/);
     assert.match(body.key, /^afk_/);
+    assert.equal(body.owner, 'dev:OpCrusher');
 
     // The key reads the fresh profile.
     const info = await fetch(`${http}/agent`, { headers: { 'X-Agent-Key': body.key } });
@@ -218,19 +230,28 @@ describe('agent self-signup (inert agent class)', () => {
     assert.equal(after.wins + after.losses, 1, 'battle settled on the agent account');
   });
 
-  it('signup validates the name and rejects short ones', async () => {
+  it('signup with empty name auto-derives from the operator profile', async () => {
+    await fetch(`${http}/me`, { headers: { 'X-Dev-Name': 'OpAuto' } });
     const res = await fetch(`${http}/agent/signup`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'ab' }),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Dev-Name': 'OpAuto' },
+      body: '{}',
     });
-    assert.equal(res.status, 400);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { name: string; key: string; owner: string };
+    assert.match(body.key, /^afk_/);
+    assert.equal(body.owner, 'dev:OpAuto');
+    assert.ok(body.name.length >= 3);
   });
 
   it('wager stays unreachable for the inert class (0 credits, no daily)', async () => {
+    await fetch(`${http}/me`, { headers: { 'X-Dev-Name': 'OpBroke' } });
     const res = await fetch(`${http}/agent/signup`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Dev-Name': 'OpBroke' },
       body: JSON.stringify({ name: 'BrokeBot' }),
     });
+    assert.equal(res.status, 200);
     const { key } = await res.json() as { key: string };
     await assert.rejects(
       playOneMatch({

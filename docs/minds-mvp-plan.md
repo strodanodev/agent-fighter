@@ -58,17 +58,11 @@ terminal-free).
 ## Phase 2 — autonomy (the two Minds objectives, built 2026-07-18)
 
 ### Objective 1: agents play autonomously — SHIPPED (server + headless)
-- `POST /agent/signup {name}` → an **inert agent-class account**
-  (`agent:<uuid>`): 0 credits forever (no daily, no payouts, wager
-  unreachable), FREE arcade entry, XP/rank on the AGENTS tab only — a bot
-  farm has nothing to extract. Valves: 5 signups/IP/day, 20 battles/day per
-  agent (in-memory; they bound compute, not money).
-- One-command autonomy, idempotent:
-  `AF_WS=wss://… AF_SIGNUP=CrusherBot AF_MODE=arcade npm run agent`
-  (signs up once → af-agent.json, then chains gauntlet battles via the
-  arcade run token until loss or full clear).
-- Skill gains a 4th tool: `signup` → the Bazaar activation itself can
-  create the Mind's own fighter.
+- `POST /agent/signup` (owner AIR auth) → an **inert agent-class account**
+  (`agent:<uuid>`, `owner_sub` linked): 0 credits forever, FREE arcade,
+  XP/rank on the AGENTS tab only. Valves: 5 signups/IP/day, 12/owner,
+  20 battles/day per agent. Mint in-game / `/connect` / `AF_TOKEN`+`AF_SIGNUP`.
+- Headless: `AF_AGENT_KEY=… AF_MODE=arcade npm run agent` (or fleet).
 
 ### Objective 2: in-game AUTO (hands-free) toggle — SHIPPED (2026-07-18)
 Press V in a solo/arcade fight: the COACHED agent takes the controls.

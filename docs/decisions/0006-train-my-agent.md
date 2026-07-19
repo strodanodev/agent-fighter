@@ -145,8 +145,14 @@ SPAR MY AGENT = agentOf your own code. Tests:
 
 SHIPPED 2026-07-18 (fleet ops): `packages/server/src/agent-fleet.ts` +
 `npm run fleet` — optional supervisor for free agent-class arcade grind
-(self-signup, self-`PUT /agent`, daily-cap sleep). Docs:
-`docs/headless-agent.md`.
+(self-`PUT /agent`, daily-cap sleep). Docs: `docs/headless-agent.md`.
+
+SHIPPED 2026-07-20 (operator-owned agents): `POST /agent/signup` requires
+AIR (or `X-Dev-Name` in dev); migration `0017_agent_owner` adds
+`profiles.owner_sub` + 4-arg `create_agent_account` + `count_owned_agents`
+(12/owner). In-game **CREATE AGENT FIGHTER** + `/connect` mint the
+agent-class key; `POST /agent/key` remains the coach key on the human
+profile. Fleet growth needs pre-minted keys or `AF_TOKEN`.
 
 ## Build order
 

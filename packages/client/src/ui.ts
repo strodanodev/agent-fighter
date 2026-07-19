@@ -2945,8 +2945,10 @@ export interface AgentView {
   keyCreatedAt?: string | null;
   /** Roster entry of the coached character — portrait + display name. */
   roster?: Roster;
-  /** Fresh plaintext key (shown ONCE, straight from POST /agent/key). */
+  /** Fresh plaintext key (shown ONCE). */
   mintedKey?: string;
+  /** coach = POST /agent/key on your profile; fighter = POST /agent/signup agent-class. */
+  mintedKeyKind?: 'coach' | 'fighter';
   mintBusy?: boolean;
   /** ≥0 → ticks since the key was copied (flips the copy chip green). */
   keyCopiedAge?: number;
@@ -3073,17 +3075,23 @@ export const drawAgent = (
 
   // ---- fresh key reveal (mint response, shown exactly once).
   const kb = py0 + ph + 14;
+  const fighterKey = v.mintedKeyKind === 'fighter';
   if (v.mintedKey) {
     const kw = 620, kx = cx - kw / 2, kh = 54;
     bevel(ctx, kx, kb, kw, kh, '#101a12', '#7ee85a', '#123018', 3);
-    label(ctx, 'YOUR COACH KEY — COPY IT NOW, IT IS NEVER SHOWN AGAIN', cx, kb + 18, 11, '#8fe8a0');
+    label(ctx, fighterKey
+      ? 'AGENT FIGHTER KEY — FOR HEADLESS / FLEET · NEVER SHOWN AGAIN'
+      : 'YOUR COACH KEY — COPY IT NOW, IT IS NEVER SHOWN AGAIN', cx, kb + 18, 11, '#8fe8a0');
     const copied = (v.keyCopiedAge ?? -1) >= 0;
-    label(ctx, copied ? '✓ COPIED — PASTE IT INTO MINDS › MY CONNECTIONS' : v.mintedKey, cx, kb + 40,
-      copied ? 13 : v.mintedKey.length > 44 ? 12 : 14, copied ? '#8fe8a0' : '#eafff0');
+    const copiedMsg = fighterKey
+      ? '✓ COPIED — AF_AGENT_KEY=…  OR PASTE INTO fleet-agents.json'
+      : '✓ COPIED — PASTE IT INTO MINDS › MY CONNECTIONS';
+    label(ctx, copied ? copiedMsg : v.mintedKey, cx, kb + 40,
+      copied ? 12 : v.mintedKey.length > 44 ? 12 : 14, copied ? '#8fe8a0' : '#eafff0');
     tapZone(kx, kb, kw, kh, 'agent:copykey');
   }
 
-  // ---- CTA row: spar (the training feedback loop) + mint/rotate.
+  // ---- CTA row: spar + mint coach key; second row creates an agent-class fighter.
   const bh = 46, by = v.mintedKey ? kb + 68 : kb + 10;
   const canSpar = v.status === 'done' && !!v.config;
   const sparW = 300, mintW = 300, gap = 16;
@@ -3103,15 +3111,26 @@ export const drawAgent = (
     label(ctx, 'MINTING…', mx + mintW / 2, by + 29, 13, '#ffffff88');
   } else {
     bevel(ctx, mx, by, mintW, bh, '#0e2438', '#5db8ff', '#163a5a', 3);
-    display(ctx, v.keyCreatedAt || v.mintedKey ? '↻ ROTATE COACH KEY' : '🔑 MINT COACH KEY', mx + mintW / 2, by + 31, 16,
+    display(ctx, v.keyCreatedAt || (v.mintedKey && !fighterKey) ? '↻ ROTATE COACH KEY' : '🔑 MINT COACH KEY', mx + mintW / 2, by + 31, 16,
       { from: '#eaf6ff', mid: '#8fd0ff', to: '#3a7ab0', outline: '#0a1a2a' });
   }
   tapZone(mx, by, mintW, bh, 'agent:mint');
-  if (v.keyCreatedAt && !v.mintedKey) {
-    label(ctx, 'ROTATING INVALIDATES THE OLD KEY — YOUR MIND NEEDS THE NEW ONE', cx, by + bh + 16, 10, '#ffffff66');
-  }
 
-  label(ctx, 'S  SPAR       K  MINT KEY       V IN-MATCH  HANDS-FREE AUTO       ESC / ‹ TITLE  BACK', cx, VH - 14, 11, '#ffffff99');
+  const by2 = by + bh + 12;
+  const fightW = sparW + gap + mintW;
+  if (v.mintBusy) {
+    bevel(ctx, rowX, by2, fightW, bh, '#191a20', '#3f414c', '#101116', 3);
+    label(ctx, 'CREATING…', cx, by2 + 29, 13, '#ffffff88');
+  } else {
+    bevel(ctx, rowX, by2, fightW, bh, '#1a1028', '#c49bff', '#2a1848', 3);
+    display(ctx, '🤖 CREATE AGENT FIGHTER · HEADLESS KEY', cx, by2 + 31, 15,
+      { from: '#f5eaff', mid: '#c49bff', to: '#6a3a9a', outline: '#140a22' });
+  }
+  tapZone(rowX, by2, fightW, bh, 'agent:fighter');
+  label(ctx, 'CREATES A FREE AGENT-CLASS ACCOUNT YOU OWN · USE THE KEY WITH npm run agent / fleet',
+    cx, by2 + bh + 14, 10, '#ffffff66');
+
+  label(ctx, 'S  SPAR       K  COACH KEY       F  AGENT FIGHTER       ESC / ‹ TITLE  BACK', cx, VH - 14, 11, '#ffffff99');
 };
 
 // ------------------------------------------------------------ wallet strip

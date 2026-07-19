@@ -3,8 +3,9 @@
  *
  * Served by the MATCH SERVER so it needs nothing from the game client
  * deploy: it script-loads the public AIR Kit UMD from the game site, signs
- * the OWNER in (AIR's own dialog), then POSTs /agent/key with the fresh JWT
- * and shows the afk_… key ONCE with copy + "paste into Minds" guidance.
+ * the OWNER in (AIR's own dialog), then POSTs /agent/key (coach) or
+ * /agent/signup (agent-class fighter) with the fresh JWT and shows the
+ * afk_… key ONCE with copy + hand-off guidance.
  * The JWT lives in page memory only; the key is never stored client-side.
  *
  * ?sdk= overrides the AIR Kit UMD URL (dev servers), ?partner= / ?airenv=
@@ -43,33 +44,47 @@ export const connectPageHtml = (): string => `<!doctype html>
   <h1>AGENT FIGHTER · <span>CONNECT A COACH</span></h1>
 
   <section id="step-signin">
-    <p>Mint the <b>agent key</b> that lets your AI coach (an Animoca Mind,
-    or any agent you trust) read and train your fighter. Style only —
-    a coach can never touch your stats, level, or credits.</p>
-    <p><button id="go">Sign in &amp; mint my key</button></p>
-    <p class="muted">Uses your Agent Fighter (AIR) account — the same login
-    as the game. Minting again later rotates the key (the old one stops
-    working).</p>
+    <p>Sign in with your Agent Fighter (AIR) account, then pick what to mint:</p>
+    <p><button id="go">Sign in &amp; mint coach key</button></p>
+    <p><button id="go-fighter" class="ghost">Sign in &amp; create agent fighter (fleet / headless)</button></p>
+    <p class="muted"><b>Coach key</b> — trains <i>your</i> fighter via Minds (style only).
+    Rotating replaces the old key.</p>
+    <p class="muted"><b>Agent fighter</b> — creates a free agent-class account
+    you own (arcade / AGENTS rank, no credits). Use the key with
+    <code>npm run agent</code> / <code>npm run fleet</code>.</p>
     <p id="err"></p>
   </section>
 
   <section id="step-key" class="hide">
-    <p><b>Your agent key</b> — shown ONCE, copy it now:</p>
+    <p><b id="key-title">Your key</b> — shown ONCE, copy it now:</p>
     <code class="key" id="key"></code>
     <p><button id="copy">Copy key</button>
        <span id="copied" class="muted hide">copied ✓</span></p>
-    <p class="warn">This page never sees it again. If you lose it, mint a
-    new one here (the lost key is revoked automatically).</p>
-    <p><b>Next — hand it to your coach:</b></p>
-    <ol>
-      <li>On <a href="https://build.hellominds.ai" target="_blank" rel="noreferrer">Minds</a>:
-          create a Mind and <b>link Telegram</b> so you can text it.</li>
-      <li><b>My Connections</b> → Agent Fighter → paste the key.</li>
-      <li>Enable the <b>Agent Fighter Coach</b> skill from the Bazaar.</li>
-      <li>Message your Mind: <i>"set up my agent — aggressive rushdown"</i>.</li>
-    </ol>
-    <p class="muted">Once your coach saves a style, the AUTO toggle unlocks
-    in-game — your trained agent can take the controls.</p>
+    <p class="warn">This page never sees it again. If you lose a coach key,
+    mint a new one (the old one is revoked). Agent-fighter keys are
+    permanent until you discard the account credentials.</p>
+    <div id="next-coach">
+      <p><b>Next — hand it to your coach:</b></p>
+      <ol>
+        <li>On <a href="https://build.hellominds.ai" target="_blank" rel="noreferrer">Minds</a>:
+            create a Mind and <b>link Telegram</b> so you can text it.</li>
+        <li><b>My Connections</b> → Agent Fighter → paste the key.</li>
+        <li>Enable the <b>Agent Fighter Coach</b> skill from the Bazaar.</li>
+        <li>Message your Mind: <i>"set up my agent — aggressive rushdown"</i>.</li>
+      </ol>
+      <p class="muted">Once your coach saves a style, the AUTO toggle unlocks
+      in-game — your trained agent can take the controls.</p>
+    </div>
+    <div id="next-fighter" class="hide">
+      <p><b>Next — run headless:</b></p>
+      <ol>
+        <li><code>AF_AGENT_KEY=afk_… AF_MODE=arcade npm run agent</code></li>
+        <li>Or add the key to <code>fleet-agents.json</code> and
+            <code>npm run fleet</code>.</li>
+      </ol>
+      <p class="muted">Same mint is available in-game under
+      <b>MY AGENT → CREATE AGENT FIGHTER</b>.</p>
+    </div>
   </section>
 
 <script>
@@ -88,27 +103,40 @@ export const connectPageHtml = (): string => `<!doctype html>
     s.onerror = () => rej(new Error('could not load the AIR Kit SDK'));
     document.head.appendChild(s);
   });
-  document.getElementById('go').onclick = async () => {
-    const btn = document.getElementById('go');
-    btn.disabled = true; err('');
+  const mint = async (kind) => {
+    const btn = document.getElementById(kind === 'fighter' ? 'go-fighter' : 'go');
+    const other = document.getElementById(kind === 'fighter' ? 'go' : 'go-fighter');
+    btn.disabled = true; other.disabled = true; err('');
     try {
       await loadSdk();
       const svc = new Airkit.AirService({ partnerId: q.get('partner') || ${JSON.stringify(AIR_PARTNER_ID)} });
       const re = await svc.init({ buildEnv: q.get('airenv') || 'sandbox' });
       if (!(re && re.isLoggedIn)) await svc.login();
       const { token } = await svc.getAccessToken();
-      const r = await fetch('/agent/key', {
-        method: 'POST', headers: { Authorization: 'Bearer ' + token },
+      const path = kind === 'fighter' ? '/agent/signup' : '/agent/key';
+      const r = await fetch(path, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + token,
+          ...(kind === 'fighter' ? { 'Content-Type': 'application/json' } : {}),
+        },
+        body: kind === 'fighter' ? '{}' : undefined,
       });
       const body = await r.json();
       if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
       document.getElementById('key').textContent = body.key;
+      document.getElementById('key-title').textContent =
+        kind === 'fighter' ? 'Your agent fighter key' : 'Your coach key';
+      document.getElementById('next-coach').classList.toggle('hide', kind === 'fighter');
+      document.getElementById('next-fighter').classList.toggle('hide', kind !== 'fighter');
       show('step-key');
     } catch (e) {
       err(e && e.message ? e.message : String(e));
-      btn.disabled = false;
+      btn.disabled = false; other.disabled = false;
     }
   };
+  document.getElementById('go').onclick = () => mint('coach');
+  document.getElementById('go-fighter').onclick = () => mint('fighter');
   document.getElementById('copy').onclick = async () => {
     await navigator.clipboard.writeText(document.getElementById('key').textContent);
     document.getElementById('copied').classList.remove('hide');
