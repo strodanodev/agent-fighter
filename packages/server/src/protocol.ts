@@ -180,14 +180,9 @@ export interface CQueue {
    */
   agentOf?: string;
   /**
-   * CONSUMABLES (ADR 0007 Phase 2, solo/arcade only): the inventory rowId of
-   * ONE unconsumed energy drink to carry into this match. The server
-   * validates ownership, marks it consumed (idempotent by match id; released
-   * again if the match settles as a no-contest), and pins its effect into
-   * `SMatch.items` — the client must apply items ONLY from that echo, never
-   * from its own request (an old server that ignores this field then simply
-   * yields an item-less match, not a desync). Ignored for wager/friendly
-   * until the open-carry rollout (ADR 0007 Phase 4).
+   * DEPRECATED (af-core-5): drinks are now EQUIPPED in the vending-machine
+   * screen and the server reads the profile's loadout itself at queue time
+   * — this field is ignored. Kept in the type so old payloads still parse.
    */
   item?: number;
 }
@@ -259,14 +254,17 @@ export interface SMatch {
    */
   arcade?: { battle: number; total: number; token: string };
   /**
-   * CONSUMABLES (ADR 0007 Phase 2): the pinned per-side drink effects, or
-   * null for an empty hand. BOTH simulating ends (client + verifier + any
-   * rollback peer) must install this via core `setMatchItems` BEFORE
-   * createGameState — the pin is part of the deterministic contract exactly
-   * like characters and `solo.personality`. Values are re-clamped in core.
-   * Absent = item-less match (pre-item servers/clients behavior).
+   * CONSUMABLES (ADR 0007 final shape): the pinned per-side drink LOADOUTS
+   * (each side's EQUIPPED cans, slot order, ≤ 3). BOTH simulating ends
+   * (client + verifier + any rollback peer) must install this via core
+   * `setMatchItems` BEFORE createGameState — the pin is part of the
+   * deterministic contract exactly like characters and `solo.personality`.
+   * Values are re-clamped in core. Absent = item-less match. The server
+   * reads each profile's equipped loadout itself at queue time (the client
+   * no longer nominates rows), and settlement consumes ONLY the cans the
+   * verified re-sim shows were drunk.
    */
-  items?: [ItemPin | null, ItemPin | null];
+  items?: [ItemPin[], ItemPin[]];
   /** This side's resume token (bearer secret — never shown to the opponent). */
   resume?: string;
 }

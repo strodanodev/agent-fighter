@@ -267,6 +267,21 @@ export interface Persistence {
   /** Un-consume every item claimed by `matchId` (refund path). */
   releaseItems: (matchId: string) => Promise<void>;
   /**
+   * Consume-only-what-you-drink settlement (ADR 0007 final shape): of the
+   * items claimed by `matchId`, keep the DRUNK rows consumed and release
+   * the rest back to the stash (they also stay equipped — an un-drunk can
+   * rides into the next match automatically).
+   */
+  settleItems: (matchId: string, drunkRowIds: number[]) => Promise<void>;
+  /**
+   * Equip up to 3 unconsumed drinks (vending-machine screen). Replaces the
+   * whole loadout: rows in `rowIds` get slots 0..2 in order, everything
+   * else unequips. Rows that aren't `sub`'s or are consumed are skipped.
+   */
+  setEquipped: (sub: string, rowIds: number[]) => Promise<void>;
+  /** The equipped, unconsumed loadout in slot order (≤ 3). */
+  equippedItems: (sub: string) => Promise<OwnedItem[]>;
+  /**
    * Plain NON-REFUNDABLE debit (arcade entry, ADR 0007 credits rework):
    * unlike escrow_match there is NO refund path and NO sweeper interest —
    * the credit is spent the moment this returns. Idempotent by
@@ -284,6 +299,8 @@ export interface OwnedItem {
   itemId: string;
   tier: number;
   createdAt: string;
+  /** 0..2 when equipped in the vending-machine loadout; null in the stash. */
+  equippedSlot?: number | null;
 }
 
 export interface PurchaseResult extends OwnedItem {
@@ -383,7 +400,9 @@ export const memoryPersistence = (): Persistence => {
   /** sub → trained agent config + key (ADR 0006). */
   const agents = new Map<string, { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null }>();
   /** Granted consumables, newest first (ADR 0007). Nonce = idempotency key. */
-  const ownedItems: (OwnedItem & { sub: string; nonce: string; consumedMatchId?: string })[] = [];
+  const ownedItems: (OwnedItem & {
+    sub: string; nonce: string; consumedMatchId?: string; slot?: number | null;
+  })[] = [];
   let nextItemRow = 1;
   /** Idempotency keys of non-refundable debits (`sub|reason|key`) — ADR 0007. */
   const debits = new Set<string>();
@@ -613,7 +632,8 @@ export const memoryPersistence = (): Persistence => {
       ownedItems
         .filter((i) => i.sub === sub && !i.consumedMatchId) // consumed = gone
         .slice(0, limit)
-        .map(({ rowId, itemId, tier, createdAt }) => ({ rowId, itemId, tier, createdAt })),
+        .map(({ rowId, itemId, tier, createdAt, slot }) =>
+          ({ rowId, itemId, tier, createdAt, equippedSlot: slot ?? null })),
     getCredits: async (sub) => (profiles.has(sub) ? prof(sub).credits : null),
     consumeItem: async (sub, rowId, matchId) => {
       const row = ownedItems.find((i) => i.sub === sub && i.rowId === rowId);
@@ -627,6 +647,27 @@ export const memoryPersistence = (): Persistence => {
         if (row.consumedMatchId === matchId) row.consumedMatchId = undefined;
       }
     },
+    settleItems: async (matchId, drunkRowIds) => {
+      for (const row of ownedItems) {
+        if (row.consumedMatchId === matchId && !drunkRowIds.includes(row.rowId)) {
+          row.consumedMatchId = undefined; // un-drunk → back to the stash
+        }
+      }
+    },
+    setEquipped: async (sub, rowIds) => {
+      for (const row of ownedItems) if (row.sub === sub) row.slot = null;
+      rowIds.slice(0, 3).forEach((rowId, slot) => {
+        const row = ownedItems.find((i) => i.sub === sub && i.rowId === rowId && !i.consumedMatchId);
+        if (row) row.slot = slot;
+      });
+    },
+    equippedItems: async (sub) =>
+      ownedItems
+        .filter((i) => i.sub === sub && !i.consumedMatchId && i.slot !== null && i.slot !== undefined)
+        .sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0))
+        .slice(0, 3)
+        .map(({ rowId, itemId, tier, createdAt, slot }) =>
+          ({ rowId, itemId, tier, createdAt, equippedSlot: slot ?? null })),
     // Mirrors 0015_arcade_entry.sql debit_credits — keep in sync.
     debitCredits: async (sub, amount, reason, key) => {
       const dedup = `${sub}|${reason}|${key}`;
@@ -846,7 +887,7 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
     listItems: async (sub, limit = 50) => {
       // Items table is RLS default-deny — only this service-role path reads it.
       const rows = (await call(
-        `/rest/v1/items?select=id,item_id,tier,created_at&profile_id=eq.${encodeURIComponent(sub)}&consumed_match_id=is.null&order=created_at.desc&limit=${limit | 0}`,
+        `/rest/v1/items?select=id,item_id,tier,created_at,equipped_slot&profile_id=eq.${encodeURIComponent(sub)}&consumed_match_id=is.null&order=created_at.desc&limit=${limit | 0}`,
         { method: 'GET' },
       )) as Array<Record<string, unknown>>;
       return rows.map((r) => ({
@@ -854,6 +895,8 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         itemId: String(r.item_id ?? ''),
         tier: Number(r.tier ?? 1),
         createdAt: String(r.created_at ?? ''),
+        equippedSlot: r.equipped_slot === null || r.equipped_slot === undefined
+          ? null : Number(r.equipped_slot),
       }));
     },
     getCredits: async (sub) => {
@@ -907,6 +950,45 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
       })) as Array<Record<string, unknown>>;
       const row = rows?.[0] ?? {};
       return { credits: Number(row.credits ?? 0), duplicate: Boolean(row.duplicate) };
+    },
+    settleItems: async (matchId, drunkRowIds) => {
+      // Release everything this match claimed EXCEPT the drunk rows.
+      const keep = drunkRowIds.map((r) => r | 0).join(',');
+      await call(
+        `/rest/v1/items?consumed_match_id=eq.${encodeURIComponent(matchId)}`
+        + (keep ? `&id=not.in.(${keep})` : ''),
+        { method: 'PATCH', body: JSON.stringify({ consumed_match_id: null, consumed_at: null }) },
+      );
+    },
+    setEquipped: async (sub, rowIds) => {
+      // Single-writer service role: clear-then-set is race-free enough.
+      await call(
+        `/rest/v1/items?profile_id=eq.${encodeURIComponent(sub)}&equipped_slot=not.is.null`,
+        { method: 'PATCH', body: JSON.stringify({ equipped_slot: null }) },
+      );
+      const picks = rowIds.slice(0, 3);
+      for (let slot = 0; slot < picks.length; slot++) {
+        await call(
+          `/rest/v1/items?id=eq.${picks[slot]! | 0}&profile_id=eq.${encodeURIComponent(sub)}`
+          + `&consumed_match_id=is.null`,
+          { method: 'PATCH', body: JSON.stringify({ equipped_slot: slot }) },
+        );
+      }
+    },
+    equippedItems: async (sub) => {
+      const rows = (await call(
+        `/rest/v1/items?select=id,item_id,tier,created_at,equipped_slot`
+        + `&profile_id=eq.${encodeURIComponent(sub)}&equipped_slot=not.is.null`
+        + `&consumed_match_id=is.null&order=equipped_slot.asc&limit=3`,
+        { method: 'GET' },
+      )) as Array<Record<string, unknown>>;
+      return rows.map((r) => ({
+        rowId: Number(r.id ?? 0),
+        itemId: String(r.item_id ?? ''),
+        tier: Number(r.tier ?? 1),
+        createdAt: String(r.created_at ?? ''),
+        equippedSlot: r.equipped_slot === null ? null : Number(r.equipped_slot),
+      }));
     },
   };
 };

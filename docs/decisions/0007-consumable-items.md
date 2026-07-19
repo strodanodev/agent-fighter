@@ -102,6 +102,32 @@ stays dry. The VS card shows your drink + the control hint.
 settle strands the drink consumed — the escrow sweeper doesn't release items
 yet (one 5 CR can; add to the sweeper later).
 
+## 2026-07-20 — final UX shape (user-directed): 3-slot equip + credits rework
+
+**Drinks (af-core-5):** players EQUIP up to 3 drinks in the vending-machine
+screen (new EQUIPPED rack; tap stash↔rack; migration 0016 `equipped_slot`,
+`POST /items/equip`). The server reads the equipped loadout itself at queue
+time (CQueue.item deprecated) for arcade, solo, AND wager (open carry both
+sides); the select screen shows a read-only indicator. In-match: one input
+bit per slot (Btn.Item/Item2/Item3 = bits 10-12), a 3-can rack under the
+health bar (per-can tap zones; R drinks the next un-drunk can), independent
+OVERCLOCK/FIREWALL timers (re-drink refreshes, never stacks), drink-consumed
+juice (ring+burst+floating tag + synthesized gulp-fizz).
+**CONSUME ONLY WHAT YOU DRINK:** settlement reads the verified re-sim's
+per-slot spent flags (VerifyOutcome.spent) — drunk cans stay consumed,
+un-drunk cans return to the stash STILL EQUIPPED; no-contest releases all;
+forfeits keep what was drunk before the drop.
+
+**Arcade credits (user rules, all shipped):** entry is a consented,
+NON-refundable 1-credit debit BEFORE character select (POST /arcade/enter →
+debit_credits RPC, migration 0015; reason 'arcade' so the escrow sweeper
+never refunds it; wallet updates instantly); every verified win pays +1;
+full clear keeps the +5 bonus (10-clear nets +14 vs the old +6 — noted for
+the pre-cash-out valve review); run tokens persist client-side and the title
+shows RESUME RUN inside the server's 5-min grace, so a crash no longer eats
+the entry. Legacy path (old clients / free agent-class) still escrows at
+battle 1.
+
 ## Studio follow-up
 
 Item/can/machine art can be generated through the existing provider

@@ -13,7 +13,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ENGINE_VERSION, ITEMS, ITEM_COST } from '@af/core';
+import { ENGINE_VERSION, ITEMS, ITEM_COST, aiPoll } from '@af/core';
 import { WebSocket } from 'ws';
 import { createMatchServer } from '../src/server.js';
 import type { MatchServer } from '../src/server.js';
@@ -132,10 +132,11 @@ describe('vending machine (ADR 0007 Phase 1)', () => {
 });
 
 /**
- * PHASE 2 — drinks in matches: consume at pair time, pin into the setup,
- * verify the buffed sim end-to-end, release on a no-contest.
+ * DRINKS IN MATCHES (ADR 0007 final shape): the server reads each profile's
+ * EQUIPPED loadout (≤3) at queue time, pins it, and settlement consumes
+ * ONLY the cans the verified re-sim shows were drunk.
  */
-describe('consumables in matches (ADR 0007 Phase 2)', () => {
+describe('consumables in matches (ADR 0007 final shape)', () => {
   let server: MatchServer;
   let mem: Persistence;
   let http = '';
@@ -154,9 +155,18 @@ describe('consumables in matches (ADR 0007 Phase 2)', () => {
     return { rowId: body.rowId, itemId: body.item.id };
   };
 
-  const inventory = async (who: string): Promise<number[]> => {
+  const equip = async (who: string, rowIds: number[]): Promise<void> => {
+    const res = await fetch(`${http}/items/equip`, {
+      method: 'POST', headers: hdr(who), body: JSON.stringify({ rowIds }),
+    });
+    assert.equal(res.status, 200);
+  };
+
+  const inventory = async (who: string): Promise<Array<{ rowId: number; equippedSlot: number | null }>> => {
     const res = await fetch(`${http}/items`, { headers: hdr(who) });
-    return (await res.json() as { items: Array<{ rowId: number }> }).items.map((i) => i.rowId);
+    return (await res.json() as {
+      items: Array<{ rowId: number; equippedSlot: number | null }>;
+    }).items;
   };
 
   before(async () => {
@@ -170,56 +180,63 @@ describe('consumables in matches (ADR 0007 Phase 2)', () => {
     server.close();
   });
 
-  it('a solo match with a drink pins it, verifies end-to-end, and consumes it', async () => {
-    const drink = await buy('Drinker', 'phase2-pull-1');
-    assert.deepEqual(await inventory('Drinker'), [drink.rowId]);
+  it('CONSUME ONLY WHAT YOU DRINK: drunk can is gone, un-drunk can comes home still equipped', async () => {
+    await fetch(`${http}/me`, { headers: hdr('Drinker') }); // profile + daily
+    await fund('Drinker', 'fund-drinker'); // two 5-CR pulls + the 1-CR solo fee
+    const a = await buy('Drinker', 'fs-pull-1');
+    const b = await buy('Drinker', 'fs-pull-2');
+    await equip('Drinker', [a.rowId, b.rowId]);
 
-    // The reference client sims the match itself — it applies the pinned
-    // items from the setup echo, so a VERIFIED result here proves both ends
-    // (client sim + server re-sim) agreed on the BUFFED simulation. If the
-    // verifier forgot installItems, the hashes/outcome would diverge.
+    // The reference client sims the match itself with the pinned loadout —
+    // a VERIFIED result proves both ends agreed on the buffed sim. The
+    // policy PULSES slot 0's bit (Btn.Item = 1<<10) — a held bit only edges
+    // once (and pre-round eats that edge), so pulse to keep making fresh
+    // rising edges until one lands on a free ground frame and drinks.
     const r = await playOneMatch({
       url: `ws://localhost:${server.port}`,
       name: 'Drinker', character: 'analog', skill: 60,
       charactersDir, aiSeed: 41, paceMs: 1, mode: 'solo',
-      item: drink.rowId,
+      policy: (g, ai) =>
+        aiPoll(ai, g) | (g.tick < 3000 && ((g.tick / 10) | 0) % 2 === 0 ? (1 << 10) : 0),
     });
     assert.equal(r.result.reason, 'verified');
     assert.equal(r.result.deviator, undefined, 'no side flagged — both simmed the same buffed match');
     assert.equal(r.result.hash, r.localHash, 'client and verifier agree bit-for-bit');
 
-    assert.deepEqual(await inventory('Drinker'), [], 'the drink was consumed by playing');
+    await new Promise((res) => setTimeout(res, 300)); // settleItems is fire-and-forget
+    const inv = await inventory('Drinker');
+    assert.ok(!inv.some((i) => i.rowId === a.rowId), 'slot-0 can was DRUNK → consumed');
+    const back = inv.find((i) => i.rowId === b.rowId);
+    assert.ok(back, 'un-drunk can came home');
+    assert.equal(back!.equippedSlot, 1, 'and it is still equipped for the next match');
   });
 
-  it('the setup echoes the pinned drink (and a bogus rowId yields an item-less match)', async () => {
-    const drink = await buy('Echoer', 'phase2-pull-2');
-    const setupWith = await rawSolo(server.port, 'Echoer', drink.rowId);
-    const items = setupWith.items as Array<{ id: string } | null> | undefined;
-    assert.ok(items?.[0], 'side 0 carries the drink');
-    assert.equal(items[0]!.id, drink.itemId);
-    assert.equal(items[1], null, 'the house drinks nothing');
-
-    // The abandoned socket settles as forfeit/incomplete eventually; either
-    // way the NEXT queue with a bogus row must be clean and item-less.
-    const setupBogus = await rawSolo(server.port, 'Echoer', 999999);
-    assert.equal(setupBogus.items, undefined, 'bogus rowId → no pin, match still starts');
+  it('the setup echoes the equipped loadout (arrays per side; house side empty)', async () => {
+    const a = await buy('Echoer', 'fs-pull-3');
+    await equip('Echoer', [a.rowId]);
+    const setup = await rawSolo(server.port, 'Echoer');
+    const items = setup.items as [Array<{ id: string }>, Array<unknown>] | undefined;
+    assert.ok(items, 'setup carries items');
+    assert.equal(items[0].length, 1, 'side 0 carries the equipped can');
+    assert.equal(items[0][0]!.id, a.itemId);
+    assert.equal(items[1].length, 0, 'the house drinks nothing');
   });
 
-  it('a silent no-contest hands the drink back', async () => {
-    const drink = await buy('Ghost', 'phase2-pull-3');
+  it('a silent no-contest hands ALL reserved cans back', async () => {
+    const a = await buy('Ghost', 'fs-pull-4');
+    await equip('Ghost', [a.rowId]);
     const ws = new WebSocket(`ws://localhost:${server.port}`);
     const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => { ws.close(); reject(new Error('no result before timeout')); }, 15_000);
       ws.on('open', () => {
         ws.send(JSON.stringify({ t: 'hello', v: PROTOCOL_VERSION, name: 'Ghost', engine: ENGINE_VERSION }));
-        ws.send(JSON.stringify({ t: 'queue', character: 'analog', mode: 'solo', item: drink.rowId }));
+        ws.send(JSON.stringify({ t: 'queue', character: 'analog', mode: 'solo' }));
       });
       ws.on('message', (d) => {
         const m = JSON.parse(String(d)) as ServerMsg & Record<string, unknown>;
         if (m.t === 'match') {
           // A few honest ticks, then total silence WITHOUT closing — the
-          // idle sweep must settle this as a no-contest (nobody to blame in
-          // PvE) and the drink must come home.
+          // idle sweep settles this as a no-contest and everything releases.
           for (let k = 0; k < 20; k++) ws.send(JSON.stringify({ t: 'i', k, v: 0 }));
         }
         if (m.t === 'result') { clearTimeout(timer); ws.close(); resolve(m); }
@@ -228,7 +245,8 @@ describe('consumables in matches (ADR 0007 Phase 2)', () => {
     });
     assert.equal(result.reason, 'incomplete', 'silence in PvE is a no-contest');
     await new Promise((r) => setTimeout(r, 300)); // releaseItems is fire-and-forget
-    assert.ok((await inventory('Ghost')).includes(drink.rowId), 'the un-drunk drink is back in the stash');
+    assert.ok((await inventory('Ghost')).some((i) => i.rowId === a.rowId),
+      'the reserved can is back in the stash');
   });
 
   // Bank +20 credits via a fabricated settled wager win (the memory impl pays
@@ -244,27 +262,24 @@ describe('consumables in matches (ADR 0007 Phase 2)', () => {
     });
   };
 
-  it('WAGER open carry: each side pins its OWN drink into the setup (Phase 4)', async () => {
+  it('WAGER open carry: each side pins its OWN equipped loadout', async () => {
     await fund('WagerA', 'fund-a');
     await fund('WagerB', 'fund-b');
-    const a = await buy('WagerA', 'phase4-a');
-    const b = await buy('WagerB', 'phase4-b');
-    // Two humans queue wager, each carrying their own can → paired, and each
-    // setup echoes items[thisSide] = my drink, items[otherSide] = theirs.
+    const a = await buy('WagerA', 'fs-pull-5');
+    const b = await buy('WagerB', 'fs-pull-6');
+    await equip('WagerA', [a.rowId]);
+    await equip('WagerB', [b.rowId]);
     const setups = await Promise.all([
-      rawWager(server.port, 'WagerA', a.rowId),
-      rawWager(server.port, 'WagerB', b.rowId),
+      rawWager(server.port, 'WagerA'),
+      rawWager(server.port, 'WagerB'),
     ]);
     for (const setup of setups) {
       const side = setup.side as number;
-      const items = setup.items as Array<{ id: string } | null> | undefined;
+      const items = setup.items as [Array<unknown>, Array<unknown>] | undefined;
       assert.ok(items, 'wager setup carries items');
-      assert.ok(items[side], 'this side has a drink');
-      assert.ok(items[1 - side], 'the opponent has a drink too (open carry)');
+      assert.equal(items[side]!.length, 1, 'this side has its drink');
+      assert.equal(items[1 - side]!.length, 1, 'the opponent has theirs too (open carry)');
     }
-    // Both drinks were consumed at pair time.
-    assert.deepEqual(await inventory('WagerA'), []);
-    assert.deepEqual(await inventory('WagerB'), []);
   });
 });
 
@@ -279,14 +294,14 @@ describe('consumables in matches (ADR 0007 Phase 2)', () => {
 const wagerSockets: WebSocket[] = [];
 
 /** Raw WAGER queue → resolve the SMatch setup (socket parked for cleanup). */
-const rawWager = (port: number, name: string, item: number): Promise<Record<string, unknown>> =>
+const rawWager = (port: number, name: string): Promise<Record<string, unknown>> =>
   new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://localhost:${port}`);
     wagerSockets.push(ws);
     const timer = setTimeout(() => { ws.close(); reject(new Error('no wager setup before timeout')); }, 8_000);
     ws.on('open', () => {
       ws.send(JSON.stringify({ t: 'hello', v: PROTOCOL_VERSION, name, engine: ENGINE_VERSION }));
-      ws.send(JSON.stringify({ t: 'queue', character: 'analog', mode: 'wager', item }));
+      ws.send(JSON.stringify({ t: 'queue', character: 'analog', mode: 'wager' }));
     });
     ws.on('message', (d) => {
       const m = JSON.parse(String(d)) as Record<string, unknown>;
@@ -296,13 +311,13 @@ const rawWager = (port: number, name: string, item: number): Promise<Record<stri
   });
 
 /** Raw solo queue → resolve the SMatch setup (then abandon the socket). */
-const rawSolo = (port: number, name: string, item: number): Promise<Record<string, unknown>> =>
+const rawSolo = (port: number, name: string): Promise<Record<string, unknown>> =>
   new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://localhost:${port}`);
     const timer = setTimeout(() => { ws.close(); reject(new Error('no setup before timeout')); }, 8_000);
     ws.on('open', () => {
       ws.send(JSON.stringify({ t: 'hello', v: PROTOCOL_VERSION, name, engine: ENGINE_VERSION }));
-      ws.send(JSON.stringify({ t: 'queue', character: 'analog', mode: 'solo', item }));
+      ws.send(JSON.stringify({ t: 'queue', character: 'analog', mode: 'solo' }));
     });
     ws.on('message', (d) => {
       const m = JSON.parse(String(d)) as Record<string, unknown>;

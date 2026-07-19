@@ -54,7 +54,7 @@ export interface NetSetup {
    * match, not a desync. Installed via installSetupItems() before EVERY
    * createGameState (begin + resume rebuild); absent clears the slot.
    */
-  items?: [NetItemPin | null, NetItemPin | null];
+  items?: [NetItemPin[], NetItemPin[]];
   /** This side's resume token — lets a dropped socket rejoin (ADR 0005). */
   resume?: string;
 }
@@ -67,11 +67,11 @@ export interface NetItemPin {
   effect: { kind: string; amount: number; durationTicks: number };
 }
 
-/** Install a setup's pinned drinks into core — part of match construction. */
+/** Install a setup's pinned drink loadouts into core — part of match construction. */
 const installSetupItems = (s: NetSetup): void => {
   setMatchItems(
-    (s.items?.[0]?.effect as ItemEffect | undefined) ?? null,
-    (s.items?.[1]?.effect as ItemEffect | undefined) ?? null,
+    s.items?.[0]?.map((p) => p.effect as ItemEffect) ?? null,
+    s.items?.[1]?.map((p) => p.effect as ItemEffect) ?? null,
   );
 };
 
@@ -177,7 +177,6 @@ export class NetSession {
     private email?: string, // AIR-account email — reputation write-back target only
     private ref?: string, // stashed dare code (?ref=) — redeemed server-side once
     private room?: string, // friendly rendezvous code (mode 'friendly' only)
-    private itemRow?: number, // CONSUMABLES (ADR 0007 Phase 4): drink to carry (wager)
   ) {
     this.connect(false);
   }
@@ -191,7 +190,7 @@ export class NetSession {
       if (resume && this.setup?.resume) {
         this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
       } else {
-        this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode, room: this.room, item: this.itemRow || undefined });
+        this.send({ t: 'queue', character: this.character, bundleHash: this.bundleHash, mode: this.mode, room: this.room });
         this.status = 'queued';
       }
       // RTT probe loop (additive to protocol 6 — an old server just never
@@ -571,7 +570,6 @@ export class SoloSession {
      * into this match. The buff only applies if the server echoes it back in
      * setup.items (an old server silently yields an item-less match).
      */
-    private itemRow?: number,
   ) {
     this.connect(false);
   }
@@ -589,7 +587,6 @@ export class SoloSession {
           mode: this.arcadeQueue ? 'arcade' : 'solo',
           runToken: this.arcadeQueue?.runToken || undefined,
           agentOf: this.arcadeQueue ? undefined : this.agentOf || undefined,
-          item: this.itemRow || undefined,
         });
         this.status = 'queued';
       }

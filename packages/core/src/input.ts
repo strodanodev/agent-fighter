@@ -16,13 +16,19 @@ export const enum Btn {
   LK = 1 << 7,
   MK = 1 << 8,
   HK = 1 << 9,
-  // CONSUMABLES (ADR 0007 Phase 3): "drink my energy can". A free input bit
-  // (10..30 were unused) so activation rides the SAME ledger + rollback +
-  // re-sim path as every button — the only rollback-correct way to trigger
-  // a mid-match effect. The sim acts on the RISING edge and no-ops once the
-  // carried drink is spent, so a held key drinks exactly once.
-  Item = 1 << 10,
+  // CONSUMABLES (ADR 0007): "drink my energy can" — one bit PER EQUIPPED
+  // SLOT (players carry up to 3 drinks). Free input bits (10..30 were
+  // unused) so activation rides the SAME ledger + rollback + re-sim path as
+  // every button — the only rollback-correct way to trigger a mid-match
+  // effect. The sim acts on each bit's RISING edge and no-ops once that
+  // slot is spent, so a held key drinks exactly once.
+  Item = 1 << 10, // slot 0
+  Item2 = 1 << 11, // slot 1
+  Item3 = 1 << 12, // slot 2
 }
+
+/** All three drink-slot bits, slot-indexed. */
+export const ITEM_BITS = [Btn.Item, Btn.Item2, Btn.Item3] as const;
 
 export type InputFrame = number;
 

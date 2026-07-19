@@ -20,7 +20,7 @@ import {
   Phase, aiPoll, createAi, createGameState, itemById,
   loadCharacter, setCharacters, setMatchItems, stateHash, step,
 } from '@af/core';
-import type { CharacterBundle, ItemDef, ItemEffect } from '@af/core';
+import type { CharacterBundle, GameState, ItemDef, ItemEffect } from '@af/core';
 import {
   ARCADE_NEXT_GRACE_MS, DEFAULT_PORT, FORFEIT_GRACE_MS, IDLE_FORFEIT_MS, INPUT_DELAY,
   INPUT_DELAY_MAX, INPUT_DELAY_MIN, PING_INTERVAL_MS, PROTOCOL_VERSION,
@@ -123,13 +123,6 @@ interface Client {
   /** AIR-account email — only the reputation write-back target (ADR 0004). */
   email: string;
   /**
-   * CONSUMABLES (ADR 0007): the inventory rowId this client queued with, for
-   * WAGER — solo/arcade claim inline in their own start path, but wager pairs
-   * later in tryPair, so the pick is parked here between queue and pairing.
-   * 0 = fight dry. Cleared once claimed.
-   */
-  pendingItem: number;
-  /**
    * Measured round-trip to this client in ms (EMA; -1 = unknown). Fed by
    * the lobby ping loop's pong echoes; read once at pair time to size the
    * adaptive input delay. Client-supplied timing, so it is only ever used
@@ -161,9 +154,13 @@ interface Match {
   solo: { skill: number; aiSeed: number; personality?: Record<string, number> } | null;
   /** AGENT ARCADE: the run this battle belongs to (null = not an arcade battle). */
   arcadeRun: ArcadeRun | null;
-  /** CONSUMABLES (ADR 0007 Phase 2): pinned per-side drinks (null = none).
-   *  Consumed at pair time (the escrow pattern); released on no-contest. */
-  items: [ItemPin | null, ItemPin | null];
+  /** CONSUMABLES (ADR 0007): pinned per-side drink loadouts (≤3 each).
+   *  Reserved (consumed) at pair time; settlement keeps only the cans the
+   *  verified re-sim shows were DRUNK and releases the rest. */
+  items: MatchItems;
+  /** The items-table rowIds behind each pin, same order — server-side only
+   *  (never shipped to clients; settlement maps spent slots → rows). */
+  itemRows: [number[], number[]];
   startedAt: number; // wall clock — solo pace sanity (SOLO_PACE_*)
   /** Per-side bearer secrets for CResume — only their owners ever see them. */
   resumeTokens: [string, string];
@@ -253,11 +250,12 @@ export const defaultArcadeSkill = (battle: number, total: number): number =>
     + (ARCADE_SKILL_MAX - ARCADE_SKILL_MIN) * (total <= 1 ? 1 : battle / (total - 1)));
 
 // ---------------------------------------------------------------- verify
-/** The pinned per-side drinks, as stored on a Match / sent in SMatch. */
-type MatchItems = [ItemPin | null, ItemPin | null];
+/** The pinned per-side drink loadouts, as stored on a Match / sent in SMatch. */
+type MatchItems = [ItemPin[], ItemPin[]];
+const NO_ITEMS: MatchItems = [[], []];
 
 /**
- * Install a match's pinned drinks into the core module slot (the
+ * Install a match's pinned drink loadouts into the core module slot (the
  * setCharacters pattern). EVERY re-sim path must run this — including the
  * item-less default, which CLEARS the slot so one verification can never
  * leak drinks into the next.
@@ -266,9 +264,24 @@ const installItems = (items: MatchItems): void => {
   // The pin's effect shape is validated at queue time (it comes from the
   // core ITEMS registry) and core re-clamps values — the cast is safe.
   setMatchItems(
-    (items[0]?.effect as ItemEffect | undefined) ?? null,
-    (items[1]?.effect as ItemEffect | undefined) ?? null,
+    items[0].map((p) => p.effect as ItemEffect),
+    items[1].map((p) => p.effect as ItemEffect),
   );
+};
+
+/**
+ * Which pinned slots the re-simmed GameState shows as DRUNK: a pinned slot
+ * whose carried kind ended at 0 was consumed in-fight. The basis of
+ * consume-only-what-you-drink settlement — partial ledgers (forfeits)
+ * still count everything drunk BEFORE the drop.
+ */
+const spentSlots = (g: GameState, items: MatchItems): [boolean[], boolean[]] => {
+  const side = (i: 0 | 1): boolean[] => {
+    const f = g.fighters[i];
+    const kinds = [f.itemKind0, f.itemKind1, f.itemKind2];
+    return items[i].map((_pin, s) => kinds[s] === 0);
+  };
+  return [side(0), side(1)];
 };
 
 interface VerifyOutcome {
@@ -277,6 +290,8 @@ interface VerifyOutcome {
   endTick: number;
   hash: number;
   reachedEnd: boolean;
+  /** Per side, per pinned slot: was the can drunk by the verified ledger? */
+  spent: [boolean[], boolean[]];
 }
 
 /**
@@ -288,7 +303,7 @@ const verifyLedger = (
   bundles: [CharacterBundle, CharacterBundle],
   seed: number,
   inputs: [number[], number[]],
-  items: MatchItems = [null, null],
+  items: MatchItems = NO_ITEMS,
 ): VerifyOutcome => {
   setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
   installItems(items);
@@ -305,6 +320,7 @@ const verifyLedger = (
     endTick: t,
     hash: stateHash(g),
     reachedEnd: g.phase === Phase.MatchOver,
+    spent: spentSlots(g, items),
   };
 };
 
@@ -320,7 +336,7 @@ const verifySoloLedger = (
   seed: number,
   playerInputs: number[],
   solo: { skill: number; aiSeed: number; personality?: Record<string, number> },
-  items: MatchItems = [null, null],
+  items: MatchItems = NO_ITEMS,
 ): VerifyOutcome => {
   setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
   installItems(items);
@@ -340,6 +356,7 @@ const verifySoloLedger = (
     endTick: t,
     hash: stateHash(g),
     reachedEnd: g.phase === Phase.MatchOver,
+    spent: spentSlots(g, items),
   };
 };
 
@@ -528,12 +545,26 @@ export const createMatchServer = (opts: {
       c.match = null;
     }
     console.log(`[match ${m.id}] ${result.reason}: winner=${result.winner} ticks=${result.endTick}`);
-    // Consumables ride the fee pattern: a NO-CONTEST hands the drink back
-    // (nothing was contested); any decided outcome — win, loss, draw,
-    // forfeit — leaves it drunk. Idempotent: release matches by match id.
-    if (persistence && result.winner === -1 && (m.items[0] || m.items[1])) {
-      void persistence.releaseItems(m.id).catch((e) =>
-        console.log(`[items] release failed for ${m.id}: ${String(e)}`));
+    // CONSUME ONLY WHAT YOU DRINK (ADR 0007 final shape): the verified
+    // re-sim knows which pinned slots were spent, so settlement keeps the
+    // DRUNK cans consumed and hands the rest back (still equipped). A
+    // NO-CONTEST releases everything — the reserved cans were never truly
+    // in play. Forfeits keep whatever was drunk BEFORE the drop.
+    if (persistence && (m.items[0].length > 0 || m.items[1].length > 0)) {
+      if (result.winner === -1) {
+        void persistence.releaseItems(m.id).catch((e) =>
+          console.log(`[items] release failed for ${m.id}: ${String(e)}`));
+      } else {
+        const drunk: number[] = [];
+        for (const side of [0, 1] as const) {
+          v.spent[side].forEach((was, s) => {
+            const row = m.itemRows[side][s];
+            if (was && row) drunk.push(row);
+          });
+        }
+        void persistence.settleItems(m.id, drunk).catch((e) =>
+          console.log(`[items] settle failed for ${m.id}: ${String(e)}`));
+      }
     }
     // Persist + award XP AFTER the result is out — progression is async and
     // must never delay or gate the verdict. record_match is idempotent by
@@ -701,7 +732,8 @@ export const createMatchServer = (opts: {
     c0: Client, c1: Client | null, mode: MatchMode | 'friendly', fee: number, id?: string,
     solo?: SoloPin,
     arcadeRun?: ArcadeRun,
-    items: [ItemPin | null, ItemPin | null] = [null, null],
+    items: MatchItems = [[], []],
+    itemRows: [number[], number[]] = [[], []],
   ): void => {
     // Arcade battles bill as the character, not "HOUSE": the run IS the mode.
     // Trained-agent opponents (dare/spar) bill as their owner's agent.
@@ -719,6 +751,7 @@ export const createMatchServer = (opts: {
       solo: solo ? { skill: solo.skill, aiSeed: solo.aiSeed, personality: solo.personality } : null,
       arcadeRun: arcadeRun ?? null,
       items,
+      itemRows,
       // Local-sim solo has NO input scheduling at all — zero added latency.
       // PvP sizes the delay from both sides' measured RTT (fallback: fixed).
       delay: solo ? 0 : c1 ? adaptiveDelay(c0, c1) : INPUT_DELAY,
@@ -752,7 +785,7 @@ export const createMatchServer = (opts: {
         arcade: arcadeRun
           ? { battle: arcadeRun.battle, total: arcadeRun.opponents.length, token: arcadeRun.token }
           : undefined,
-        items: m.items[0] || m.items[1] ? m.items : undefined,
+        items: m.items[0].length > 0 || m.items[1].length > 0 ? m.items : undefined,
         resume: m.resumeTokens[c.side],
       };
       send(c, setup);
@@ -811,13 +844,13 @@ export const createMatchServer = (opts: {
             continue;
           }
         }
-        // CONSUMABLES (ADR 0007 Phase 4): open carry — each side drinks its
-        // own. Claim both after escrow (a failed claim runs that side dry).
-        const p0 = await claimOne(c0, c0.pendingItem, matchId);
-        const p1 = await claimOne(c1, c1.pendingItem, matchId);
-        c0.pendingItem = 0;
-        c1.pendingItem = 0;
-        startMatch(c0, c1, 'wager', fee, matchId, undefined, undefined, [p0, p1]);
+        // CONSUMABLES (ADR 0007): open carry — each side's EQUIPPED loadout
+        // rides in. Reserve both after escrow (a failed claim runs that
+        // side dry); only the cans actually drunk stay consumed at settle.
+        const e0 = await claimEquipped(c0, matchId);
+        const e1 = await claimEquipped(c1, matchId);
+        startMatch(c0, c1, 'wager', fee, matchId, undefined, undefined,
+          [e0.pins, e1.pins], [e0.rows, e1.rows]);
       }
     } finally {
       pairing = false;
@@ -837,32 +870,40 @@ export const createMatchServer = (opts: {
    * agent's owner is not a party to the match and earns nothing.
    */
   /**
-   * CONSUMABLES (ADR 0007): atomically claim ONE client's queued drink and
-   * build its pin. A failed claim (not yours, already drunk, raced another
-   * match) NEVER kills the match — the fee is already escrowed, so it simply
-   * runs without that drink and the client learns from the SMatch.items echo.
+   * CONSUMABLES (ADR 0007 final shape): read this client's EQUIPPED loadout
+   * (up to 3 drinks, chosen in the vending-machine screen) and RESERVE each
+   * can for this match (consumeItem — the same row can't ride two concurrent
+   * matches). Settlement later keeps only the cans actually drunk. A failed
+   * reserve NEVER kills the match — it simply runs without that can and the
+   * client learns from the SMatch.items echo.
    */
-  const claimOne = async (c: Client, itemRow: number, matchId: string): Promise<ItemPin | null> => {
-    if (!itemRow || !persistence || !c.identity?.sub || isAgentClassSub(c.identity.sub)) return null;
+  const claimEquipped = async (c: Client, matchId: string):
+    Promise<{ pins: ItemPin[]; rows: number[] }> => {
+    const none = { pins: [] as ItemPin[], rows: [] as number[] };
+    if (!persistence || !c.identity?.sub || isAgentClassSub(c.identity.sub)) return none;
     try {
-      const claimed = await persistence.consumeItem(c.identity.sub, itemRow, matchId);
-      const def = claimed ? itemById(claimed.itemId) : undefined;
-      if (claimed && def) {
-        console.log(`[items] ${c.name} drinks ${def.id} (T${def.tier}) in ${matchId}`);
-        return { id: def.id, name: def.name, tier: def.tier, effect: def.effect };
+      const equipped = await persistence.equippedItems(c.identity.sub);
+      const pins: ItemPin[] = [];
+      const rows: number[] = [];
+      for (const it of equipped.slice(0, 3)) {
+        const claimed = await persistence.consumeItem(c.identity.sub, it.rowId, matchId);
+        const def = claimed ? itemById(claimed.itemId) : undefined;
+        if (claimed && def) {
+          pins.push({ id: def.id, name: def.name, tier: def.tier, effect: def.effect });
+          rows.push(claimed.rowId);
+        }
       }
-      console.log(`[items] ${c.name} queued item row ${itemRow} but it wasn't consumable — runs without it`);
+      if (pins.length > 0) {
+        console.log(`[items] ${c.name} carries ${pins.map((p) => p.id).join('+')} into ${matchId}`);
+      }
+      return { pins, rows };
     } catch (e) {
-      console.log(`[items] claim failed in ${matchId}: ${String(e)}`);
+      console.log(`[items] equip claim failed in ${matchId}: ${String(e)}`);
+      return none;
     }
-    return null;
   };
 
-  /** Solo/arcade: the human is side 0, the house has no inventory. */
-  const claimItem = async (c: Client, itemRow: number, matchId: string):
-    Promise<[ItemPin | null, ItemPin | null]> => [await claimOne(c, itemRow, matchId), null];
-
-  const startSolo = async (c: Client, pin?: SoloPin, itemRow = 0): Promise<void> => {
+  const startSolo = async (c: Client, pin?: SoloPin): Promise<void> => {
     const fee = persistence ? SOLO_FEE : 0;
     const matchId = newMatchId();
     if (fee > 0) {
@@ -876,13 +917,15 @@ export const createMatchServer = (opts: {
     // Resolve AFTER escrow so a slow roster lookup can't race fee refunds,
     // and so dare-vs-agent pins (already resolved) skip another round-trip.
     const resolved = pin ?? await soloOpts(c);
-    const items = await claimItem(c, itemRow, matchId);
+    const claimed = await claimEquipped(c, matchId);
+    const items: MatchItems = [claimed.pins, []];
+    const itemRows: [number[], number[]] = [claimed.rows, []];
     if (c.ws.readyState !== WebSocket.OPEN) {
       // Vanished after escrow → settle as incomplete so the fee refunds.
-      startMatch(c, null, 'solo', fee, matchId, resolved, undefined, items);
+      startMatch(c, null, 'solo', fee, matchId, resolved, undefined, items, itemRows);
       return finishMatch(c.match!, null);
     }
-    startMatch(c, null, 'solo', fee, matchId, resolved, undefined, items);
+    startMatch(c, null, 'solo', fee, matchId, resolved, undefined, items, itemRows);
   };
 
   /**
@@ -993,7 +1036,7 @@ export const createMatchServer = (opts: {
    * free. Each battle is mechanically a local-sim solo match (pinned AI,
    * ledger re-sim) — only the fee, opponent sequencing, and payouts differ.
    */
-  const startArcadeBattle = async (c: Client, run: ArcadeRun, itemRow = 0): Promise<void> => {
+  const startArcadeBattle = async (c: Client, run: ArcadeRun): Promise<void> => {
     // Agent-class runs are FREE (inert economy — XP/rank only).
     const fee = run.battle === 0 && !run.paid && persistence && !isAgentClassSub(run.sub)
       ? ARCADE_FEE : 0;
@@ -1015,14 +1058,16 @@ export const createMatchServer = (opts: {
       character: run.opponents[run.battle]!,
       aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
     };
-    const items = await claimItem(c, itemRow, matchId);
+    const claimed = await claimEquipped(c, matchId);
+    const items: MatchItems = [claimed.pins, []];
+    const itemRows: [number[], number[]] = [claimed.rows, []];
     if (c.ws.readyState !== WebSocket.OPEN) {
       // Vanished after escrow → settle as incomplete so the fee refunds
       // (the run stays retryable until it expires).
-      startMatch(c, null, 'arcade', fee, matchId, opts, run, items);
+      startMatch(c, null, 'arcade', fee, matchId, opts, run, items, itemRows);
       return finishMatch(c.match!, null);
     }
-    startMatch(c, null, 'arcade', fee, matchId, opts, run, items);
+    startMatch(c, null, 'arcade', fee, matchId, opts, run, items, itemRows);
   };
 
   const onMessage = (c: Client, raw: string): void => {
@@ -1115,12 +1160,10 @@ export const createMatchServer = (opts: {
           : msg.mode === 'friendly' ? 'friendly'
           : 'wager';
         const runToken = typeof msg.runToken === 'string' ? msg.runToken : '';
-        // CONSUMABLES (ADR 0007 Phase 3/4): drinks ride solo/arcade AND wager
-        // (open carry — each player brings and drinks their own, at their own
-        // discretion). Friendly stays dry (unranked, anti-collusion).
-        const itemRow = mode !== 'friendly'
-          && typeof msg.item === 'number' && Number.isInteger(msg.item) && msg.item > 0
-          ? msg.item : 0;
+        // CONSUMABLES (ADR 0007 final shape): the server reads each
+        // profile's EQUIPPED loadout itself (claimEquipped) for solo,
+        // arcade AND wager — CQueue.item is deprecated and ignored.
+        // Friendly stays dry (unranked, anti-collusion).
         void (async () => {
           await c.identityReady;
           if (c.state !== 'lobby' || c.ws.readyState !== WebSocket.OPEN) return;
@@ -1187,7 +1230,7 @@ export const createMatchServer = (opts: {
               }
               c.state = 'queued';
               send(c, { t: 'queued' });
-              return startArcadeBattle(c, run, itemRow);
+              return startArcadeBattle(c, run);
             }
             // LEGACY new run (old clients / free agent-class): 1 credit
             // escrows with battle 1. New clients pre-pay via /arcade/enter
@@ -1218,7 +1261,7 @@ export const createMatchServer = (opts: {
             arcadeRuns.set(fresh.token, fresh);
             c.state = 'queued';
             send(c, { t: 'queued' });
-            return startArcadeBattle(c, fresh, itemRow);
+            return startArcadeBattle(c, fresh);
           }
           // Fast pre-check for a friendly error; escrow re-checks atomically.
           const fee = mode === 'solo' ? SOLO_FEE : WAGER_FEE;
@@ -1233,12 +1276,12 @@ export const createMatchServer = (opts: {
             if (typeof pin === 'string') return send(c, { t: 'error', msg: pin });
             c.state = 'queued';
             send(c, { t: 'queued' });
-            return startSolo(c, pin, itemRow);
+            return startSolo(c, pin);
           }
           c.state = 'queued';
           send(c, { t: 'queued' });
-          if (mode === 'solo') await startSolo(c, undefined, itemRow);
-          else { c.pendingItem = itemRow; queue.push(c); void tryPair(); }
+          if (mode === 'solo') await startSolo(c);
+          else { queue.push(c); void tryPair(); }
         })();
         return;
       }
@@ -1295,7 +1338,7 @@ export const createMatchServer = (opts: {
           agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
           mode: m.mode, fee: m.fee,
           solo: m.solo ?? undefined,
-          items: m.items[0] || m.items[1] ? m.items : undefined,
+          items: m.items[0].length > 0 || m.items[1].length > 0 ? m.items : undefined,
           resume: m.resumeTokens[side],
           inputs: [toNullable(m.inputs[0]), toNullable(m.inputs[1])],
         });
@@ -1590,10 +1633,13 @@ export const createMatchServer = (opts: {
     // key can never drain the owner's credits into gacha pulls. Agent-class
     // accounts are refused outright (they hold 0 credits by construction;
     // this is belt-and-braces).
-    //   GET  /items      → { cost, catalog, items: [inventory] }
-    //   POST /items/buy  → body { nonce } → server-side roll + atomic debit;
-    //                      idempotent by nonce (a retry replays the grant).
-    if (path === '/items' || path === '/items/buy') {
+    //   GET  /items       → { cost, catalog, items: [inventory w/ equippedSlot] }
+    //   POST /items/buy   → body { nonce } → server-side roll + atomic debit;
+    //                       idempotent by nonce (a retry replays the grant).
+    //   POST /items/equip → body { rowIds: number[] } (≤3, slot order) —
+    //                       replaces the whole equipped loadout; [] unequips
+    //                       all. These cans ride into every ranked match.
+    if (path === '/items' || path === '/items/buy' || path === '/items/equip') {
       if (!persistence) return json(res, 503, { error: 'persistence not configured' });
       const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '')?.[1];
       const devName = persistence.dev ? String(req.headers['x-dev-name'] ?? '') : '';
@@ -1604,6 +1650,26 @@ export const createMatchServer = (opts: {
         if (!identity) return json(res, 401, { error: 'sign in required' });
         if (isAgentClassSub(identity.sub)) {
           return json(res, 403, { error: 'agent-class accounts have no credits to spend' });
+        }
+
+        if (path === '/items/equip') {
+          if (req.method !== 'POST') return json(res, 405, { error: 'POST {rowIds} to equip' });
+          let body = '';
+          for await (const chunk of req) body += chunk;
+          let rowIds: number[] = [];
+          try {
+            const raw = (JSON.parse(body || '{}') as Record<string, unknown>).rowIds;
+            if (!Array.isArray(raw)) return json(res, 400, { error: 'rowIds: number[] required' });
+            rowIds = raw.filter((r): r is number => typeof r === 'number' && Number.isInteger(r) && r > 0);
+          } catch { return json(res, 400, { error: 'bad json' }); }
+          if (rowIds.length > 3) return json(res, 400, { error: 'equip at most 3 drinks' });
+          await persistence.setEquipped(identity.sub, rowIds);
+          const equipped = await persistence.equippedItems(identity.sub);
+          return json(res, 200, {
+            equipped: equipped.map((it) => ({
+              ...it, def: ITEMS.find((d) => d.id === it.itemId) ?? null,
+            })),
+          });
         }
 
         if (path === '/items/buy') {
@@ -1826,7 +1892,6 @@ export const createMatchServer = (opts: {
       identityReady: Promise.resolve(),
       account: null,
       email: '',
-      pendingItem: 0,
       rtt: -1,
     };
     clients.add(c);

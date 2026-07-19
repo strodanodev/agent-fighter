@@ -90,9 +90,15 @@ const SFX_FILES: Record<SfxId, string> = {
 
 const FILES: Record<SoundId, string> = { ...MUSIC_FILES, ...SFX_FILES };
 
-/** Shared title-screen / stage-BGM pool — the 4 "Ending" themes. */
+/**
+ * Shared title-screen / stage-BGM pool. Only 3 of the 4 "Ending" themes:
+ * `ending_megaman1` is a ~5s victory-fanfare stinger, not a real loopable
+ * track (the others run 45-86s) — looping it as stage/title BGM meant a
+ * short triumphant jingle repeating every few seconds mid-fight, easily
+ * (and reasonably) mistaken for the "You Win" cue looping during a match.
+ */
 export const ROTATION: MusicId[] = [
-  'ending_after_the_battle', 'ending_gambit', 'ending_grief', 'ending_megaman1',
+  'ending_after_the_battle', 'ending_gambit', 'ending_grief',
 ];
 
 /**

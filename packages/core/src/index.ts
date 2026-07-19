@@ -1,6 +1,6 @@
 export { FP, fp, fpMul, fpToPx, clamp, nextRand } from './fp.js';
 export {
-  Btn, PUNCH_MASK, KICK_MASK, ATTACK_MASK, DIR_MASK,
+  Btn, ITEM_BITS, PUNCH_MASK, KICK_MASK, ATTACK_MASK, DIR_MASK,
   held, pressed, pressedAttacks, countBits,
 } from './input.js';
 export type { InputFrame, InputSource } from './input.js';
@@ -27,5 +27,5 @@ export type { AiState, AiPersonality } from './ai.js';
 export {
   ITEMS, ITEM_COST, ITEM_TIER_ODDS, ITEM_TIER_COLORS, ITEM_TIER_LABELS, itemById,
 } from './items.js';
-export { setMatchItems } from './state.js';
+export { ITEM_SLOTS, setMatchItems } from './state.js';
 export type { ItemDef, ItemEffect, ItemEffectKind, ItemTier } from './items.js';

@@ -106,16 +106,16 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
     // with different character pairs would silently corrupt each other's
     // lockstep sims without this.
     let myChars: [ReturnType<typeof loadCharacter>, ReturnType<typeof loadCharacter>] | null = null;
-    // Pinned drinks (ADR 0007) are engine-global exactly like characters —
-    // re-pin both before every burst or concurrent sessions corrupt each
-    // other. [null, null] when the setup carried no items.
+    // Pinned drink loadouts (ADR 0007) are engine-global exactly like
+    // characters — re-pin both before every burst or concurrent sessions
+    // corrupt each other. undefined when the setup carried no items.
     let myItems: SMatch['items'] = undefined;
     const pinChars = (): void => {
       if (!myChars) return;
       setCharacters(myChars[0], myChars[1]);
       setMatchItems(
-        (myItems?.[0]?.effect as ItemEffect | undefined) ?? null,
-        (myItems?.[1]?.effect as ItemEffect | undefined) ?? null,
+        myItems?.[0]?.map((p) => p.effect as ItemEffect) ?? null,
+        myItems?.[1]?.map((p) => p.effect as ItemEffect) ?? null,
       );
     };
 

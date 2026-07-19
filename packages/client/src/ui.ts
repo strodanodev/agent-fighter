@@ -827,55 +827,72 @@ const ITEM_KIND_UI: Record<number, { color: string; tag: string }> = {
   4: { color: '#ffd166', tag: 'MTR' },
 };
 
+/** Carried slot s of a fighter (mirrors core slotOf — HUD read only). */
+const hudSlotKind = (f: GameState['fighters'][0], s: number): number =>
+  s === 0 ? f.itemKind0 : s === 1 ? f.itemKind1 : f.itemKind2;
+
 /**
- * CONSUMABLES (ADR 0007 Phase 3): the energy-drink slot below each health
- * bar. A CARRIED (un-drunk) can shows tappable for the local player — click
- * it or press R to drink. Once drunk, a timed buff shows its countdown; an
- * instant drink (heal/meter) just vanishes. Sits in the clear band right of
- * the nameplate, below the health bar. `isLocal` = the human's own can.
+ * CONSUMABLES (ADR 0007): the energy-drink rack below each health bar — up
+ * to 3 equipped cans side by side. The local player's carried cans are TAP
+ * TARGETS ('item:use:N'); pressing R drinks the next un-drunk one. The
+ * opponent's rack shows dimmed (open carry = informed stakes). Active
+ * OVERCLOCK/FIREWALL buffs show countdown chips after their can is drunk.
  */
 const drawItemSlot = (
   ctx: CanvasRenderingContext2D, i: 0 | 1, f: GameState['fighters'][0],
   tick: number, isLocal: boolean,
 ): void => {
-  const w = 20, h = 28;
-  const x = i === 0 ? HUD.edge + HUD.nameW + 22 : VW - HUD.edge - HUD.nameW - 22 - w;
+  const w = 20, h = 28, gap = 10;
+  const baseX = i === 0 ? HUD.edge + HUD.nameW + 22 : VW - HUD.edge - HUD.nameW - 22 - (w + gap) * 3 + gap;
   const y = HUD.barY + HUD.barH + 4;
+  let firstCarried = true;
 
-  if (f.itemKind !== 0) {
-    // Carried, un-drunk.
-    const ui = ITEM_KIND_UI[f.itemKind] ?? { color: '#cfd8e3', tag: 'CAN' };
+  for (let s = 0; s < 3; s++) {
+    const kind = hudSlotKind(f, s);
+    const x = baseX + s * (w + gap);
+    if (kind === 0) continue; // never carried, or already drunk
+    const ui = ITEM_KIND_UI[kind] ?? { color: '#cfd8e3', tag: 'CAN' };
     if (isLocal) {
-      // Yours: pulse, prompt, and make the whole slot a tap target.
-      tapZone(x - 8, y - 6, w + 16, h + 24, 'item:use');
+      tapZone(x - 5, y - 6, w + 10, h + 24, `item:use:${s}`);
       const pulse = 0.5 + 0.5 * Math.abs(Math.sin(tick / 14));
       ctx.save();
       ctx.shadowColor = ui.color;
-      ctx.shadowBlur = 6 + 10 * pulse;
+      ctx.shadowBlur = firstCarried ? 6 + 10 * pulse : 4;
       drawCan(ctx, x, y, w, h, ui.color, 4);
       ctx.restore();
       label(ctx, ui.tag, x + w / 2, y + h + 10, 9, ui.color);
-      label(ctx, 'R', x + w / 2, y - 3, 10, tick % 40 < 30 ? '#ffffff' : ui.color);
+      if (firstCarried) {
+        label(ctx, 'R', x + w / 2, y - 3, 10, tick % 40 < 30 ? '#ffffff' : ui.color);
+      }
+      firstCarried = false;
     } else {
-      // Opponent's carried drink — informational, dimmer, no tap zone.
       ctx.save();
-      ctx.globalAlpha = 0.7;
+      ctx.globalAlpha = 0.65;
       drawCan(ctx, x, y, w, h, ui.color, 0);
       ctx.restore();
       label(ctx, ui.tag, x + w / 2, y + h + 10, 9, `${ui.color}aa`);
     }
-    return;
   }
 
-  // Drunk: show the active timed buff's countdown, blinking the last 3s.
-  if (f.itemBuffLeft > 0) {
-    const secs = Math.ceil(f.itemBuffLeft / TICKS_PER_SEC);
-    const color = f.itemDmg > 0 ? '#ff9d6b' : '#6fd3ff';
-    if (!(secs <= 3 && tick % 24 < 12)) {
-      drawCan(ctx, x, y, w, h, color, 6);
-      label(ctx, `${secs}s`, x + w / 2, y + h + 10, 10, '#ffffffdd');
-    }
-  }
+  // Active buff countdown chips (after their cans are drunk) — sit right of
+  // the rack, blinking their last 3 seconds.
+  const chips: Array<{ left: number; color: string }> = [];
+  if (f.itemDmgLeft > 0) chips.push({ left: f.itemDmgLeft, color: '#ff9d6b' });
+  if (f.itemDefLeft > 0) chips.push({ left: f.itemDefLeft, color: '#6fd3ff' });
+  chips.forEach((c, k) => {
+    const secs = Math.ceil(c.left / TICKS_PER_SEC);
+    if (secs <= 3 && tick % 24 < 12) return;
+    const cx = i === 0
+      ? baseX + (w + gap) * 3 + 8 + k * 34
+      : baseX - 16 - k * 34;
+    ctx.save();
+    ctx.fillStyle = c.color;
+    ctx.beginPath();
+    ctx.arc(cx, y + 10, 7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    label(ctx, `${secs}s`, cx, y + 32, 10, '#ffffffdd');
+  });
 };
 
 export const drawHud = (
@@ -1463,6 +1480,8 @@ export interface ShopInventoryEntry {
   name: string;
   tier: number;
   desc: string;
+  /** 0..2 when in the equipped loadout; null = in the stash. */
+  equippedSlot?: number | null;
 }
 
 export interface ShopReveal { name: string; tier: number; desc: string; flavor: string }
@@ -1491,6 +1510,8 @@ export interface ShopView {
   spinAge: number;
   /** Full drink catalog — the slot reel cycles through it. */
   catalog: ShopReelEntry[];
+  /** The equipped loadout in slot order (≤3) — drawn as the EQUIPPED rack. */
+  equipped: ShopInventoryEntry[];
 }
 
 /** Spin length: 3 seconds at 60 ticks/sec (main.ts lands the reveal here). */
@@ -1721,22 +1742,52 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
     label(ctx, '(OR PRESS R) TO DRINK IT MID-FIGHT. USED = GONE.', lx + 14, ry + 196, 12, '#8fd0ff', 'left');
   }
 
-  // ---- Stash (inventory shelf, right-bottom) -----------------------------
-  const sy = 348;
-  label(ctx, `MY STASH · ${v.items.length}`, rx, sy, 14, GOLD_LT, 'left');
-  if (v.items.length === 0) {
-    label(ctx, v.status === 'done' ? 'EMPTY — PULL YOUR FIRST DRINK' : '…', rx, sy + 26, 12, '#ffffff66', 'left');
+  // ---- EQUIPPED rack (ADR 0007): the ≤3 cans that ride into every ranked
+  // match. Tap an equipped can to send it back to the stash; tap a stash
+  // row to equip it into the next free slot (both fire 'equip:<rowId>').
+  const eqY = 340;
+  label(ctx, 'EQUIPPED — CARRIED INTO EVERY FIGHT', rx, eqY, 13, GOLD_LT, 'left');
+  for (let s = 0; s < 3; s++) {
+    const bx = rx + s * 62, by = eqY + 8, bw = 54, bh = 58;
+    const it = v.equipped[s];
+    ctx.fillStyle = it ? 'rgba(24,44,26,0.85)' : 'rgba(12,10,24,0.7)';
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.strokeStyle = it ? '#7ddf8a' : 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+    if (it) {
+      tapZone(bx, by, bw, bh, `equip:${it.rowId}`);
+      const tier = Math.max(1, Math.min(3, it.tier));
+      drawCan(ctx, bx + 16, by + 6, 20, 34, TIER_COLORS[tier]!, tier === 3 ? 8 : 0);
+      label(ctx, TIER_LABELS[tier]!, bx + bw / 2, by + bh - 6, 9, TIER_COLORS[tier]!);
+    } else {
+      label(ctx, `${s + 1}`, bx + bw / 2, by + bh / 2 + 6, 16, '#ffffff33');
+    }
   }
-  const shown = v.items.slice(0, 6);
+  label(ctx, 'TAP TO UNEQUIP', rx + 3 * 62 + 8, eqY + 42, 9, '#ffffff55', 'left');
+
+  // ---- Stash (inventory shelf) — tap a row to EQUIP it -------------------
+  const stash = v.items.filter((it) => it.equippedSlot === null || it.equippedSlot === undefined);
+  const sy = 424;
+  label(ctx, `MY STASH · ${stash.length}`, rx, sy, 14, GOLD_LT, 'left');
+  if (stash.length === 0) {
+    label(ctx, v.status === 'done'
+      ? (v.items.length > 0 ? 'ALL CANS EQUIPPED' : 'EMPTY — PULL YOUR FIRST DRINK')
+      : '…', rx, sy + 26, 12, '#ffffff66', 'left');
+  }
+  const shown = stash.slice(0, 4);
   shown.forEach((it, k) => {
     const y = sy + 12 + k * 26;
     const tier = Math.max(1, Math.min(3, it.tier));
+    tapZone(rx - 4, y - 3, rw + 8, 26, `equip:${it.rowId}`);
     drawCan(ctx, rx, y, 12, 20, TIER_COLORS[tier]!);
     label(ctx, `${it.name}  ·  ${TIER_LABELS[tier]}`, rx + 20, y + 14, 12, '#ffffffcc', 'left');
     label(ctx, it.desc, rx + 20 + 190, y + 14, 10, '#ffffff66', 'left');
   });
-  if (v.items.length > shown.length) {
-    label(ctx, `+${v.items.length - shown.length} MORE IN THE STASH`, rx, sy + 12 + shown.length * 26 + 14, 10, '#ffffff55', 'left');
+  if (stash.length > shown.length) {
+    label(ctx, `+${stash.length - shown.length} MORE IN THE STASH`, rx, sy + 12 + shown.length * 26 + 14, 10, '#ffffff55', 'left');
+  } else if (shown.length > 0) {
+    label(ctx, 'TAP A CAN TO EQUIP IT', rx, sy + 12 + shown.length * 26 + 14, 10, '#7ddf8a99', 'left');
   }
 
   // Error toast (insufficient credits / server hiccup) — flashing red.

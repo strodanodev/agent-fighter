@@ -250,8 +250,14 @@ export const ROUND_SECONDS = 99;
  *            FighterState fields (itemKind/itemAmount/itemDur) carry the
  *            un-drunk drink. Serialize layout shifts again (goldens
  *            re-blessed); no drink pressed = still bit-identical to pre-item.
+ * af-core-5: THREE equipped drink slots per fighter (ADR 0007 final shape):
+ *            Btn.Item/Item2/Item3 each drink their slot; carried state is
+ *            9 scalars (kind/amount/dur ×3) and the damage/defense buffs run
+ *            independent timers (itemDmgLeft/itemDefLeft) so OVERCLOCK and
+ *            FIREWALL coexist; re-drinking a kind refreshes, never stacks.
+ *            Serialize layout shifts (goldens re-blessed).
  */
-export const ENGINE_VERSION = 'af-core-4';
+export const ENGINE_VERSION = 'af-core-5';
 
 export const TUNING = {
   roundsToWin: 2, // best of 3
