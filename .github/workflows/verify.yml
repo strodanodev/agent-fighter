@@ -20,3 +20,19 @@ jobs:
           node-version: 20
       - run: npm ci
       - run: npm run verify
+
+  # Browser-vs-Node golden determinism (audit 2026-07-18 carried gate). The
+  # money path assumes a match simulated in a player's browser re-simulates
+  # bit-identically on the Node server; this asserts it in Chromium AND WebKit
+  # (iOS Safari's engine) against the committed golden. A red run = a sim drift
+  # that would flag honest players as deviators and forfeit real credits.
+  determinism-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium webkit
+      - run: npm run determinism:browser
