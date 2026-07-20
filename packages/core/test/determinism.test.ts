@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  Btn, Phase, STAGE, createGameState, restore, snapshot, stateHash, step,
+  Btn, Phase, STAGE, createGameState, fp, restore, snapshot, stateHash, step,
 } from '../src/index.js';
 import type { GameState, InputFrame } from '../src/index.js';
 
@@ -154,5 +154,58 @@ describe('bounds sanity', () => {
     // MatchOver is terminal: only the tick counter advances.
     assert.equal(s.phase, Phase.MatchOver);
     assert.notEqual(stateHash(s), h); // tick still counts (input ledger alignment)
+  });
+});
+
+describe('view lock (per-stage bounds)', () => {
+  const BOUNDS = { left: 300, right: 1300 }; // 1000px region, comfortably > spawn span
+
+  it('createGameState pins fixed-point walls inset by wallPad', () => {
+    const s = createGameState(1, BOUNDS);
+    assert.equal(s.wallL, fp(BOUNDS.left + STAGE.wallPad));
+    assert.equal(s.wallR, fp(BOUNDS.right - STAGE.wallPad));
+    // Tighter than the full-stage default in both directions.
+    assert.ok(s.wallL > fp(STAGE.wallPad));
+    assert.ok(s.wallR < fp(STAGE.widthPx - STAGE.wallPad));
+  });
+
+  it('fighters clamp to the custom walls every tick (never the full stage)', () => {
+    const script = makeInputScript(0x5eed, 2400);
+    const s = createGameState(9, BOUNDS);
+    for (const f of s.fighters) { // spawns already inside the tighter walls
+      assert.ok(f.x >= s.wallL && f.x <= s.wallR);
+    }
+    for (const inputs of script) {
+      step(s, inputs);
+      for (const f of s.fighters) {
+        assert.ok(f.x >= s.wallL, `x ${f.x} < wallL ${s.wallL}`);
+        assert.ok(f.x <= s.wallR, `x ${f.x} > wallR ${s.wallR}`);
+      }
+    }
+  });
+
+  it('snapshot/restore round-trips the walls', () => {
+    const s = createGameState(2, BOUNDS);
+    const snap = snapshot(s);
+    s.wallL = 0; s.wallR = 0; // corrupt, then restore
+    restore(s, snap);
+    assert.equal(s.wallL, fp(BOUNDS.left + STAGE.wallPad));
+    assert.equal(s.wallR, fp(BOUNDS.right - STAGE.wallPad));
+  });
+
+  it('custom bounds diverge from the default-stage hash', () => {
+    const script = makeInputScript(0xabc, 600);
+    const def = createGameState(4);
+    const bnd = createGameState(4, BOUNDS);
+    for (const inputs of script) { step(def, inputs); step(bnd, inputs); }
+    assert.notEqual(stateHash(def), stateHash(bnd));
+  });
+
+  it('default bounds are identical to no bounds (backward-compat)', () => {
+    const script = makeInputScript(0xdef, 600);
+    const implicit = createGameState(5);
+    const explicit = createGameState(5, { left: 0, right: STAGE.widthPx });
+    for (const inputs of script) { step(implicit, inputs); step(explicit, inputs); }
+    assert.equal(stateHash(implicit), stateHash(explicit));
   });
 });

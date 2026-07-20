@@ -19,7 +19,7 @@ import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './a
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  currentStageCamLimits, drawAgent, drawGameOver, drawHud, drawInvite, drawLoading, drawNetError, drawOpponentGone,
+  currentStageBounds, currentStageCamLimits, drawAgent, drawGameOver, drawHud, drawInvite, drawLoading, drawNetError, drawOpponentGone,
   drawRanks, drawReconnecting, drawResults, drawSelect, drawShop, drawStage, drawStageSelect, drawTitle,
   drawVsCard, drawWallet, resetTaps, SHOP_SPIN_TICKS, setBgVideo, setGameLogo, setLogo,
   setStageAsset, setUiKit, setVendingArt, tapHit, tapZone, worldTransform,
@@ -1256,7 +1256,9 @@ const installOnlineMatch = (): void => {
 const startFight = (): void => {
   fighters = [allRosters[picks[0]]!, allRosters[picks[1]]!];
   setCharacters(fighters[0].ch, fighters[1].ch);
-  game = createGameState(seed++);
+  // Local play: walls follow the selected stage's view-lock region (matches
+  // the online feel, where the server pins the same bounds).
+  game = createGameState(seed++, currentStageBounds());
   cpuAi = mode === 'cpu'
     ? createAi(1, skillForCpuLevel(cpuLevelFor(profile, lever)), seed * 31 + 7)
     : null;
@@ -1321,7 +1323,7 @@ const startArcadeFight = (): void => {
     stageCursor = (seed + run.stage) % stageAssets.length;
     setStageAsset(stageAssets[stageCursor] ?? null);
   }
-  game = createGameState(seed++);
+  game = createGameState(seed++, currentStageBounds());
   cpuAi = createAi(1, arcadeSkill(run.stage, run.total), seed * 31 + 7);
   statDmg = 0;
   statBestCombo = 0;
@@ -1406,7 +1408,11 @@ const updateCamera = (g: GameState): void => {
   const viewW = VW / cam.zoom;
   const viewH = VH / cam.zoom;
   const midX = (x0 + x1) / 2;
-  const targetX = Math.max(0, Math.min(STAGE.widthPx - viewW, midX - viewW / 2));
+  // VIEW LOCK: pan only within the stage's playable region. When the region is
+  // narrower than the viewport, `Math.max(b.left, …)` collapses the window to
+  // its left edge (the min-zoom floor keeps this from cropping the action).
+  const b = currentStageBounds();
+  const targetX = Math.max(b.left, Math.min(Math.max(b.left, b.right - viewW), midX - viewW / 2));
   let targetY = boxT - CONTENT_TOP / cam.zoom;
 
   if (limits) {

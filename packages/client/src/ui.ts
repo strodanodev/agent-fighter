@@ -62,6 +62,16 @@ export const currentStageCamLimits = (): StageCamLimits | null =>
     : null;
 
 /**
+ * The active stage's VIEW-LOCK region in world px. The camera clamps `cam.x`
+ * to it; no bounds (or no stage art) → the full stage width, i.e. today's
+ * behavior. Kept in lockstep with the sim walls the server pins per match.
+ */
+export const currentStageBounds = (): { left: number; right: number } => {
+  const b = stageAsset?.meta.bounds;
+  return b ? { left: b.left, right: b.right } : { left: 0, right: STAGE.widthPx };
+};
+
+/**
  * Arcade presentation layer: rooftop stage, framed HUD, title / select /
  * results screens. Pure drawing — zero game logic, zero sim reads beyond the
  * exported GameState fields. Character art is the only thing not authored

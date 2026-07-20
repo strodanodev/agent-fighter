@@ -1,4 +1,4 @@
-import { fp } from './fp.js';
+import { fp, fpToPx } from './fp.js';
 import { ROUND_SECONDS, STAGE, TICKS_PER_SEC, TUNING, loadCharacter } from './data.js';
 import type { LoadedCharacter } from './data.js';
 import type { ItemEffect } from './items.js';
@@ -124,6 +124,13 @@ export interface GameState {
   phaseTimer: number; // PreRound / RoundOver countdown
   hitstopLeft: number; // global freeze frames (the crunch)
   superFlashLeft: number; // super cinematic freeze
+  // Per-match playfield walls (fixed-point world px), set once at match start
+  // from the stage's bounds (server-authoritative). Constant for the match, but
+  // they live in state — and in serialize() — because the sim clamps fighters to
+  // them, so rollback/verification must agree on them. Default (no stage bounds)
+  // is fp(wallPad)..fp(widthPx-wallPad), identical to the old module constants.
+  wallL: number;
+  wallR: number;
   fighters: [FighterState, FighterState];
   projectiles: ProjectileState[]; // fixed PROJECTILE_SLOTS length
 }
@@ -250,30 +257,63 @@ const emptyProjectile = (): ProjectileState => ({
   active: 0, owner: 0, moveIdx: -1, x: 0, y: 0, velX: 0, life: 0, hasHit: 0,
 });
 
-export const createGameState = (seed: number): GameState => ({
-  tick: 0,
-  rngSeed: seed | 0,
-  phase: Phase.PreRound,
-  winner: -1,
-  roundWinner: -1,
-  roundsWon0: 0,
-  roundsWon1: 0,
-  roundNum: 0,
-  timerTicks: ROUND_SECONDS * TICKS_PER_SEC,
-  phaseTimer: TUNING.preRoundTicks,
-  hitstopLeft: 0,
-  superFlashLeft: 0,
-  fighters: [
-    spawnItemFighter(0),
-    spawnItemFighter(1),
-  ],
-  projectiles: Array.from({ length: PROJECTILE_SLOTS }, emptyProjectile),
-});
+/** Playfield bounds in world px (the region the camera + walls are locked to). */
+export interface StageBounds { left: number; right: number }
+
+/** Default bounds = the full stage width — bit-identical to the old constants. */
+const DEFAULT_BOUNDS: StageBounds = { left: 0, right: STAGE.widthPx };
+
+/** Fixed-point walls for a region, inset by wallPad (as the old WALL_L/R were). */
+const wallLFp = (b: StageBounds): number => fp(b.left + STAGE.wallPad);
+const wallRFp = (b: StageBounds): number => fp(b.right - STAGE.wallPad);
+
+/** World-px spawn center of a region (both fighters spawn ±spawnOffset of it). */
+const centerPx = (wallL: number, wallR: number): number =>
+  fpToPx(Math.trunc((wallL + wallR) / 2));
+
+/** Spawn ±offset, shrunk so a NARROW view-locked region can't spawn a fighter
+ *  outside its own walls. Full-width stages keep the full SPAWN_OFFSET (the
+ *  gap dwarfs it), so default play is unchanged. */
+const spawnOffsetFor = (wallL: number, wallR: number): number => {
+  const halfGap = fpToPx((wallR - wallL) / 2);
+  return Math.max(0, Math.min(SPAWN_OFFSET, halfGap - 20));
+};
+
+export const createGameState = (
+  seed: number,
+  bounds: StageBounds = DEFAULT_BOUNDS,
+): GameState => {
+  const wallL = wallLFp(bounds);
+  const wallR = wallRFp(bounds);
+  const cx = centerPx(wallL, wallR);
+  const off = spawnOffsetFor(wallL, wallR);
+  return {
+    tick: 0,
+    rngSeed: seed | 0,
+    phase: Phase.PreRound,
+    winner: -1,
+    roundWinner: -1,
+    roundsWon0: 0,
+    roundsWon1: 0,
+    roundNum: 0,
+    timerTicks: ROUND_SECONDS * TICKS_PER_SEC,
+    phaseTimer: TUNING.preRoundTicks,
+    hitstopLeft: 0,
+    superFlashLeft: 0,
+    wallL,
+    wallR,
+    fighters: [
+      spawnItemFighter(0, cx, off),
+      spawnItemFighter(1, cx, off),
+    ],
+    projectiles: Array.from({ length: PROJECTILE_SLOTS }, emptyProjectile),
+  };
+};
 
 /** Spawn side `i` at match start, loading its carried drinks from the pin. */
-const spawnItemFighter = (i: 0 | 1): FighterState => {
+const spawnItemFighter = (i: 0 | 1, cx: number, off: number): FighterState => {
   const f = spawnFighter(
-    STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET),
+    cx + (i === 0 ? -off : off),
     i === 0 ? 1 : -1,
     characters[i],
     i,
@@ -294,10 +334,12 @@ const loadCarriedSlots = (f: FighterState, i: 0 | 1): void => {
 
 /** Between rounds: reset positions/health/actions; meter and score persist. */
 export const resetRound = (s: GameState): void => {
+  const cx = centerPx(s.wallL, s.wallR);
+  const off = spawnOffsetFor(s.wallL, s.wallR);
   for (const i of [0, 1] as const) {
     const prev = s.fighters[i];
     const fresh = spawnFighter(
-      STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET),
+      cx + (i === 0 ? -off : off),
       i === 0 ? 1 : -1,
       characters[i],
       i,
@@ -366,6 +408,9 @@ const GLOBAL_FIELDS = [
   'tick', 'rngSeed', 'phase', 'winner', 'roundWinner',
   'roundsWon0', 'roundsWon1', 'roundNum',
   'timerTicks', 'phaseTimer', 'hitstopLeft', 'superFlashLeft',
+  // Appended (protocol = field order): per-match walls. Constant during a match,
+  // but serialized so a bounds mismatch surfaces as a desync hash divergence.
+  'wallL', 'wallR',
 ] as const;
 
 /** Deterministic flat serialization — field order is part of the protocol. */

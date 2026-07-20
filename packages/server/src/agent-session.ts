@@ -186,7 +186,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
           ];
           myItems = msg.items;
           pinChars();
-          game = createGameState(msg.seed);
+          game = createGameState(msg.seed, msg.bounds);
           ai = createAi(side, opts.skill, opts.aiSeed ?? msg.seed ^ (side + 1) * 0x9e37, opts.personality);
           const paceMs = opts.paceMs ?? 16;
           const burst = paceMs <= 2 ? 64 : 1;

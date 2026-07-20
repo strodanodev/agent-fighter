@@ -10,8 +10,12 @@ import { Action, PROJECTILE_SLOTS, Phase, characters, resetRound } from './state
 import type { FighterState, GameState, ProjectileState } from './state.js';
 
 const FLOOR = fp(STAGE.floorYPx);
-const WALL_L = fp(STAGE.wallPad);
-const WALL_R = fp(STAGE.widthPx - STAGE.wallPad);
+// Per-match playfield walls (fixed-point world px). Refreshed from the current
+// GameState at the top of every step() (see below) so per-stage bounds are
+// honored deterministically. The defaults are the full-width stage, matching the
+// old constants for any state built before the first step / with default bounds.
+let WALL_L = fp(STAGE.wallPad);
+let WALL_R = fp(STAGE.widthPx - STAGE.wallPad);
 const FRICTION = fp(TUNING.friction);
 const CORNER = fp(TUNING.cornerThresholdPx);
 
@@ -833,6 +837,11 @@ const resolveGrabs = (s: GameState): void => {
  * This is the ONLY way state changes. Deterministic by construction.
  */
 export const step = (s: GameState, inputs: [InputFrame, InputFrame]): void => {
+  // Honor this match's playfield walls. Set from state every tick BEFORE any
+  // physics/combat helper reads WALL_L/WALL_R, so rollback re-sims and per-stage
+  // bounds stay deterministic (the helpers below are only reached from here).
+  WALL_L = s.wallL;
+  WALL_R = s.wallR;
   s.tick++;
   const [f0, f1] = s.fighters;
   const [c0, c1] = characters;

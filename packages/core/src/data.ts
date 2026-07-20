@@ -256,8 +256,14 @@ export const ROUND_SECONDS = 99;
  *            independent timers (itemDmgLeft/itemDefLeft) so OVERCLOCK and
  *            FIREWALL coexist; re-drinking a kind refreshes, never stacks.
  *            Serialize layout shifts (goldens re-blessed).
+ * af-core-6: per-stage playfield bounds (ADR: view lock). wallL/wallR are now
+ *            per-match state (2 appended global scalars) instead of module
+ *            constants; the sim clamps fighters to them and the server sends the
+ *            stage's bounds in the match handshake. Default (no stage bounds) is
+ *            the old full-width walls, so behavior is unchanged — but the
+ *            serialize layout grew by 2 int32, so goldens were re-blessed.
  */
-export const ENGINE_VERSION = 'af-core-5';
+export const ENGINE_VERSION = 'af-core-6';
 
 export const TUNING = {
   roundsToWin: 2, // best of 3

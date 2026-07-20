@@ -202,8 +202,14 @@ const ROUND_SECONDS = 99;
  *            independent timers (itemDmgLeft/itemDefLeft) so OVERCLOCK and
  *            FIREWALL coexist; re-drinking a kind refreshes, never stacks.
  *            Serialize layout shifts (goldens re-blessed).
+ * af-core-6: per-stage playfield bounds (ADR: view lock). wallL/wallR are now
+ *            per-match state (2 appended global scalars) instead of module
+ *            constants; the sim clamps fighters to them and the server sends the
+ *            stage's bounds in the match handshake. Default (no stage bounds) is
+ *            the old full-width walls, so behavior is unchanged — but the
+ *            serialize layout grew by 2 int32, so goldens were re-blessed.
  */
-const ENGINE_VERSION = 'af-core-5';
+const ENGINE_VERSION = 'af-core-6';
 const TUNING = {
     roundsToWin: 2, // best of 3
     preRoundTicks: 60,
@@ -730,28 +736,50 @@ const spawnFighter = (x, facing, ch, _side) => ({
 const emptyProjectile = () => ({
     active: 0, owner: 0, moveIdx: -1, x: 0, y: 0, velX: 0, life: 0, hasHit: 0,
 });
-const createGameState = (seed) => ({
-    tick: 0,
-    rngSeed: seed | 0,
-    phase: 0 /* Phase.PreRound */,
-    winner: -1,
-    roundWinner: -1,
-    roundsWon0: 0,
-    roundsWon1: 0,
-    roundNum: 0,
-    timerTicks: ROUND_SECONDS * TICKS_PER_SEC,
-    phaseTimer: TUNING.preRoundTicks,
-    hitstopLeft: 0,
-    superFlashLeft: 0,
-    fighters: [
-        spawnItemFighter(0),
-        spawnItemFighter(1),
-    ],
-    projectiles: Array.from({ length: PROJECTILE_SLOTS }, emptyProjectile),
-});
+/** Default bounds = the full stage width — bit-identical to the old constants. */
+const DEFAULT_BOUNDS = { left: 0, right: STAGE.widthPx };
+/** Fixed-point walls for a region, inset by wallPad (as the old WALL_L/R were). */
+const wallLFp = (b) => fp(b.left + STAGE.wallPad);
+const wallRFp = (b) => fp(b.right - STAGE.wallPad);
+/** World-px spawn center of a region (both fighters spawn ±spawnOffset of it). */
+const centerPx = (wallL, wallR) => fpToPx(Math.trunc((wallL + wallR) / 2));
+/** Spawn ±offset, shrunk so a NARROW view-locked region can't spawn a fighter
+ *  outside its own walls. Full-width stages keep the full SPAWN_OFFSET (the
+ *  gap dwarfs it), so default play is unchanged. */
+const spawnOffsetFor = (wallL, wallR) => {
+    const halfGap = fpToPx((wallR - wallL) / 2);
+    return Math.max(0, Math.min(SPAWN_OFFSET, halfGap - 20));
+};
+const createGameState = (seed, bounds = DEFAULT_BOUNDS) => {
+    const wallL = wallLFp(bounds);
+    const wallR = wallRFp(bounds);
+    const cx = centerPx(wallL, wallR);
+    const off = spawnOffsetFor(wallL, wallR);
+    return {
+        tick: 0,
+        rngSeed: seed | 0,
+        phase: 0 /* Phase.PreRound */,
+        winner: -1,
+        roundWinner: -1,
+        roundsWon0: 0,
+        roundsWon1: 0,
+        roundNum: 0,
+        timerTicks: ROUND_SECONDS * TICKS_PER_SEC,
+        phaseTimer: TUNING.preRoundTicks,
+        hitstopLeft: 0,
+        superFlashLeft: 0,
+        wallL,
+        wallR,
+        fighters: [
+            spawnItemFighter(0, cx, off),
+            spawnItemFighter(1, cx, off),
+        ],
+        projectiles: Array.from({ length: PROJECTILE_SLOTS }, emptyProjectile),
+    };
+};
 /** Spawn side `i` at match start, loading its carried drinks from the pin. */
-const spawnItemFighter = (i) => {
-    const f = spawnFighter(STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET), i === 0 ? 1 : -1, characters[i], i);
+const spawnItemFighter = (i, cx, off) => {
+    const f = spawnFighter(cx + (i === 0 ? -off : off), i === 0 ? 1 : -1, characters[i], i);
     loadCarriedSlots(f, i);
     return f;
 };
@@ -772,9 +800,11 @@ const loadCarriedSlots = (f, i) => {
 };
 /** Between rounds: reset positions/health/actions; meter and score persist. */
 const resetRound = (s) => {
+    const cx = centerPx(s.wallL, s.wallR);
+    const off = spawnOffsetFor(s.wallL, s.wallR);
     for (const i of [0, 1]) {
         const prev = s.fighters[i];
-        const fresh = spawnFighter(STAGE.widthPx / 2 + (i === 0 ? -SPAWN_OFFSET : SPAWN_OFFSET), i === 0 ? 1 : -1, characters[i], i);
+        const fresh = spawnFighter(cx + (i === 0 ? -off : off), i === 0 ? 1 : -1, characters[i], i);
         fresh.meter = prev.meter; // meter persists across rounds
         // Carried drinks persist too — each can is per-MATCH, drink it any
         // round; a spent slot stays spent. The ACTIVE buffs do NOT carry
@@ -842,6 +872,9 @@ const GLOBAL_FIELDS = [
     'tick', 'rngSeed', 'phase', 'winner', 'roundWinner',
     'roundsWon0', 'roundsWon1', 'roundNum',
     'timerTicks', 'phaseTimer', 'hitstopLeft', 'superFlashLeft',
+    // Appended (protocol = field order): per-match walls. Constant during a match,
+    // but serialized so a bounds mismatch surfaces as a desync hash divergence.
+    'wallL', 'wallR',
 ];
 /** Deterministic flat serialization — field order is part of the protocol. */
 const serialize = (s) => {
@@ -884,8 +917,12 @@ const stateHash = (s) => {
 
 // ---- core/src/sim.js ----
 const FLOOR = fp(STAGE.floorYPx);
-const WALL_L = fp(STAGE.wallPad);
-const WALL_R = fp(STAGE.widthPx - STAGE.wallPad);
+// Per-match playfield walls (fixed-point world px). Refreshed from the current
+// GameState at the top of every step() (see below) so per-stage bounds are
+// honored deterministically. The defaults are the full-width stage, matching the
+// old constants for any state built before the first step / with default bounds.
+let WALL_L = fp(STAGE.wallPad);
+let WALL_R = fp(STAGE.widthPx - STAGE.wallPad);
 const FRICTION = fp(TUNING.friction);
 const CORNER = fp(TUNING.cornerThresholdPx);
 /** Mirror a character-space rect into world space based on facing. */
@@ -1661,6 +1698,11 @@ const resolveGrabs = (s) => {
  * This is the ONLY way state changes. Deterministic by construction.
  */
 const step = (s, inputs) => {
+    // Honor this match's playfield walls. Set from state every tick BEFORE any
+    // physics/combat helper reads WALL_L/WALL_R, so rollback re-sims and per-stage
+    // bounds stay deterministic (the helpers below are only reached from here).
+    WALL_L = s.wallL;
+    WALL_R = s.wallR;
     s.tick++;
     const [f0, f1] = s.fighters;
     const [c0, c1] = characters;
@@ -3079,7 +3121,10 @@ const stageCamLimits = (stage, vw, vh) => {
     const scale = STAGE.widthPx / m.imageW;
     const topY = STAGE.floorYPx - m.floorY * scale;
     const botY = topY + m.imageH * scale;
-    const minZoom = Math.max(vw / STAGE.widthPx, vh / Math.max(1, botY - topY));
+    // Horizontal floor uses the LOCKED region width (not the full stage), so the
+    // camera can't zoom out far enough to reveal art outside the view lock.
+    const regionW = Math.max(1, (m.bounds ? m.bounds.right - m.bounds.left : STAGE.widthPx));
+    const minZoom = Math.max(vw / regionW, vh / Math.max(1, botY - topY));
     return { topY, botY, minZoom };
 };
 /**
@@ -3156,6 +3201,17 @@ const drawStageLayers = (ctx, stage, cam, vw, vh) => {
         ctx.fillRect(L - 10, topY + drawH - 1, viewW + 20, B + 10 - (topY + drawH) + 1);
     }
     ctx.imageSmoothingEnabled = false;
+    // Plain `background.png` as the backdrop, drawn BEHIND the parallax planes —
+    // but only when no layer is itself a stretched backdrop (`stretch:true`).
+    // The Studio composes stages as a full-scene background.png + isolated
+    // object planes (layer-mid/fg) and its preview draws the background first
+    // (see studio main.ts `paint()`); without this the game ignored stage.image
+    // whenever ANY layer existed, so those stages rendered as bare skyColor —
+    // a black screen. Stages that DO carry a stretched layer-bg (rooftop,
+    // school) already have their backdrop and are left untouched.
+    if (stage.image && !stage.layers.some((l) => l.stretch)) {
+        ctx.drawImage(stage.image, 0, topY, STAGE.widthPx, drawH);
+    }
     for (const layer of stage.layers) {
         // Every plane draws its WHOLE source image (never cropped, so soft
         // edges/fades stay intact). Backdrops stretch to the shared bg-fit
@@ -3679,7 +3735,7 @@ class NetSession {
     begin() {
         const s = this.setup;
         installSetupItems(s);
-        this.game = createGameState(s.seed);
+        this.game = createGameState(s.seed, s.bounds);
         // First `delay` ticks are neutral by convention — symmetric with the peer.
         for (let k = 0; k < s.delay; k++) {
             this.myInputs[k] = 0;
@@ -3707,7 +3763,7 @@ class NetSession {
         this.usedOpp = [];
         this.snaps = new Array(SNAP_RING).fill(null);
         installSetupItems(s);
-        this.game = createGameState(s.seed);
+        this.game = createGameState(s.seed, s.bounds);
         let t = 0;
         while (this.myInputs[t] !== undefined && this.oppInputs[t] !== undefined
             && this.game.phase !== 3 /* Phase.MatchOver */) {
@@ -3986,7 +4042,7 @@ class SoloSession {
     rebuildFrom(s) {
         this.setup = s;
         installSetupItems(s);
-        this.game = createGameState(s.seed);
+        this.game = createGameState(s.seed, s.bounds);
         this.houseAi = createAi(1, s.solo.skill, s.solo.aiSeed, s.solo.personality);
         const mine = s.inputs[0];
         let t = 0;
@@ -4049,7 +4105,7 @@ class SoloSession {
     begin() {
         const s = this.setup;
         installSetupItems(s);
-        this.game = createGameState(s.seed);
+        this.game = createGameState(s.seed, s.bounds);
         this.houseAi = createAi(1, s.solo.skill, s.solo.aiSeed, s.solo.personality);
         // Same throttled-tab race as NetSession.begin(): a result that landed
         // before the first frame must keep its terminal status.
@@ -5389,6 +5445,15 @@ const drawMenuBackdrop = (ctx) => {
 const currentStageCamLimits = () => stageAsset && (stageAsset.image || stageAsset.layers.length > 0)
     ? stageCamLimits(stageAsset, VW, VH)
     : null;
+/**
+ * The active stage's VIEW-LOCK region in world px. The camera clamps `cam.x`
+ * to it; no bounds (or no stage art) → the full stage width, i.e. today's
+ * behavior. Kept in lockstep with the sim walls the server pins per match.
+ */
+const currentStageBounds = () => {
+    const b = stageAsset?.meta.bounds;
+    return b ? { left: b.left, right: b.right } : { left: 0, right: STAGE.widthPx };
+};
 const VW = STAGE.viewportW; // 960 — screen px
 const VH = STAGE.viewportH; // 540
 const ZOOM_MIN = 0.85;
@@ -10178,7 +10243,9 @@ const installOnlineMatch = () => {
 const startFight = () => {
     fighters = [allRosters[picks[0]], allRosters[picks[1]]];
     setCharacters(fighters[0].ch, fighters[1].ch);
-    game = createGameState(seed++);
+    // Local play: walls follow the selected stage's view-lock region (matches
+    // the online feel, where the server pins the same bounds).
+    game = createGameState(seed++, currentStageBounds());
     cpuAi = mode === 'cpu'
         ? createAi(1, skillForCpuLevel(cpuLevelFor(profile, lever)), seed * 31 + 7)
         : null;
@@ -10240,7 +10307,7 @@ const startArcadeFight = () => {
         stageCursor = (seed + run.stage) % stageAssets.length;
         setStageAsset(stageAssets[stageCursor] ?? null);
     }
-    game = createGameState(seed++);
+    game = createGameState(seed++, currentStageBounds());
     cpuAi = createAi(1, arcadeSkill(run.stage, run.total), seed * 31 + 7);
     statDmg = 0;
     statBestCombo = 0;
@@ -10318,7 +10385,11 @@ const updateCamera = (g) => {
     const viewW = VW / cam.zoom;
     const viewH = VH / cam.zoom;
     const midX = (x0 + x1) / 2;
-    const targetX = Math.max(0, Math.min(STAGE.widthPx - viewW, midX - viewW / 2));
+    // VIEW LOCK: pan only within the stage's playable region. When the region is
+    // narrower than the viewport, `Math.max(b.left, …)` collapses the window to
+    // its left edge (the min-zoom floor keeps this from cropping the action).
+    const b = currentStageBounds();
+    const targetX = Math.max(b.left, Math.min(Math.max(b.left, b.right - viewW), midX - viewW / 2));
     let targetY = boxT - CONTENT_TOP / cam.zoom;
     if (limits) {
         // Keep the art covering: its top must be at/above the screen top and its

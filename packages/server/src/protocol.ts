@@ -216,6 +216,13 @@ export interface SMatch {
   side: 0 | 1;
   seed: number;
   stage: string;
+  /**
+   * The stage's playfield bounds in world px (the region camera + walls lock
+   * to). Server-authoritative and part of the deterministic contract: BOTH
+   * simulating ends must pass this to `createGameState(seed, bounds)` so the
+   * fighter walls agree. Absent = full-width stage (the engine default).
+   */
+  bounds?: { left: number; right: number };
   delay: number; // INPUT_DELAY — both sides use it
   chars: [{ id: string; hash?: string }, { id: string; hash?: string }];
   names: [string, string];

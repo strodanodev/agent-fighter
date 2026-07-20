@@ -1687,7 +1687,8 @@ const applyBundleToSim = (): string | null => {
     const lc = loadCharacter(structuredClone(stBundle!));
     const lc2 = stP2Bundle ? loadCharacter(structuredClone(stP2Bundle)) : lc;
     setCharacters(lc, lc2);
-    stGame = createGameState(stSeed++);
+    // Reflect the edited stage's view lock so fighters stop at the new walls.
+    stGame = createGameState(stSeed++, stStageMeta?.bounds);
     return null;
   } catch (e) {
     return (e as Error).message;
@@ -1790,7 +1791,7 @@ const renderTestTab = (): HTMLElement => {
         let p1 = 0;
         for (const [code, bit] of P1_KEYMAP) if (keysDown.has(code)) p1 |= bit;
         step(stGame, [p1, dummyInput(stGame)]);
-        if (stGame.phase === Phase.MatchOver) stGame = createGameState(stSeed++);
+        if (stGame.phase === Phase.MatchOver) stGame = createGameState(stSeed++, stStageMeta?.bounds);
       }
       acc -= 1000 / TICKS_PER_SEC;
     }
@@ -3061,6 +3062,10 @@ interface StageMetaEd {
   floorY: number;
   skyColor: string;
   deckColor: string;
+  /** VIEW LOCK: playable region in world px (0..STAGE.widthPx). The camera and
+   *  the sim walls lock to it in-game. Absent → full stage width. Edited via the
+   *  draggable handles / number inputs in the Stage tab preview. */
+  bounds?: { left: number; right: number };
   layers?: StageLayerMetaEd[];
 }
 
@@ -3214,6 +3219,12 @@ const saveStageEd = async (): Promise<void> => {
   } else {
     delete stStageMeta.layers;
   }
+  // A view lock that spans the whole stage is the default — drop it so unbounded
+  // stages stay clean (and byte-identical to before this feature).
+  if (stStageMeta.bounds
+    && stStageMeta.bounds.left <= 0 && stStageMeta.bounds.right >= STAGE.widthPx) {
+    delete stStageMeta.bounds;
+  }
   await apiJson(`/api/stages/${stStageId}/stage.json`, {
     method: 'PUT', body: JSON.stringify(stStageMeta, null, 2),
   });
@@ -3296,6 +3307,13 @@ const renderStageTab = (): HTMLElement => {
   const worldToPx = pw / STAGE.widthPx;
   const cv = mkEl('canvas', { width: pw, height: ph, class: 'frcanvas', style: 'cursor:crosshair' });
 
+  // VIEW LOCK region (world px). Absent meta.bounds reads as the full stage;
+  // `ensureBounds` materializes it on first edit so the drag/inputs can mutate.
+  const MIN_REGION = 240; // world px — keep the playfield from collapsing
+  const viewBounds = (): { left: number; right: number } => m.bounds ?? { left: 0, right: STAGE.widthPx };
+  const ensureBounds = (): { left: number; right: number } =>
+    (m.bounds ??= { left: 0, right: STAGE.widthPx });
+
   /** Selected layer's on-screen draw rect (preview px), or null (backdrop/none). */
   const selRect = (): { x: number; y: number; w: number; h: number } | null => {
     if (stStageSelLayer < 0) return null;
@@ -3371,6 +3389,37 @@ const renderStageTab = (): HTMLElement => {
     ctx.font = 'bold 12px monospace';
     ctx.textAlign = 'left';
     ctx.fillText(`floor y=${m.floorY}${stStageSelLayer < 0 ? ' (drag)' : ''}`, 8, fy - 6);
+    // VIEW LOCK: shade the region the camera/walls exclude, and draw draggable
+    // left/right handles. Editable in the same "no layer selected" mode as the
+    // floor line, so it never fights with layer positioning.
+    {
+      const bx = viewBounds();
+      const lx = bx.left * worldToPx;
+      const rx = bx.right * worldToPx;
+      ctx.fillStyle = 'rgba(8,10,20,0.62)';
+      if (lx > 0) ctx.fillRect(0, 0, lx, ph);
+      if (rx < pw) ctx.fillRect(rx, 0, pw - rx, ph);
+      ctx.strokeStyle = '#39d3c8';
+      ctx.setLineDash([6, 5]);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(lx, 0); ctx.lineTo(lx, ph);
+      ctx.moveTo(rx, 0); ctx.lineTo(rx, ph);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // Grab tabs so the thin lines are easy to hit.
+      ctx.fillStyle = '#39d3c8';
+      ctx.fillRect(lx - 3, ph / 2 - 16, 6, 32);
+      ctx.fillRect(rx - 3, ph / 2 - 16, 6, 32);
+      ctx.fillStyle = '#39d3c8';
+      ctx.font = 'bold 12px monospace';
+      const editing = stStageSelLayer < 0;
+      ctx.textAlign = 'left';
+      ctx.fillText(`L ${bx.left}${editing ? ' (drag)' : ''}`, Math.min(lx + 4, pw - 60), 16);
+      ctx.textAlign = 'right';
+      ctx.fillText(`R ${bx.right}`, Math.max(rx - 4, 60), 16);
+      ctx.textAlign = 'left';
+    }
     // Selection box + resize handle for the layer being positioned.
     const sr = selRect();
     if (sr) {
@@ -3388,17 +3437,24 @@ const renderStageTab = (): HTMLElement => {
   // setTimeout, NOT rAF — hidden tabs throttle rAF to zero (automation runs headless).
   setTimeout(paint, 0);
 
-  type DragMode = 'floor' | 'move' | 'scale' | null;
+  type DragMode = 'floor' | 'move' | 'scale' | 'boundL' | 'boundR' | null;
   let dragMode: DragMode = null;
   let dragStart = { x: 0, y: 0, offsetX: 0, offsetY: 0, scale: 0 };
   cv.onmousedown = (e) => {
     const r = cv.getBoundingClientRect();
     const px_ = e.clientX - r.left, py_ = e.clientY - r.top;
     const sr = selRect();
+    const bx = viewBounds();
+    const nearL = Math.abs(px_ - bx.left * worldToPx) <= 6;
+    const nearR = Math.abs(px_ - bx.right * worldToPx) <= 6;
     if (sr && px_ >= sr.x + sr.w - 10 && px_ <= sr.x + sr.w + 4 && py_ >= sr.y + sr.h - 10 && py_ <= sr.y + sr.h + 4) {
       dragMode = 'scale';
     } else if (sr) {
       dragMode = 'move';
+    } else if (nearL) {
+      dragMode = 'boundL';
+    } else if (nearR) {
+      dragMode = 'boundR';
     } else {
       dragMode = 'floor';
     }
@@ -3409,6 +3465,17 @@ const renderStageTab = (): HTMLElement => {
     if (!dragMode) return;
     const r = cv.getBoundingClientRect();
     const px_ = e.clientX - r.left, py_ = e.clientY - r.top;
+    if (dragMode === 'boundL' || dragMode === 'boundR') {
+      const b = ensureBounds();
+      const wx = Math.max(0, Math.min(STAGE.widthPx, Math.round(px_ / worldToPx)));
+      if (dragMode === 'boundL') b.left = Math.min(wx, b.right - MIN_REGION);
+      else b.right = Math.max(wx, b.left + MIN_REGION);
+      b.left = Math.max(0, b.left);
+      b.right = Math.min(STAGE.widthPx, b.right);
+      stStageDirty = true;
+      paint();
+      return;
+    }
     if (dragMode === 'floor') {
       m.floorY = Math.max(0, Math.min(m.imageH, Math.round((py_ / ph) * m.imageH)));
       stStageDirty = true;
@@ -3520,6 +3587,34 @@ const renderStageTab = (): HTMLElement => {
       })),
       mkEl('span', { class: 'hint' },
         'floor line = where fighters\' feet sit in the image · sky/deck colors extend every plane when the camera sees past it'),
+    ),
+    mkEl('div', { class: 'row' },
+      mkEl('label', { class: 'field', title: 'left edge of the playfield in world px (0..' + STAGE.widthPx + ') — camera + walls lock here. Drag the cyan handle in the preview too.' },
+        'view-lock left ', mkEl('input', {
+          type: 'number', min: '0', max: String(STAGE.widthPx), step: '10', value: String(viewBounds().left),
+          onchange: (e: Event) => {
+            const b = ensureBounds();
+            const v = Math.round(Number((e.target as HTMLInputElement).value) || 0);
+            b.left = Math.max(0, Math.min(v, b.right - MIN_REGION));
+            stStageDirty = true; renderAll();
+          },
+        })),
+      mkEl('label', { class: 'field', title: 'right edge of the playfield in world px' },
+        'right ', mkEl('input', {
+          type: 'number', min: '0', max: String(STAGE.widthPx), step: '10', value: String(viewBounds().right),
+          onchange: (e: Event) => {
+            const b = ensureBounds();
+            const v = Math.round(Number((e.target as HTMLInputElement).value) || STAGE.widthPx);
+            b.right = Math.min(STAGE.widthPx, Math.max(v, b.left + MIN_REGION));
+            stStageDirty = true; renderAll();
+          },
+        })),
+      m.bounds ? mkEl('button', {
+        title: 'remove the view lock — camera + walls use the full stage width again',
+        onclick: () => { delete m.bounds; stStageDirty = true; renderAll(); },
+      }, 'full width') : null,
+      mkEl('span', { class: 'hint' },
+        `view lock: the region the camera pans within and fighters are walled to (world px, 0..${STAGE.widthPx}). Absent = full width.`),
     ),
     mkEl('div', { class: 'genblock' },
       mkEl('b', {}, 'parallax planes — depth-scrolling background, midground, foreground'),

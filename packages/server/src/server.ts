@@ -148,6 +148,11 @@ interface Match {
   clients: [Client, Client | null];
   seed: number;
   stage: string;
+  /** The chosen stage's playfield bounds (world px), read from its stage.json
+   *  at pair time. Server-authoritative; shipped in SMatch/SResumed and passed
+   *  to createGameState so the verifier's walls match the clients'. Undefined =
+   *  full-width stage. */
+  bounds?: { left: number; right: number };
   chars: [string, string];
   names: [string, string];
   /** Local-sim solo: the deterministic house AI the client must simulate.
@@ -315,10 +320,11 @@ const verifyLedger = (
   seed: number,
   inputs: [number[], number[]],
   items: MatchItems = NO_ITEMS,
+  bounds?: { left: number; right: number },
 ): VerifyOutcome => {
   setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
   installItems(items);
-  const g = createGameState(seed);
+  const g = createGameState(seed, bounds);
   const n = Math.min(inputs[0].length, inputs[1].length);
   let t = 0;
   while (g.phase !== Phase.MatchOver && t < n) {
@@ -348,10 +354,11 @@ const verifySoloLedger = (
   playerInputs: number[],
   solo: { skill: number; aiSeed: number; personality?: Record<string, number> },
   items: MatchItems = NO_ITEMS,
+  bounds?: { left: number; right: number },
 ): VerifyOutcome => {
   setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
   installItems(items);
-  const g = createGameState(seed);
+  const g = createGameState(seed, bounds);
   // Trained-agent opponents (ADR 0006) pin a personality too — same
   // re-derivation, so a coached agent can't be puppeteered either.
   const ai = createAi(1, solo.skill, solo.aiSeed, solo.personality);
@@ -410,6 +417,21 @@ export const createMatchServer = (opts: {
   const bundleOf = (id: string): CharacterBundle => {
     const file = join(charactersDir, id, 'character.json');
     return JSON.parse(readFileSync(file, 'utf8')) as CharacterBundle;
+  };
+  /** A stage's playfield bounds (world px) from its stage.json, or undefined
+   *  (full-width). Best-effort: a missing/garbled stage never blocks a match. */
+  const stageBoundsOf = (id: string): { left: number; right: number } | undefined => {
+    if (!id) return undefined;
+    try {
+      const file = join(stagesDir, id, 'stage.json');
+      const meta = JSON.parse(readFileSync(file, 'utf8')) as { bounds?: { left: number; right: number } };
+      const b = meta.bounds;
+      return b && Number.isFinite(b.left) && Number.isFinite(b.right) && b.right > b.left
+        ? { left: b.left, right: b.right }
+        : undefined;
+    } catch {
+      return undefined;
+    }
   };
   const listIds = (dir: string, marker: string): string[] =>
     existsSync(dir)
@@ -475,8 +497,8 @@ export const createMatchServer = (opts: {
 
     const bundles: [CharacterBundle, CharacterBundle] = [bundleOf(m.chars[0]), bundleOf(m.chars[1])];
     const verify = (): VerifyOutcome => (m.solo
-      ? verifySoloLedger(bundles, m.seed, m.inputs[0], m.solo, m.items)
-      : verifyLedger(bundles, m.seed, m.inputs, m.items));
+      ? verifySoloLedger(bundles, m.seed, m.inputs[0], m.solo, m.items, m.bounds)
+      : verifyLedger(bundles, m.seed, m.inputs, m.items, m.bounds));
 
     const v = verify();
     // Desync forensics: whose reported hashes diverge from the re-sim?
@@ -708,7 +730,7 @@ export const createMatchServer = (opts: {
 
     setCharacters(loadCharacter(bundleOf(m.chars[0])), loadCharacter(bundleOf(m.chars[1])));
     installItems(m.items); // forensics must re-sim the SAME buffed match
-    const g = createGameState(m.seed);
+    const g = createGameState(m.seed, m.bounds);
     const ai = m.solo ? createAi(1, m.solo.skill, m.solo.aiSeed, m.solo.personality) : null;
     let t = 0;
     for (const tick of ticks) {
@@ -778,6 +800,9 @@ export const createMatchServer = (opts: {
       finished: false,
       forfeitTimer: null,
     };
+    // Resolve the chosen stage's playfield bounds once (part of the pinned,
+    // deterministic setup — shipped to clients and used by the verifier).
+    m.bounds = stageBoundsOf(m.stage);
     c0.match = m; c0.side = 0; c0.state = 'playing';
     if (c1) { c1.match = m; c1.side = 1; c1.state = 'playing'; }
 
@@ -786,6 +811,7 @@ export const createMatchServer = (opts: {
       if (!c) continue;
       const setup: SMatch = {
         t: 'match', matchId: m.id, side: c.side, seed: m.seed, stage: m.stage,
+        bounds: m.bounds,
         delay: m.delay,
         chars: [
           { id: m.chars[0], hash: bundleOf(m.chars[0]).versionHash },
@@ -1403,6 +1429,7 @@ export const createMatchServer = (opts: {
           Array.from(a, (v) => (v === undefined ? null : v));
         send(c, {
           t: 'resumed', matchId: m.id, side, seed: m.seed, stage: m.stage,
+          bounds: m.bounds,
           delay: m.delay, // the PINNED pair-time delay — the ledger was scheduled with it
           chars: [
             { id: m.chars[0], hash: bundleOf(m.chars[0]).versionHash },

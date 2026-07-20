@@ -304,6 +304,13 @@ export interface StageMeta {
   floorY: number;
   skyColor: string;
   deckColor: string;
+  /**
+   * VIEW LOCK: the playable region in world px (0..STAGE.widthPx). The camera
+   * never pans outside it and the sim walls fighters to it. Absent → the full
+   * stage width (today's behavior). Edited in the Studio; the server ships it
+   * in the match handshake so the deterministic walls agree.
+   */
+  bounds?: { left: number; right: number };
   /** Multi-plane parallax art. Absent/empty → legacy single `background.png`. */
   layers?: StageLayerMeta[];
 }
@@ -381,7 +388,10 @@ export const stageCamLimits = (
   const scale = STAGE.widthPx / m.imageW;
   const topY = STAGE.floorYPx - m.floorY * scale;
   const botY = topY + m.imageH * scale;
-  const minZoom = Math.max(vw / STAGE.widthPx, vh / Math.max(1, botY - topY));
+  // Horizontal floor uses the LOCKED region width (not the full stage), so the
+  // camera can't zoom out far enough to reveal art outside the view lock.
+  const regionW = Math.max(1, (m.bounds ? m.bounds.right - m.bounds.left : STAGE.widthPx));
+  const minZoom = Math.max(vw / regionW, vh / Math.max(1, botY - topY));
   return { topY, botY, minZoom };
 };
 

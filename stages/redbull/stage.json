@@ -10,9 +10,9 @@
       "file": "layer-mid.png",
       "depth": 0.45,
       "stretch": false,
-      "scale": 0.35974113283749204,
-      "offsetX": 342,
-      "offsetY": -259
+      "scale": 0.32393384117082535,
+      "offsetX": 1077,
+      "offsetY": -221
     },
     {
       "file": "layer-fg.png",
@@ -22,5 +22,9 @@
       "offsetX": 398,
       "offsetY": -85
     }
-  ]
+  ],
+  "bounds": {
+    "left": 406,
+    "right": 1600
+  }
 }

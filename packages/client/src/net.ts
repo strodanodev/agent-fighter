@@ -31,6 +31,10 @@ export interface NetSetup {
   side: 0 | 1;
   seed: number;
   stage: string;
+  /** VIEW-LOCK bounds (world px) pinned by the server. Passed to every
+   *  createGameState (begin + resume rebuild) so the sim walls match the
+   *  server's verifier. Absent = full-width stage. */
+  bounds?: { left: number; right: number };
   delay: number;
   chars: [{ id: string; hash?: string }, { id: string; hash?: string }];
   names: [string, string];
@@ -362,7 +366,7 @@ export class NetSession {
   begin(): void {
     const s = this.setup!;
     installSetupItems(s);
-    this.game = createGameState(s.seed);
+    this.game = createGameState(s.seed, s.bounds);
     // First `delay` ticks are neutral by convention — symmetric with the peer.
     for (let k = 0; k < s.delay; k++) {
       this.myInputs[k] = 0;
@@ -391,7 +395,7 @@ export class NetSession {
     this.usedOpp = [];
     this.snaps = new Array(SNAP_RING).fill(null);
     installSetupItems(s);
-    this.game = createGameState(s.seed);
+    this.game = createGameState(s.seed, s.bounds);
     let t = 0;
     while (
       this.myInputs[t] !== undefined && this.oppInputs[t] !== undefined
@@ -679,7 +683,7 @@ export class SoloSession {
   private rebuildFrom(s: NetSetup & { inputs: [(number | null)[], (number | null)[]] }): void {
     this.setup = s;
     installSetupItems(s);
-    this.game = createGameState(s.seed);
+    this.game = createGameState(s.seed, s.bounds);
     this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed, s.solo!.personality);
     const mine = s.inputs[0];
     let t = 0;
@@ -736,7 +740,7 @@ export class SoloSession {
   begin(): void {
     const s = this.setup!;
     installSetupItems(s);
-    this.game = createGameState(s.seed);
+    this.game = createGameState(s.seed, s.bounds);
     this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed, s.solo!.personality);
     // Same throttled-tab race as NetSession.begin(): a result that landed
     // before the first frame must keep its terminal status.

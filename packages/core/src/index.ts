@@ -18,7 +18,7 @@ export {
   Action, Phase, PROJECTILE_SLOTS, characters, setCharacters,
   createGameState, resetRound, snapshot, restore, serialize, stateHash,
 } from './state.js';
-export type { GameState, FighterState, ProjectileState } from './state.js';
+export type { GameState, FighterState, ProjectileState, StageBounds } from './state.js';
 export { step, debugBoxes, debugInfo } from './sim.js';
 export type { DebugBox, DebugFighterInfo } from './sim.js';
 export { SYS, spriteForFighter } from './anim.js';
