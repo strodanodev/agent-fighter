@@ -2,7 +2,7 @@
   "name": "redbull",
   "imageW": 1024,
   "imageH": 559,
-  "floorY": 507,
+  "floorY": 511,
   "skyColor": "#2b1b4d",
   "deckColor": "#3a3644",
   "layers": [
@@ -10,9 +10,9 @@
       "file": "layer-mid.png",
       "depth": 0.45,
       "stretch": false,
-      "scale": 0.32393384117082535,
-      "offsetX": 1077,
-      "offsetY": -221
+      "scale": 0.631578947368421,
+      "offsetX": -175,
+      "offsetY": -489
     },
     {
       "file": "layer-fg.png",
@@ -24,7 +24,7 @@
     }
   ],
   "bounds": {
-    "left": 406,
-    "right": 1600
+    "left": 210,
+    "right": 1360
   }
 }

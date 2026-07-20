@@ -117,7 +117,7 @@
               "juggleCost": 1
             }
           ],
-          "sprite": "5LP_s1.png"
+          "sprite": "5LK_s0.png"
         },
         {
           "frames": 6,
@@ -191,7 +191,7 @@
               "juggleCost": 1
             }
           ],
-          "sprite": "5MP_s1.png"
+          "sprite": "5LK_s0.png"
         },
         {
           "frames": 10,
@@ -449,7 +449,7 @@
               "h": 108
             }
           ],
-          "sprite": "5HK_s0.png"
+          "sprite": "5LK_s0.png"
         },
         {
           "frames": 5,
@@ -487,7 +487,7 @@
               "juggleCost": 1
             }
           ],
-          "sprite": "5HK_s1.png"
+          "sprite": "5HK_s0.png"
         },
         {
           "frames": 18,
@@ -712,7 +712,7 @@
               "knockdown": true
             }
           ],
-          "sprite": "2HP_s1.png"
+          "sprite": "5LK_s0.png"
         },
         {
           "frames": 20,
@@ -1140,7 +1140,7 @@
               "knockdown": true
             }
           ],
-          "sprite": "j_HP_s1.png"
+          "sprite": "5LK_s0.png"
         },
         {
           "frames": 8,
@@ -1345,7 +1345,7 @@
               "knockdown": true
             }
           ],
-          "sprite": "j_HK_s1.png"
+          "sprite": "5LK_s0.png"
         },
         {
           "frames": 8,
@@ -1499,7 +1499,7 @@
               "knockdown": true
             }
           ],
-          "sprite": "623P_s1.png"
+          "sprite": "5LK_s0.png"
         },
         {
           "frames": 14,
@@ -1570,7 +1570,7 @@
               "airPopVelY": -7
             }
           ],
-          "sprite": "214K_s1.png"
+          "sprite": "5LK_s0.png"
         },
         {
           "frames": 8,
@@ -1678,7 +1678,7 @@
               "airPopVelY": -6
             }
           ],
-          "sprite": "236PP_s1.png"
+          "sprite": "5LK_s0.png"
         },
         {
           "frames": 4,
@@ -1746,7 +1746,7 @@
               "airPopVelY": -6
             }
           ],
-          "sprite": "236PP_s3.png"
+          "sprite": "5HK_s0.png"
         },
         {
           "frames": 4,
@@ -1780,7 +1780,7 @@
               "airPopVelY": -6
             }
           ],
-          "sprite": "236PP_s4.png"
+          "sprite": "5LK_s0.png"
         },
         {
           "frames": 5,
@@ -1816,7 +1816,7 @@
               "knockdown": true
             }
           ],
-          "sprite": "236PP_s5.png"
+          "sprite": "5HK_s0.png"
         },
         {
           "frames": 24,
@@ -1939,7 +1939,7 @@
               "h": 108
             }
           ],
-          "sprite": "sys_walkF_s2.png"
+          "sprite": "sys_idle_s1.png"
         },
         {
           "frames": 7,
@@ -2070,7 +2070,7 @@
               "h": 108
             }
           ],
-          "sprite": "sys_jump_s1.png"
+          "sprite": "sys_dashB_s0.png"
         },
         {
           "frames": 8,
@@ -3246,5 +3246,5 @@
       "flipH": false
     }
   },
-  "versionHash": "fd0509aa99321a74"
+  "versionHash": "1f7567cd2de7e536"
 }

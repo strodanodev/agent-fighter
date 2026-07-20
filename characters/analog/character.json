@@ -114,6 +114,19 @@
             }
           ],
           "sprite": "5LP_s2.png"
+        },
+        {
+          "frames": 6,
+          "phase": "recovery",
+          "hurtboxes": [
+            {
+              "x": -26,
+              "y": -108,
+              "w": 52,
+              "h": 108
+            }
+          ],
+          "sprite": "5LP_s2.png"
         }
       ],
       "meterGainWhiff": 5,
@@ -1680,7 +1693,7 @@
               "airPopVelY": -6
             }
           ],
-          "sprite": "236PP_s1.png"
+          "sprite": "236PP_s6.png"
         },
         {
           "frames": 4,
@@ -1818,7 +1831,7 @@
               "knockdown": true
             }
           ],
-          "sprite": "236PP_s5.png"
+          "sprite": "236PP_s3.png"
         },
         {
           "frames": 24,
@@ -2104,7 +2117,7 @@
               "h": 108
             }
           ],
-          "sprite": "sys_jump_s1.png"
+          "sprite": "sys_dashF_s0.png"
         },
         {
           "frames": 8,
@@ -3284,5 +3297,5 @@
       "flipH": false
     }
   },
-  "versionHash": "0b2978992aca5d23"
+  "versionHash": "ee41dde5e2a6f1b8"
 }

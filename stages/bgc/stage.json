@@ -27,5 +27,9 @@
       "offsetX": 443,
       "offsetY": -517
     }
-  ]
+  ],
+  "bounds": {
+    "left": 0,
+    "right": 1065
+  }
 }

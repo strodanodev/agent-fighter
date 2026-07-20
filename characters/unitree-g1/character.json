@@ -3270,7 +3270,15 @@
       "panY": 0.7464438476076793,
       "rotate": 0,
       "flipH": false
+    },
+    "vsPortrait": "_vs.png",
+    "vsFraming": {
+      "zoom": 1.15,
+      "panX": 0,
+      "panY": 0,
+      "rotate": 0,
+      "flipH": false
     }
   },
-  "versionHash": "9e7b7ce62be319e3"
+  "versionHash": "567ad0a6504e05ed"
 }
