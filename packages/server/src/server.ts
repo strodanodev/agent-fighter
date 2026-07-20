@@ -704,6 +704,17 @@ export const createMatchServer = (opts: {
     }
   };
 
+  // Defensive wrapper for TIMER-invoked finishMatch (audit 2026-07-20 CT-4):
+  // finishMatch re-sims the ledger and reads character bundles, which can throw
+  // (e.g. a bundle file that vanished mid-deploy). Inside a setTimeout/interval
+  // callback that throw is an uncaughtException that would take down the whole
+  // process and freeze every OTHER live match. Catch it so one match dies alone.
+  // (The ws-message callsites are already under the message-handler try/catch.)
+  const safeFinish = (m: Match, side: 0 | 1 | null): void => {
+    try { if (!m.finished) finishMatch(m, side); }
+    catch (err) { console.error(`[finishMatch] failed for match ${m.id}:`, err); }
+  };
+
   /**
    * Desync forensics: which side's reported hashes diverge from ground truth?
    * ONE forward re-sim from tick 0, checking every reported hash as the sim
@@ -1104,25 +1115,33 @@ export const createMatchServer = (opts: {
    */
   const trainedAgentPin = async (code: string): Promise<SoloPin | string> => {
     if (!persistence) return 'trained agents need the online economy';
-    const owner = await persistence.findByRefCode(code);
-    if (!owner) return 'no fighter behind that code';
-    const info = await persistence.getAgent(owner.sub);
-    if (!info?.config) return `${owner.name} has not trained an agent yet`;
-    // Validated at PUT time, but the roster can shrink between then and now.
-    if (!characterIds.includes(info.config.character)) {
-      return `${owner.name}'s agent mains a retired fighter — they need to re-coach`;
+    try {
+      const owner = await persistence.findByRefCode(code);
+      if (!owner) return 'no fighter behind that code';
+      const info = await persistence.getAgent(owner.sub);
+      if (!info?.config) return `${owner.name} has not trained an agent yet`;
+      // Validated at PUT time, but the roster can shrink between then and now.
+      if (!characterIds.includes(info.config.character)) {
+        return `${owner.name}'s agent mains a retired fighter — they need to re-coach`;
+      }
+      return {
+        level: info.level,
+        skill: skillForLevel(info.level),
+        character: info.config.character,
+        // Style-only by construction: the knobs were clamped at PUT /agent
+        // time; clamp again here so a hand-edited DB row still can't smuggle
+        // out-of-range values into the pinned setup.
+        personality: clampPersonality(info.config.personality),
+        agentName: `${owner.name.toUpperCase()}'S AGENT · LV${info.level}`,
+        aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
+      };
+    } catch (err) {
+      // A Supabase blip here would otherwise reject up into the queue IIFE
+      // (audit 2026-07-20 CT-4). Return a clean, retryable client message
+      // instead — no fee has been charged at this point.
+      console.error(`[trainedAgentPin] ${code} failed:`, err);
+      return 'could not resolve that agent right now — please try again';
     }
-    return {
-      level: info.level,
-      skill: skillForLevel(info.level),
-      character: info.config.character,
-      // Style-only by construction: the knobs were clamped at PUT /agent
-      // time; clamp again here so a hand-edited DB row still can't smuggle
-      // out-of-range values into the pinned setup.
-      personality: clampPersonality(info.config.personality),
-      agentName: `${owner.name.toUpperCase()}'S AGENT · LV${info.level}`,
-      aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
-    };
   };
 
   /**
@@ -1237,7 +1256,13 @@ export const createMatchServer = (opts: {
               console.log(`[account] ${c.name}: ${String(e)}`);
             }
           }
-        })();
+        })().catch((err) => {
+          // findByAgentKey / verifyAirToken rejecting (a Supabase or JWKS blip)
+          // must not become an unhandled rejection (audit 2026-07-20 CT-4).
+          // Leave c.identity unset → the client is treated as unauthenticated,
+          // exactly the graceful path the queue handler already guards for.
+          console.error(`[auth] identity resolution failed for ${c.name}:`, err);
+        });
         return send(c, { t: 'welcome', id: c.id, engine: ENGINE_VERSION });
       }
       case 'queue': {
@@ -1382,7 +1407,16 @@ export const createMatchServer = (opts: {
           send(c, { t: 'queued' });
           if (mode === 'solo') await startSolo(c);
           else { queue.push(c); void tryPair(); }
-        })();
+        })().catch((err) => {
+          // Any throw in the queue path (a Supabase blip in trainedAgentPin, a
+          // missing bundle in startMatch) must not crash the process and freeze
+          // every other match (audit 2026-07-20 CT-4). Log, free the client from
+          // a half-queued state so they can retry, and tell them plainly.
+          console.error(`[queue] handler failed for ${c.name}:`, err);
+          if (c.state === 'queued') c.state = 'lobby';
+          try { send(c, { t: 'error', msg: 'could not start the match — please try again' }); }
+          catch { /* socket already gone */ }
+        });
         return;
       }
       case 'resume': {
@@ -1421,9 +1455,7 @@ export const createMatchServer = (opts: {
         // its own full grace window rather than inheriting a half-spent one.
         const otherGone = ([0, 1] as const).find((s) => m.gone[s] && m.clients[s]);
         if (otherGone !== undefined) {
-          m.forfeitTimer = setTimeout(() => {
-            if (!m.finished) finishMatch(m, otherGone);
-          }, FORFEIT_GRACE_MS);
+          m.forfeitTimer = setTimeout(() => safeFinish(m, otherGone), FORFEIT_GRACE_MS);
         }
         const toNullable = (a: number[]): (number | null)[] =>
           Array.from(a, (v) => (v === undefined ? null : v));
@@ -1506,7 +1538,7 @@ export const createMatchServer = (opts: {
         // sides agree (deterministic sims agree on the tick; a lone report
         // gets a short grace then verifies).
         if (m.solo || (m.overAt[0] >= 0 && m.overAt[1] >= 0)) finishMatch(m, null);
-        else setTimeout(() => { if (!m.finished) finishMatch(m, null); }, 3000);
+        else setTimeout(() => safeFinish(m, null), 3000);
         return;
       }
     }
@@ -1536,7 +1568,7 @@ export const createMatchServer = (opts: {
     m.forfeitTimer = setTimeout(() => {
       if (m.finished) return;
       const bothGone = m.gone[0] && (m.gone[1] || !!m.solo);
-      finishMatch(m, bothGone ? null : c.side);
+      safeFinish(m, bothGone ? null : c.side);
     }, FORFEIT_GRACE_MS);
   };
 
@@ -1605,7 +1637,7 @@ export const createMatchServer = (opts: {
       // forfeits the lone silent side (griefing / lag-switch protection).
       const loser = m.solo || silent.length !== 1 ? null : silent[0]!;
       console.log(`[match ${m.id}] idle ${idleMs}ms → ${loser === null ? 'no contest' : `forfeit side ${loser}`}`);
-      finishMatch(m, loser);
+      safeFinish(m, loser);
     }
   }, 5_000);
   idleSweep.unref?.();
@@ -1619,6 +1651,32 @@ export const createMatchServer = (opts: {
   const json = (res: import('node:http').ServerResponse, code: number, body: unknown): void => {
     res.writeHead(code, { 'Content-Type': 'application/json', ...CORS });
     res.end(JSON.stringify(body));
+  };
+
+  // Read a POST body with a hard size cap (audit 2026-07-20 H1). The handlers
+  // accumulated chunks with NO limit — a multi-GB body (or many concurrent big
+  // ones) could OOM the container, a hard kill no try/catch or process handler
+  // can catch. On overflow: answer 413, destroy the socket, return null (the
+  // caller returns immediately). The ws side already caps at maxPayload 16 KB.
+  const MAX_HTTP_BODY = 64 * 1024;
+  const readCappedBody = async (
+    req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse,
+  ): Promise<string | null> => {
+    let body = '';
+    let size = 0;
+    let over = false;
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length;
+      // Stop BUFFERING past the cap but keep draining the stream to its end,
+      // rather than breaking/destroying the socket mid-flush — that would race
+      // the 413 write and reset the connection before the client reads it. The
+      // point of the cap is bounded MEMORY (no unbounded `body +=`), which this
+      // preserves; the discarded chunks are GC'd each turn of the loop.
+      if (over || size > MAX_HTTP_BODY) { over = true; continue; }
+      body += chunk;
+    }
+    if (over) { json(res, 413, { error: 'request body too large' }); return null; }
+    return body;
   };
 
   const http = createHttpServer((req, res) => {
@@ -1696,8 +1754,8 @@ export const createMatchServer = (opts: {
           : devName ? { sub: `dev:${devName.slice(0, 24)}` }
           : null;
         if (!identity) return json(res, 401, { error: 'sign in required' });
-        let body = '';
-        for await (const chunk of req) body += chunk;
+        const body = await readCappedBody(req, res);
+        if (body === null) return;
         let nonce = '';
         try { nonce = String((JSON.parse(body || '{}') as Record<string, unknown>).nonce ?? ''); }
         catch { return json(res, 400, { error: 'bad json' }); }
@@ -1759,8 +1817,8 @@ export const createMatchServer = (opts: {
 
         if (path === '/items/equip') {
           if (req.method !== 'POST') return json(res, 405, { error: 'POST {rowIds} to equip' });
-          let body = '';
-          for await (const chunk of req) body += chunk;
+          const body = await readCappedBody(req, res);
+          if (body === null) return;
           let rowIds: number[] = [];
           try {
             const raw = (JSON.parse(body || '{}') as Record<string, unknown>).rowIds;
@@ -1779,8 +1837,8 @@ export const createMatchServer = (opts: {
 
         if (path === '/items/buy') {
           if (req.method !== 'POST') return json(res, 405, { error: 'POST {nonce} to buy' });
-          let body = '';
-          for await (const chunk of req) body += chunk;
+          const body = await readCappedBody(req, res);
+          if (body === null) return;
           let nonce = '';
           try { nonce = String((JSON.parse(body || '{}') as Record<string, unknown>).nonce ?? ''); }
           catch { return json(res, 400, { error: 'bad json' }); }
@@ -1863,8 +1921,8 @@ export const createMatchServer = (opts: {
         // Empty name → get_account keeps any existing display name (0009).
         await persistence.getAccount({ sub: ownerSub }, '', false);
         const ownerInfo = await persistence.getAgent(ownerSub);
-        let body = '';
-        for await (const chunk of req) body += chunk;
+        const body = await readCappedBody(req, res);
+        if (body === null) return;
         let name = '';
         try { name = String((JSON.parse(body || '{}') as Record<string, unknown>).name ?? ''); }
         catch { return json(res, 400, { error: 'bad json' }); }
@@ -1940,8 +1998,8 @@ export const createMatchServer = (opts: {
           if (!putCap.bump(`put:${sub}:${hour}`, PUTS_PER_HOUR)) {
             return json(res, 429, { error: `coaching limit: ${PUTS_PER_HOUR} changes/hour` });
           }
-          let body = '';
-          for await (const chunk of req) body += chunk;
+          const body = await readCappedBody(req, res);
+          if (body === null) return;
           let parsed: Record<string, unknown>;
           try { parsed = JSON.parse(body || '{}') as Record<string, unknown>; }
           catch { return json(res, 400, { error: 'bad json' }); }
@@ -2105,4 +2163,19 @@ if (isMain) {
   };
   process.on('SIGTERM', () => bail('SIGTERM'));
   process.on('SIGINT', () => bail('SIGINT'));
+
+  // Last-resort safety net (audit 2026-07-20 CT-4). Several async paths — the
+  // identityReady IIFE, the queue handler, timer-invoked finishMatch — can
+  // reject/throw outside the ws message guard; Node's default is to KILL the
+  // process, freezing EVERY live match at "VERIFYING WITH SERVER…". Logging and
+  // staying up keeps one bad match (a Supabase blip, a missing bundle) from
+  // taking down everyone else. This is a stopgap; the durable fix is targeted
+  // try/catch at each site. Registered only here (isMain), never in
+  // createMatchServer, so tests that spin up many servers don't stack listeners.
+  process.on('unhandledRejection', (reason) => {
+    console.error(`[fatal] unhandledRejection (kept alive):`, reason);
+  });
+  process.on('uncaughtException', (err) => {
+    console.error(`[fatal] uncaughtException (kept alive):`, err);
+  });
 }

@@ -43,6 +43,11 @@ test('expired token is rejected', () => {
   assert.throws(() => verifyJwtWithKeys(token, KEYS, NOW), /expired/);
 });
 
+test('a token with NO exp is rejected (no permanent bearer credentials)', () => {
+  const token = signJwt({ sub: 'user' }); // valid signature, but no exp claim
+  assert.throws(() => verifyJwtWithKeys(token, KEYS, NOW), /missing exp/);
+});
+
 test('alg:none and HMAC are disallowed (no downgrade attacks)', () => {
   const none = `${b64url(Buffer.from('{"alg":"none"}'))}.${b64url(Buffer.from('{"sub":"x"}'))}.`;
   assert.throws(() => verifyJwtWithKeys(none, KEYS, NOW), /disallowed alg/);

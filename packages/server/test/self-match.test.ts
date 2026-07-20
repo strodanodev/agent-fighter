@@ -53,6 +53,18 @@ class RawClient {
     this.ws.send(JSON.stringify(msg));
   }
 
+  /** Resolve on socket open; reject fast on error/timeout. A bare
+   *  `ws.on('open')` wait hangs the whole run forever if the connect errors
+   *  instead of opening — turn that into a prompt, reported failure. */
+  opened(ms = 3000): Promise<void> {
+    if (this.ws.readyState === WebSocket.OPEN) return Promise.resolve();
+    return new Promise<void>((res, rej) => {
+      const to = setTimeout(() => rej(new Error('ws open timed out')), ms);
+      this.ws.on('open', () => { clearTimeout(to); res(); });
+      this.ws.on('error', (e) => { clearTimeout(to); rej(e instanceof Error ? e : new Error(String(e))); });
+    });
+  }
+
   async waitFor(pred: (m: Record<string, unknown>) => boolean, ms = 3000): Promise<Record<string, unknown>> {
     const deadline = Date.now() + ms;
     for (;;) {
@@ -88,8 +100,8 @@ describe('wager queue: one identity on two sockets never self-pairs', () => {
     const a = new RawClient(url);
     const b = new RawClient(url);
     clients.push(a, b);
-    await new Promise<void>((res) => a.ws.on('open', () => res()));
-    await new Promise<void>((res) => b.ws.on('open', () => res()));
+    await a.opened();
+    await b.opened();
     const hello = { t: 'hello', v: PROTOCOL_VERSION, engine: ENGINE_VERSION, name: 'Selfy' };
     a.send(hello);
     b.send(hello);
@@ -120,7 +132,7 @@ describe('wager queue: one identity on two sockets never self-pairs', () => {
     // Socket A from the previous test is still queued. A NEW identity joins…
     const c = new RawClient(url);
     clients.push(c);
-    await new Promise<void>((res) => c.ws.on('open', () => res()));
+    await c.opened();
     c.send({ t: 'hello', v: PROTOCOL_VERSION, engine: ENGINE_VERSION, name: 'Other' });
     await c.waitFor((m) => m.t === 'account');
     c.send({ t: 'queue', character: 'vector' });

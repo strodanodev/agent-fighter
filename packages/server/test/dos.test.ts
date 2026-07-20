@@ -17,6 +17,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocket } from 'ws';
@@ -79,7 +80,10 @@ const runForensicsMatch = async (
 
   // Ground-truth sim: idle player (0) vs the pinned deterministic house AI.
   setCharacters(loadCharacter(bundleOf(setup.chars[0].id)), loadCharacter(bundleOf(setup.chars[1].id)));
-  const g = createGameState(setup.seed);
+  // Sim with the SAME per-stage bounds the server verifies against (SMatch.bounds
+  // → createGameState(seed, bounds)); omitting them diverges the ground-truth
+  // hashes from the server's re-sim for non-default stages (flaky since af-core-6).
+  const g = createGameState(setup.seed, setup.bounds);
   const ai = createAi(1, setup.solo.skill, setup.solo.aiSeed);
   const hashAfter: number[] = []; // hashAfter[t] = stateHash after t+1 steps
   while (g.phase !== Phase.MatchOver && hashAfter.length < 60 * 60 * 30) {
@@ -178,4 +182,35 @@ test('ws maxPayload: an oversized frame closes the socket instead of buffering 1
   ws.send('x'.repeat(64 * 1024));
   const code = await closed;
   assert.equal(code, 1009, 'ws must reject the frame with "message too big"');
+});
+
+// Raw POST with Connection: close — no keep-alive socket lingers to slow
+// teardown or trip a --test-force-exit event-loop assertion the way fetch does.
+const rawPost = (port: number, path: string, headers: Record<string, string>, body: string): Promise<number> =>
+  new Promise((resolve, reject) => {
+    const req = httpRequest(
+      { hostname: '127.0.0.1', port, path, method: 'POST',
+        headers: { ...headers, 'content-length': Buffer.byteLength(body), connection: 'close' } },
+      (res) => { res.resume(); res.on('end', () => resolve(res.statusCode ?? 0)); },
+    );
+    req.on('error', reject);
+    req.end(body);
+  });
+
+test('HTTP body cap: an oversized POST is refused (413), not buffered into the process', async (t) => {
+  // The HTTP POST handlers used to accumulate the request body with no limit —
+  // a multi-GB body could OOM the container, a hard kill no try/catch catches
+  // (audit 2026-07-20 H1). memoryPersistence is dev:true, so `x-dev-name`
+  // authenticates past the auth gate that precedes the body read.
+  const server = await createMatchServer({ port: 0, persistence: memoryPersistence() });
+  t.after(() => server.close());
+  const dev = { 'content-type': 'application/json', 'x-dev-name': 'Flooder' };
+
+  const big = await rawPost(server.port, '/arcade/enter', dev, 'x'.repeat(200 * 1024));
+  assert.equal(big, 413, 'a 200 KB body is refused with 413');
+
+  // A normal small body still parses (it fails later validation, but is NEVER
+  // rejected by the size cap) — proves the cap does not break real requests.
+  const small = await rawPost(server.port, '/arcade/enter', dev, JSON.stringify({ nonce: 'entry-0001' }));
+  assert.notEqual(small, 413, 'a normal body is not rejected by the cap');
 });

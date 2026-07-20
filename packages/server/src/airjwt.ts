@@ -85,8 +85,12 @@ export const verifyJwtWithKeys = (
   if (!ok) throw new Error('bad signature');
 
   const payload = b64urlJson(parts[1]!);
-  const exp = Number(payload.exp ?? 0);
-  if (exp > 0 && exp < nowSec) throw new Error('expired');
+  // exp is REQUIRED (audit 2026-07-18 H4): a token with no exp otherwise never
+  // expires — a permanent bearer credential if it ever leaks. AIR session
+  // tokens always carry it.
+  const exp = Number(payload.exp);
+  if (!Number.isFinite(exp) || exp <= 0) throw new Error('missing exp — refusing a non-expiring token');
+  if (exp < nowSec) throw new Error('expired');
   const nbf = Number(payload.nbf ?? 0);
   if (nbf > 0 && nbf > nowSec + 60) throw new Error('not yet valid');
   return payload;
@@ -142,10 +146,21 @@ export const verifyAirToken = async (
     }
     const sub = String(payload.sub ?? '');
     if (!sub) return null;
+    const partnerId = typeof payload.partnerId === 'string' ? payload.partnerId : undefined;
+    // Cross-app token replay guard (audit 2026-07-18 H4): any token AIR's JWKS
+    // signed — including one minted for a DIFFERENT partner app — verifies here.
+    // Enforce our own partnerId when it is configured. Env-gated so it stays a
+    // no-op until AIR_PARTNER_ID is set to the correct value (never lock out
+    // real tokens by guessing it).
+    const required = process.env.AIR_PARTNER_ID;
+    if (required && partnerId !== required) {
+      console.log(`[auth] token rejected: partnerId "${partnerId ?? ''}" != "${required}"`);
+      return null;
+    }
     return {
       sub,
       address: typeof payload.abstractAccountAddress === 'string' ? payload.abstractAccountAddress : undefined,
-      partnerId: typeof payload.partnerId === 'string' ? payload.partnerId : undefined,
+      partnerId,
     };
   } catch (e) {
     console.log(`[auth] token rejected: ${String((e as Error).message ?? e)}`);

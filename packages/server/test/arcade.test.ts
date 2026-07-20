@@ -76,7 +76,11 @@ const simBattle = (
   setup: SMatch, mySkill: number, mySeed: number,
 ): { winner: number; inputs: number[] } => {
   setCharacters(loadCharacter(bundleOf(setup.chars[0].id)), loadCharacter(bundleOf(setup.chars[1].id)));
-  const g = createGameState(setup.seed);
+  // Must sim with the SAME per-stage playfield bounds the server verifies
+  // against (protocol SMatch.bounds → createGameState(seed, bounds)); omitting
+  // them searches for winning lines against default walls, which then fail to
+  // reproduce on the server for stages whose bounds differ (flaky since af-core-6).
+  const g = createGameState(setup.seed, setup.bounds);
   const house = createAi(1, setup.solo!.skill, setup.solo!.aiSeed);
   const me = mySkill >= 0 ? createAi(0, mySkill, mySeed) : null;
   const inputs: number[] = [];
