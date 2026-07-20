@@ -146,6 +146,14 @@ let netInstalled = false;
 // persistence, name-keyed identities) — for development only; a production
 // server (real Supabase) ignores dev names and demands a verified AIR token.
 const DEV_GUEST = new URLSearchParams(location.search).get('dev');
+/**
+ * Signed-in = a real AIR session (or a ?dev= economy identity). Guests may play
+ * AGENT ARCADE locally, reward-free (no fee / XP / records); signing in is only
+ * required for RANKED (wager), the shop, MY AGENT, and dares — the account IS
+ * the wallet those settle into. This is a module-level probe so the in-gesture
+ * pointerdown handler (which fires the OAuth dialog on iOS) can read it too.
+ */
+const isSignedIn = (): boolean => auth.status === 'in' || !!DEV_GUEST;
 let account: NetAccount | null = null;
 let accountFetch: 'idle' | 'busy' | 'done' | 'fail' = 'idle';
 /** Coached agent config (ADR 0006) — non-null unlocks AUTO in solo/arcade. */
@@ -1804,11 +1812,20 @@ const tickSelect = (): void => {
       if (selectingAgentOf) startOnline('solo', undefined, selectingAgentOf);
       else if (selectingFriendly) startOnline('friendly');
       else if (mode === 'cpu') {
-        // ADR 0007: a pre-paid run token queues battle 1 (fee already taken
-        // at /arcade/enter). No token = legacy path (escrow at battle 1).
+        // GUEST: the same gauntlet, run fully LOCAL and reward-free — no fee,
+        // no account, no server. The GAME OVER card invites them to sign in.
+        if (!isSignedIn()) { startArcadePractice(); return; }
+        // SIGNED-IN (ADR 0007): a pre-paid run token queues battle 1 (fee
+        // already taken at /arcade/enter). No token = legacy path (escrow at
+        // battle 1). Either way the run is RANKED and server-verified.
         const token = pendingArcadeToken || undefined;
         pendingArcadeToken = '';
         startOnline('arcade', token);
+      } else if (!isSignedIn()) {
+        // WAGER needs the account for escrow — a guest who reached select via
+        // "change fighter" is bounced to sign-in rather than queued unpaid.
+        locked = [false, false];
+        void authLogin();
       } else startOnline('wager');
     }
     return;
@@ -1896,7 +1913,7 @@ const frame = (): void => {
       authLabel: authName() ?? (DEV_GUEST ? `DEV·${DEV_GUEST.toUpperCase()}` : null),
       authBusy: auth.status === 'busy',
       authError: auth.status === 'error' ? auth.error : undefined,
-      gate: !signedIn,
+      signedIn,
       address: auth.address || undefined,
       account: accountFetch === 'done' && account
         ? { credits: account.credits, level: account.level, wins: account.wins, losses: account.losses }
@@ -1941,11 +1958,17 @@ const frame = (): void => {
      * whole run). Select's lock handler does the actual queue.
      */
     const launchMode = (): void => {
-      // AGENT ARCADE (ADR 0007 credits rework): ask for the 1-credit entry
-      // BEFORE character select. Only when the live economy is reachable —
-      // otherwise the legacy select→queue path still handles server-down
-      // (practice fallback) and dev servers without persistence.
-      if (mode === 'cpu' && accountFetch === 'done' && account) {
+      // RANKED WAGER stakes real credits → needs the AIR account for escrow.
+      // A guest here opens sign-in instead of queuing. (On touch the dialog is
+      // fired in-gesture from the pointerdown handler; this covers desktop
+      // Enter and any keyboard fall-through — authLogin() no-ops if already busy.)
+      if (mode === 'online' && !isSignedIn()) { void authLogin(); return; }
+      // AGENT ARCADE (ADR 0007 credits rework): a SIGNED-IN player pays the
+      // 1-credit entry BEFORE character select (when the live economy is
+      // reachable). GUESTS skip straight to select → the run starts locally,
+      // reward-free (handled at the select lock). Server-down / dev-no-persist
+      // signed-in players also fall through to the legacy select→queue path.
+      if (mode === 'cpu' && isSignedIn() && accountFetch === 'done' && account) {
         if (pendingArcadeToken) { enterSelectForArcade(); return; } // already paid
         arcadeEntryConfirm = true;
         return;
@@ -2067,19 +2090,19 @@ const frame = (): void => {
       audioMenuOpen = false;
       screen = 'ranks';
       fetchRanks();
-    } else if (signedIn && account?.refCode && (pressedThisFrame.has('KeyD') || taps.has('dare'))) {
+    } else if (pressedThisFrame.has('KeyD') || taps.has('dare')) {
       // "I DARE YOU TO FIGHT" — the full invite screen (poster, taunt,
       // shareable link). Both sides earn +25 credits when a friend accepts.
-      enterInvite('title');
-    } else if (signedIn && (pressedThisFrame.has('KeyA') || taps.has('myagent'))) {
+      // Account-only → a guest tap opens sign-in instead (the touch dialog is
+      // fired in-gesture from the pointerdown handler; this is the desktop path).
+      if (signedIn && account?.refCode) enterInvite('title'); else void authLogin();
+    } else if (pressedThisFrame.has('KeyA') || taps.has('myagent')) {
       // MY AGENT (ADR 0006): view the coached config, mint the coach key,
       // spar your own agent. Sign-in required — the agent IS the account.
-      enterAgentScreen();
-    } else if (signedIn && (pressedThisFrame.has('KeyB') || taps.has('shop'))) {
+      if (signedIn) enterAgentScreen(); else void authLogin();
+    } else if (pressedThisFrame.has('KeyB') || taps.has('shop')) {
       // VENDING MACHINE (ADR 0007): gacha energy drinks for credits.
-      enterShop();
-    } else if (!signedIn) {
-      // Gated: every other key/tap waits for the sign-in.
+      if (signedIn) enterShop(); else void authLogin();
     } else if (tappedMode) {
       mode = tappedMode;
       launchMode();
@@ -2807,6 +2830,28 @@ const frame = (): void => {
         ctx.fillStyle = '#ffffff88';
         ctx.fillText('VERIFYING WITH SERVER…', VW / 2, VH - 60);
       }
+    } else if (!isSignedIn()) {
+      // GUEST arcade loss — the SOFT sign-in prompt ("play some more"). They can
+      // still re-enter the free gauntlet from the title; signing in banks
+      // credits/XP and unlocks RANKED. Drawn AFTER drawGameOver so this tap
+      // zone wins over its full-screen 'start' (dismiss-to-title) region. The
+      // OAuth dialog fires in-gesture from the pointerdown handler above.
+      const bw = 380, bh = 42, bx = VW / 2 - bw / 2, by = VH - 100;
+      ctx.save();
+      ctx.fillStyle = 'rgba(20,10,30,0.92)';
+      ctx.fillRect(bx, by, bw, bh);
+      ctx.strokeStyle = uiTick % 44 < 34 ? '#ffe9a3' : '#ffd166';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 15px "Courier New", monospace';
+      ctx.fillStyle = '#ffd166';
+      ctx.fillText('◆ SIGN IN TO PLAY MORE', VW / 2, by + 19);
+      ctx.font = '11px "Courier New", monospace';
+      ctx.fillStyle = '#ffffffaa';
+      ctx.fillText('bank credits & XP · unlock ranked · +10 free daily', VW / 2, by + 34);
+      ctx.restore();
+      tapZone(bx, by, bw, bh, 'signin');
     }
     const dismiss = pressedThisFrame.has('Enter') || pressedThisFrame.has('Space')
       || pressedThisFrame.has('Escape') || taps.has('start');
@@ -2939,10 +2984,28 @@ Object.assign(globalThis, {
 // "the buttons do nothing". Handle those few here, in-gesture, and delete the
 // tap so the frame loop never fires it a second time.
 canvas.addEventListener('pointerdown', () => {
-  // Home-screen sign-in gate: the whole game is unreachable on iPhone if this
-  // dialog can't open. (Guard on the audio dropdown so a tap meant to dismiss
-  // it isn't hijacked into a login — mirrors the frame loop's branch order.)
+  // Home-screen sign-in toggle: RANKED + the account tools are unreachable on
+  // iPhone if this dialog can't open. (Guard on the audio dropdown so a tap
+  // meant to dismiss it isn't hijacked into a login — mirrors the frame loop's
+  // branch order.)
   if (screen === 'title' && !audioMenuOpen && taps.has('signin')) {
+    toggleSignIn();
+    taps.delete('signin');
+    return;
+  }
+  // GUEST account-gated title actions (RANKED wager row, shop, my agent, dare)
+  // open the AIR OAuth dialog — same iOS user-activation rule as the gate
+  // button, so fire it in-gesture and drop the taps. AGENT ARCADE (mode:cpu),
+  // rankings, and change-fighter are NOT here: guests reach those freely.
+  if (screen === 'title' && !audioMenuOpen && !isSignedIn()
+    && (taps.has('mode:online') || taps.has('shop') || taps.has('myagent') || taps.has('dare'))) {
+    void authLogin();
+    taps.delete('mode:online'); taps.delete('shop'); taps.delete('myagent'); taps.delete('dare');
+    return;
+  }
+  // GAME OVER (guest arcade loss): the "SIGN IN TO PLAY MORE" CTA is the same
+  // in-gesture OAuth surface. Any OTHER tap dismisses to the title (frame loop).
+  if (screen === 'gameover' && taps.has('signin')) {
     toggleSignIn();
     taps.delete('signin');
     return;

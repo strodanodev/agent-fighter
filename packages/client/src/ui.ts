@@ -1022,8 +1022,12 @@ export interface TitleMenuState {
   authLabel?: string | null;
   authBusy?: boolean;
   authError?: string;
-  /** Sign-in required (M5): menu locked until the player authenticates. */
-  gate?: boolean;
+  /**
+   * A real AIR session (or ?dev= identity). Guests still see the full menu and
+   * can play AGENT ARCADE for free — false only downgrades the copy and gates
+   * the account-only actions (wager / shop / my agent / dare) behind sign-in.
+   */
+  signedIn?: boolean;
   /** Smart-account address (upper-left wallet line). */
   address?: string;
   /** Server account snapshot — credits/level/W-L (null = server offline). */
@@ -1296,35 +1300,32 @@ export const drawTitle = (
   const barH = 200, barY = VH - barH;
 
   const menuY0 = barY + 30;
-  if (menu.gate) {
-    // M5: signing in is REQUIRED — the AIR account is the wallet the whole
-    // credits economy settles into, so there is nothing to enter as a ghost.
-    const pulse = 1 + 0.04 * Math.sin(tick / 9);
-    if (menu.authBusy) {
-      display(ctx, 'SIGNING IN…', cx, menuY0 + 18, 26, { glow: 'rgba(143,184,255,0.55)' });
-      label(ctx, 'complete the AIR dialog to continue', cx, menuY0 + 48, 13, '#ffffffaa');
-    } else {
-      // A live challenge rode in on ?room= — tell them WHY they're signing
-      // in; the title auto-joins the room the moment the gate clears.
-      if (menu.challenge && tick % 40 < 30) {
-        label(ctx, '⚔ YOUR OPPONENT IS WAITING — SIGN IN TO FIGHT ⚔', cx, menuY0 - 6, 13, '#ff5d7e');
+  // AGENT ARCADE is FREE-TO-PLAY: the menu is always live. Signing in is only
+  // needed for RANKED wager + the account tools — a guest sees the same layout,
+  // just with sign-in copy and those actions routed through the AIR dialog.
+  const guest = !menu.signedIn;
+  {
+    // Guest status line above the rows: sign-in progress, a waiting challenge,
+    // or the last auth error — the old full-screen "SIGN IN TO ENTER" wall is
+    // gone (it blocked free play).
+    if (guest) {
+      if (menu.authBusy) {
+        label(ctx, 'SIGNING IN…  complete the AIR dialog', cx, menuY0 - 8, 13, '#ffd166');
+      } else if (menu.challenge && tick % 40 < 30) {
+        label(ctx, '⚔ YOUR OPPONENT IS WAITING — SIGN IN TO FIGHT ⚔', cx, menuY0 - 8, 13, '#ff5d7e');
       }
-      display(ctx, 'SIGN IN TO ENTER', cx, menuY0 + 18, 28, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
-      label(ctx, 'TAP / PRESS  L  ·  AIR ACCOUNT (GOOGLE / EMAIL / WALLET)', cx, menuY0 + 48, 14, '#ffd166');
-      label(ctx, '10 FREE CREDITS EVERY DAY YOU LOG IN   ·   R: RANKINGS', cx, menuY0 + 70, 12, '#ffffff88');
-      // The gate is mandatory and phones have no `L` key — the sign-in
-      // headline itself has to be tappable or mobile can never get in.
-      tapZone(cx - 260, menuY0 - 4, 520, 60, 'signin');
-      tapZone(cx - 260, menuY0 + 60, 520, 22, 'ranks');
+      if (menu.authError) label(ctx, `⚠ ${menu.authError.slice(0, 64)}`, cx, menuY0 + 8, 12, '#ff9d9d');
     }
-    if (menu.authError) label(ctx, `⚠ ${menu.authError.slice(0, 64)}`, cx, menuY0 + 92, 12, '#ff9d9d');
-  } else {
     // 2-player local is disabled (single-controller / mobile focus) — omitted.
     // Mode rows are big button plates (≥44px tall — a real finger target on a
     // phone), each with a one-line subtitle explaining the stakes.
     const rows: [Mode, string, string][] = [
-      ['cpu', 'AGENT ARCADE', 'RANKED · 1 CREDIT PER RUN · BEAT EVERY AGENT'],
-      ['online', 'ONLINE WAGER', '10 CREDITS ENTRY · WINNER TAKES THE POT'],
+      ['cpu', 'AGENT ARCADE', guest
+        ? 'FREE TO PLAY · BEAT EVERY AGENT · NO SIGN-IN'
+        : 'RANKED · 1 CREDIT PER RUN · BEAT EVERY AGENT'],
+      ['online', 'ONLINE WAGER', guest
+        ? 'SIGN IN TO WAGER · WINNER TAKES THE POT'
+        : '10 CREDITS ENTRY · WINNER TAKES THE POT'],
     ];
     const btnW = Math.min(560, VW - 48), btnH = 46, btnGap = 10;
     const btnX = cx - btnW / 2;
@@ -1360,12 +1361,19 @@ export const drawTitle = (
     }
     // Bottom action pills: every keyboard shortcut gets a real button — no
     // keyboard on a phone. Registered as generous ≥30px-tall tap targets.
-    const pills: [string, string, string][] = [
-      ['A · MY AGENT', 'myagent', '#8fd0ff'],
-      ['R · RANKINGS', 'ranks', '#ffffffcc'],
-      ['L · SIGN OUT', 'signin', '#ffffff99'],
-    ];
-    if (menu.refCode) pills.push(['D · DARE +25', 'dare', tick % 44 < 36 ? '#ffd166' : '#ffe9a3']);
+    // GUESTS get a prominent SIGN IN (rewards + ranked) beside RANKINGS; the
+    // account tools (MY AGENT / DARE / SIGN OUT) appear once signed in.
+    const pills: [string, string, string][] = guest
+      ? [
+        ['L · SIGN IN', 'signin', tick % 44 < 36 ? '#ffd166' : '#ffe9a3'],
+        ['R · RANKINGS', 'ranks', '#ffffffcc'],
+      ]
+      : [
+        ['A · MY AGENT', 'myagent', '#8fd0ff'],
+        ['R · RANKINGS', 'ranks', '#ffffffcc'],
+        ['L · SIGN OUT', 'signin', '#ffffff99'],
+      ];
+    if (!guest && menu.refCode) pills.push(['D · DARE +25', 'dare', tick % 44 < 36 ? '#ffd166' : '#ffe9a3']);
     const pillW = 158, pillH = 30, pillGap = 12;
     const rowW = pills.length * pillW + (pills.length - 1) * pillGap;
     const py = fy + 24;
@@ -1383,7 +1391,7 @@ export const drawTitle = (
 
     // VENDING MACHINE (ADR 0007) — upper-RIGHT corner, the only chrome that
     // lives there on the title. Signed-in only: pulls cost credits.
-    drawVendingIcon(ctx, tick);
+    if (!guest) drawVendingIcon(ctx, tick);
   }
 
   // Account/wallet block — upper LEFT, under the audio chip (M5 spec).
