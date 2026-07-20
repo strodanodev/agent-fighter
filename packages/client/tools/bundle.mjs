@@ -29,6 +29,7 @@ const ORDER = [
   'core/src/fp.js',
   'core/src/input.js',
   'core/src/data.js',
+  'core/src/items.js',
   'core/src/characters/analog.js',
   'core/src/motion.js',
   'core/src/state.js',
@@ -52,8 +53,39 @@ const ORDER = [
 
 const seen = new Map();
 const chunks = [];
+// Every INTERNAL value import across the bundled set, collected before imports
+// are stripped and validated against `seen` once concatenation is done. This
+// turns the bundler's original failure mode — a module left out of ORDER whose
+// symbols are referenced but never defined — into a loud BUILD error instead of
+// a `ReferenceError: X is not defined` that only fires on a rare runtime path.
+// (Regression: `itemById` from core/src/items.ts was used on the results screen
+// but items.js was absent from ORDER, freezing the client mid-match, 2026-07-21.)
+const valueImports = [];
+
+// tsc has already elided type-only imports from the emitted JS, so every
+// `import … from` left here is a real runtime binding. `@af/core` is a path
+// alias emitted verbatim (never rewritten by tsc) and relative paths point at
+// sibling bundled modules — both are INTERNAL and must resolve inside the
+// bundle. Bare packages (node:*, @mocanetwork/*, …) are external and skipped.
+const collectImports = (src, rel) => {
+  for (const m of src.matchAll(/^import\s+([\s\S]*?)\s+from\s+['"]([^'"]+)['"]\s*;/gm)) {
+    const spec = m[2];
+    const internal = spec.startsWith('.') || spec === '@af/core' || spec.startsWith('@af/');
+    if (!internal) continue;
+    const named = m[1].trim().match(/^\{([\s\S]*)\}$/);
+    if (!named) continue; // default / namespace imports: none in the bundled set
+    for (const part of named[1].split(',')) {
+      // Validate the ORIGINAL exported name (`x` in `x as y`) — that is the
+      // binding a concatenation bundle must actually define.
+      const name = part.trim().split(/\s+as\s+/)[0].trim();
+      if (name) valueImports.push({ rel, name, spec });
+    }
+  }
+};
+
 for (const rel of ORDER) {
   let src = readFileSync(join(tmp, rel), 'utf8');
+  collectImports(src, rel);
   src = src
     .replace(/^import\s[^;]*;\s*$/gm, '')
     .replace(/^export\s*\{[^}]*\}\s*(from\s*[^;]*)?;\s*$/gm, '')
@@ -67,6 +99,22 @@ for (const rel of ORDER) {
   chunks.push(`// ---- ${rel} ----\n${src.trim()}`);
 }
 rmSync(tmp, { recursive: true, force: true });
+
+// Completeness guard: an internal import with no matching definition means its
+// defining module is missing from ORDER above. Fail the build with the exact
+// symbols and offending files rather than shipping a bundle that throws only
+// when that code path finally runs in production.
+const unresolved = valueImports.filter(({ name }) => !seen.has(name));
+if (unresolved.length > 0) {
+  const lines = unresolved.map(
+    ({ rel, name, spec }) => `    - '${name}' (from '${spec}') imported by ${rel}`,
+  );
+  throw new Error(
+    `Bundler: ${unresolved.length} imported symbol(s) have no definition in the bundle. Their ` +
+      `defining module is missing from ORDER in packages/client/tools/bundle.mjs — add it:\n` +
+      lines.join('\n'),
+  );
+}
 
 const js = chunks.join('\n\n');
 const html = `<!DOCTYPE html>

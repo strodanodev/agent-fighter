@@ -112,6 +112,48 @@ const loadCharacter = (b) => {
         }
         moveIdxById[m.id] = i;
     });
+    // Value bounds (audit 2026-07-18 validation holes + 2026-07-20 CT-3-adjacent
+    // soft-lock). The structure is validated above; these reject NUMERIC data
+    // that would silently SOFT-LOCK a match (deterministic on both peers, so it
+    // never desyncs — it just freezes) or hand a cheating bundle free resources:
+    //  · gravity <= 0 → an airborne fighter never falls;
+    //  · throwTossVelY / launchVelY >= 0 → the victim never leaves the ground, so
+    //    AirHitstun (which exits only on landing) runs until the round timer;
+    //  · negative chip heals, negative juggleCost = infinite combo, negative
+    //    meterCost mints meter (health has no upper clamp).
+    // Bounds are loose enough that all 12 shipped bundles pass unchanged
+    // (verified: gravity 0.8, toss -8, launchVelY -17..-12, chip/juggle/meter >=0).
+    const num = (v, what) => {
+        if (typeof v !== 'number' || !Number.isFinite(v))
+            throw new Error(`${b.name}: ${what} must be a finite number (got ${v})`);
+        return v;
+    };
+    if (num(b.maxHealth, 'maxHealth') <= 0)
+        throw new Error(`${b.name}: maxHealth must be > 0 (got ${b.maxHealth})`);
+    if (num(b.gravity, 'gravity') <= 0)
+        throw new Error(`${b.name}: gravity must be > 0 or fighters never fall (got ${b.gravity})`);
+    if (num(b.throwTossVelY, 'throwTossVelY') >= 0)
+        throw new Error(`${b.name}: throwTossVelY must be < 0 (upward); a non-upward toss strands the victim in AirHitstun (got ${b.throwTossVelY})`);
+    const checkHit = (h, where) => {
+        num(h.damage, `${where} damage`);
+        if (num(h.chip, `${where} chip`) < 0)
+            throw new Error(`${b.name}: ${where} chip must be >= 0; negative chip heals (got ${h.chip})`);
+        if (num(h.juggleCost, `${where} juggleCost`) < 0)
+            throw new Error(`${b.name}: ${where} juggleCost must be >= 0; negative enables infinite combos (got ${h.juggleCost})`);
+        if (h.launchVelY !== undefined && num(h.launchVelY, `${where} launchVelY`) >= 0)
+            throw new Error(`${b.name}: ${where} launchVelY must be < 0 (upward); a non-upward launch strands the victim in AirHitstun (got ${h.launchVelY})`);
+        if (h.airPopVelY !== undefined)
+            num(h.airPopVelY, `${where} airPopVelY`);
+    };
+    b.moves.forEach((m) => {
+        if (m.meterCost !== undefined && num(m.meterCost, `${m.id} meterCost`) < 0)
+            throw new Error(`${b.name}: ${m.id} meterCost must be >= 0; negative mints meter (got ${m.meterCost})`);
+        for (const st of m.steps)
+            for (const h of st.hitboxes ?? [])
+                checkHit(h, m.id);
+        if (m.projectile)
+            checkHit(m.projectile.hit, `${m.id} projectile`);
+    });
     const normals = [new Int32Array(10).fill(-1), new Int32Array(10).fill(-1), new Int32Array(10).fill(-1)];
     const specials = [];
     let superIdx = -1;
@@ -208,8 +250,16 @@ const ROUND_SECONDS = 99;
  *            stage's bounds in the match handshake. Default (no stage bounds) is
  *            the old full-width walls, so behavior is unchanged — but the
  *            serialize layout grew by 2 int32, so goldens were re-blessed.
+ * af-core-7: Grab (throw startup) is strike-invulnerable (audit 2026-07-20
+ *            CT-3). Fixes the "throw the fireballer" soft-lock: the victim's
+ *            lingering projectile could knock the grabber to Hitstun, stranding
+ *            the victim in Thrown with no resolver until the round timer (~99s,
+ *            read as a freeze). No serialize-layout change and NO golden hash
+ *            moved (no golden replay lands a projectile on a grabbing fighter),
+ *            but the SIM behavior changed in that scenario, so client and server
+ *            must pin the same engine — hence the version bump + paired deploy.
  */
-const ENGINE_VERSION = 'af-core-6';
+const ENGINE_VERSION = 'af-core-7';
 const TUNING = {
     roundsToWin: 2, // best of 3
     preRoundTicks: 60,
@@ -241,6 +291,82 @@ const TUNING = {
     cornerThresholdPx: 26, // "at the wall" for pushback transfer
     throwStartsComboScaling: true,
 };
+
+// ---- core/src/items.js ----
+/**
+ * CONSUMABLE ITEMS — "energy drinks" (ADR 0007). Pure DATA, exactly like
+ * characters: a small effect vocabulary the engine interprets, never
+ * per-item code.
+ *
+ * Phase 1 (shop/gacha/inventory) ships without the sim reading this module
+ * at all — so no ENGINE_VERSION bump and the golden replays stay green.
+ * Phase 2 will interpret `effect` inside step() via a loadout pinned into
+ * match setup (the ADR 0006 `solo.personality` pattern).
+ *
+ * Determinism contract: the GACHA ROLL IS SERVER-SIDE, at purchase time —
+ * by the time a match starts an item is a fixed, known effect. This file
+ * must stay free of randomness (guards.test.ts bans Math.random in core)
+ * and of sim imports.
+ */
+/** Price of one vending-machine pull, in credits (mirrored in 0013_items.sql docs). */
+const ITEM_COST = 5;
+/** Gacha tier odds, percent — consumed by the SERVER's roll, never the sim. */
+const ITEM_TIER_ODDS = [
+    { tier: 1, pct: 70 },
+    { tier: 2, pct: 25 },
+    { tier: 3, pct: 5 },
+];
+/** UI accent per tier (index by tier; 0 unused). */
+const ITEM_TIER_COLORS = ['', '#cfd8e3', '#6fd3ff', '#ffd166'];
+const ITEM_TIER_LABELS = ['', 'LV 1', 'LV 2', 'LV 3'];
+/**
+ * The drink registry: 4 effect lines × 3 tiers. Amounts are data, not
+ * balance gospel — they will be tuned like TUNING once Phase 2 makes them
+ * matter in a match.
+ */
+const ITEMS = [
+    // PATCH — instant heal.
+    { id: 'patch1', name: 'PATCH COLA', tier: 1,
+        effect: { kind: 'heal', amount: 100, durationTicks: 0 },
+        desc: 'RESTORE 10% HEALTH', flavor: 'Tastes like battery acid. Works.' },
+    { id: 'patch2', name: 'PATCH COLA ZERO', tier: 2,
+        effect: { kind: 'heal', amount: 200, durationTicks: 0 },
+        desc: 'RESTORE 20% HEALTH', flavor: 'Now with 0% downtime.' },
+    { id: 'patch3', name: 'PATCH OMEGA', tier: 3,
+        effect: { kind: 'heal', amount: 350, durationTicks: 0 },
+        desc: 'RESTORE 35% HEALTH', flavor: 'Factory-reset for your ribs.' },
+    // OVERCLOCK — damage up ("crit" reframed as a flat bonus; ADR 0007).
+    { id: 'over1', name: 'OVERCLOCK LITE', tier: 1,
+        effect: { kind: 'damageMult', amount: 100, durationTicks: 600 },
+        desc: '+10% DAMAGE · 10s', flavor: 'Warranty void where prohibited.' },
+    { id: 'over2', name: 'OVERCLOCK', tier: 2,
+        effect: { kind: 'damageMult', amount: 150, durationTicks: 900 },
+        desc: '+15% DAMAGE · 15s', flavor: 'Fan noise sold separately.' },
+    { id: 'over3', name: 'OVERCLOCK REDLINE', tier: 3,
+        effect: { kind: 'damageMult', amount: 250, durationTicks: 900 },
+        desc: '+25% DAMAGE · 15s', flavor: 'Thermal limits are a mindset.' },
+    // FIREWALL — defense up (damage-taken reduction).
+    { id: 'wall1', name: 'FIREWALL FIZZ', tier: 1,
+        effect: { kind: 'defenseMult', amount: 100, durationTicks: 600 },
+        desc: '-10% DAMAGE TAKEN · 10s', flavor: 'Blocks most packets. And fists.' },
+    { id: 'wall2', name: 'FIREWALL PRO', tier: 2,
+        effect: { kind: 'defenseMult', amount: 150, durationTicks: 900 },
+        desc: '-15% DAMAGE TAKEN · 15s', flavor: 'Enterprise-grade shins.' },
+    { id: 'wall3', name: 'FIREWALL TITANIUM', tier: 3,
+        effect: { kind: 'defenseMult', amount: 250, durationTicks: 900 },
+        desc: '-25% DAMAGE TAKEN · 15s', flavor: 'Deny all. Feel nothing.' },
+    // VOLT — instant meter.
+    { id: 'volt1', name: 'VOLT SODA', tier: 1,
+        effect: { kind: 'meterGain', amount: 500, durationTicks: 0 },
+        desc: '+½ SUPER BAR', flavor: 'Lightly carbonated lightning.' },
+    { id: 'volt2', name: 'VOLT SURGE', tier: 2,
+        effect: { kind: 'meterGain', amount: 1000, durationTicks: 0 },
+        desc: '+1 SUPER BAR', flavor: 'Grid-certified. Mostly.' },
+    { id: 'volt3', name: 'VOLT MAXIMUM', tier: 3,
+        effect: { kind: 'meterGain', amount: 1500, durationTicks: 0 },
+        desc: '+1½ SUPER BARS', flavor: 'Do not drink near capacitors.' },
+];
+const itemById = (id) => ITEMS.find((i) => i.id === id);
 
 // ---- core/src/characters/analog.js ----
 /**
@@ -1482,8 +1608,14 @@ const itemScaled = (dmg, src, vic, floor) => {
 };
 /** Apply one hit/block. Returns 0 none, 1 hit, 2 block. */
 const strike = (s, src, vic, hb) => {
+    // Grab (throw startup) is strike-invulnerable so a throw is uninterruptible
+    // (audit 2026-07-20 CT-3). In 1v1 the only thing that can strike a grabbing
+    // fighter is the thrown victim's own lingering projectile; without this it
+    // knocked the grabber to Hitstun and stranded the victim in Thrown — with no
+    // resolver left — until the round timer, a ~99s soft-lock read as a freeze.
     if (vic.action === 19 /* Action.KO */ || vic.action === 15 /* Action.Knockdown */
-        || vic.action === 16 /* Action.Getup */ || vic.action === 18 /* Action.Thrown */)
+        || vic.action === 16 /* Action.Getup */ || vic.action === 18 /* Action.Thrown */
+        || vic.action === 17 /* Action.Grab */)
         return 0;
     const vicAir = !grounded(vic);
     const inCombo = vic.action === 10 /* Action.Hitstun */ || vic.action === 11 /* Action.AirHitstun */;
@@ -9073,6 +9205,39 @@ const initTouchControls = () => {
 
 
 const TICK_MS = 1000 / TICKS_PER_SEC;
+// ---------------------------------------------------------------- crash safety
+// A single uncaught exception inside the frame loop used to skip the trailing
+// requestAnimationFrame and freeze the canvas permanently and silently (audit
+// 2026-07-20 CT-1). These report-and-continue hooks + the try/catch in loop()
+// downgrade a stray throw to a logged blip. Purely additive: on a clean frame
+// nothing here runs, so existing behaviour is unchanged.
+let lastErrLog = 0;
+const reportClientError = (where, err) => {
+    const now = typeof performance !== 'undefined' ? performance.now() : 0;
+    if (now - lastErrLog < 1000)
+        return; // throttle to at most one report/sec
+    lastErrLog = now;
+    try {
+        console.error(`[af] ${where}:`, err);
+    }
+    catch { /* console unavailable — nothing safe left to do */ }
+};
+try {
+    addEventListener('error', (e) => reportClientError('window.error', e.error ?? e.message));
+    addEventListener('unhandledrejection', (e) => reportClientError('unhandledrejection', e.reason));
+}
+catch { /* addEventListener unavailable in this context — non-fatal */ }
+// fetch with a hard timeout (audit 2026-07-18 client #4). Browser fetch has no
+// default timeout — minutes on a stalled mobile connection — and a hung request
+// SOFT-LOCKS UI flows that gate on it (the shop reel spins until its buy
+// settles, with ESC disabled while it does). On timeout the request aborts and
+// rejects, so the caller's existing catch resets the flow instead of hanging.
+const FETCH_TIMEOUT_MS = 12_000;
+const fetchT = (url, opts = {}, ms = FETCH_TIMEOUT_MS) => {
+    const ctl = new AbortController();
+    const to = setTimeout(() => ctl.abort(), ms);
+    return fetch(url, { ...opts, signal: ctl.signal }).finally(() => clearTimeout(to));
+};
 // ---------------------------------------------------------------- input
 const keys = new Set();
 const pressedThisFrame = new Set();
@@ -9120,13 +9285,17 @@ const localSlotKinds = (g) => {
     const f = g.fighters[localSide()];
     return [f.itemKind0, f.itemKind1, f.itemKind2];
 };
-const pollLocal = (g) => {
+const pollLocal = (g, edges = true) => {
     let f = autoSpecialActive() ? pollAutoSpecial(g.fighters[localSide()]) : pollPad(P0_MAP);
-    let mask = itemUseMask;
+    // `edges` is false on catch-up sub-steps (CT-2): the one-shot item/drink bits
+    // fire only on the first sim step of the rAF so a multi-tick burst can't
+    // re-trigger them every tick. Held movement/attack input still applies each
+    // step via pollPad/pollAutoSpecial above.
+    let mask = edges ? itemUseMask : 0;
     // Press edge, NOT held (`keys.has`): while held, the "first carried" slot
     // re-targets the frame after a can empties, minting a fresh rising edge
     // per slot — one held R chugged the whole rack at a can per frame.
-    if (pressedThisFrame.has('KeyR')) {
+    if (edges && pressedThisFrame.has('KeyR')) {
         // R = drink the next un-drunk can (slot order).
         const kinds = localSlotKinds(g);
         const s = kinds.findIndex((k) => k !== 0);
@@ -9363,7 +9532,7 @@ const fetchRanks = () => {
     ranksBusy = true;
     ranksRows = null;
     ranksErr = '';
-    void fetch(`${matchHttpUrl()}/leaderboard?limit=100`)
+    void fetchT(`${matchHttpUrl()}/leaderboard?limit=100`)
         .then(async (res) => {
         if (!res.ok)
             throw new Error(`server said ${res.status}`);
@@ -9379,7 +9548,7 @@ const HOUSE_WALLET = '0xA6E7…13C9';
 const shortAddr = (a) => a && a.length >= 10 ? `${a.slice(0, 6)}…${a.slice(-4)}` : (a ?? '');
 const fetchAgentRoster = () => {
     agentRosterFetched = true;
-    void fetch(`${matchHttpUrl()}/agents/roster`)
+    void fetchT(`${matchHttpUrl()}/agents/roster`)
         .then(async (r) => { if (r.ok)
         agentRoster = (await r.json()); })
         .catch(() => { });
@@ -9478,7 +9647,7 @@ const fetchAccount = async () => {
         if (ref)
             q.set('ref', ref);
         const qs = q.toString();
-        const res = await fetch(`${matchHttpUrl()}/me${qs ? `?${qs}` : ''}`, { headers });
+        const res = await fetchT(`${matchHttpUrl()}/me${qs ? `?${qs}` : ''}`, { headers });
         if (!res.ok) {
             accountFetch = 'fail';
             return;
@@ -9495,7 +9664,7 @@ const fetchAccount = async () => {
         accountFetch = 'done';
         // TRAIN MY AGENT (ADR 0006): the coached config gates + drives AUTO
         // (hands-free) mode. Best-effort — no config just leaves AUTO locked.
-        void fetch(`${matchHttpUrl()}/agent`, { headers })
+        void fetchT(`${matchHttpUrl()}/agent`, { headers })
             .then((r) => (r.ok ? r.json() : null))
             .then((info) => {
             agentCfg = info?.config ?? null;
@@ -9532,7 +9701,7 @@ const fetchAgentScreen = async () => {
             agentScreenFetch = 'fail';
             return;
         }
-        const res = await fetch(`${matchHttpUrl()}/agent`, { headers });
+        const res = await fetchT(`${matchHttpUrl()}/agent`, { headers });
         if (!res.ok) {
             agentScreenFetch = 'fail';
             return;
@@ -9554,7 +9723,7 @@ const mintAgentKey = async () => {
         const headers = await agentAuthHeaders();
         if (!headers)
             return;
-        const res = await fetch(`${matchHttpUrl()}/agent/key`, { method: 'POST', headers });
+        const res = await fetchT(`${matchHttpUrl()}/agent/key`, { method: 'POST', headers });
         if (!res.ok)
             return;
         const body = (await res.json());
@@ -9582,7 +9751,7 @@ const createAgentFighter = async () => {
             return;
         headers['Content-Type'] = 'application/json';
         // Name omitted — server derives from the owner profile + tag.
-        const res = await fetch(`${matchHttpUrl()}/agent/signup`, {
+        const res = await fetchT(`${matchHttpUrl()}/agent/signup`, {
             method: 'POST', headers, body: '{}',
         });
         if (!res.ok)
@@ -9656,7 +9825,7 @@ const fetchShop = async () => {
             shopFetch = 'fail';
             return;
         }
-        const res = await fetch(`${matchHttpUrl()}/items`, { headers: shopHeaders });
+        const res = await fetchT(`${matchHttpUrl()}/items`, { headers: shopHeaders });
         if (!res.ok) {
             shopFetch = 'fail';
             return;
@@ -9689,7 +9858,7 @@ const pullShop = async () => {
             return;
         // Client purchase id — the server's idempotency key for THIS pull.
         const nonce = `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
-        const res = await fetch(`${matchHttpUrl()}/items/buy`, {
+        const res = await fetchT(`${matchHttpUrl()}/items/buy`, {
             method: 'POST', headers, body: JSON.stringify({ nonce }),
         });
         const body = (await res.json().catch(() => ({})));
@@ -9775,7 +9944,7 @@ const toggleEquip = async (rowId) => {
         const headers = shopHeaders ?? await agentAuthHeaders();
         if (!headers)
             return;
-        const res = await fetch(`${matchHttpUrl()}/items/equip`, {
+        const res = await fetchT(`${matchHttpUrl()}/items/equip`, {
             method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
             body: JSON.stringify({ rowIds: next }),
         });
@@ -9886,7 +10055,7 @@ const payArcadeEntry = async () => {
         if (!headers)
             return;
         const nonce = `a_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-        const res = await fetch(`${matchHttpUrl()}/arcade/enter`, {
+        const res = await fetchT(`${matchHttpUrl()}/arcade/enter`, {
             method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
             body: JSON.stringify({ nonce }),
         });
@@ -10886,9 +11055,15 @@ const tickStageSelect = () => {
     if (tapStart || pressedThisFrame.has('Enter') || pressedThisFrame.has('Space'))
         startFight();
 };
-const frame = () => {
-    uiTick++;
-    updateFx(); // advance cosmetic particles/rings every frame (fight AND results)
+const frame = (steps = 1) => {
+    // `steps` = fixed-timestep ticks owed this rAF (>1 only when catching up after
+    // a stall). The SIM loops `steps` times in the fight branch, but the whole
+    // frame RENDERS ONCE — that is the fix for the CT-2 catch-up render spiral
+    // (audit 2026-07-20), where a slow frame made the old loop re-render up to 12
+    // times per rAF. At a steady 60fps steps===1, so normal play is unchanged.
+    uiTick += steps;
+    for (let s = 0; s < steps; s++)
+        updateFx(); // advance cosmetic particles/rings per tick (fight AND results)
     // Tap targets are rebuilt by this frame's draw calls. Clearing here (rather
     // than after) means a press landing between frames still hit-tests the
     // layout the player can actually see.
@@ -11536,13 +11711,20 @@ const frame = () => {
         itemUseMask = (!holdSim && !netDead)
             ? ((taps.has('item:use:0') ? 1 : 0) | (taps.has('item:use:1') ? 2 : 0) | (taps.has('item:use:2') ? 4 : 0))
             : 0;
-        if (net && !holdSim && !netDead) {
-            net.frame(pollLocal(game)); // session owns stepping (rollback or local-sim)
-        }
-        else if (!net && !holdSim) {
-            // Offline the human is always P1 (localSide() === 0).
-            const p2 = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
-            step(game, [pollLocal(game), p2]);
+        // Advance the sim the `steps` fixed ticks owed this rAF (CT-2: render is
+        // ONCE, below — only the simulation catches up here). Edge inputs fire on
+        // the first sub-step only (pollLocal's `edges` flag); held input applies
+        // every step. holdSim/netDead gate the whole loop, exactly as before.
+        for (let s = 0; s < steps; s++) {
+            const edges = s === 0;
+            if (net && !holdSim && !netDead) {
+                net.frame(pollLocal(game, edges)); // session owns stepping (rollback or local-sim)
+            }
+            else if (!net && !holdSim) {
+                // Offline the human is always P1 (localSide() === 0).
+                const p2 = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
+                step(game, [pollLocal(game, edges), p2]);
+            }
         }
         itemUseMask = 0;
         updateJuice(game);
@@ -11789,6 +11971,12 @@ const frame = () => {
     }
     else if (screen === 'results' && game) {
         resultsAge++;
+        // The 25s verification stall-guard must keep ticking here (audit 2026-07-18
+        // client #5): net.frame() — its only other caller — is NOT invoked on this
+        // screen, so without this a server that never sends 'result' leaves the card
+        // on "VERIFYING WITH SERVER…" forever. checkVerifyWatchdog is side-effect
+        // free (it only flips status→error after the deadline; no stepping, no send).
+        net?.checkVerifyWatchdog();
         // Online progression is SERVER-AWARDED (Phase B): the xp message lands
         // after the verified result, only for signed-in players.
         if (net?.xp && !xpBanner) {
@@ -11846,6 +12034,12 @@ const frame = () => {
                 ctx.fillStyle = ok ? '#7ee85a' : '#ffd166';
                 ctx.fillText(ok ? `✓ SERVER-VERIFIED RESULT · ${net.result.rounds[0]}-${net.result.rounds[1]}${pot}`
                     : `RESULT: ${net.result.reason.toUpperCase()}`, VW / 2, VH - 44);
+            }
+            else if (net.status === 'error') {
+                // The watchdog fired (server stranded the verification). Say so instead
+                // of an eternal "VERIFYING…"; ESC/Enter below still leaves the screen.
+                ctx.fillStyle = '#ffd166';
+                ctx.fillText('SERVER STOPPED ANSWERING — STRANDED FEES REFUND AUTOMATICALLY', VW / 2, VH - 44);
             }
             else {
                 ctx.fillStyle = '#ffffff88';
@@ -12046,19 +12240,33 @@ const loop = (now) => {
     acc = Math.min(acc + rafDt, 200); // tab-switch guard
     last = now;
     perfFps += ((1000 / Math.max(1, rafDt)) - perfFps) * 0.05; // EMA
-    let ran = false;
     const t0 = performance.now();
-    while (acc >= TICK_MS) {
-        frame();
-        acc -= TICK_MS;
-        ran = true;
+    try {
+        // Count the fixed-timestep ticks owed this rAF, then advance + render ONCE
+        // (frame loops the sim internally). Rendering once per SIM TICK — up to 12
+        // per rAF at the 200ms cap — was the CT-2 catch-up spiral (audit 2026-07-20).
+        let steps = 0;
+        while (acc >= TICK_MS) {
+            acc -= TICK_MS;
+            steps++;
+        }
+        if (steps > 0) {
+            frame(steps);
+            perfMs += (performance.now() - t0 - perfMs) * 0.1; // EMA
+        }
+        else if (screen === 'loading') {
+            frame(1); // keep the loading screen painted while nothing else advances
+        }
+        if (perfShow)
+            drawPerf();
     }
-    if (ran)
-        perfMs += (performance.now() - t0 - perfMs) * 0.1; // EMA
-    if (!ran && screen === 'loading')
-        frame(); // keep the loading screen painted
-    if (perfShow)
-        drawPerf();
+    catch (err) {
+        acc = 0; // don't re-enter a throwing frame repeatedly within one catch-up burst
+        reportClientError('loop', err);
+    }
+    // ALWAYS re-arm the loop. A single thrown exception must never skip this and
+    // freeze the game permanently (audit 2026-07-20 CT-1); a transient throw
+    // self-heals on the next frame instead of killing the canvas.
     requestAnimationFrame(loop);
 };
 void boot();
