@@ -616,8 +616,14 @@ const itemScaled = (dmg: number, src: StrikeSource, vic: FighterState, floor: nu
 
 /** Apply one hit/block. Returns 0 none, 1 hit, 2 block. */
 const strike = (s: GameState, src: StrikeSource, vic: FighterState, hb: HitboxDef): number => {
+  // Grab (throw startup) is strike-invulnerable so a throw is uninterruptible
+  // (audit 2026-07-20 CT-3). In 1v1 the only thing that can strike a grabbing
+  // fighter is the thrown victim's own lingering projectile; without this it
+  // knocked the grabber to Hitstun and stranded the victim in Thrown — with no
+  // resolver left — until the round timer, a ~99s soft-lock read as a freeze.
   if (vic.action === Action.KO || vic.action === Action.Knockdown
-    || vic.action === Action.Getup || vic.action === Action.Thrown) return 0;
+    || vic.action === Action.Getup || vic.action === Action.Thrown
+    || vic.action === Action.Grab) return 0;
 
   const vicAir = !grounded(vic);
   const inCombo = vic.action === Action.Hitstun || vic.action === Action.AirHitstun;

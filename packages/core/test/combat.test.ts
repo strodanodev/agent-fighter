@@ -1,9 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  Action, Btn, Phase, TUNING, characters, createGameState, fp, fpToPx, step,
+  Action, Btn, Phase, TUNING, characters, createGameState, fp, fpToPx, loadCharacter, step,
 } from '../src/index.js';
-import type { GameState, InputFrame } from '../src/index.js';
+import type { CharacterBundle, GameState, HitboxDef, InputFrame } from '../src/index.js';
 
 /**
  * M1 combat mechanics coverage. These tests drive the sim exclusively through
@@ -373,6 +373,39 @@ describe('throws', () => {
     assert.notEqual(s.fighters[0].action, Action.Grab);
   });
 
+  it('a lingering projectile cannot orphan a thrown fighter (Grab is strike-invulnerable)', () => {
+    // Audit 2026-07-20 CT-3: "throw the fireballer". The victim (f1) had a
+    // fireball in flight when f0 threw it; the fireball then strikes the GRABBER
+    // (f0) mid-throw. Pre-fix, Grab was not strike-invulnerable, so f0 was
+    // knocked to Hitstun and f1 was stranded in Thrown until the round timer —
+    // a ~99s soft-lock read as a freeze. The throw must be uninterruptible.
+    const s = startFight();
+    teleport(s, 790, 845);
+    step(s, [Btn.Right | Btn.HP, 0]); // f0 throws f1
+    assert.equal(s.fighters[0].action, Action.Grab);
+    assert.equal(s.fighters[1].action, Action.Thrown);
+
+    // f1's in-flight fireball, overlapping the grabber (owner 1 → targets f0).
+    const projIdx = characters[1].b.moves.findIndex((m) => m.projectile);
+    assert.ok(projIdx >= 0, 'the character has a projectile move');
+    const p = s.projectiles[0]!;
+    p.active = 1; p.owner = 1; p.moveIdx = projIdx; p.hasHit = 0; p.life = 90;
+    p.x = s.fighters[0].x; p.y = s.fighters[0].y; p.velX = 0; // sits on the grabber
+
+    // Run well past the throw's resolution. No fighter may remain in Thrown, and
+    // the throw must have connected (the projectile did not cancel it).
+    let stranded = false;
+    for (let i = 0; i < TUNING.grabTicks + 150; i++) {
+      step(s, [0, 0]);
+      if (i > TUNING.grabTicks + 5
+        && (s.fighters[0].action === Action.Thrown || s.fighters[1].action === Action.Thrown)) {
+        stranded = true;
+      }
+    }
+    assert.equal(stranded, false, 'no fighter is stranded in Thrown after the throw resolves');
+    assert.ok(s.fighters[1].health < MAXHP, 'the throw connected — the projectile did not interrupt it');
+  });
+
   it('out of range, 6+HP is just a normal', () => {
     const s = startFight();
     teleport(s, 600, 1000);
@@ -433,4 +466,40 @@ describe('hitstop + round flow', () => {
     assert.equal(s.phase, Phase.RoundOver);
     assert.equal(s.roundWinner, 0);
   });
+});
+
+describe('bundle value validation (audit 2026-07-18 holes + 2026-07-20 CT-3 soft-lock)', () => {
+  const base = (): CharacterBundle => structuredClone(characters[0]!.b);
+  /** Corrupt a cloned shipped bundle and assert loadCharacter rejects it. */
+  const rejects = (mut: (b: CharacterBundle) => void, msg: RegExp): void => {
+    const b = base();
+    mut(b);
+    assert.throws(() => loadCharacter(b), msg);
+  };
+  /** The first hitbox in the bundle (every character has attacks). */
+  const firstHit = (b: CharacterBundle): HitboxDef => {
+    for (const m of b.moves) for (const st of m.steps) for (const h of st.hitboxes ?? []) return h;
+    throw new Error('no hitbox in bundle');
+  };
+
+  it('accepts every shipped bundle unchanged', () => {
+    for (const c of characters) assert.doesNotThrow(() => loadCharacter(structuredClone(c.b)));
+  });
+  it('rejects maxHealth <= 0', () => rejects((b) => { b.maxHealth = 0; }, /maxHealth/));
+  it('rejects gravity <= 0 (fighters never fall)', () => rejects((b) => { b.gravity = 0; }, /gravity/));
+  it('rejects a non-upward throw toss (AirHitstun soft-lock)', () => rejects((b) => { b.throwTossVelY = 0; }, /throwTossVelY/));
+  it('rejects a non-upward launcher (AirHitstun soft-lock)', () => rejects((b) => {
+    let found = false;
+    outer: for (const m of b.moves) for (const st of m.steps) for (const h of st.hitboxes ?? []) {
+      if (h.launchVelY !== undefined) { h.launchVelY = 0; found = true; break outer; }
+    }
+    if (!found) firstHit(b).launchVelY = 0; // inject one so the test is meaningful
+  }, /launchVelY/));
+  it('rejects negative chip (heals the victim)', () => rejects((b) => { firstHit(b).chip = -50; }, /chip/));
+  it('rejects negative juggleCost (infinite combo)', () => rejects((b) => { firstHit(b).juggleCost = -1; }, /juggleCost/));
+  it('rejects negative meterCost (mints meter)', () => rejects((b) => {
+    for (const m of b.moves) if (m.meterCost !== undefined) { m.meterCost = -1; return; }
+    throw new Error('no super with meterCost in bundle');
+  }, /meterCost/));
+  it('rejects NaN numerics', () => rejects((b) => { b.gravity = NaN; }, /finite/));
 });

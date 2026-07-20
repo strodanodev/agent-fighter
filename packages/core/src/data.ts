@@ -169,6 +169,37 @@ export const loadCharacter = (b: CharacterBundle): LoadedCharacter => {
     moveIdxById[m.id] = i;
   });
 
+  // Value bounds (audit 2026-07-18 validation holes + 2026-07-20 CT-3-adjacent
+  // soft-lock). The structure is validated above; these reject NUMERIC data
+  // that would silently SOFT-LOCK a match (deterministic on both peers, so it
+  // never desyncs — it just freezes) or hand a cheating bundle free resources:
+  //  · gravity <= 0 → an airborne fighter never falls;
+  //  · throwTossVelY / launchVelY >= 0 → the victim never leaves the ground, so
+  //    AirHitstun (which exits only on landing) runs until the round timer;
+  //  · negative chip heals, negative juggleCost = infinite combo, negative
+  //    meterCost mints meter (health has no upper clamp).
+  // Bounds are loose enough that all 12 shipped bundles pass unchanged
+  // (verified: gravity 0.8, toss -8, launchVelY -17..-12, chip/juggle/meter >=0).
+  const num = (v: number, what: string): number => {
+    if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`${b.name}: ${what} must be a finite number (got ${v})`);
+    return v;
+  };
+  if (num(b.maxHealth, 'maxHealth') <= 0) throw new Error(`${b.name}: maxHealth must be > 0 (got ${b.maxHealth})`);
+  if (num(b.gravity, 'gravity') <= 0) throw new Error(`${b.name}: gravity must be > 0 or fighters never fall (got ${b.gravity})`);
+  if (num(b.throwTossVelY, 'throwTossVelY') >= 0) throw new Error(`${b.name}: throwTossVelY must be < 0 (upward); a non-upward toss strands the victim in AirHitstun (got ${b.throwTossVelY})`);
+  const checkHit = (h: HitboxDef, where: string): void => {
+    num(h.damage, `${where} damage`);
+    if (num(h.chip, `${where} chip`) < 0) throw new Error(`${b.name}: ${where} chip must be >= 0; negative chip heals (got ${h.chip})`);
+    if (num(h.juggleCost, `${where} juggleCost`) < 0) throw new Error(`${b.name}: ${where} juggleCost must be >= 0; negative enables infinite combos (got ${h.juggleCost})`);
+    if (h.launchVelY !== undefined && num(h.launchVelY, `${where} launchVelY`) >= 0) throw new Error(`${b.name}: ${where} launchVelY must be < 0 (upward); a non-upward launch strands the victim in AirHitstun (got ${h.launchVelY})`);
+    if (h.airPopVelY !== undefined) num(h.airPopVelY, `${where} airPopVelY`);
+  };
+  b.moves.forEach((m) => {
+    if (m.meterCost !== undefined && num(m.meterCost, `${m.id} meterCost`) < 0) throw new Error(`${b.name}: ${m.id} meterCost must be >= 0; negative mints meter (got ${m.meterCost})`);
+    for (const st of m.steps) for (const h of st.hitboxes ?? []) checkHit(h, m.id);
+    if (m.projectile) checkHit(m.projectile.hit, `${m.id} projectile`);
+  });
+
   const normals = [new Int32Array(10).fill(-1), new Int32Array(10).fill(-1), new Int32Array(10).fill(-1)];
   const specials: LoadedCharacter['specials'] = [];
   let superIdx = -1;
@@ -262,8 +293,16 @@ export const ROUND_SECONDS = 99;
  *            stage's bounds in the match handshake. Default (no stage bounds) is
  *            the old full-width walls, so behavior is unchanged — but the
  *            serialize layout grew by 2 int32, so goldens were re-blessed.
+ * af-core-7: Grab (throw startup) is strike-invulnerable (audit 2026-07-20
+ *            CT-3). Fixes the "throw the fireballer" soft-lock: the victim's
+ *            lingering projectile could knock the grabber to Hitstun, stranding
+ *            the victim in Thrown with no resolver until the round timer (~99s,
+ *            read as a freeze). No serialize-layout change and NO golden hash
+ *            moved (no golden replay lands a projectile on a grabbing fighter),
+ *            but the SIM behavior changed in that scenario, so client and server
+ *            must pin the same engine — hence the version bump + paired deploy.
  */
-export const ENGINE_VERSION = 'af-core-6';
+export const ENGINE_VERSION = 'af-core-7';
 
 export const TUNING = {
   roundsToWin: 2, // best of 3
