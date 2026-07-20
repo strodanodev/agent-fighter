@@ -9,10 +9,10 @@
  *    (spec §3: the hash is part of match setup once money is on the line).
  */
 import { createServer } from 'node:http';
-import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { bundleHash } from './bundle-hash.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, '..', '..');
@@ -246,12 +246,6 @@ const readBody = (req) => new Promise((resolve, reject) => {
 
 const safeId = (id) => /^[a-z0-9][a-z0-9-]{0,40}$/.test(id);
 const safeSprite = (name) => /^[a-zA-Z0-9._-]{1,80}\.(png|webp|json)$/.test(name);
-
-/** Canonical content hash: bundle JSON minus the hash field itself. */
-const bundleHash = (bundle) => {
-  const { versionHash, ...rest } = bundle;
-  return createHash('sha256').update(JSON.stringify(rest)).digest('hex').slice(0, 16);
-};
 
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json',
