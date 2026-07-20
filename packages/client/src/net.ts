@@ -514,7 +514,7 @@ export class NetSession {
    * "VERIFYING WITH SERVER…" forever. Money is safe either way (the escrow
    * sweeper settles stranded fees server-side); this just tells the human.
    */
-  private checkVerifyWatchdog(): void {
+  checkVerifyWatchdog(): void {
     if (this.overSentAt && !this.result && this.status === 'playing'
       && Date.now() - this.overSentAt > 25_000) {
       this.status = 'error';
@@ -780,7 +780,7 @@ export class SoloSession {
    * SERVER…" forever. Surface the existing net-error overlay instead;
    * stranded fees refund via the server's escrow sweeper.
    */
-  private checkVerifyWatchdog(): void {
+  checkVerifyWatchdog(): void {
     if (this.overSentAt && !this.result && this.status === 'playing'
       && Date.now() - this.overSentAt > 25_000) {
       this.status = 'error';

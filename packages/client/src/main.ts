@@ -43,6 +43,38 @@ import { initPwa } from './pwa.js';
 
 const TICK_MS = 1000 / TICKS_PER_SEC;
 
+// ---------------------------------------------------------------- crash safety
+// A single uncaught exception inside the frame loop used to skip the trailing
+// requestAnimationFrame and freeze the canvas permanently and silently (audit
+// 2026-07-20 CT-1). These report-and-continue hooks + the try/catch in loop()
+// downgrade a stray throw to a logged blip. Purely additive: on a clean frame
+// nothing here runs, so existing behaviour is unchanged.
+let lastErrLog = 0;
+const reportClientError = (where: string, err: unknown): void => {
+  const now = typeof performance !== 'undefined' ? performance.now() : 0;
+  if (now - lastErrLog < 1000) return; // throttle to at most one report/sec
+  lastErrLog = now;
+  try {
+    console.error(`[af] ${where}:`, err);
+  } catch { /* console unavailable — nothing safe left to do */ }
+};
+try {
+  addEventListener('error', (e) => reportClientError('window.error', (e as ErrorEvent).error ?? (e as ErrorEvent).message));
+  addEventListener('unhandledrejection', (e) => reportClientError('unhandledrejection', (e as PromiseRejectionEvent).reason));
+} catch { /* addEventListener unavailable in this context — non-fatal */ }
+
+// fetch with a hard timeout (audit 2026-07-18 client #4). Browser fetch has no
+// default timeout — minutes on a stalled mobile connection — and a hung request
+// SOFT-LOCKS UI flows that gate on it (the shop reel spins until its buy
+// settles, with ESC disabled while it does). On timeout the request aborts and
+// rejects, so the caller's existing catch resets the flow instead of hanging.
+const FETCH_TIMEOUT_MS = 12_000;
+const fetchT = (url: string, opts: RequestInit = {}, ms = FETCH_TIMEOUT_MS): Promise<Response> => {
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), ms);
+  return fetch(url, { ...opts, signal: ctl.signal }).finally(() => clearTimeout(to));
+};
+
 // ---------------------------------------------------------------- input
 const keys = new Set<string>();
 const pressedThisFrame = new Set<string>();
@@ -92,13 +124,17 @@ const localSlotKinds = (g: GameState): [number, number, number] => {
   return [f.itemKind0, f.itemKind1, f.itemKind2];
 };
 
-const pollLocal = (g: GameState): InputFrame => {
+const pollLocal = (g: GameState, edges = true): InputFrame => {
   let f = autoSpecialActive() ? pollAutoSpecial(g.fighters[localSide()]) : pollPad(P0_MAP);
-  let mask = itemUseMask;
+  // `edges` is false on catch-up sub-steps (CT-2): the one-shot item/drink bits
+  // fire only on the first sim step of the rAF so a multi-tick burst can't
+  // re-trigger them every tick. Held movement/attack input still applies each
+  // step via pollPad/pollAutoSpecial above.
+  let mask = edges ? itemUseMask : 0;
   // Press edge, NOT held (`keys.has`): while held, the "first carried" slot
   // re-targets the frame after a can empties, minting a fresh rising edge
   // per slot — one held R chugged the whole rack at a can per frame.
-  if (pressedThisFrame.has('KeyR')) {
+  if (edges && pressedThisFrame.has('KeyR')) {
     // R = drink the next un-drunk can (slot order).
     const kinds = localSlotKinds(g);
     const s = kinds.findIndex((k) => k !== 0);
@@ -339,7 +375,7 @@ const fetchRanks = (): void => {
   ranksBusy = true;
   ranksRows = null;
   ranksErr = '';
-  void fetch(`${matchHttpUrl()}/leaderboard?limit=100`)
+  void fetchT(`${matchHttpUrl()}/leaderboard?limit=100`)
     .then(async (res) => {
       if (!res.ok) throw new Error(`server said ${res.status}`);
       ranksRows = (await res.json()) as RankRow[];
@@ -371,7 +407,7 @@ const shortAddr = (a?: string | null): string =>
 
 const fetchAgentRoster = (): void => {
   agentRosterFetched = true;
-  void fetch(`${matchHttpUrl()}/agents/roster`)
+  void fetchT(`${matchHttpUrl()}/agents/roster`)
     .then(async (r) => { if (r.ok) agentRoster = (await r.json()) as RosterResp; })
     .catch(() => { /* offline — the house agent is synthesized in resolveAgentOpp */ });
 };
@@ -465,7 +501,7 @@ const fetchAccount = async (): Promise<void> => {
     if (name) q.set('name', name.toUpperCase());
     if (ref) q.set('ref', ref);
     const qs = q.toString();
-    const res = await fetch(`${matchHttpUrl()}/me${qs ? `?${qs}` : ''}`, { headers });
+    const res = await fetchT(`${matchHttpUrl()}/me${qs ? `?${qs}` : ''}`, { headers });
     if (!res.ok) { accountFetch = 'fail'; return; }
     account = (await res.json()) as NetAccount;
     if (account.dailyGranted) accountToastAge = 0;
@@ -476,7 +512,7 @@ const fetchAccount = async (): Promise<void> => {
     accountFetch = 'done';
     // TRAIN MY AGENT (ADR 0006): the coached config gates + drives AUTO
     // (hands-free) mode. Best-effort — no config just leaves AUTO locked.
-    void fetch(`${matchHttpUrl()}/agent`, { headers })
+    void fetchT(`${matchHttpUrl()}/agent`, { headers })
       .then((r) => (r.ok ? r.json() : null))
       .then((info: { config?: AgentCoachConfig | null } | null) => {
         agentCfg = info?.config ?? null;
@@ -518,7 +554,7 @@ const fetchAgentScreen = async (): Promise<void> => {
   try {
     const headers = await agentAuthHeaders();
     if (!headers) { agentScreenFetch = 'fail'; return; }
-    const res = await fetch(`${matchHttpUrl()}/agent`, { headers });
+    const res = await fetchT(`${matchHttpUrl()}/agent`, { headers });
     if (!res.ok) { agentScreenFetch = 'fail'; return; }
     agentScreenInfo = (await res.json()) as AgentScreenInfo;
     agentCfg = agentScreenInfo.config ?? null; // keep the AUTO gate in sync
@@ -535,7 +571,7 @@ const mintAgentKey = async (): Promise<void> => {
   try {
     const headers = await agentAuthHeaders();
     if (!headers) return;
-    const res = await fetch(`${matchHttpUrl()}/agent/key`, { method: 'POST', headers });
+    const res = await fetchT(`${matchHttpUrl()}/agent/key`, { method: 'POST', headers });
     if (!res.ok) return;
     const body = (await res.json()) as { key?: string };
     if (body.key) {
@@ -559,7 +595,7 @@ const createAgentFighter = async (): Promise<void> => {
     if (!headers) return;
     headers['Content-Type'] = 'application/json';
     // Name omitted — server derives from the owner profile + tag.
-    const res = await fetch(`${matchHttpUrl()}/agent/signup`, {
+    const res = await fetchT(`${matchHttpUrl()}/agent/signup`, {
       method: 'POST', headers, body: '{}',
     });
     if (!res.ok) return;
@@ -639,7 +675,7 @@ const fetchShop = async (): Promise<void> => {
     // headers so the balance shown and the wallet charged cannot diverge.
     shopHeaders = await agentAuthHeaders();
     if (!shopHeaders) { shopFetch = 'fail'; return; }
-    const res = await fetch(`${matchHttpUrl()}/items`, { headers: shopHeaders });
+    const res = await fetchT(`${matchHttpUrl()}/items`, { headers: shopHeaders });
     if (!res.ok) { shopFetch = 'fail'; return; }
     const body = (await res.json()) as {
       cost?: number;
@@ -674,7 +710,7 @@ const pullShop = async (): Promise<void> => {
     if (!headers) return;
     // Client purchase id — the server's idempotency key for THIS pull.
     const nonce = `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
-    const res = await fetch(`${matchHttpUrl()}/items/buy`, {
+    const res = await fetchT(`${matchHttpUrl()}/items/buy`, {
       method: 'POST', headers, body: JSON.stringify({ nonce }),
     });
     const body = (await res.json().catch(() => ({}))) as {
@@ -752,7 +788,7 @@ const toggleEquip = async (rowId: number): Promise<void> => {
   try {
     const headers = shopHeaders ?? await agentAuthHeaders();
     if (!headers) return;
-    const res = await fetch(`${matchHttpUrl()}/items/equip`, {
+    const res = await fetchT(`${matchHttpUrl()}/items/equip`, {
       method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
       body: JSON.stringify({ rowIds: next }),
     });
@@ -879,7 +915,7 @@ const payArcadeEntry = async (): Promise<void> => {
     const headers = await agentAuthHeaders();
     if (!headers) return;
     const nonce = `a_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-    const res = await fetch(`${matchHttpUrl()}/arcade/enter`, {
+    const res = await fetchT(`${matchHttpUrl()}/arcade/enter`, {
       method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
       body: JSON.stringify({ nonce }),
     });
@@ -1872,9 +1908,14 @@ const tickStageSelect = (): void => {
   if (tapStart || pressedThisFrame.has('Enter') || pressedThisFrame.has('Space')) startFight();
 };
 
-const frame = (): void => {
-  uiTick++;
-  updateFx(); // advance cosmetic particles/rings every frame (fight AND results)
+const frame = (steps = 1): void => {
+  // `steps` = fixed-timestep ticks owed this rAF (>1 only when catching up after
+  // a stall). The SIM loops `steps` times in the fight branch, but the whole
+  // frame RENDERS ONCE — that is the fix for the CT-2 catch-up render spiral
+  // (audit 2026-07-20), where a slow frame made the old loop re-render up to 12
+  // times per rAF. At a steady 60fps steps===1, so normal play is unchanged.
+  uiTick += steps;
+  for (let s = 0; s < steps; s++) updateFx(); // advance cosmetic particles/rings per tick (fight AND results)
   // Tap targets are rebuilt by this frame's draw calls. Clearing here (rather
   // than after) means a press landing between frames still hit-tests the
   // layout the player can actually see.
@@ -2442,12 +2483,19 @@ const frame = (): void => {
     itemUseMask = (!holdSim && !netDead)
       ? ((taps.has('item:use:0') ? 1 : 0) | (taps.has('item:use:1') ? 2 : 0) | (taps.has('item:use:2') ? 4 : 0))
       : 0;
-    if (net && !holdSim && !netDead) {
-      net.frame(pollLocal(game)); // session owns stepping (rollback or local-sim)
-    } else if (!net && !holdSim) {
-      // Offline the human is always P1 (localSide() === 0).
-      const p2: InputFrame = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
-      step(game, [pollLocal(game), p2]);
+    // Advance the sim the `steps` fixed ticks owed this rAF (CT-2: render is
+    // ONCE, below — only the simulation catches up here). Edge inputs fire on
+    // the first sub-step only (pollLocal's `edges` flag); held input applies
+    // every step. holdSim/netDead gate the whole loop, exactly as before.
+    for (let s = 0; s < steps; s++) {
+      const edges = s === 0;
+      if (net && !holdSim && !netDead) {
+        net.frame(pollLocal(game, edges)); // session owns stepping (rollback or local-sim)
+      } else if (!net && !holdSim) {
+        // Offline the human is always P1 (localSide() === 0).
+        const p2: InputFrame = cpuAi ? aiPoll(cpuAi, game) : pollPad(P1_MAP);
+        step(game, [pollLocal(game, edges), p2]);
+      }
     }
     itemUseMask = 0;
     updateJuice(game);
@@ -2684,6 +2732,12 @@ const frame = (): void => {
     }
   } else if (screen === 'results' && game) {
     resultsAge++;
+    // The 25s verification stall-guard must keep ticking here (audit 2026-07-18
+    // client #5): net.frame() — its only other caller — is NOT invoked on this
+    // screen, so without this a server that never sends 'result' leaves the card
+    // on "VERIFYING WITH SERVER…" forever. checkVerifyWatchdog is side-effect
+    // free (it only flips status→error after the deadline; no stepping, no send).
+    net?.checkVerifyWatchdog();
     // Online progression is SERVER-AWARDED (Phase B): the xp message lands
     // after the verified result, only for signed-in players.
     if (net?.xp && !xpBanner) {
@@ -2744,6 +2798,11 @@ const frame = (): void => {
           ok ? `✓ SERVER-VERIFIED RESULT · ${net.result.rounds[0]}-${net.result.rounds[1]}${pot}`
             : `RESULT: ${net.result.reason.toUpperCase()}`,
           VW / 2, VH - 44);
+      } else if (net.status === 'error') {
+        // The watchdog fired (server stranded the verification). Say so instead
+        // of an eternal "VERIFYING…"; ESC/Enter below still leaves the screen.
+        ctx.fillStyle = '#ffd166';
+        ctx.fillText('SERVER STOPPED ANSWERING — STRANDED FEES REFUND AUTOMATICALLY', VW / 2, VH - 44);
       } else {
         ctx.fillStyle = '#ffffff88';
         ctx.fillText('VERIFYING WITH SERVER…', VW / 2, VH - 44);
@@ -2931,16 +2990,27 @@ const loop = (now: number): void => {
   acc = Math.min(acc + rafDt, 200); // tab-switch guard
   last = now;
   perfFps += ((1000 / Math.max(1, rafDt)) - perfFps) * 0.05; // EMA
-  let ran = false;
   const t0 = performance.now();
-  while (acc >= TICK_MS) {
-    frame();
-    acc -= TICK_MS;
-    ran = true;
+  try {
+    // Count the fixed-timestep ticks owed this rAF, then advance + render ONCE
+    // (frame loops the sim internally). Rendering once per SIM TICK — up to 12
+    // per rAF at the 200ms cap — was the CT-2 catch-up spiral (audit 2026-07-20).
+    let steps = 0;
+    while (acc >= TICK_MS) { acc -= TICK_MS; steps++; }
+    if (steps > 0) {
+      frame(steps);
+      perfMs += (performance.now() - t0 - perfMs) * 0.1; // EMA
+    } else if (screen === 'loading') {
+      frame(1); // keep the loading screen painted while nothing else advances
+    }
+    if (perfShow) drawPerf();
+  } catch (err) {
+    acc = 0; // don't re-enter a throwing frame repeatedly within one catch-up burst
+    reportClientError('loop', err);
   }
-  if (ran) perfMs += (performance.now() - t0 - perfMs) * 0.1; // EMA
-  if (!ran && screen === 'loading') frame(); // keep the loading screen painted
-  if (perfShow) drawPerf();
+  // ALWAYS re-arm the loop. A single thrown exception must never skip this and
+  // freeze the game permanently (audit 2026-07-20 CT-1); a transient throw
+  // self-heals on the next frame instead of killing the canvas.
   requestAnimationFrame(loop);
 };
 
