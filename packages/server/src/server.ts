@@ -395,7 +395,22 @@ export const createMatchServer = (opts: {
   idleForfeitMs?: number;
 } = {}): Promise<MatchServer> => {
   const root = opts.root ?? REPO_ROOT;
-  const idleMs = opts.idleForfeitMs ?? IDLE_FORFEIT_MS;
+  // Input-silence forfeit window. The idle sweep is a REALTIME liveness
+  // assumption: a real client streams inputs every tick, so 30s of silence
+  // means the tab is gone → settle the solo match as a no-contest.
+  //
+  // Offline-sim tests (noPaceCheck) violate that assumption BY DESIGN: they
+  // compute a whole match locally and submit the ledger in one burst, so the
+  // socket is silent for the entire (blocking, machine-speed-dependent)
+  // winning-line search. On a slow/loaded box that search outlasts the 30s
+  // window and the sweep settles a legitimately-WON match as 'incomplete' the
+  // instant the loop frees — the "flaky arcade" no-contest. noPaceCheck already
+  // opts out of the sibling realtime heuristics (settlement pace check + the
+  // per-input maxTick cap); the idle sweep is the same class, so it relaxes
+  // here too. A test that specifically EXERCISES idle-forfeit still opts in by
+  // passing an explicit idleForfeitMs, which always wins over this default.
+  const idleMs = opts.idleForfeitMs
+    ?? (opts.noPaceCheck ? Number.MAX_SAFE_INTEGER : IDLE_FORFEIT_MS);
   const charactersDir = join(root, 'characters');
   const stagesDir = join(root, 'stages');
   loadDotEnv(root); // SUPABASE_URL / SUPABASE_SERVICE_KEY / AIR_* config

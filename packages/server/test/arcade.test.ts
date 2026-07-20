@@ -76,10 +76,13 @@ const simBattle = (
   setup: SMatch, mySkill: number, mySeed: number,
 ): { winner: number; inputs: number[] } => {
   setCharacters(loadCharacter(bundleOf(setup.chars[0].id)), loadCharacter(bundleOf(setup.chars[1].id)));
-  // Must sim with the SAME per-stage playfield bounds the server verifies
-  // against (protocol SMatch.bounds → createGameState(seed, bounds)); omitting
-  // them searches for winning lines against default walls, which then fail to
-  // reproduce on the server for stages whose bounds differ (flaky since af-core-6).
+  // Sim with the SAME per-stage playfield bounds the server verifies against
+  // (protocol SMatch.bounds → createGameState(seed, bounds)): omitting them
+  // would search for a winning line against default walls that then won't
+  // reproduce on the server for a view-locked stage. This is setup PARITY, not
+  // the old "flaky since af-core-6" symptom — that flake was the realtime idle
+  // sweep settling this offline-sim match as a no-contest while winningLine ran
+  // (fixed server-side: noPaceCheck now relaxes the idle window, server.ts).
   const g = createGameState(setup.seed, setup.bounds);
   const house = createAi(1, setup.solo!.skill, setup.solo!.aiSeed);
   const me = mySkill >= 0 ? createAi(0, mySkill, mySeed) : null;
