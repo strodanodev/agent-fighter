@@ -3265,9 +3265,9 @@
     "refChroma": 13,
     "selectPortrait": "_select.png",
     "selectFraming": {
-      "zoom": 1.25,
-      "panX": 0,
-      "panY": 0.7241379310344828,
+      "zoom": 1.8,
+      "panX": 0.06944444444444423,
+      "panY": 0.751098659635245,
       "rotate": 0,
       "flipH": false
     },

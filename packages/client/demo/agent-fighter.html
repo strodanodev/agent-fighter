@@ -7692,16 +7692,25 @@ friendly) => {
     label(ctx, '‹ TITLE', backX + backW / 2, backY + backH / 2 + 4, 12, '#ffffffcc');
     if (cpuInfo)
         drawCpuBadge(ctx, cpuInfo, tick);
-    // Portrait grid — a single row (wraps past 6). Compact so the bottom band
-    // is free for the two fighter cards.
+    // Portrait grid — wraps past 6 columns. The fighter cards below own a FIXED
+    // band at the bottom of the screen; the grid gets the fixed region between
+    // the heading and that band. Cells shrink to fit as the roster grows so the
+    // grid never pushes the cards off-screen (that cropped the layout once the
+    // roster passed two rows).
     const cols = Math.min(rosters.length, 6);
     const gap = 12;
+    const nameH = 20; // per-cell headroom for the name label under each portrait
     const maxGridW = 720;
-    const cell = Math.min(96, Math.floor((maxGridW - (cols - 1) * gap) / cols));
     const rows = Math.ceil(rosters.length / cols);
+    const cardW = 448, cardH = 188;
+    const cardY = VH - cardH - 30; // fixed: the card band never moves
+    const gy = 74;
+    const bandH = cardY - 6 - gy; // vertical room the grid must fit within
+    const cellByW = Math.floor((maxGridW - (cols - 1) * gap) / cols);
+    const cellByH = Math.floor((bandH - nameH - (rows - 1) * (gap + nameH)) / rows);
+    const cell = Math.max(28, Math.min(96, cellByW, cellByH));
     const gridW = cols * cell + (cols - 1) * gap;
     const gx = (VW - gridW) / 2;
-    const gy = 74;
     rosters.forEach((r, k) => {
         const x = gx + (k % cols) * (cell + gap);
         const y = gy + Math.floor(k / cols) * (cell + gap + 20);
@@ -7747,8 +7756,7 @@ friendly) => {
     });
     // Two fighter cards in the bottom band — one per side, showing the fighter
     // each cursor is hovering, with stats derived from real bundle config.
-    const cardW = 448, cardH = 188;
-    const cardY = Math.max(gy + rows * (cell + gap + 20) + 6, VH - cardH - 30);
+    // (cardW/cardH/cardY are fixed above; the grid sizes itself around them.)
     // Animated hanging BANNERS in the empty side-margins beside the grid: the
     // player's (device region) on the left, the opponent's (auth metadata) on
     // the right — both fall back to a WE ARE ANONYMOUS banner when unknown. They

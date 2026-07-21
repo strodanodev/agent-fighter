@@ -1,5 +1,5 @@
 {
-  "name": "eliza",
+  "name": "eliza OS",
   "maxHealth": 10000,
   "walkFSpeed": 4.2,
   "walkBSpeed": 3.2,
@@ -3280,5 +3280,5 @@
       "flipH": false
     }
   },
-  "versionHash": "50d4ecc0d98efcac"
+  "versionHash": "0f033acf9ff171ca"
 }
