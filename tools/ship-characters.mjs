@@ -214,7 +214,7 @@ if (!gitLines('diff --cached --name-only').length) fail('nothing staged to commi
 const body = `${message}\n\nShipped via \`npm run ship\`. rehash --check clean, verify ${flags.skipVerify ? 'SKIPPED' : 'green'}.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n`;
 const commit = spawnSync('git', ['commit', '-q', '-F', '-'], { cwd: ROOT, input: body, encoding: 'utf8' });
 if (commit.status !== 0) fail(`git commit failed: ${commit.stderr ?? ''}`);
-ok(`committed: ${git('log -1 --format=%h\\ %s')}`);
+ok(`committed: ${git('log -1 --oneline')}`);
 
 // ── 7. push ─────────────────────────────────────────────────────────────────
 step('Push to GitHub');
