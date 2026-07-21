@@ -214,3 +214,31 @@ test('HTTP body cap: an oversized POST is refused (413), not buffered into the p
   const small = await rawPost(server.port, '/arcade/enter', dev, JSON.stringify({ nonce: 'entry-0001' }));
   assert.notEqual(small, 413, 'a normal body is not rejected by the cap');
 });
+
+test('connection cap (per-IP): a flood past the limit is refused with 1013, not admitted', async (t) => {
+  // v1.02_scale: the clients set was unbounded — a connection flood had no
+  // ceiling. Per-IP cap 2 here; all test sockets share 127.0.0.1.
+  const server = await createMatchServer({ port: 0, persistence: memoryPersistence(), maxConnsPerIp: 2 });
+  t.after(() => server.close());
+  const url = `ws://127.0.0.1:${server.port}`;
+  const opened: WebSocket[] = [];
+  t.after(() => opened.forEach((w) => w.close()));
+  const openOne = (): Promise<WebSocket> => new Promise((res, rej) => {
+    const ws = new WebSocket(url); opened.push(ws);
+    ws.on('open', () => res(ws));
+    ws.on('error', () => rej(new Error('socket errored before open')));
+  });
+
+  // Two sockets fill the per-IP budget and stay open.
+  const a = await openOne();
+  const b = await openOne();
+  assert.equal(a.readyState, WebSocket.OPEN);
+  assert.equal(b.readyState, WebSocket.OPEN);
+
+  // The third is refused the moment it connects — 1013 Try Again Later — and
+  // never joins the live set (it would otherwise ride every sweep).
+  const c = new WebSocket(url); opened.push(c);
+  c.on('error', () => { /* a refused socket can surface as an error too */ });
+  const code = await new Promise<number>((res) => c.on('close', (x) => res(x)));
+  assert.equal(code, 1013, 'the over-cap connection is refused with 1013');
+});

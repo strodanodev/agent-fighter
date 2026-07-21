@@ -63,6 +63,23 @@ try {
   addEventListener('unhandledrejection', (e) => reportClientError('unhandledrejection', (e as PromiseRejectionEvent).reason));
 } catch { /* addEventListener unavailable in this context — non-fatal */ }
 
+// Storage that never throws (audit 2026-07-18 client #1). localStorage access
+// raises SecurityError in sandboxed iframes / hardened-privacy contexts — and
+// this module reads it at TOP LEVEL (the remembered fighter, below). An
+// unguarded throw there aborts the whole bundle at eval time, before any error
+// UI exists → a permanent white screen, in exactly the embed contexts the game
+// is shared into (dare / share links). These wrappers degrade storage to a
+// no-op instead of crashing the app.
+const safeGetItem = (k: string): string | null => {
+  try { return localStorage.getItem(k); } catch { return null; }
+};
+const safeSetItem = (k: string, v: string): void => {
+  try { localStorage.setItem(k, v); } catch { /* storage unavailable — non-fatal */ }
+};
+const safeRemoveItem = (k: string): void => {
+  try { localStorage.removeItem(k); } catch { /* storage unavailable — non-fatal */ }
+};
+
 // fetch with a hard timeout (audit 2026-07-18 client #4). Browser fetch has no
 // default timeout — minutes on a stalled mobile connection — and a hung request
 // SOFT-LOCKS UI flows that gate on it (the shop reel spins until its buy
@@ -203,7 +220,7 @@ let practiceFree = false; // offline-fallback match: no fee, no XP, no records
 // ---- P0 loop redesign: quick play, VS card, wallet strip.
 // The remembered fighter makes the title's ENTER a one-input path to a match.
 const LAST_FIGHTER_KEY = 'af-last-fighter';
-let lastFighter = localStorage.getItem(LAST_FIGHTER_KEY) ?? '';
+let lastFighter = safeGetItem(LAST_FIGHTER_KEY) ?? '';
 /** Title-screen Music/SFX/Hits dropdown (speaker chip always visible). */
 let audioMenuOpen = false;
 /** Ambient menu video — paused during fights to free its decoder (iOS memory). */
@@ -236,7 +253,7 @@ const toggleSignIn = (): void => {
 // redeems it server-side (+25 credits each, once ever, new accounts only).
 const REF_CODE_KEY = 'af-ref-code';
 const DARE_LINK_BASE = 'https://agent-fighter-web.vercel.app/dare';
-const storedRef = (): string | undefined => localStorage.getItem(REF_CODE_KEY) ?? undefined;
+const storedRef = (): string | undefined => safeGetItem(REF_CODE_KEY) ?? undefined;
 let referralToastAge = -1; // ≥0 → the "+25 DARE ACCEPTED" toast is animating
 
 // ---- Invite screen ("PUT A BOUNTY ON YOUR OWN HEAD") — the sender side of
@@ -508,7 +525,7 @@ const fetchAccount = async (): Promise<void> => {
     if ((account.referralGranted ?? 0) > 0) referralToastAge = 0;
     // The server has now decided the referral (granted or ineligible) —
     // either way the code is spent for this account. Stop resending it.
-    if (ref) localStorage.removeItem(REF_CODE_KEY);
+    if (ref) safeRemoveItem(REF_CODE_KEY);
     accountFetch = 'done';
     // TRAIN MY AGENT (ADR 0006): the coached config gates + drives AUTO
     // (hands-free) mode. Best-effort — no config just leaves AUTO locked.
@@ -867,14 +884,14 @@ const ARCADE_RUN_KEY = 'af-arcade-run';
 interface StoredArcadeRun { token: string; charId: string; battle: number; total: number; ts: number }
 const storeArcadeRun = (r: StoredArcadeRun | null): void => {
   try {
-    if (r) localStorage.setItem(ARCADE_RUN_KEY, JSON.stringify(r));
-    else localStorage.removeItem(ARCADE_RUN_KEY);
+    if (r) safeSetItem(ARCADE_RUN_KEY, JSON.stringify(r));
+    else safeRemoveItem(ARCADE_RUN_KEY);
   } catch { /* private mode — resume is best-effort */ }
 };
 /** The stored run, if it's fresh enough for the server to still hold it. */
 const storedArcadeRun = (): StoredArcadeRun | null => {
   try {
-    const raw = localStorage.getItem(ARCADE_RUN_KEY);
+    const raw = safeGetItem(ARCADE_RUN_KEY);
     if (!raw) return null;
     const r = JSON.parse(raw) as StoredArcadeRun;
     if (!r.token || !r.charId || Date.now() - r.ts > 4 * 60_000) return null;
@@ -1073,7 +1090,7 @@ const applyBootDeepLink = (): void => {
   // the AIR dialog round-trip and redeems on the first signed-in contact.
   const refQ = q.get('ref');
   if (refQ && /^[A-Za-z0-9-]{3,40}$/.test(refQ)) {
-    localStorage.setItem(REF_CODE_KEY, refQ.toUpperCase());
+    safeSetItem(REF_CODE_KEY, refQ.toUpperCase());
   }
 
   // Live challenge (?room=): remember it in-memory only — it's a "fight me
@@ -1162,7 +1179,7 @@ const resetMatchFx = (g: GameState): void => {
 const startOnline = (m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: string, agentOf?: string): void => {
   const roster = allRosters[picks[0]]!;
   lastFighter = roster.id;
-  localStorage.setItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
+  safeSetItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
   queuedMode = m;
   queuedAgentOf = m === 'solo' ? agentOf ?? '' : ''; // rematch re-queues the same agent
   // CONSUMABLES (ADR 0007 final shape): nothing to send — the server reads
@@ -1340,7 +1357,7 @@ const startArcadePractice = (): void => {
   const me = picks[0];
   const roster = allRosters[me]!;
   lastFighter = roster.id;
-  localStorage.setItem(LAST_FIGHTER_KEY, lastFighter);
+  safeSetItem(LAST_FIGHTER_KEY, lastFighter);
   // Every enabled agent except the player's own — shuffled so each run has a
   // fresh order. A roster of one still works: it becomes a mirror match.
   const opponents = allRosters

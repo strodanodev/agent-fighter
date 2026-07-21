@@ -311,64 +311,80 @@ interface VerifyOutcome {
 }
 
 /**
- * Re-simulate the ledger and derive the result. Synchronous on purpose:
- * verification is the trust anchor and Node's single thread makes the
- * global character slots race-free without locks.
+ * Re-simulate the ledger, derive the result, AND scan the client-reported
+ * hashes for the deviator — in ONE forward pass (v1.02_scale).
+ *
+ * Synchronous on purpose: verification is the trust anchor and Node's single
+ * thread makes the global character slots race-free without locks.
+ *
+ * This used to be TWO full re-sims per settled match: `verifyLedger` (derive
+ * the outcome) followed by `findDeviator` (walk the ledger again checking
+ * reported hashes). They stepped the identical deterministic simulation from
+ * tick 0 with the identical inputs/AI, so one pass produces both — halving the
+ * event-loop time every match settlement blocks for. Behaviour is unchanged:
+ * the outcome is the full re-sim result, and the deviator is still the EARLIEST
+ * diverging reported tick (checkpoints are visited in ascending tick order, and
+ * once a side is convicted no later tick can overrule it).
+ *
+ * Solo (protocol v3): the client streamed only ITS inputs; the opponent is
+ * re-derived from the pinned deterministic AI (same skill/aiSeed/personality,
+ * same aiPoll-before-step ordering as the client), so the house cannot be
+ * puppeteered and a coached agent (ADR 0006) can't be either.
  */
-const verifyLedger = (
+const verifyAndScan = (
   bundles: [CharacterBundle, CharacterBundle],
   seed: number,
   inputs: [number[], number[]],
+  hashes: [Map<number, number>, Map<number, number>],
+  solo: { skill: number; aiSeed: number; personality?: Record<string, number> } | null,
   items: MatchItems = NO_ITEMS,
   bounds?: { left: number; right: number },
-): VerifyOutcome => {
+  matchId = '',
+): { outcome: VerifyOutcome; deviator: 0 | 1 | undefined } => {
   setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
   installItems(items);
   const g = createGameState(seed, bounds);
-  const n = Math.min(inputs[0].length, inputs[1].length);
-  let t = 0;
-  while (g.phase !== Phase.MatchOver && t < n) {
-    step(g, [inputs[0][t]! | 0, inputs[1][t]! | 0]);
-    t++;
-  }
-  return {
-    winner: g.phase === Phase.MatchOver ? g.winner : -1,
-    rounds: [g.roundsWon0, g.roundsWon1],
-    endTick: t,
-    hash: stateHash(g),
-    reachedEnd: g.phase === Phase.MatchOver,
-    spent: spentSlots(g, items),
-  };
-};
+  const ai = solo ? createAi(1, solo.skill, solo.aiSeed, solo.personality) : null;
+  const n = solo ? inputs[0].length : Math.min(inputs[0].length, inputs[1].length);
 
-/**
- * LOCAL-SIM SOLO verification (protocol v3): the client streamed only ITS
- * inputs; the opponent is re-derived here from the pinned deterministic AI —
- * same (skill, aiSeed), same aiPoll-before-step ordering as the client. A
- * client that simulated any other opponent produces different hashes and a
- * different outcome, so the house cannot be puppeteered.
- */
-const verifySoloLedger = (
-  bundles: [CharacterBundle, CharacterBundle],
-  seed: number,
-  playerInputs: number[],
-  solo: { skill: number; aiSeed: number; personality?: Record<string, number> },
-  items: MatchItems = NO_ITEMS,
-  bounds?: { left: number; right: number },
-): VerifyOutcome => {
-  setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
-  installItems(items);
-  const g = createGameState(seed, bounds);
-  // Trained-agent opponents (ADR 0006) pin a personality too — same
-  // re-derivation, so a coached agent can't be puppeteered either.
-  const ai = createAi(1, solo.skill, solo.aiSeed, solo.personality);
-  let t = 0;
-  while (g.phase !== Phase.MatchOver && t < playerInputs.length) {
-    const opp = aiPoll(ai, g);
-    step(g, [playerInputs[t]! | 0, opp]);
-    t++;
+  // Reported-hash checkpoints, keyed by tick. Sides added [0,1] (solo: [0]) so
+  // a tick both sides report checks side 0 first — identical to the old
+  // findDeviator ordering, which returned the first diverging side at a tick.
+  const checks = new Map<number, [0 | 1, number][]>();
+  for (const side of (solo ? [0] : [0, 1]) as (0 | 1)[]) {
+    for (const [tick, h] of hashes[side]) {
+      if (tick < 0) continue;
+      let at = checks.get(tick);
+      if (!at) checks.set(tick, at = []);
+      at.push([side, h]);
+    }
   }
-  return {
+
+  let deviator: 0 | 1 | undefined = undefined;
+  let t = 0;
+  const checkNow = (): void => {
+    if (deviator !== undefined) return;
+    const at = checks.get(t);
+    if (!at) return;
+    const truth = stateHash(g);
+    for (const [side, h] of at) {
+      if (truth !== h) {
+        console.log(`[match ${matchId}] hash mismatch side=${side} tick=${t} reported=${h} truth=${truth}`);
+        deviator = side;
+        return;
+      }
+    }
+  };
+
+  checkNow(); // tick 0 (initial state), if any hash was reported for it
+  while (g.phase !== Phase.MatchOver && t < n) {
+    const p1 = ai ? aiPoll(ai, g) : inputs[1][t]! | 0;
+    step(g, [inputs[0][t]! | 0, p1]);
+    t++;
+    checkNow();
+  }
+
+  const outcome: VerifyOutcome = {
     winner: g.phase === Phase.MatchOver ? g.winner : -1,
     rounds: [g.roundsWon0, g.roundsWon1],
     endTick: t,
@@ -376,6 +392,7 @@ const verifySoloLedger = (
     reachedEnd: g.phase === Phase.MatchOver,
     spent: spentSlots(g, items),
   };
+  return { outcome, deviator };
 };
 
 // ---------------------------------------------------------------- server
@@ -393,6 +410,9 @@ export const createMatchServer = (opts: {
   arcadeSkill?: (battle: number, total: number) => number;
   /** Test hook: shorten the input-silence forfeit window (default 30s). */
   idleForfeitMs?: number;
+  /** Connection caps (v1.02_scale). Default from AF_MAX_CONNS[_PER_IP] env. */
+  maxConns?: number;
+  maxConnsPerIp?: number;
 } = {}): Promise<MatchServer> => {
   const root = opts.root ?? REPO_ROOT;
   // Input-silence forfeit window. The idle sweep is a REALTIME liveness
@@ -464,6 +484,14 @@ export const createMatchServer = (opts: {
   const arcadeSkill = opts.arcadeSkill ?? defaultArcadeSkill;
 
   const clients = new Set<Client>();
+  // CONNECTION CAPS (v1.02_scale). The clients set was previously unbounded: a
+  // connection flood — each socket individually cheap but pinged/swept on every
+  // sweep — had no ceiling and no per-IP limit. A global cap protects the shared
+  // event loop; a per-IP cap stops one host from eating it while staying
+  // generous for shared-NAT / multi-tab. Both env-tunable for ops headroom.
+  const MAX_CONNS = opts.maxConns ?? (Number(process.env.AF_MAX_CONNS) || 5000);
+  const MAX_CONNS_PER_IP = opts.maxConnsPerIp ?? (Number(process.env.AF_MAX_CONNS_PER_IP) || 64);
+  const connsByIp = new Map<string, number>();
   const queue: Client[] = [];
   /**
    * Friendly rendezvous (v5): room code → the player parked in it, waiting.
@@ -511,14 +539,11 @@ export const createMatchServer = (opts: {
     if (m.forfeitTimer) clearTimeout(m.forfeitTimer);
 
     const bundles: [CharacterBundle, CharacterBundle] = [bundleOf(m.chars[0]), bundleOf(m.chars[1])];
-    const verify = (): VerifyOutcome => (m.solo
-      ? verifySoloLedger(bundles, m.seed, m.inputs[0], m.solo, m.items, m.bounds)
-      : verifyLedger(bundles, m.seed, m.inputs, m.items, m.bounds));
-
-    const v = verify();
-    // Desync forensics: whose reported hashes diverge from the re-sim?
-    // Solo has one human side; the opponent is the server's own AI.
-    const deviator = findDeviator(m, v.endTick);
+    // ONE forward re-sim derives the outcome AND names the deviator (v1.02_scale;
+    // was two full passes). Solo has one human side; the opponent is the
+    // server's own re-derived AI.
+    const { outcome: v, deviator } = verifyAndScan(
+      bundles, m.seed, m.inputs, m.hashes, m.solo ?? null, m.items, m.bounds, m.id);
 
     // THE SETTLEMENT LADDER (ADR 0003/0005). The input ledger is the truth;
     // a dropped socket never overrules it:
@@ -728,52 +753,6 @@ export const createMatchServer = (opts: {
   const safeFinish = (m: Match, side: 0 | 1 | null): void => {
     try { if (!m.finished) finishMatch(m, side); }
     catch (err) { console.error(`[finishMatch] failed for match ${m.id}:`, err); }
-  };
-
-  /**
-   * Desync forensics: which side's reported hashes diverge from ground truth?
-   * ONE forward re-sim from tick 0, checking every reported hash as the sim
-   * passes it — O(ledger), NOT O(hashes × ledger). The per-hash prefix
-   * replay this replaces was a synchronous DoS: 400 reported hashes × a
-   * full-length ledger ≈ tens of millions of sim steps (plus two bundle
-   * loads per hash) inside one finishMatch, freezing the event loop for
-   * every match and socket on the server (audit 2026-07-18, finding 2).
-   * When both sides diverge, the EARLIEST diverging tick names the deviator.
-   */
-  const findDeviator = (m: Match, endTick: number): 0 | 1 | undefined => {
-    const checks = new Map<number, [0 | 1, number][]>();
-    const ticks: number[] = [];
-    for (const side of (m.solo ? [0] : [0, 1]) as (0 | 1)[]) {
-      for (const [tick, h] of m.hashes[side]) {
-        if (tick < 0 || tick > endTick) continue;
-        let at = checks.get(tick);
-        if (!at) { checks.set(tick, at = []); ticks.push(tick); }
-        at.push([side, h]);
-      }
-    }
-    if (ticks.length === 0) return undefined;
-    ticks.sort((a, b) => a - b);
-
-    setCharacters(loadCharacter(bundleOf(m.chars[0])), loadCharacter(bundleOf(m.chars[1])));
-    installItems(m.items); // forensics must re-sim the SAME buffed match
-    const g = createGameState(m.seed, m.bounds);
-    const ai = m.solo ? createAi(1, m.solo.skill, m.solo.aiSeed, m.solo.personality) : null;
-    let t = 0;
-    for (const tick of ticks) {
-      while (t < tick && g.phase !== Phase.MatchOver) {
-        const p1 = ai ? aiPoll(ai, g) : m.inputs[1][t]! | 0;
-        step(g, [m.inputs[0][t]! | 0, p1]);
-        t++;
-      }
-      const truth = stateHash(g);
-      for (const [side, h] of checks.get(tick)!) {
-        if (truth !== h) {
-          console.log(`[match ${m.id}] hash mismatch side=${side} tick=${tick} reported=${h} truth=${truth}`);
-          return side;
-        }
-      }
-    }
-    return undefined;
   };
 
   /**
@@ -2088,6 +2067,16 @@ export const createMatchServer = (opts: {
   const wss = new WebSocketServer({ server: http, maxPayload: 16 * 1024 });
 
   wss.on('connection', (ws, req) => {
+    const ip = (String(req.headers['x-forwarded-for'] ?? '').split(',')[0] ?? '').trim()
+      || req.socket.remoteAddress || 'unknown';
+    const perIp = connsByIp.get(ip) ?? 0;
+    if (clients.size >= MAX_CONNS || perIp >= MAX_CONNS_PER_IP) {
+      // 1013 = Try Again Later. Refuse BEFORE allocating a Client or joining
+      // the sweeps — a flood must never grow the live set (v1.02_scale).
+      try { ws.close(1013, 'server busy'); } catch { /* already closing */ }
+      return;
+    }
+    connsByIp.set(ip, perIp + 1);
     const c: Client = {
       ws, id: `c${nextId++}`, name: 'anon', agent: false,
       state: 'lobby', character: '', match: null, side: 0, identity: null,
@@ -2110,7 +2099,11 @@ export const createMatchServer = (opts: {
         send(c, { t: 'error', msg: 'internal error — the match settles by the disconnect ladder' });
       }
     });
-    ws.on('close', () => onClose(c));
+    ws.on('close', () => {
+      const n = (connsByIp.get(ip) ?? 1) - 1;
+      if (n <= 0) connsByIp.delete(ip); else connsByIp.set(ip, n);
+      onClose(c);
+    });
     ws.on('error', () => { /* close follows */ });
   });
 
