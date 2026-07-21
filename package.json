@@ -24,7 +24,8 @@
     "studio": "npm run start -w @af/studio",
     "deploy": "node tools/deploy.mjs",
     "deploy:server": "node tools/deploy.mjs server",
-    "deploy:client": "node tools/deploy.mjs client"
+    "deploy:client": "node tools/deploy.mjs client",
+    "ship": "node tools/ship-characters.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.24.0",
