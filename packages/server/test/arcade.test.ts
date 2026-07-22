@@ -84,7 +84,11 @@ const simBattle = (
   // sweep settling this offline-sim match as a no-contest while winningLine ran
   // (fixed server-side: noPaceCheck now relaxes the idle window, server.ts).
   const g = createGameState(setup.seed, setup.bounds);
-  const house = createAi(1, setup.solo!.skill, setup.solo!.aiSeed);
+  // Build the house AI from the FULL pin — including the curated arcade
+  // personality (SMatch.solo.personality) — exactly as the real client does.
+  // Omitting it re-samples a random personality from the seed, whose ledger
+  // then won't reproduce on the server's re-sim (false deviator / wrong winner).
+  const house = createAi(1, setup.solo!.skill, setup.solo!.aiSeed, setup.solo!.personality);
   const me = mySkill >= 0 ? createAi(0, mySkill, mySeed) : null;
   const inputs: number[] = [];
   while (g.phase !== Phase.MatchOver && inputs.length < 60 * 60 * 10) {

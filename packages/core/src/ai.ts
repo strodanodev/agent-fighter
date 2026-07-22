@@ -1,8 +1,8 @@
 import { Btn } from './input.js';
 import type { InputFrame } from './input.js';
 import { fp, fpToPx, nextRand } from './fp.js';
-import { TUNING } from './data.js';
-import type { LoadedCharacter } from './data.js';
+import { STAGE, TUNING } from './data.js';
+import type { GuardKind, LoadedCharacter, MoveDef } from './data.js';
 import { Action, Phase, characters } from './state.js';
 import type { FighterState, GameState } from './state.js';
 
@@ -84,12 +84,10 @@ export interface AiState {
   // Habits / movement.
   moveDir: number; // -1 back, 0 hold, 1 fwd
   moveTicks: number;
-  guardHigh: number; // 0 = crouch guard default, 1 = standing
 
   // Adaptation memory.
   eatJump: number;
   eatLow: number;
-  eatOverhead: number;
   eatThrow: number;
   eatProj: number;
 
@@ -150,11 +148,22 @@ const skillRamp = (ai: AiState, floor: number): number => {
 const pxDist = (a: FighterState, b: FighterState): number =>
   Math.abs(fpToPx(a.x - b.x));
 
-const aiGrounded = (f: FighterState): boolean => f.y >= fp(460);
+const aiGrounded = (f: FighterState): boolean => f.y >= fp(STAGE.floorYPx);
 
 const actionable = (f: FighterState): boolean =>
   f.action === Action.Idle || f.action === Action.WalkF
   || f.action === Action.WalkB || f.action === Action.Crouch;
+
+/** Does any hitbox in this move guard as `kind`? Lets the AI learn low vs
+ *  overhead pressure from the connecting move's own data (no per-char code). */
+const moveHasGuard = (mv: MoveDef | null | undefined, kind: GuardKind): boolean => {
+  if (!mv) return false;
+  for (const step of mv.steps) {
+    if (!step.hitboxes) continue;
+    for (const hb of step.hitboxes) if (hb.guard === kind) return true;
+  }
+  return false;
+};
 
 // ---------------------------------------------------------------- meter
 /**
@@ -240,8 +249,7 @@ export const createAi = (
     reacted: 1,
     moveDir: 0,
     moveTicks: 0,
-    guardHigh: 0,
-    eatJump: 0, eatLow: 0, eatOverhead: 0, eatThrow: 0, eatProj: 0,
+    eatJump: 0, eatLow: 0, eatThrow: 0, eatProj: 0,
     lastHealth: -1,
     airAttackDone: 0,
     bookGround: [], bookLauncher: -1, bookAir: [],
@@ -398,10 +406,13 @@ export const aiPoll = (ai: AiState, g: GameState): InputFrame => {
     if (!aiGrounded(op)) ai.eatJump = Math.min(9, ai.eatJump + 1);
     else if (op.action === Action.Grab || me.action === Action.Thrown) ai.eatThrow = Math.min(9, ai.eatThrow + 1);
     else if (op.action === Action.Crouch || op.action === Action.Attack) {
-      // crude read: low pokes come from crouch-stance moves
+      // Learn low pressure from the CONNECTING move's own guard (stance is the
+      // fallback for an untagged move). Feeds the Defend appetite below.
+      // (Every overhead in this roster is a jump-in — already counted as
+      // eatJump above, so there is no separate grounded-overhead counter.)
       const opCh = characters[(1 - ai.side) as 0 | 1];
       const mv = op.moveIdx >= 0 ? opCh.b.moves[op.moveIdx] : null;
-      if (mv?.stance === 'crouch') ai.eatLow = Math.min(9, ai.eatLow + 1);
+      if (moveHasGuard(mv, 'low') || mv?.stance === 'crouch') ai.eatLow = Math.min(9, ai.eatLow + 1);
     }
     ai.lastHealth = me.health;
   } else if (me.health > ai.lastHealth) {
@@ -574,7 +585,8 @@ const pickIntent = (ai: AiState, g: GameState, me: FighterState, op: FighterStat
     w.push([Intent.Pressure, ai.p.aggression + (losing ? 40 : 0)]);
     w.push([Intent.Observe, 60]);
     w.push([Intent.Retreat, 70 - Math.trunc(ai.p.aggression / 4)]);
-    w.push([Intent.Defend, 50 + ai.eatThrow * 10]);
+    // Being thrown OR lowed repeatedly makes the AI want to block more.
+    w.push([Intent.Defend, 50 + ai.eatThrow * 10 + ai.eatLow * 8]);
   } else if (dist < 260) {
     w.push([Intent.Approach, ai.p.aggression]);
     w.push([Intent.Observe, ai.p.patience]);
@@ -648,8 +660,11 @@ const actIntent = (
       return emit(me, null, 0, false);
     }
     case Intent.Defend: {
-      // Hold guard. Default crouch-block; stand vs remembered overheads/jumpers.
-      const standGuard = ai.eatOverhead >= 2 || (!aiGrounded(op) && chance(ai, 200));
+      // Hold guard. Default crouch-block (beats lows); stand only vs an airborne
+      // attacker (jump-in overheads). eatLow doesn't belong here — it must not
+      // reduce anti-overhead standing; it feeds the appetite for Defend itself
+      // (pickIntent), so a low-pressured AI simply chooses to block more.
+      const standGuard = !aiGrounded(op) && chance(ai, 200);
       return emit(me, null, -1, !standGuard);
     }
     case Intent.Oki: {
