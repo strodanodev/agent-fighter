@@ -3278,7 +3278,8 @@
       "panY": 0,
       "rotate": 0,
       "flipH": false
-    }
+    },
+    "style": "zoner"
   },
   "versionHash": "49426e827b4660a3",
   "tuning": {

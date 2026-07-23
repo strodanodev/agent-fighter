@@ -3278,7 +3278,8 @@
       "panY": 0.6553920028008404,
       "rotate": 0,
       "flipH": false
-    }
+    },
+    "style": "all-rounder"
   },
   "versionHash": "451b35ee5d5b977a"
 }

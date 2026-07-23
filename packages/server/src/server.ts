@@ -266,33 +266,35 @@ export const defaultArcadeSkill = (battle: number, total: number): number =>
     + (ARCADE_SKILL_MAX - ARCADE_SKILL_MIN) * (total <= 1 ? 1 : battle / (total - 1)));
 
 /**
- * Arcade opponents all share ONE moveset (the roster is a single archetype),
- * so PERSONALITY is the only lever that makes a gauntlet feel varied. Give each
- * fighter a signature style (deterministic by id) instead of the random
- * per-seed sampling — players learn "this one rushes, that one zones". Values
- * stay inside AI_PERSONALITY_RANGES; createAi clamps regardless. The chosen
- * style ships in the match pin (SMatch.solo), so the client sim and the server
- * re-sim build the identical AI — no desync.
+ * Arcade opponents all share ONE moveset (the roster is a single archetype), so
+ * PERSONALITY is the only lever that makes a gauntlet feel varied. Each fighter's
+ * style is its CANONICAL identity — the same `meta.style` that drives its feel
+ * (tools/apply-char-tuning.mjs writes both), so a character both PLAYS and FEELS
+ * like its archetype. Values stay inside AI_PERSONALITY_RANGES (createAi clamps).
+ * The chosen personality ships in the match pin (SMatch.solo), so the client sim
+ * and the server re-sim build the identical AI — no desync.
  */
-const ARCADE_STYLES: Record<string, number>[] = [
+const STYLE_ORDER = ['rushdown', 'zoner', 'turtle', 'jumpy', 'grappler', 'all-rounder'] as const;
+type StyleName = typeof STYLE_ORDER[number];
+const ARCADE_PERSONALITY: Record<StyleName, Record<string, number>> = {
   // rushdown — in your face, low patience, hates to zone
-  { aggression: 210, jumpiness: 120, zoner: 45, throwHappy: 110, pushblocker: 90, patience: 70 },
+  rushdown: { aggression: 210, jumpiness: 120, zoner: 45, throwHappy: 110, pushblocker: 90, patience: 70 },
   // zoner — keep-away, fireballs, patient
-  { aggression: 110, jumpiness: 55, zoner: 205, throwHappy: 40, pushblocker: 120, patience: 190 },
+  zoner: { aggression: 110, jumpiness: 55, zoner: 205, throwHappy: 40, pushblocker: 120, patience: 190 },
   // turtle — block-heavy, defensive, punishes
-  { aggression: 100, jumpiness: 45, zoner: 120, throwHappy: 60, pushblocker: 210, patience: 195 },
+  turtle: { aggression: 100, jumpiness: 45, zoner: 120, throwHappy: 60, pushblocker: 210, patience: 195 },
   // jumpy — air-heavy pressure
-  { aggression: 175, jumpiness: 185, zoner: 70, throwHappy: 70, pushblocker: 80, patience: 90 },
-  // grappler-ish — walks in, throws a lot
-  { aggression: 200, jumpiness: 50, zoner: 45, throwHappy: 150, pushblocker: 140, patience: 120 },
+  jumpy: { aggression: 175, jumpiness: 185, zoner: 70, throwHappy: 70, pushblocker: 80, patience: 90 },
+  // grappler — walks in, throws a lot
+  grappler: { aggression: 200, jumpiness: 50, zoner: 45, throwHappy: 150, pushblocker: 140, patience: 120 },
   // all-rounder — balanced
-  { aggression: 150, jumpiness: 110, zoner: 120, throwHappy: 90, pushblocker: 140, patience: 130 },
-];
-/** Stable style pick for a fighter id (same fighter → same style every run). */
-const arcadeStyleFor = (charId: string): Record<string, number> => {
+  'all-rounder': { aggression: 150, jumpiness: 110, zoner: 120, throwHappy: 90, pushblocker: 140, patience: 130 },
+};
+/** Stable style fallback for a character with no declared meta.style. */
+const styleFallback = (charId: string): StyleName => {
   let h = 0;
   for (let i = 0; i < charId.length; i++) h = (h * 31 + charId.charCodeAt(i)) | 0;
-  return ARCADE_STYLES[Math.abs(h) % ARCADE_STYLES.length]!;
+  return STYLE_ORDER[Math.abs(h) % STYLE_ORDER.length]!;
 };
 
 // ---------------------------------------------------------------- verify
@@ -482,6 +484,13 @@ export const createMatchServer = (opts: {
   const bundleOf = (id: string): CharacterBundle => {
     const file = join(charactersDir, id, 'character.json');
     return JSON.parse(readFileSync(file, 'utf8')) as CharacterBundle;
+  };
+  /** A character's canonical style (its bundle meta.style), else a stable hash
+   *  fallback for an unstyled character. Drives its arcade AI personality —
+   *  the same style that drives its feel (tuning). */
+  const styleOfChar = (id: string): StyleName => {
+    const s = (bundleOf(id) as { meta?: { style?: string } }).meta?.style;
+    return s && (STYLE_ORDER as readonly string[]).includes(s) ? s as StyleName : styleFallback(id);
   };
   /** A stage's playfield bounds (world px) from its stage.json, or undefined
    *  (full-width). Best-effort: a missing/garbled stage never blocks a match. */
@@ -1198,8 +1207,9 @@ export const createMatchServer = (opts: {
       skill: arcadeSkill(run.battle, run.opponents.length),
       character: oppChar,
       aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
-      // Signature style per fighter so the gauntlet feels varied (one archetype).
-      personality: arcadeStyleFor(oppChar),
+      // Personality from the character's CANONICAL style (its meta.style — the
+      // same style that drives its feel), so a bot plays it like its archetype.
+      personality: ARCADE_PERSONALITY[styleOfChar(oppChar)],
     };
     const claimed = await claimEquipped(c, matchId);
     const items: MatchItems = [claimed.pins, []];

@@ -8,9 +8,11 @@
  * strongest. This is a STARTING POINT — the values are just DATA in each
  * character.json afterward, so hand-tweak any character freely.
  *
- * NOTE: this feel axis is independent of the arcade AI-personality axis
- * (server.ts `arcadeStyleFor`, which biases how a bot PLAYS). Unifying the two
- * onto one canonical per-character style is a possible follow-up.
+ * UNIFIED IDENTITY: the chosen style is also written to `meta.style`, which the
+ * server reads to pick the character's arcade AI personality (server.ts). So one
+ * style per character drives BOTH its feel (tuning here) and how a bot plays it.
+ * `meta` is denylisted from the pinned bundle hash, so meta.style does not change
+ * versionHash (it's out-of-sim, like the AI personality it selects).
  *
  * Overrides only the genuinely-per-fighter knobs (defaults: jumpSquatTicks 4,
  * getupTicks 14, grabTicks 18; knockdownTicks 36 left global). all-rounder
@@ -63,9 +65,10 @@ for (const id of ids) {
   const b = JSON.parse(readFileSync(file, 'utf8'));
   const style = styleFor(id);
   const prof = PROFILE[style];
-  const before = JSON.stringify(b.tuning);
+  const before = JSON.stringify([b.tuning, b.meta?.style]);
   if (prof) b.tuning = prof; else delete b.tuning;
-  const after = JSON.stringify(b.tuning);
+  b.meta = { ...(b.meta ?? {}), style }; // canonical style — also drives arcade AI
+  const after = JSON.stringify([b.tuning, b.meta.style]);
   const diff = before !== after;
   if (diff) changed++;
   console.log(`${(diff ? (checkOnly ? 'DRIFT' : 'write') : ' ok  ')} ${id.padEnd(14)} ${style.padEnd(12)} ${prof ? JSON.stringify(prof) : '(defaults)'}`);
