@@ -6,6 +6,7 @@ export {
 export type { InputFrame, InputSource } from './input.js';
 export {
   ENGINE_VERSION, STAGE, TICKS_PER_SEC, ROUND_SECONDS, TUNING,
+  TUNING_DEFAULTS, applyTuning, resetTuning,
   BUTTON_BITS, BUTTON_PRIORITY, loadCharacter,
 } from './data.js';
 export type {

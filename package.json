@@ -22,6 +22,7 @@
     "agent": "npm run agent -w @af/server",
     "fleet": "npm run fleet -w @af/server",
     "studio": "npm run start -w @af/studio",
+    "lab": "node tools/feel-lab/build.mjs",
     "deploy": "node tools/deploy.mjs",
     "deploy:server": "node tools/deploy.mjs server",
     "deploy:client": "node tools/deploy.mjs client",

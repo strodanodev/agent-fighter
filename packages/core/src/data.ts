@@ -304,7 +304,7 @@ export const ROUND_SECONDS = 99;
  */
 export const ENGINE_VERSION = 'af-core-7';
 
-export const TUNING = {
+const TUNING_INIT = {
   roundsToWin: 2, // best of 3
   preRoundTicks: 60,
   roundOverTicks: 120,
@@ -334,4 +334,26 @@ export const TUNING = {
   friction: 0.5, // px/tick² ground slide decel
   cornerThresholdPx: 26, // "at the wall" for pushback transfer
   throwStartsComboScaling: true,
-} as const;
+};
+
+/**
+ * The feel knobs. **Mutable by design** — CLAUDE.md: "tuning values will be
+ * tuned constantly." The sim reads this object live, so `applyTuning` lets the
+ * local Feel Lab (tools/feel-lab) retune the game in real time.
+ *
+ * SAFETY: only the Feel Lab ever calls `applyTuning`/`resetTuning`. The shipped
+ * client and the server verifier BOTH run `TUNING_DEFAULTS` untouched, so no
+ * online/verified match is ever affected. Same TUNING → same sim, so
+ * determinism is unchanged; only the values would differ if someone tuned.
+ */
+export const TUNING: typeof TUNING_INIT = { ...TUNING_INIT };
+/** The shipped defaults — frozen. `resetTuning()` restores these. */
+export const TUNING_DEFAULTS: Readonly<typeof TUNING_INIT> = Object.freeze({ ...TUNING_INIT });
+/** Feel Lab only: overwrite named knobs in place (the sim reads TUNING live). */
+export const applyTuning = (patch: Partial<typeof TUNING_INIT>): void => {
+  Object.assign(TUNING, patch);
+};
+/** Feel Lab only: restore every knob to its shipped default. */
+export const resetTuning = (): void => {
+  Object.assign(TUNING, TUNING_DEFAULTS);
+};
