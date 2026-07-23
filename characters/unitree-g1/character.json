@@ -3280,5 +3280,10 @@
       "flipH": false
     }
   },
-  "versionHash": "d99d313b94a51c38"
+  "versionHash": "f5c3a63f5d6093cf",
+  "tuning": {
+    "jumpSquatTicks": 3,
+    "getupTicks": 12,
+    "grabTicks": 20
+  }
 }
