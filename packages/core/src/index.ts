@@ -6,11 +6,11 @@ export {
 export type { InputFrame, InputSource } from './input.js';
 export {
   ENGINE_VERSION, STAGE, TICKS_PER_SEC, ROUND_SECONDS, TUNING,
-  TUNING_DEFAULTS, applyTuning, resetTuning,
+  TUNING_DEFAULTS, applyTuning, resetTuning, CHAR_TUNING_KEYS,
   BUTTON_BITS, BUTTON_PRIORITY, loadCharacter,
 } from './data.js';
 export type {
-  CharacterBundle, LoadedCharacter, MoveDef, MoveStep, HitboxDef, ProjectileDef,
+  CharacterBundle, CharTuning, LoadedCharacter, MoveDef, MoveStep, HitboxDef, ProjectileDef,
   CancelEdge, Rect, GuardKind, MoveStance, MoveKind, MovePhase, ButtonName,
 } from './data.js';
 export { HIST_LEN, numpadDir, detectMotion, downTappedRecently } from './motion.js';

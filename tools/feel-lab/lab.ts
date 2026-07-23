@@ -17,11 +17,11 @@
 import {
   createGameState, step, setCharacters, loadCharacter,
   Phase, Btn, STAGE, TICKS_PER_SEC,
-  TUNING, TUNING_DEFAULTS, applyTuning, resetTuning,
+  TUNING, TUNING_DEFAULTS, applyTuning, resetTuning, CHAR_TUNING_KEYS,
   debugBoxes, debugInfo,
-  createAi, aiPoll,
+  characters, createAi, aiPoll,
 } from '@af/core';
-import type { GameState, AiState, CharacterBundle, InputFrame } from '@af/core';
+import type { GameState, AiState, CharacterBundle, CharTuning, InputFrame } from '@af/core';
 
 // ------------------------------------------------------------------- bundles
 const BUNDLES = (window as unknown as { __LAB_BUNDLES__: Record<string, CharacterBundle> }).__LAB_BUNDLES__ ?? {};
@@ -58,8 +58,20 @@ let lastHp: [number, number] = [0, 0];
 let comboDmg: [number, number] = [0, 0];
 const inputHist: number[] = []; // P0 InputFrames, most-recent last
 
+// Per-character tuning overrides the user dials in the Lab (empty = the
+// character's own bundle value, or the global TUNING default). Applied on top
+// of the bundle at load, so it rides the same validated path as a shipped
+// archetype override.
+const labTun: [Record<string, number>, Record<string, number>] = [{}, {}];
+const mkChar = (id: string, side: 0 | 1) => {
+  const b = BUNDLES[id]!;
+  // Always clone (never the shared embedded bundle) so live edits to
+  // characters[side].b.tuning can't pollute another match.
+  return loadCharacter({ ...b, tuning: { ...(b as { tuning?: CharTuning }).tuning, ...labTun[side] } });
+};
+
 const resetMatch = (): void => {
-  setCharacters(loadCharacter(BUNDLES[sel.p0]!), loadCharacter(BUNDLES[sel.p1]!));
+  setCharacters(mkChar(sel.p0, 0), mkChar(sel.p1, 1));
   game = createGameState((seedN = (seedN * 1103515245 + 12345) & 0x7fffffff));
   const style = STYLES[sel.style] ?? undefined;
   ai = createAi(1, sel.skill, (seedN ^ 0xabcd) | 0, style ?? undefined);
@@ -229,6 +241,42 @@ const buildTuning = (): void => {
 };
 const syncTuning = (): void => { for (const s of syncers) s(); };
 
+// -------------------------------------------------- per-character tuning UI
+// Push the current per-character overrides onto the LIVE loaded character so a
+// change is felt this tick (no match reset). Only integer≥1 values are stored,
+// so this can never inject a NaN duration that would soft-lock a state.
+const applyCharTun = (side: 0 | 1): void => {
+  const ch = characters[side];
+  if (!ch) return;
+  const own = (BUNDLES[side === 0 ? sel.p0 : sel.p1] as { tuning?: CharTuning }).tuning;
+  (ch.b as { tuning?: CharTuning }).tuning = { ...own, ...labTun[side] };
+};
+const buildCharTuning = (): void => {
+  const root = $('chartun');
+  const col = (side: 0 | 1): string => {
+    const id = side === 0 ? sel.p0 : sel.p1;
+    const own = ((BUNDLES[id] as { tuning?: CharTuning }).tuning ?? {}) as Record<string, number>;
+    const inputs = CHAR_TUNING_KEYS.map((k) => {
+      const def = own[k] ?? (TUNING_DEFAULTS as Record<string, number>)[k];
+      const cur = labTun[side][k];
+      return `<div class="ctrow"><label>${k}</label><input data-side="${side}" data-key="${k}" type="number" min="1" step="1" placeholder="${def}" value="${cur ?? ''}"></div>`;
+    }).join('');
+    return `<div class="ctcol"><div class="cth" style="color:${side === 0 ? '#4fd1ff' : '#ff8a5c'}">${side === 0 ? 'P0' : 'P1'} ${nameOf(id)}</div>${inputs}</div>`;
+  };
+  root.innerHTML = col(0) + col(1);
+  root.querySelectorAll('input').forEach((el) => {
+    const inp = el as HTMLInputElement;
+    inp.onchange = () => {
+      const side = Number(inp.dataset.side) as 0 | 1;
+      const key = inp.dataset.key!;
+      const v = parseInt(inp.value, 10);
+      if (Number.isInteger(v) && v >= 1) labTun[side][key] = v;
+      else { delete labTun[side][key]; inp.value = ''; }
+      applyCharTun(side); // live — no match reset
+    };
+  });
+};
+
 // ------------------------------------------------------------------- match controls DOM
 const opt = (v: string, cur: string): string => `<option value="${v}" ${v === cur ? 'selected' : ''}>${v}</option>`;
 const buildControls = (): void => {
@@ -240,8 +288,8 @@ const buildControls = (): void => {
     <div class="crow"><label>AI skill</label><input id="selSkill" type="range" min="0" max="100" value="${sel.skill}"><span id="skillV">${sel.skill}</span></div>
     <div class="crow"><label>AI style</label><select id="selStyle">${Object.keys(STYLES).map((s) => opt(s, sel.style)).join('')}</select></div>
     <div class="crow"><button id="btnReset">reset match (R)</button></div>`;
-  ($('selP0') as HTMLSelectElement).onchange = (e) => { sel.p0 = (e.target as HTMLSelectElement).value; resetMatch(); };
-  ($('selP1') as HTMLSelectElement).onchange = (e) => { sel.p1 = (e.target as HTMLSelectElement).value; resetMatch(); };
+  ($('selP0') as HTMLSelectElement).onchange = (e) => { sel.p0 = (e.target as HTMLSelectElement).value; labTun[0] = {}; resetMatch(); buildCharTuning(); };
+  ($('selP1') as HTMLSelectElement).onchange = (e) => { sel.p1 = (e.target as HTMLSelectElement).value; labTun[1] = {}; resetMatch(); buildCharTuning(); };
   ($('selMode') as HTMLSelectElement).onchange = (e) => { sel.mode = (e.target as HTMLSelectElement).value as P1Mode; };
   ($('selStyle') as HTMLSelectElement).onchange = (e) => { sel.style = (e.target as HTMLSelectElement).value; resetMatch(); };
   const sk = $('selSkill') as HTMLInputElement;
@@ -282,6 +330,7 @@ const frame = (now: number): void => {
 // ------------------------------------------------------------------- boot
 buildControls();
 buildTuning();
+buildCharTuning();
 $('btnResetTuning').onclick = () => { resetTuning(); syncTuning(); };
 $('btnExport').onclick = () => {
   const json = JSON.stringify(TUNING, null, 2);

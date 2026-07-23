@@ -1,7 +1,7 @@
-import { describe, it } from 'node:test';
+import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  Action, Btn, Phase, TUNING, characters, createGameState, fp, fpToPx, loadCharacter, step,
+  Action, Btn, Phase, TUNING, characters, createGameState, fp, fpToPx, loadCharacter, setCharacters, step,
 } from '../src/index.js';
 import type { CharacterBundle, GameState, HitboxDef, InputFrame } from '../src/index.js';
 
@@ -502,4 +502,57 @@ describe('bundle value validation (audit 2026-07-18 holes + 2026-07-20 CT-3 soft
     throw new Error('no super with meterCost in bundle');
   }, /meterCost/));
   it('rejects NaN numerics', () => rejects((b) => { b.gravity = NaN; }, /finite/));
+  it('rejects an unknown tuning override key', () => rejects((b) => { b.tuning = { nope: 5 } as never; }, /unknown tuning/));
+  it('rejects a non-positive tuning value', () => rejects((b) => { b.tuning = { grabTicks: 0 }; }, /tuning\.grabTicks/));
+  it('rejects a non-integer tuning value', () => rejects((b) => { b.tuning = { jumpSquatTicks: 4.5 }; }, /tuning\.jumpSquatTicks/));
+  it('accepts a valid tuning override', () => {
+    const b = base(); b.tuning = { jumpSquatTicks: 10, grabTicks: 8 };
+    assert.doesNotThrow(() => loadCharacter(b));
+  });
+});
+
+describe('per-character tuning overrides change behavior (archetype feel)', () => {
+  const orig0 = characters[0]!, orig1 = characters[1]!;
+  after(() => setCharacters(orig0, orig1)); // don't leak the swap to other suites
+
+  /** Frames the fighter spends in JumpSquat before leaving the ground. */
+  const jumpSquatFrames = (): number => {
+    const s = createGameState(1);
+    while (s.phase === Phase.PreRound) step(s, [0, 0]);
+    let g = 0;
+    while (s.fighters[0].action !== Action.JumpSquat && g++ < 30) step(s, [Btn.Up, 0]);
+    let f = 0;
+    while (s.fighters[0].action === Action.JumpSquat && f++ < 90) step(s, [Btn.Up, 0]);
+    return f;
+  };
+
+  it('a heavier jumpSquatTicks delays the jump by exactly the override delta', () => {
+    setCharacters(loadCharacter(structuredClone(orig0.b)), loadCharacter(structuredClone(orig1.b)));
+    const base = jumpSquatFrames();
+    const heavy = structuredClone(orig0.b);
+    heavy.tuning = { jumpSquatTicks: TUNING.jumpSquatTicks + 8 };
+    setCharacters(loadCharacter(heavy), loadCharacter(structuredClone(orig1.b)));
+    const slow = jumpSquatFrames();
+    assert.equal(slow, base + 8, `override adds exactly its delta to prejump (${slow} vs ${base})`);
+  });
+
+  it('the override is per-fighter: P1 (no override) still jumps at the default', () => {
+    const heavy = structuredClone(orig0.b);
+    heavy.tuning = { jumpSquatTicks: TUNING.jumpSquatTicks + 8 };
+    setCharacters(loadCharacter(heavy), loadCharacter(structuredClone(orig1.b)));
+    const s = createGameState(1);
+    while (s.phase === Phase.PreRound) step(s, [0, 0]);
+    // Drive BOTH into jumpsquat; P1 (default) must leave first.
+    let g = 0;
+    while ((s.fighters[0].action !== Action.JumpSquat || s.fighters[1].action !== Action.JumpSquat) && g++ < 30) {
+      step(s, [Btn.Up, Btn.Up]);
+    }
+    let p1LeftAt = -1, p0LeftAt = -1, f = 0;
+    while ((p0LeftAt < 0 || p1LeftAt < 0) && f++ < 90) {
+      step(s, [Btn.Up, Btn.Up]);
+      if (p1LeftAt < 0 && s.fighters[1].action !== Action.JumpSquat) p1LeftAt = f;
+      if (p0LeftAt < 0 && s.fighters[0].action !== Action.JumpSquat) p0LeftAt = f;
+    }
+    assert.ok(p1LeftAt >= 0 && p0LeftAt > p1LeftAt, `P0 (heavy) leaves after P1 (default): ${p0LeftAt} > ${p1LeftAt}`);
+  });
 });

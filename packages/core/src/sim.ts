@@ -242,12 +242,12 @@ const updateFighter = (
 
     case Action.Knockdown:
       f.actionFrame++;
-      if (f.actionFrame >= TUNING.knockdownTicks) setAction(f, Action.Getup);
+      if (f.actionFrame >= (ch.b.tuning?.knockdownTicks ?? TUNING.knockdownTicks)) setAction(f, Action.Getup);
       break;
 
     case Action.Getup:
       f.actionFrame++;
-      if (f.actionFrame >= TUNING.getupTicks) setAction(f, Action.Idle);
+      if (f.actionFrame >= (ch.b.tuning?.getupTicks ?? TUNING.getupTicks)) setAction(f, Action.Idle);
       break;
 
     case Action.Thrown:
@@ -304,7 +304,7 @@ const updateFighter = (
 
     case Action.JumpSquat:
       f.actionFrame++;
-      if (f.actionFrame >= TUNING.jumpSquatTicks) {
+      if (f.actionFrame >= (ch.b.tuning?.jumpSquatTicks ?? TUNING.jumpSquatTicks)) {
         setAction(f, Action.Air);
         f.velY = fp(f.superJumped ? ch.b.superJumpVelY : ch.b.jumpVelY);
         const dir = (held(io.input, Btn.Right) ? 1 : 0) - (held(io.input, Btn.Left) ? 1 : 0);
@@ -814,7 +814,7 @@ const resolveGrabs = (s: GameState): void => {
       setAction(vic, Action.Idle);
       continue;
     }
-    if (att.actionFrame >= TUNING.grabTicks) {
+    if (att.actionFrame >= (ch.b.tuning?.grabTicks ?? TUNING.grabTicks)) {
       // Throw connects: damage + untechable toss.
       const dir = att.throwBack ? -att.facing : att.facing;
       vic.techLeft = 0;

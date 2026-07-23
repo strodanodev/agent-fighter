@@ -85,6 +85,29 @@ export interface CancelEdge {
   on: ('hit' | 'block' | 'whiff')[];
 }
 
+/**
+ * Per-character overrides for the handful of genuinely PER-FIGHTER feel knobs
+ * (the rest of TUNING is match-global — round flow, scaling, meter cap). These
+ * ship IN the bundle, so they are pinned + content-hashed like the moveset:
+ * both clients and the server re-sim load identical values → deterministic, no
+ * desync. Absent (or a missing key) → the global TUNING default.
+ *
+ * This is how archetypes get distinct FEEL on the shared engine — a nimble
+ * rushdown jumps and wakes up faster; a heavy grappler has a quick command
+ * grab. (Most other feel already lives in per-move hitboxes and the per-
+ * character bundle fields above, so this set is deliberately small.)
+ */
+export interface CharTuning {
+  jumpSquatTicks?: number; // prejump frames — low = nimble, high = committal
+  knockdownTicks?: number; // time spent knocked down before getup
+  getupTicks?: number;     // wakeup duration
+  grabTicks?: number;      // throw / command-grab startup — low = fast grappler
+}
+/** The knobs a bundle may override (the CharTuning keys), for validation. */
+export const CHAR_TUNING_KEYS: (keyof CharTuning)[] = [
+  'jumpSquatTicks', 'knockdownTicks', 'getupTicks', 'grabTicks',
+];
+
 export interface CharacterBundle {
   name: string;
   /**
@@ -116,6 +139,8 @@ export interface CharacterBundle {
   throwDamage: number;
   throwTossVelX: number;
   throwTossVelY: number;
+  /** Optional per-fighter feel overrides (archetype flavor). See CharTuning. */
+  tuning?: CharTuning;
   moves: MoveDef[];
   cancels: CancelEdge[];
 }
@@ -199,6 +224,18 @@ export const loadCharacter = (b: CharacterBundle): LoadedCharacter => {
     for (const st of m.steps) for (const h of st.hitboxes ?? []) checkHit(h, m.id);
     if (m.projectile) checkHit(m.projectile.hit, `${m.id} projectile`);
   });
+
+  // Per-character tuning overrides: allowlisted keys only, positive integer
+  // durations (a 0/negative/NaN duration would soft-lock the state it gates).
+  if (b.tuning) {
+    for (const k of Object.keys(b.tuning)) {
+      if (!(CHAR_TUNING_KEYS as string[]).includes(k)) {
+        throw new Error(`${b.name}: unknown tuning override "${k}" (allowed: ${CHAR_TUNING_KEYS.join(', ')})`);
+      }
+      const v = (b.tuning as Record<string, number>)[k]!;
+      if (!Number.isInteger(v) || v < 1) throw new Error(`${b.name}: tuning.${k} must be an integer >= 1 (got ${v})`);
+    }
+  }
 
   const normals = [new Int32Array(10).fill(-1), new Int32Array(10).fill(-1), new Int32Array(10).fill(-1)];
   const specials: LoadedCharacter['specials'] = [];

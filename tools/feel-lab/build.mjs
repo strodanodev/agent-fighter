@@ -80,6 +80,12 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><title>Feel Lab Â
   .trow .num{flex:0 0 74px}
   .tbtns{display:flex;gap:8px;margin-bottom:8px}
   #exportOut{display:none;width:100%;height:120px;margin-top:8px;background:#0b0e13;color:#9fb0c8;border:1px solid #2f3a4e;border-radius:4px}
+  #chartun{display:flex;gap:12px}
+  .ctcol{flex:1 1 0}
+  .cth{font-weight:bold;font-size:12px;margin-bottom:5px}
+  .ctrow{display:flex;align-items:center;gap:6px;margin:3px 0}
+  .ctrow label{flex:1 1 auto;color:#9fb0c8;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ctrow input{flex:0 0 60px}
   .keys{color:#6b7688;font-size:11px;margin-top:6px}
 </style></head>
 <body>
@@ -92,7 +98,11 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><title>Feel Lab Â
     </div>
     <div class="right">
       <div class="panel"><h2>match</h2><div id="controls"></div></div>
-      <div class="panel"><h2>tuning (live)</h2>
+      <div class="panel"><h2>per-character tuning (archetype feel)</h2>
+        <div id="chartun"></div>
+        <div class="keys">blank = the character's own value / global default. Try P0 jumpSquatTicks 14 (heavy) vs P1 4 (nimble), or grabTicks 8 (fast grappler).</div>
+      </div>
+      <div class="panel"><h2>global tuning (live)</h2>
         <div class="tbtns"><button id="btnResetTuning">reset defaults</button><button id="btnExport">export TUNING</button></div>
         <div id="tuning"></div>
         <textarea id="exportOut" readonly></textarea>
