@@ -224,7 +224,7 @@ describe('agent-class signup (operator-owned, inert)', () => {
     });
     assert.equal(r.result.reason, 'verified');
     assert.ok(r.arcade, 'arcade run info surfaced');
-    assert.equal(r.arcade!.battle, 0, 'battle 1 of the run');
+    assert.equal(r.arcade!.fights, 0, 'first fight of the run');
 
     const after = await (await fetch(`${http}/agent`, { headers: { 'X-Agent-Key': body.key } })).json() as { wins: number; losses: number; xp: number };
     assert.equal(after.wins + after.losses, 1, 'battle settled on the agent account');

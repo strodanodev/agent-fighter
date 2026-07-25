@@ -36,6 +36,10 @@ const ORDER = [
   'core/src/sim.js',
   'core/src/anim.js',
   'core/src/ai.js',
+  // AGENT ARCADE v2 (ADR 0008). arcade-board depends on arcade-map + items,
+  // so it must follow both. The sim reads neither.
+  'core/src/arcade-map.js',
+  'core/src/arcade-board.js',
   'client/src/atlas.js',
   'client/src/chrome.js',
   'client/src/progress.js',

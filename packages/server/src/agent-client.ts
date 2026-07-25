@@ -119,7 +119,11 @@ for (let n = 1; n <= matches; n++) {
       // Ranked play is wall-clock pace-checked server-side (anti-TAS):
       // faster-than-realtime sims settle as incomplete, not wins.
       if (paceMs < 14) console.log(`note: AF_PACE=${paceMs} is faster than realtime — ranked servers will flag it (use 16)`);
-      // One RUN = battles until a loss ends it or the gauntlet is cleared.
+      // One RUN = battles until a loss ends it or the deep exit is reached.
+      // ARCADE v2 (ADR 0008): this loop never names a board node, so the
+      // server autopilots the cheapest line to the deep exit. That is the
+      // whole integration — headless agents do not read maps, and being
+      // agent-class they bank nothing anyway.
       let runToken: string | undefined;
       let battle = 0;
       let retries = 0;
@@ -127,21 +131,21 @@ for (let n = 1; n <= matches; n++) {
         const r = await playOneMatch({
           ...base, mode, runToken, aiSeed: (Date.now() % 100000) + n * 100 + battle,
         });
-        report(`[run ${n} · battle ${(r.arcade?.battle ?? battle) + 1}/${r.arcade?.total ?? '?'}]`, r);
+        report(`[run ${n} · fight ${(r.arcade?.fights ?? battle) + 1}/${r.arcade?.total ?? '?'}]`, r);
         if (r.result.reason === 'incomplete' && r.arcade?.token && retries < 3) {
-          // No-contest (pace/network): the run token stays armed for the
-          // SAME battle — retry rather than abandoning the run.
+          // No-contest (pace/network): the run keeps its position, so retry
+          // the SAME node rather than abandoning the run.
           retries++;
           runToken = r.arcade.token;
-          console.log(`[run ${n}] no contest — retrying battle ${(r.arcade.battle) + 1} (${retries}/3)`);
+          console.log(`[run ${n}] no contest — retrying fight ${r.arcade.fights + 1} (${retries}/3)`);
           continue;
         }
         retries = 0;
         const won = r.result.reason === 'verified' && r.result.winner === 0;
         const total = r.arcade?.total ?? 0;
-        battle = (r.arcade?.battle ?? battle) + 1;
-        if (!won) { console.log(`[run ${n}] GAME OVER at battle ${battle}`); break; }
-        if (battle >= total) { console.log(`[run ${n}] FULL CLEAR — ${total} battles`); break; }
+        battle = (r.arcade?.fights ?? battle) + 1;
+        if (!won) { console.log(`[run ${n}] GAME OVER at fight ${battle}`); break; }
+        if (battle >= total) { console.log(`[run ${n}] REACHED THE DEEP EXIT — ${total} fights`); break; }
         runToken = r.arcade?.token;
         if (!runToken) break; // server ended the run
       }

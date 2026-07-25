@@ -1,5 +1,8 @@
-import { AI_PERSONALITY_RANGES, STAGE, TICKS_PER_SEC, TUNING } from '@af/core';
-import type { GameState } from '@af/core';
+import {
+  AI_PERSONALITY_RANGES, EXIT_BONUS, REGION_NAME, STAGE, TICKS_PER_SEC, TUNING,
+  exitRoutes, nodeById, successors,
+} from '@af/core';
+import type { Board, BoardNode, BoardRegion, GameState } from '@af/core';
 import { drawPortrait } from './atlas.js';
 import type { Roster } from './atlas.js';
 import {
@@ -3620,4 +3623,296 @@ export const drawOpponentGone = (
     ? "IF THEY DON'T RETURN, THE ROUND IS YOURS — NOTHING WAS STAKED"
     : "IF THEY DON'T RETURN, YOU WIN BY FORFEIT",
   VW / 2, boxY + 146, 11, '#ffd166');
+};
+
+// ---------------------------------------------------------------- ARCADE MAP
+/**
+ * AGENT ARCADE v2 — the gauntlet map screen (ADR 0008).
+ *
+ * The whole board is revealed from the first frame: this is a PUZZLE, and a
+ * puzzle you cannot see is a gamble. All the variance lives in the fights.
+ *
+ * The screen has exactly one job — make the trade legible. Every pickup on
+ * this board has a fighter standing in front of it, so the only question a
+ * player ever answers here is "is that pile worth another fight?". The right
+ * panel therefore quotes both halves of it: what each route costs, and what
+ * each exit is still worth from where they are standing.
+ */
+export interface MapView {
+  board: Board;
+  /** Node the run is standing on. */
+  at: number;
+  fights: number;
+  total: number;
+  /** UNBANKED pickups — the thing a loss would take away. */
+  bag: { credits: number; drinks: number };
+  /** Practice/guest run: same board, no stakes, no payouts. */
+  practice: boolean;
+  /** charId to display name (the roster lookup lives in main.ts). */
+  nameOf: (charId: string) => string;
+  /** A request is in flight — inputs are disarmed. */
+  busy: boolean;
+  toast?: string;
+}
+
+const NODE_STROKE: Record<string, string> = {
+  start: '#e9e4f5',
+  fight: '#e2564a',
+  gate: '#f0a93b',
+  boss: '#ff5d3b',
+  loot: '#f2c14e',
+  exit: '#5cb85c',
+};
+
+/** Board lattice to screen pixels. One place, so hit-testing always agrees. */
+const MAP_X0 = 26;
+const MAP_Y0 = 92;
+const MAP_CELL = 13;
+
+export const drawMap = (ctx: CanvasRenderingContext2D, tick: number, v: MapView): void => {
+  drawMenuBackdrop(ctx);
+  ctx.fillStyle = 'rgba(6,4,14,0.80)';
+  ctx.fillRect(0, 0, VW, VH);
+
+  const { board, at } = v;
+  const here = nodeById(board, at);
+  const options = successors(board, at)
+    .map((id) => nodeById(board, id))
+    .filter((n): n is BoardNode => !!n);
+
+  display(ctx, 'GAUNTLET MAP', 26, 56, 34, { align: 'left', glow: 'rgba(255,209,102,0.45)' });
+  label(ctx, v.practice
+    ? 'PRACTICE RUN · NO ENTRY · NO REWARDS'
+    : `${REGION_NAME[here ? here.region : 1]} · ${v.fights} FIGHT${v.fights === 1 ? '' : 'S'} DEEP`,
+  26, 76, 12, '#ffd166cc', 'left');
+
+  const px = (x: number): number => MAP_X0 + x * MAP_CELL;
+  const py = (y: number): number => MAP_Y0 + y * MAP_CELL;
+
+  // The board needs its OWN dark plate. Without one the menu backdrop art
+  // reads straight through the lattice and the routes become unreadable —
+  // which is fatal for the one screen whose entire job is legibility.
+  const boardX = MAP_X0 - 10;
+  const boardW = 32 * MAP_CELL + 20;
+  ctx.fillStyle = 'rgba(8,5,18,0.86)';
+  ctx.fillRect(boardX, 92, boardW, VH - 92 - 24);
+  ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(boardX + 0.5, 92.5, boardW - 1, VH - 92 - 25);
+
+  // Region bands, so depth reads at a glance. Labels sit INSIDE the plate,
+  // right-aligned, so they never collide with the panel beside it.
+  const bands: [BoardRegion, string][] = [[1, '#e2564a'], [2, '#f0a93b'], [3, '#8b5cf6']];
+  for (const [region, color] of bands) {
+    const ys = board.nodes.filter((n) => n.region === region).map((n) => n.y);
+    if (ys.length === 0) continue;
+    const top = Math.max(93, py(Math.min(...ys) - 1));
+    const bot = Math.min(VH - 25, py(Math.max(...ys) + 1));
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.12;
+    ctx.fillRect(boardX + 1, top, boardW - 2, bot - top);
+    ctx.globalAlpha = 1;
+    label(ctx, REGION_NAME[region], boardX + boardW - 8, top + 12, 9, `${color}ee`, 'right');
+  }
+
+  // Edges. The ones leaving HERE are lit; the rest are structure.
+  for (const [from, to] of board.edges) {
+    const a = nodeById(board, from);
+    const b = nodeById(board, to);
+    if (!a || !b) continue;
+    const live = from === at;
+    ctx.strokeStyle = live ? 'rgba(255,209,102,0.85)' : 'rgba(255,255,255,0.14)';
+    ctx.lineWidth = live ? 2.2 : 1;
+    ctx.beginPath();
+    ctx.moveTo(px(a.x), py(a.y));
+    ctx.lineTo(px(b.x), py(b.y));
+    ctx.stroke();
+  }
+
+  for (const n of board.nodes) {
+    const cx = px(n.x);
+    const cy = py(n.y);
+    const isHere = n.id === at;
+    const reachable = options.some((o) => o.id === n.id);
+    const r = n.kind === 'boss' ? 8 : n.kind === 'exit' ? 7.5 : 6;
+    ctx.globalAlpha = isHere || reachable ? 1 : 0.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(10,7,20,0.9)';
+    ctx.fill();
+    ctx.strokeStyle = NODE_STROKE[n.kind] ?? '#ffffff';
+    ctx.lineWidth = reachable ? 2.6 : 1.6;
+    ctx.stroke();
+    if (n.loot && n.loot.kind === 'credits') {
+      label(ctx, `${n.loot.amount}`, cx, cy + 3, 9, '#f2c14e');
+    } else if (n.loot && n.loot.kind === 'drink') {
+      label(ctx, '▯', cx, cy + 3.5, 10, '#4fc4d6');
+    } else if (n.kind === 'exit') {
+      label(ctx, `${n.exitTier ?? 1}`, cx, cy + 3.5, 10, '#7ee85a');
+    } else if (n.kind === 'boss') {
+      label(ctx, '☠', cx, cy + 4, 10, '#ff9d7a');
+    }
+    ctx.globalAlpha = 1;
+    // Reachable routes get a tap target far bigger than the dot.
+    if (reachable && !v.busy) tapZone(cx - 13, cy - 13, 26, 26, `map:go:${n.id}`);
+  }
+
+  // "You are here" — the only animated thing on the screen.
+  if (here) {
+    const pulse = 10 + Math.sin(tick / 7) * 2;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(px(here.x), py(here.y), pulse, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // ---- the panel -----------------------------------------------------------
+  const panelX = 480;
+  const panelW = VW - panelX - 24;
+  ctx.fillStyle = 'rgba(10,6,22,0.66)';
+  ctx.fillRect(panelX, 92, panelW, VH - 92 - 24);
+  ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(panelX + 0.5, 92.5, panelW - 1, VH - 92 - 25);
+
+  let y = 118;
+  label(ctx, 'CARRYING', panelX + 16, y, 12, '#ffffff88', 'left');
+  const bagText = `${v.bag.credits} CR`
+    + (v.bag.drinks > 0 ? `  ·  ${v.bag.drinks} DRINK${v.bag.drinks === 1 ? '' : 'S'}` : '');
+  label(ctx, bagText, panelX + panelW - 16, y, 15, v.bag.credits > 0 ? '#f2c14e' : '#ffffff55', 'right');
+  y += 16;
+  label(ctx, v.bag.credits + v.bag.drinks > 0
+    ? 'LOSE A FIGHT AND THIS IS GONE'
+    : 'NOTHING TO LOSE YET',
+  panelX + 16, y, 10, '#ff9d9d', 'left');
+
+  // Exit routes — the greed/speed decision, priced.
+  y += 26;
+  label(ctx, 'EXITS FROM HERE', panelX + 16, y, 12, '#ffffff88', 'left');
+  for (const { node, route } of exitRoutes(board, at)) {
+    y += 19;
+    const tier = node.exitTier ?? 1;
+    const gone = !route.reachable;
+    label(ctx, `EXIT ${tier}  ·  +${EXIT_BONUS[tier]} CR`, panelX + 16, y, 13,
+      gone ? '#ffffff33' : '#7ee85a', 'left');
+    label(ctx, gone ? 'ROUTED PAST' : `${route.fights} FIGHT${route.fights === 1 ? '' : 'S'}`,
+      panelX + panelW - 16, y, 13, gone ? '#ffffff33' : '#ffffffcc', 'right');
+  }
+
+  // Moves — one row per legal route, quoting cost and prize.
+  y += 30;
+  label(ctx, 'YOUR MOVE', panelX + 16, y, 12, '#ffffff88', 'left');
+  let slot = 0;
+  for (const n of options) {
+    y += 30;
+    slot++;
+    const rowY = y - 20;
+    const hot = !v.busy;
+    ctx.fillStyle = hot ? 'rgba(255,209,102,0.10)' : 'rgba(255,255,255,0.04)';
+    ctx.fillRect(panelX + 12, rowY, panelW - 24, 26);
+    if (hot) tapZone(panelX + 12, rowY, panelW - 24, 26, `map:go:${n.id}`);
+
+    if (n.kind === 'exit') {
+      const tier = n.exitTier ?? 1;
+      label(ctx, `${slot}  EXTRACT HERE`, panelX + 20, y - 2, 13, '#7ee85a', 'left');
+      label(ctx, `+${EXIT_BONUS[tier]} CR`, panelX + panelW - 20, y - 2, 13, '#7ee85a', 'right');
+      continue;
+    }
+    // A guarded pickup: name the prize, because the prize IS the offer.
+    const behind = successors(board, n.id)
+      .map((s) => nodeById(board, s))
+      .filter((b): b is BoardNode => !!b);
+    const prize = behind.length === 1 ? behind[0]!.loot : undefined;
+    const who = v.nameOf(n.charId ?? '').toUpperCase().slice(0, 14);
+    const kindTag = n.kind === 'boss' ? 'BOSS · ' : n.kind === 'gate' ? 'GATE · ' : '';
+    label(ctx, `${slot}  ${kindTag}${who}`, panelX + 20, y - 2, 13, '#ffffffdd', 'left');
+    label(ctx,
+      prize && prize.kind === 'credits' ? `+${prize.amount} CR · 1 FIGHT`
+        : prize && prize.kind === 'drink' ? '+1 DRINK · 1 FIGHT'
+          : '1 FIGHT',
+      panelX + panelW - 20, y - 2, 12, prize ? '#f2c14e' : '#ffffff77', 'right');
+  }
+
+  if (options.length === 0) {
+    y += 26;
+    label(ctx, 'NO ROUTES LEFT — THIS RUN IS OVER', panelX + 16, y, 12, '#ff9d9d', 'left');
+  }
+
+  if (v.busy) label(ctx, 'WORKING…', panelX + panelW / 2, VH - 44, 13, '#ffd166');
+  if (v.toast) label(ctx, v.toast.slice(0, 46), VW / 2, VH - 32, 12, '#ffd166');
+  label(ctx, '1-4 / TAP: TAKE A ROUTE      ESC: ABANDON THE RUN',
+    26, VH - 14, 11, '#ffffff66', 'left');
+};
+
+/**
+ * Post-extraction summary — the payoff for the only action in the mode that
+ * turns a bag into money. Also the honest place to show a diminishing-returns
+ * haircut, rather than letting a player wonder why the board said 30 and the
+ * wallet said 22.
+ */
+export interface ExtractView {
+  exitTier: number;
+  bonus: number;
+  bag: number;
+  granted: number;
+  multiplierPct: number;
+  drinks: number;
+  drinksLeftBehind: number;
+  fights: number;
+  practice: boolean;
+}
+
+export const drawExtract = (ctx: CanvasRenderingContext2D, tick: number, v: ExtractView): void => {
+  drawMenuBackdrop(ctx);
+  ctx.fillStyle = 'rgba(4,10,6,0.84)';
+  ctx.fillRect(0, 0, VW, VH);
+  const cx = VW / 2;
+
+  display(ctx, 'EXTRACTED', cx, 150, 64, {
+    from: '#e8ffe6', mid: '#7ee85a', to: '#2e7a39', glow: 'rgba(126,232,90,0.45)',
+  });
+  label(ctx, `EXIT ${v.exitTier} · ${v.fights} FIGHT${v.fights === 1 ? '' : 'S'} SURVIVED`,
+    cx, 178, 14, '#ffffffcc');
+
+  // The receipt gets its own plate. This is the one screen where a player
+  // checks arithmetic against what the board promised — the backdrop art
+  // reads straight through otherwise and the numbers stop being numbers.
+  const rows = 2
+    + (!v.practice && v.multiplierPct < 100 ? 1 : 0)
+    + (v.drinks > 0 ? 1 : 0)
+    + (v.drinksLeftBehind > 0 ? 1 : 0);
+  const plateH = 26 * rows + 62;
+  ctx.fillStyle = 'rgba(6,12,8,0.88)';
+  ctx.fillRect(cx - 214, 208, 428, plateH);
+  ctx.strokeStyle = 'rgba(126,232,90,0.28)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(cx - 213.5, 208.5, 427, plateH - 1);
+
+  let y = 236;
+  const row = (k: string, val: string, color = '#ffffffdd'): void => {
+    label(ctx, k, cx - 190, y, 14, '#ffffff88', 'left');
+    label(ctx, val, cx + 190, y, 16, color, 'right');
+    y += 26;
+  };
+  row('PICKED UP', `${v.bag} CR`);
+  row(`EXIT ${v.exitTier} BONUS`, `+${v.bonus} CR`);
+  if (!v.practice && v.multiplierPct < 100) row("TODAY'S RATE", `x${v.multiplierPct}%`, '#ffd166');
+  if (v.drinks > 0) row('DRINKS BANKED', `${v.drinks}`, '#4fc4d6');
+  if (v.drinksLeftBehind > 0) row('OVER DAILY DRINK CAP', `${v.drinksLeftBehind} LOST`, '#ff9d9d');
+
+  y += 8;
+  ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx - 190, y - 18);
+  ctx.lineTo(cx + 190, y - 18);
+  ctx.stroke();
+  label(ctx, v.practice ? 'PRACTICE — NOTHING BANKED' : 'BANKED', cx - 190, y, 15, '#ffffff', 'left');
+  label(ctx, v.practice ? '0 CR' : `+${v.granted} CR`, cx + 190, y, 26,
+    v.practice ? '#ffffff55' : '#7ee85a', 'right');
+
+  label(ctx, 'TAP / ENTER: TITLE', cx, VH - 40, 13,
+    `rgba(255,255,255,${0.55 + Math.sin(tick / 10) * 0.25})`);
+  tapZone(0, 0, VW, VH, 'start');
 };

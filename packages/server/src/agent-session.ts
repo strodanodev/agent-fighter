@@ -55,14 +55,23 @@ export interface AgentOptions {
   personality?: Record<string, number>;
   /**
    * Queue mode — 'wager' (default, PvP pot), 'solo' (one match vs the house
-   * AI), or 'arcade' (one BATTLE of the ranked gauntlet — chain battles by
-   * passing the returned run token back via `runToken`). Solo and arcade
-   * battles are LOCAL-SIM (protocol v3/v4): the server pins a deterministic
+   * AI), or 'arcade' (one BATTLE of the ranked gauntlet map — chain battles
+   * by passing the returned run token back via `runToken`). Solo and arcade
+   * battles are LOCAL-SIM (protocol v3/v7): the server pins a deterministic
    * house AI in the setup; this session simulates it locally and streams
    * only its own inputs. No opponent packets exist at all.
+   *
+   * ARCADE v2 NOTE (ADR 0008): headless agents do not read the board. They
+   * omit CQueue.arcadeNode, which puts the server on AUTOPILOT down the
+   * cheapest line to the deep exit. Agent-class accounts bank nothing
+   * either way, so the loot they walk past is nobody's money.
    */
   mode?: 'wager' | 'solo' | 'arcade';
-  /** Arcade continuation: the run token from the previous battle's result. */
+  /**
+   * Arcade continuation: the run token from the previous battle's result.
+   * A run must first be opened with POST /arcade/enter + POST /arcade/run
+   * (which locks the fighter and mints the board).
+   */
   runToken?: string;
   /**
    * Solo only (ADR 0006): fight the TRAINED agent behind this dare/ref code
@@ -83,7 +92,7 @@ export interface AgentResult {
   localHash: number; // my sim's final hash — must equal result.hash
   localTicks: number;
   /** Arcade battles: run position + the token that queues the NEXT battle. */
-  arcade?: { battle: number; total: number; token: string };
+  arcade?: { token: string; node: number; fights: number; total: number };
 }
 
 /** Play exactly one online match. Resolves with the server-verified result. */

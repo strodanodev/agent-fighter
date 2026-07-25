@@ -7,10 +7,11 @@
  * to draw (`spriteForFighter`) and blits it.
  */
 import {
-  Action, Btn, Phase, STAGE, TICKS_PER_SEC, TUNING,
-  aiPoll, createAi, createGameState, debugBoxes, itemById, setCharacters, step,
+  Action, Btn, EXIT_BONUS, EXIT_FIGHT_FLOOR, Phase, REGION_NAME, STAGE,
+  TICKS_PER_SEC, TUNING, aiPoll, createAi, createGameState, debugBoxes,
+  generateBoard, isLegalMove, itemById, nodeById, setCharacters, step, successors,
 } from '@af/core';
-import type { AiState, GameState, InputFrame } from '@af/core';
+import type { AiState, Board, BoardNode, GameState, InputFrame } from '@af/core';
 import {
   awardXp, cpuLevelFor, loadLever, loadProfile, saveLever, skillForCpuLevel, xpForNext,
 } from './progress.js';
@@ -19,12 +20,12 @@ import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './a
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  currentStageBounds, currentStageCamLimits, drawAgent, drawGameOver, drawHud, drawInvite, drawLoading, drawNetError, drawOpponentGone,
+  currentStageBounds, currentStageCamLimits, drawAgent, drawExtract, drawGameOver, drawHud, drawInvite, drawLoading, drawMap, drawNetError, drawOpponentGone,
   drawRanks, drawReconnecting, drawResults, drawSelect, drawShop, drawStage, drawStageSelect, drawTitle,
   drawVsCard, drawWallet, resetTaps, SHOP_SPIN_TICKS, setBgVideo, setGameLogo, setLogo,
   setStageAsset, setUiKit, setVendingArt, tapHit, tapZone, worldTransform,
 } from './ui.js';
-import type { AgentOpponent, Cam, HudFx, HudId, Mode, RankRow, ShopInventoryEntry, ShopReveal, XpInfo } from './ui.js';
+import type { AgentOpponent, Cam, ExtractView, HudFx, HudId, Mode, RankRow, ShopInventoryEntry, ShopReveal, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit, loadVendingArt } from './chrome.js';
 import type { BgVideo, StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
@@ -187,7 +188,7 @@ const tapAt = (clientX: number, clientY: number): void => {
 };
 
 // ---------------------------------------------------------------- state
-type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'gameover' | 'ranks' | 'invite' | 'agent' | 'shop';
+type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'gameover' | 'ranks' | 'invite' | 'agent' | 'shop' | 'map' | 'extract';
 
 let screen: Screen = 'loading';
 let mode: Mode = 'cpu';
@@ -853,12 +854,18 @@ let locked: [boolean, boolean] = [false, false];
 // no fee, no XP, no records.
 interface ArcadeRun {
   practice: boolean;
-  /** 0-based index of the battle being played. */
-  stage: number;
-  /** Battles in the whole run. */
+  /** The generated board. Fully revealed — this is a puzzle, not a gamble. */
+  board: Board;
+  /** Node the run is STANDING on. Ranked: mirrors the server, never leads it. */
+  at: number;
+  /** Node currently being fought, or -1. */
+  pending: number;
+  /** Fights WON this run. */
+  fights: number;
+  /** Fights on the cheapest line to the deep exit (the 7 in 2/4/7). */
   total: number;
-  /** PRACTICE only: roster indices to fight, in run order. */
-  opponents: number[];
+  /** UNBANKED pickups — what a loss takes away. */
+  bag: { credits: number; drinks: { itemId: string; tier: number }[] };
   /** RANKED only: bearer token that continues the run after a win. */
   runToken?: string;
 }
@@ -894,7 +901,9 @@ const storedArcadeRun = (): StoredArcadeRun | null => {
     const raw = safeGetItem(ARCADE_RUN_KEY);
     if (!raw) return null;
     const r = JSON.parse(raw) as StoredArcadeRun;
-    if (!r.token || !r.charId || Date.now() - r.ts > 4 * 60_000) return null;
+    // Kept just inside the server's ARCADE_NEXT_GRACE_MS (30min, ADR 0008) so
+    // the RESUME pill never offers a run the server has already swept.
+    if (!r.token || !r.charId || Date.now() - r.ts > 25 * 60_000) return null;
     return r;
   } catch {
     return null;
@@ -1176,7 +1185,11 @@ const resetMatchFx = (g: GameState): void => {
  * 'friendly' = private challenge (v5): PvP paired by `friendlyRoom` instead
  *   of the public queue. FREE and UNRANKED — verified winner, nothing else.
  */
-const startOnline = (m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: string, agentOf?: string): void => {
+const startOnline = (
+  m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: string, agentOf?: string,
+  /** ARCADE v2: the board node being moved to — the move IS the queue. */
+  arcadeNode?: number,
+): void => {
   const roster = allRosters[picks[0]]!;
   lastFighter = roster.id;
   safeSetItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
@@ -1201,7 +1214,7 @@ const startOnline = (m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: str
       ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(),
         m === 'friendly' ? friendlyRoom : undefined)
       : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(),
-        m === 'arcade' ? { runToken } : undefined,
+        m === 'arcade' ? { runToken, node: arcadeNode } : undefined,
         m === 'solo' ? agentOf : undefined);
   });
 };
@@ -1267,22 +1280,23 @@ const installOnlineMatch = (): void => {
   netInstalled = true;
   quitConfirm = false; // fresh match — clear any stale quit prompt
   screen = 'fight';
-  // AGENT ARCADE: adopt the SERVER's run position — it owns the sequencing.
+  // AGENT ARCADE v2: the SERVER owns the run position — adopt, never assert.
+  // The BOARD is not in this message (it never changes mid-run and is far too
+  // big to repeat); it was fetched once from POST /arcade/run.
   if (s.mode === 'arcade' && s.arcade) {
-    arcade = {
-      practice: false,
-      stage: s.arcade.battle,
-      total: s.arcade.total,
-      opponents: [],
-      runToken: s.arcade.token,
-    };
-    // Crash insurance (ADR 0007): entries are non-refundable now, so the run
-    // token must survive a killed PWA — the title offers RESUME within the
-    // server's grace window instead of silently eating the credit.
+    if (arcade && !arcade.practice) {
+      arcade.pending = s.arcade.node;
+      arcade.fights = s.arcade.fights;
+      arcade.total = s.arcade.total;
+      arcade.runToken = s.arcade.token;
+    }
+    // Crash insurance (ADR 0007): entries are non-refundable, so the run token
+    // must survive a killed PWA — the title offers RESUME within the server's
+    // grace window instead of silently eating the credit.
     storeArcadeRun({
       token: s.arcade.token,
       charId: s.chars[0].id,
-      battle: s.arcade.battle,
+      battle: s.arcade.fights,
       total: s.arcade.total,
       ts: Date.now(),
     });
@@ -1293,8 +1307,12 @@ const installOnlineMatch = (): void => {
   vsCardAge = 0;
   vsStakes = s.mode === 'arcade'
     ? [
-      `BATTLE ${(s.arcade?.battle ?? 0) + 1} OF ${s.arcade?.total ?? 0}${(s.fee ?? 0) > 0 ? `      ENTRY −${s.fee} CR` : ''}`,
-      "RANKED GAUNTLET · SERVER-VERIFIED · LOSE ONCE AND IT'S GAME OVER",
+      `${arcade ? REGION_NAME[nodeById(arcade.board, s.arcade?.node ?? -1)?.region ?? 1] : 'GAUNTLET'}`
+      + `      ${s.arcade?.fights ?? 0} FIGHT${(s.arcade?.fights ?? 0) === 1 ? '' : 'S'} DEEP`
+      + (arcade && arcade.bag.credits > 0 ? `      CARRYING ${arcade.bag.credits} CR` : ''),
+      arcade && arcade.bag.credits + arcade.bag.drinks.length > 0
+        ? 'LOSE AND THE BAG IS GONE · SERVER-VERIFIED'
+        : "RANKED GAUNTLET · SERVER-VERIFIED · LOSE ONCE AND IT'S GAME OVER",
     ]
     : s.mode === 'solo'
       ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP',
@@ -1309,7 +1327,7 @@ const installOnlineMatch = (): void => {
   if (myDrinks.length > 0) {
     vsStakes.push(`🥤 ${myDrinks.map((d) => d.name).join(' · ')} — TAP A CAN OR PRESS R TO DRINK`);
   }
-  const newChallenger = s.mode === 'arcade' && (s.arcade?.battle ?? 0) > 0;
+  const newChallenger = s.mode === 'arcade' && (s.arcade?.fights ?? 0) > 0;
   void audio.playStinger(newChallenger ? 'here_comes_a_new_challenger' : 'vs',
     { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
@@ -1338,54 +1356,239 @@ const startFight = (): void => {
 };
 
 // ---------------------------------------------------------------- arcade
-/**
- * AI skill ramp across the gauntlet: the first battle is winnable by a
- * newcomer, the last one plays at near-max skill. (The 0-100 lever is
- * @af/core's createAi knob.)
- */
-const ARCADE_SKILL_MIN = 35, ARCADE_SKILL_MAX = 95;
-const arcadeSkill = (stage: number, total: number): number =>
-  Math.round(ARCADE_SKILL_MIN
-    + (ARCADE_SKILL_MAX - ARCADE_SKILL_MIN) * (total <= 1 ? 1 : stage / (total - 1)));
+// AGENT ARCADE v2 (ADR 0008): a RUN is a walk across a generated 32x32 board.
+// Wins pay XP; credits come ONLY from board pickups banked by reaching an exit
+// alive. RANKED runs are server-authoritative — this module draws the board and
+// asks; the server owns where you stand and what you carry. PRACTICE runs
+// (guest / server-offline) use the identical generator locally, reward-free.
+let mapBusy = false; // an /arcade/* request is in flight
+let mapToast = '';
+/** Escape was pressed once with a loaded bag — the next one really quits. */
+let mapAbandonArmed = false;
+let extractView: ExtractView | null = null;
+
+/** The roster ids a board may be populated from (never the player's own). */
+const arcadeRoster = (): string[] => allRosters
+  .filter((r, i) => !r.disabled && i !== picks[0])
+  .map((r) => r.id);
+
+const rosterName = (charId: string): string =>
+  allRosters.find((r) => r.id === charId)?.bundle.name ?? charId;
 
 /**
- * PRACTICE gauntlet — the offline fallback when the match server is
- * unreachable. Same run structure as ranked arcade, fully local: no fee,
- * no XP, no records.
+ * PRACTICE gauntlet — guests, and the fallback when the match server is
+ * unreachable. Same board generator, same rules, fully local: no entry, no
+ * XP, no records, and an extraction that banks nothing.
  */
 const startArcadePractice = (): void => {
-  const me = picks[0];
-  const roster = allRosters[me]!;
+  const roster = allRosters[picks[0]]!;
   lastFighter = roster.id;
   safeSetItem(LAST_FIGHTER_KEY, lastFighter);
-  // Every enabled agent except the player's own — shuffled so each run has a
-  // fresh order. A roster of one still works: it becomes a mirror match.
-  const opponents = allRosters
-    .map((r, i) => (!r.disabled && i !== me ? i : -1))
-    .filter((i) => i >= 0);
-  for (let i = opponents.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1)); // client-only — the sim gets its own seeds
-    [opponents[i], opponents[j]] = [opponents[j]!, opponents[i]!];
-  }
-  if (opponents.length === 0) opponents.push(me);
-  arcade = { practice: true, opponents, stage: 0, total: opponents.length };
-  startArcadeFight();
+  const pool = arcadeRoster();
+  const board = generateBoard({
+    roster: pool.length > 0 ? pool : [roster.id],
+    seed: (Math.random() * 0x7fffffff) | 0,
+  });
+  arcade = {
+    practice: true, board, at: board.start, pending: -1,
+    fights: 0, total: EXIT_FIGHT_FLOOR[3], bag: { credits: 0, drinks: [] },
+  };
+  enterMap();
 };
 
-/** Begin the current PRACTICE stage — a fully local fight vs the next agent. */
-const startArcadeFight = (): void => {
+/** Show the board. Every route decision in the mode is made on this screen. */
+const enterMap = (): void => {
+  mapToast = '';
+  mapBusy = false;
+  mapAbandonArmed = false;
+  net = null;
+  cpuAi = null;
+  screen = 'map';
+  void audio.playBgm('player_select', { fadeInSec: 0.5 });
+};
+
+/**
+ * Walk a PRACTICE run onto `to` and sweep up what it lands on — the exact
+ * mirror of the server's advanceRun (server.ts). Auto-collect exists because
+ * a guarded pickup's fighter has the pickup as its ONLY successor: once the
+ * guard is beaten there is no decision left to make, so a manual step there
+ * could only ever go wrong.
+ */
+const practiceAdvance = (run: ArcadeRun, to: number): void => {
+  run.at = to;
+  for (;;) {
+    const outs = successors(run.board, run.at);
+    if (outs.length !== 1) break;
+    const next = nodeById(run.board, outs[0]!);
+    if (!next || next.kind !== 'loot' || !next.loot) break;
+    if (next.loot.kind === 'credits') run.bag.credits += next.loot.amount;
+    else run.bag.drinks.push({ itemId: next.loot.itemId, tier: next.loot.tier });
+    run.at = next.id;
+  }
+};
+
+/** POST /arcade/run — locks the fighter on the first call, resumes after. */
+const fetchArcadeRun = async (token: string, character?: string): Promise<boolean> => {
+  const headers = await agentAuthHeaders();
+  if (!headers) return false;
+  const res = await fetchT(`${matchHttpUrl()}/arcade/run`, {
+    method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token, character }),
+  });
+  const body = (await res.json().catch(() => ({}))) as {
+    board?: Board; at?: number; pending?: number; fights?: number; total?: number;
+    bag?: { credits: number; drinks: { itemId: string; tier: number }[] };
+    character?: string; error?: string;
+  };
+  if (!res.ok || !body.board) {
+    mapToast = (body.error ?? 'RUN NOT FOUND').toUpperCase().slice(0, 46);
+    return false;
+  }
+  arcade = {
+    practice: false,
+    board: body.board,
+    at: body.at ?? body.board.start,
+    pending: body.pending ?? -1,
+    fights: body.fights ?? 0,
+    total: body.total ?? EXIT_FIGHT_FLOOR[3],
+    bag: body.bag ?? { credits: 0, drinks: [] },
+    runToken: token,
+  };
+  // Crash insurance: entries are non-refundable, so the token must survive a
+  // killed PWA — the title offers RESUME inside the server's grace window.
+  storeArcadeRun({
+    token,
+    charId: body.character ?? allRosters[picks[0]]!.id,
+    battle: arcade.fights,
+    total: arcade.total,
+    ts: Date.now(),
+  });
+  return true;
+};
+
+/** Start a RANKED run: lock the fighter, mint the board, show the map. */
+const startArcadeRanked = (token: string): void => {
+  mapBusy = true;
+  mapToast = '';
+  screen = 'map';
+  void (async () => {
+    let ok = false;
+    try {
+      ok = await fetchArcadeRun(token, allRosters[picks[0]]!.id);
+    } catch {
+      mapToast = 'SERVER UNREACHABLE';
+    }
+    mapBusy = false;
+    if (ok) { enterMap(); return; }
+    storeArcadeRun(null);
+    screen = 'title';
+    showToast(mapToast || 'ARCADE RUN FAILED');
+  })();
+};
+
+/** Refresh the run from the server after a battle — it owns the position. */
+const refreshArcadeRun = (): void => {
+  const run = arcade;
+  if (!run || run.practice || !run.runToken) return;
+  mapBusy = true;
+  const token = run.runToken;
+  void (async () => {
+    let ok = false;
+    try {
+      ok = await fetchArcadeRun(token);
+    } catch {
+      mapToast = 'SERVER UNREACHABLE';
+    }
+    mapBusy = false;
+    if (!ok) endArcade();
+  })();
+};
+
+/** Take a route: fight the chosen node, or extract through the chosen exit. */
+const arcadeGo = (nodeId: number): void => {
+  const run = arcade;
+  if (!run || mapBusy) return;
+  if (!isLegalMove(run.board, run.at, nodeId)) return;
+  const node = nodeById(run.board, nodeId);
+  if (!node) return;
+  if (node.kind === 'exit') { arcadeExtract(node); return; }
+  run.pending = nodeId;
+  if (run.practice) { startPracticeFight(node); return; }
+  startOnline('arcade', run.runToken, undefined, nodeId);
+};
+
+/** Bank the bag and end the run — the only way credits leave the board. */
+const arcadeExtract = (node: BoardNode): void => {
+  const run = arcade;
+  if (!run || mapBusy) return;
+  const tier = (node.exitTier ?? 1) as 1 | 2 | 3;
+  if (run.practice) {
+    extractView = {
+      exitTier: tier, bonus: EXIT_BONUS[tier], bag: run.bag.credits,
+      granted: 0, multiplierPct: 0, drinks: run.bag.drinks.length,
+      drinksLeftBehind: 0, fights: run.fights, practice: true,
+    };
+    screen = 'extract';
+    return;
+  }
+  mapBusy = true;
+  void (async () => {
+    try {
+      const headers = await agentAuthHeaders();
+      if (!headers) return;
+      const res = await fetchT(`${matchHttpUrl()}/arcade/extract`, {
+        method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: run.runToken, node: node.id }),
+      });
+      const body = (await res.json().catch(() => ({}))) as {
+        exitTier?: number; bonus?: number; bag?: number; granted?: number;
+        multiplierPct?: number; credits?: number | null;
+        drinks?: unknown[]; drinksLeftBehind?: number; fights?: number; error?: string;
+      };
+      if (!res.ok) {
+        mapToast = (body.error ?? 'EXTRACTION FAILED').toUpperCase().slice(0, 46);
+        return;
+      }
+      if (typeof body.credits === 'number' && account) {
+        account = { ...account, credits: body.credits };
+      }
+      extractView = {
+        exitTier: body.exitTier ?? tier,
+        bonus: body.bonus ?? EXIT_BONUS[tier],
+        bag: body.bag ?? run.bag.credits,
+        granted: body.granted ?? 0,
+        multiplierPct: body.multiplierPct ?? 100,
+        drinks: body.drinks?.length ?? 0,
+        drinksLeftBehind: body.drinksLeftBehind ?? 0,
+        fights: body.fights ?? run.fights,
+        practice: false,
+      };
+      storeArcadeRun(null); // banked — nothing left to resume
+      screen = 'extract';
+    } catch {
+      mapToast = 'SERVER UNREACHABLE — THE RUN IS STILL YOURS';
+    } finally {
+      mapBusy = false;
+    }
+  })();
+};
+
+/** Begin a PRACTICE fight against the fighter standing on `node`. */
+const startPracticeFight = (node: BoardNode): void => {
   const run = arcade!;
-  const opp = run.opponents[run.stage]!;
-  picks[1] = opp;
-  fighters = [allRosters[picks[0]]!, allRosters[opp]!];
+  const opp = allRosters.findIndex((r) => r.id === node.charId);
+  picks[1] = opp >= 0 ? opp : picks[0];
+  fighters = [allRosters[picks[0]]!, allRosters[picks[1]]!];
   setCharacters(fighters[0].ch, fighters[1].ch);
-  // Rotate the stage art each battle so the run tours the whole game.
+  // Rotate the stage art each battle so a run tours the whole game.
   if (stageAssets.length > 0) {
-    stageCursor = (seed + run.stage) % stageAssets.length;
+    stageCursor = (seed + run.fights) % stageAssets.length;
     setStageAsset(stageAssets[stageCursor] ?? null);
   }
   game = createGameState(seed++, currentStageBounds());
-  cpuAi = createAi(1, arcadeSkill(run.stage, run.total), seed * 31 + 7);
+  // The BOARD sets the difficulty (region band), not the fight count — a long
+  // safe detour must never be free money.
+  cpuAi = createAi(1, node.skill ?? 50, seed * 31 + 7);
   statDmg = 0;
   statBestCombo = 0;
   xpBanner = null;
@@ -1395,10 +1598,11 @@ const startArcadeFight = (): void => {
   screen = 'fight';
   vsCardAge = 0;
   vsStakes = [
-    `BATTLE ${run.stage + 1} OF ${run.total}`,
+    `${REGION_NAME[node.region]} · ${run.fights} FIGHT${run.fights === 1 ? '' : 'S'} DEEP`
+    + (run.bag.credits > 0 ? `      CARRYING ${run.bag.credits} CR` : ''),
     'PRACTICE GAUNTLET · NO FEE · NO XP · NO RECORDS',
   ];
-  void audio.playStinger(run.stage === 0 ? 'vs' : 'here_comes_a_new_challenger',
+  void audio.playStinger(run.fights === 0 ? 'vs' : 'here_comes_a_new_challenger',
     { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
 
@@ -1762,12 +1966,12 @@ const renderFight = (g: GameState): void => {
         // Arcade: the HUD prefixes the character name itself, so the server
         // name ("ELON · 1/8") would double it — show just the run position.
         `${arcade && !arcade.practice
-          ? `BATTLE ${arcade.stage + 1}/${arcade.total}`
+          ? `${arcade.fights + 1}/${arcade.total} DEEP`
           : net.setup.names[1]}${net.setup.agents[1] ? ' · AGENT' : ''}${net.side === 1 ? ' (YOU)' : ''}`,
       ]
       : cpuAi
         ? ['', arcade
-          ? `BATTLE ${arcade.stage + 1}/${arcade.total}`
+          ? `${arcade.fights + 1}/${arcade.total} DEEP`
           : `AGENT LV ${cpuLevelFor(profile, lever)}`]
         : undefined,
     autoSpecialCharged(g.fighters[localSide()]),
@@ -1868,12 +2072,13 @@ const tickSelect = (): void => {
         // GUEST: the same gauntlet, run fully LOCAL and reward-free — no fee,
         // no account, no server. The GAME OVER card invites them to sign in.
         if (!isSignedIn()) { startArcadePractice(); return; }
-        // SIGNED-IN (ADR 0007): a pre-paid run token queues battle 1 (fee
-        // already taken at /arcade/enter). No token = legacy path (escrow at
-        // battle 1). Either way the run is RANKED and server-verified.
-        const token = pendingArcadeToken || undefined;
+        // SIGNED-IN (ADR 0008): the pre-paid token now LOCKS the fighter and
+        // mints the board, then the map screen takes over. No token means the
+        // entry never landed — bounce to the title rather than play unpaid.
+        const token = pendingArcadeToken;
         pendingArcadeToken = '';
-        startOnline('arcade', token);
+        if (!token) { screen = 'title'; showToast('ENTER AGENT ARCADE FROM THE TITLE'); return; }
+        startArcadeRanked(token);
       } else if (!isSignedIn()) {
         // WAGER needs the account for escrow — a guest who reached select via
         // "change fighter" is bounced to sign-in rather than queued unpaid.
@@ -2116,7 +2321,9 @@ const frame = (steps = 1): void => {
       if (idx >= 0) {
         picks = [idx, idx];
         mode = 'cpu';
-        startOnline('arcade', resumable.token);
+        // The board lives server-side, so resuming is a plain read: the run
+        // comes back standing exactly where it fell.
+        startArcadeRanked(resumable.token);
       } else {
         storeArcadeRun(null);
       }
@@ -2201,6 +2408,64 @@ const frame = (steps = 1): void => {
       void createAgentFighter();
     } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
       screen = 'title';
+    }
+  } else if (screen === 'map' && arcade) {
+    // AGENT ARCADE v2 (ADR 0008): the board is the whole between-fights loop.
+    // Every credit in this mode is decided here — take the short line to an
+    // exit, or spend another fight on a guarded pile.
+    drawMap(ctx, uiTick, {
+      board: arcade.board,
+      at: arcade.at,
+      fights: arcade.fights,
+      total: arcade.total,
+      bag: { credits: arcade.bag.credits, drinks: arcade.bag.drinks.length },
+      practice: arcade.practice,
+      nameOf: rosterName,
+      busy: mapBusy,
+      toast: mapToast || undefined,
+    });
+    drawWalletStrip();
+    if (!mapBusy) {
+      // Taps carry the node id, so a mis-drawn row can never move the run
+      // somewhere illegal — arcadeGo re-checks the edge either way.
+      let chosen = -1;
+      for (const t of taps) {
+        if (t.startsWith('map:go:')) {
+          const id = Number(t.slice(7));
+          if (Number.isFinite(id)) chosen = id;
+        }
+      }
+      // Keyboard 1-4 mirror the panel rows, in the same order they are drawn.
+      const options = successors(arcade.board, arcade.at);
+      for (let i = 0; i < Math.min(options.length, 4); i++) {
+        if (pressedThisFrame.has(`Digit${i + 1}`)) chosen = options[i]!;
+      }
+      if (chosen >= 0) {
+        audio.playSfx('select_confirm');
+        arcadeGo(chosen);
+      } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
+        // Abandoning forfeits the bag exactly like dying does. When there IS
+        // a bag, say what it costs and make them mean it — one stray Escape
+        // must not be able to throw away credits they fought for.
+        const carrying = arcade.bag.credits + arcade.bag.drinks.length;
+        if (carrying > 0 && !mapAbandonArmed) {
+          mapAbandonArmed = true;
+          mapToast = `ESC AGAIN TO ABANDON — YOU LOSE ${arcade.bag.credits} CR`
+            + (arcade.bag.drinks.length > 0 ? ` + ${arcade.bag.drinks.length} DRINK` : '');
+        } else {
+          endArcade();
+        }
+      } else if (mapAbandonArmed && (pressedThisFrame.size > 0 || taps.size > 0)) {
+        mapAbandonArmed = false; // any other input stands the prompt down
+        mapToast = '';
+      }
+    }
+  } else if (screen === 'extract' && extractView) {
+    drawExtract(ctx, uiTick, extractView);
+    drawWalletStrip();
+    if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('start')) {
+      extractView = null;
+      endArcade();
     }
   } else if (screen === 'shop') {
     if (shopRevealAge >= 0) shopRevealAge++;
@@ -2680,11 +2945,23 @@ const frame = (steps = 1): void => {
       resultsAge = 0;
       const lostIt = net.result.winner === 1 - localSide() || net.result.winner === -1;
       if (arcade) {
-        // Whatever ended it, the run is over server-side → GAME OVER card.
-        gameOverAge = 0;
-        screen = 'gameover';
-        audio.playSfx('you_lose', { volume: 0.8 });
-        void audio.playStinger('game_over');
+        if (net.result.reason === 'incomplete' && !arcade.practice) {
+          // NO-CONTEST (network blip / pace flag): the server kept the run,
+          // the position AND the bag. Showing GAME OVER here would tell a
+          // player they lost a loaded run that is in fact still theirs —
+          // send them back to the map and re-read the truth from the server.
+          net.close();
+          net = null;
+          enterMap(); // clears the toast, so set it after
+          mapToast = 'NO CONTEST — THE RUN AND YOUR BAG ARE INTACT';
+          refreshArcadeRun();
+        } else {
+          // A real loss: the run is over server-side and the bag is gone.
+          gameOverAge = 0;
+          screen = 'gameover';
+          audio.playSfx('you_lose', { volume: 0.8 });
+          void audio.playStinger('game_over');
+        }
       } else {
         screen = 'results';
         if (lostIt) audio.playSfx('you_lose', { volume: 0.8 });
@@ -2706,11 +2983,16 @@ const frame = (steps = 1): void => {
         // practice runs pay nothing by design.
         if (game.winner === 0) {
           screen = 'results';
-          // Clearing the FINAL battle rolls the (very unserious) end credits
-          // instead of the usual between-battles ranking loop.
-          const cleared = arcade.stage + 1 >= arcade.total;
+          // PRACTICE runs advance locally the way the server advances a ranked
+          // one (practiceAdvance mirrors advanceRun, auto-collect included).
+          // Ranked runs wait for the verdict and then re-read the server.
+          if (arcade.practice && arcade.pending >= 0) {
+            arcade.fights++;
+            practiceAdvance(arcade, arcade.pending);
+            arcade.pending = -1;
+          }
           void audio.playStinger('win', {
-            onEnded: () => void audio.playBgm(cleared ? 'credits' : 'ranking', { fadeInSec: 1 }),
+            onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
           });
         } else {
           gameOverAge = 0;
@@ -2792,12 +3074,10 @@ const frame = (steps = 1): void => {
     // Arcade: this screen is the between-battles interstitial. The run only
     // moves FORWARD (next challenger) or ENDS (quit to title) — there is no
     // path back to the select screen mid-run.
-    const arcadeDone = arcade ? arcade.stage + 1 >= arcade.total : false;
     drawResults(ctx, game, fighters!, uiTick, resultsAge, xpBanner,
       arcade
-        ? (arcadeDone
-          ? `ARCADE COMPLETE — ALL ${arcade.total} AGENTS DOWN!        TAP / ENTER: TITLE`
-          : `BATTLE ${arcade.stage + 1} OF ${arcade.total} CLEARED        TAP / ENTER: NEXT CHALLENGER        ESC: QUIT`)
+        ? (`${arcade.bag.credits > 0 ? `CARRYING ${arcade.bag.credits} CR — UNBANKED` : 'ROUTE CLEARED'}`
+          + '        TAP / ENTER: BACK TO THE MAP        ESC: QUIT')
         : net
           ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : queuedMode === 'friendly' ? 'FREE' : '10 CR'}        ESC: CHANGE FIGHTER`
           : undefined,
@@ -2847,20 +3127,13 @@ const frame = (steps = 1): void => {
       }
     } else if (pressedThisFrame.has('Enter') || taps.has('start')) {
       if (arcade) {
-        // Forward through the gauntlet — same fighter, next challenger.
-        if (arcadeDone) {
-          endArcade();
-        } else if (arcade.practice) {
-          arcade.stage++;
-          startArcadeFight();
-        } else {
-          // RANKED: re-queue with the run token — the server owns the next
-          // battle (opponent, skill, position) and re-validates the token.
-          const token = arcade.runToken;
-          net?.close();
-          net = null;
-          startOnline('arcade', token);
-        }
+        // Forward is the MAP: the next decision is a route, not a rematch.
+        // Ranked runs re-read the server first — it, not this client, owns
+        // where the run now stands and what ended up in the bag.
+        net?.close();
+        net = null;
+        enterMap();
+        if (!arcade.practice) refreshArcadeRun();
       } else if (net) {
         // INSTANT REMATCH (P0): one input → straight back into the queue
         // with the same fighter and mode. No select detour, no re-confirm.
@@ -2889,7 +3162,7 @@ const frame = (steps = 1): void => {
     renderFight(game);
     drawGameOver(ctx, uiTick, gameOverAge, {
       by: fighters?.[1]?.bundle.name ?? 'THE HOUSE',
-      stage: (arcade?.stage ?? 0) + 1,
+      stage: (arcade?.fights ?? 0) + 1,
       total: arcade?.total ?? 1,
     });
     // Ranked run: the server's verdict (and the XP burn) land moments after
@@ -3062,6 +3335,29 @@ Object.assign(globalThis, {
   // Sever the live socket WITHOUT the leave-intent flag — simulates a wifi
   // blip so the reconnect path can be tested from the console/automation.
   afNetDrop: () => { net?.debugDrop(); },
+  /**
+   * AGENT ARCADE v2 run state. Exposed deliberately: the last time a new
+   * field was verified live it was missing from the hooks, so the browser
+   * probe read `undefined` and a working feature looked broken for ten
+   * cycles. Anything automation needs to assert about a run goes HERE.
+   */
+  afArcade: () => (arcade ? {
+    practice: arcade.practice,
+    templateId: arcade.board.templateId,
+    seed: arcade.board.seed,
+    nodes: arcade.board.nodes.length,
+    at: arcade.at,
+    pending: arcade.pending,
+    fights: arcade.fights,
+    total: arcade.total,
+    bag: { credits: arcade.bag.credits, drinks: arcade.bag.drinks.length },
+    moves: successors(arcade.board, arcade.at).map((id) => {
+      const n = nodeById(arcade!.board, id)!;
+      return { id, kind: n.kind, charId: n.charId, exitTier: n.exitTier };
+    }),
+    busy: mapBusy,
+    toast: mapToast,
+  } : null),
 });
 
 // Actions that open an OS / OAuth surface (share sheet, clipboard, the AIR

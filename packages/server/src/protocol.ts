@@ -7,7 +7,7 @@
  * server relays it and re-simulates the ledger to derive the result.
  */
 
-export const PROTOCOL_VERSION = 6; // v6: opponent-disconnect heads-up (oppgone/oppback)
+export const PROTOCOL_VERSION = 7; // v7: AGENT ARCADE gauntlet map (ADR 0008)
 export const DEFAULT_PORT = 8477;
 
 /**
@@ -86,14 +86,20 @@ export const FORFEIT_GRACE_MS = 20_000;
 export const IDLE_FORFEIT_MS = 30_000;
 
 /**
- * AGENT ARCADE (v4): how long a run may sit between battles (the results
- * interstitial) before its token expires. Raised 2min → 5min with the
- * ADR 0007 credits rework: entries are now PRE-PAID and non-refundable, and
- * the client persists its run token so a crashed PWA can relaunch and
- * RESUME the run — the window has to survive an app restart, not just a
- * results-screen pause. Expiry forces a fresh (paid) run.
+ * AGENT ARCADE: how long a run may sit between fights before its token
+ * expires. 2min → 5min (ADR 0007: pre-paid non-refundable entries + PWA
+ * resume) → 30min (ADR 0008).
+ *
+ * The v2 raise is a design consequence, not a tuning whim. Between fights the
+ * player now sits on the MAP — a 32×32 board they are meant to STUDY, with an
+ * unbanked bag riding on the decision. Five minutes was generous for tapping
+ * "next challenger"; it is hostile to someone weighing whether a 12-credit
+ * pile is worth another fight, and expiry would cost them a paid run AND the
+ * bag. Nothing is held hostage by a long window either — unlike a wager pot,
+ * an arcade run has no opponent waiting and no escrow to strand; the only
+ * cost is one small run object in server memory.
  */
-export const ARCADE_NEXT_GRACE_MS = 300_000;
+export const ARCADE_NEXT_GRACE_MS = 1_800_000;
 
 // ---- client → server
 export interface CHello {
@@ -134,12 +140,15 @@ export interface CHello {
  *  · 'wager'  — PvP. Entrance WAGER_FEE credits each; winner takes the pot.
  *  · 'solo'   — a single match vs the HOUSE agent at your level. SOLO_FEE
  *    credits; win nets +1 credit, a loss burns the fee AND −15 XP.
- *  · 'arcade' — AGENT ARCADE, the RANKED gauntlet (v4): ARCADE_FEE credits
- *    buys ONE RUN through every enabled agent, one battle at a time. Each
- *    battle is a solo-style local-sim match, server-verified, and settles
- *    XP/W-L on the same ranked ladder. Winning a battle arms the run token
- *    for the next one (re-queue with `runToken`); any loss ends the run.
- *    Credits pay out only at milestones + a full-clear bonus.
+ *  · 'arcade' — AGENT ARCADE, the RANKED gauntlet map (v7, ADR 0008):
+ *    ARCADE_FEE credits buys ONE RUN across a generated 32×32 board. Each
+ *    battle is a solo-style local-sim match, server-verified, settling
+ *    XP/W-L on the same ranked ladder. Winning arms the run token for the
+ *    next MOVE (re-queue with `runToken` + `arcadeNode`); any loss ends the
+ *    run AND forfeits everything picked up but not yet extracted.
+ *    **Wins pay no credits.** Credits come only from board pickups, banked
+ *    by reaching an exit alive (POST /arcade/extract) — the whole point of
+ *    the mode is that fighting is the cost and the board is the earning.
  *  · 'friendly' — private challenge (v5): the two sockets presenting the
  *    same `room` code are paired with each other instead of the public
  *    FIFO. FREE and UNRANKED by design (no fee, no pot, no XP, no W-L —
@@ -160,6 +169,20 @@ export interface CQueue {
    * bearer secret tied to the account that started the run.
    */
   runToken?: string;
+  /**
+   * AGENT ARCADE v2 (ADR 0008): the board node the player chose to move to.
+   * It must be a FIGHT node adjacent to where the run currently stands —
+   * the server validates the edge against its own copy of the board, so
+   * this is a request, never an assertion. THE MOVE IS THE QUEUE: choosing
+   * a route and starting the match are one action, which is why there is no
+   * separate /arcade/move endpoint.
+   *
+   * Omitted = AUTOPILOT: the server walks the cheapest line toward the deep
+   * exit itself. Headless agents (npm run agent / npm run fleet) rely on
+   * this — they are agent-class and economically inert, so which loot they
+   * skip is nobody's money.
+   */
+  arcadeNode?: number;
   /**
    * Friendly rendezvous code (required when mode === 'friendly'): both
    * players present the SAME string and meet. By convention it's the
@@ -254,12 +277,19 @@ export interface SMatch {
     personality?: Record<string, number>;
   };
   /**
-   * AGENT ARCADE (v4): present iff mode === 'arcade'. `battle` is 0-based;
-   * `token` re-queues the run for the next battle after a verified win
-   * (CQueue.runToken). Battles are otherwise exactly local-sim solo matches
-   * (the `solo` field above is set too).
+   * AGENT ARCADE v2 (v7, ADR 0008): present iff mode === 'arcade'. Battles
+   * are otherwise exactly local-sim solo matches (`solo` above is set too).
+   *
+   * The BOARD itself does not ride this message — the client fetches it once
+   * per run from POST /arcade/run (it is far too big to repeat every battle,
+   * and it never changes mid-run). What rides here is only where this
+   * particular fight sits on it:
+   *  · `node`   — the board node being fought (the one the player moved to)
+   *  · `fights` — fights already WON this run, so the HUD can say where you are
+   *  · `total`  — fights on the cheapest line to the deep exit (the 7 in "7 min")
+   *  · `token`  — re-arms the run for the next move (CQueue.runToken)
    */
-  arcade?: { battle: number; total: number; token: string };
+  arcade?: { token: string; node: number; fights: number; total: number };
   /**
    * CONSUMABLES (ADR 0007 final shape): the pinned per-side drink LOADOUTS
    * (each side's EQUIPPED cans, slot order, ≤ 3). BOTH simulating ends

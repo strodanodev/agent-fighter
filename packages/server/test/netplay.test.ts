@@ -104,6 +104,9 @@ describe('persistence hook (Phase B)', () => {
       setEquipped: async () => {},
       equippedItems: async () => [],
       debitCredits: async () => ({ credits: 100, duplicate: false }),
+      arcadeExtract: async () => ({
+        credits: 100, granted: 0, multiplierPct: 100, drinkBudget: 3, duplicate: false,
+      }),
     };
     const s2 = await createMatchServer({ port: 0, persistence: mock, noPaceCheck: true });
     try {

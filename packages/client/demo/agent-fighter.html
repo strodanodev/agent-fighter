@@ -80,6 +80,10 @@ const countBits = (v) => {
 };
 
 // ---- core/src/data.js ----
+/** The knobs a bundle may override (the CharTuning keys), for validation. */
+const CHAR_TUNING_KEYS = [
+    'jumpSquatTicks', 'knockdownTicks', 'getupTicks', 'grabTicks',
+];
 // ---------------------------------------------------------------------------
 // Loaded character: bundle + precomputed lookup tables the sim uses per tick.
 // Built once at load; all lookups by integer index (deterministic).
@@ -154,6 +158,18 @@ const loadCharacter = (b) => {
         if (m.projectile)
             checkHit(m.projectile.hit, `${m.id} projectile`);
     });
+    // Per-character tuning overrides: allowlisted keys only, positive integer
+    // durations (a 0/negative/NaN duration would soft-lock the state it gates).
+    if (b.tuning) {
+        for (const k of Object.keys(b.tuning)) {
+            if (!CHAR_TUNING_KEYS.includes(k)) {
+                throw new Error(`${b.name}: unknown tuning override "${k}" (allowed: ${CHAR_TUNING_KEYS.join(', ')})`);
+            }
+            const v = b.tuning[k];
+            if (!Number.isInteger(v) || v < 1)
+                throw new Error(`${b.name}: tuning.${k} must be an integer >= 1 (got ${v})`);
+        }
+    }
     const normals = [new Int32Array(10).fill(-1), new Int32Array(10).fill(-1), new Int32Array(10).fill(-1)];
     const specials = [];
     let superIdx = -1;
@@ -260,7 +276,7 @@ const ROUND_SECONDS = 99;
  *            must pin the same engine — hence the version bump + paired deploy.
  */
 const ENGINE_VERSION = 'af-core-7';
-const TUNING = {
+const TUNING_INIT = {
     roundsToWin: 2, // best of 3
     preRoundTicks: 60,
     roundOverTicks: 120,
@@ -290,6 +306,27 @@ const TUNING = {
     friction: 0.5, // px/tick² ground slide decel
     cornerThresholdPx: 26, // "at the wall" for pushback transfer
     throwStartsComboScaling: true,
+};
+/**
+ * The feel knobs. **Mutable by design** — CLAUDE.md: "tuning values will be
+ * tuned constantly." The sim reads this object live, so `applyTuning` lets the
+ * local Feel Lab (tools/feel-lab) retune the game in real time.
+ *
+ * SAFETY: only the Feel Lab ever calls `applyTuning`/`resetTuning`. The shipped
+ * client and the server verifier BOTH run `TUNING_DEFAULTS` untouched, so no
+ * online/verified match is ever affected. Same TUNING → same sim, so
+ * determinism is unchanged; only the values would differ if someone tuned.
+ */
+const TUNING = { ...TUNING_INIT };
+/** The shipped defaults — frozen. `resetTuning()` restores these. */
+const TUNING_DEFAULTS = Object.freeze({ ...TUNING_INIT });
+/** Feel Lab only: overwrite named knobs in place (the sim reads TUNING live). */
+const applyTuning = (patch) => {
+    Object.assign(TUNING, patch);
+};
+/** Feel Lab only: restore every knob to its shipped default. */
+const resetTuning = () => {
+    Object.assign(TUNING, TUNING_DEFAULTS);
 };
 
 // ---- core/src/items.js ----
@@ -1243,12 +1280,12 @@ const updateFighter = (s, f, other, ch, io) => {
             break; // physics only
         case 15 /* Action.Knockdown */:
             f.actionFrame++;
-            if (f.actionFrame >= TUNING.knockdownTicks)
+            if (f.actionFrame >= (ch.b.tuning?.knockdownTicks ?? TUNING.knockdownTicks))
                 setAction(f, 16 /* Action.Getup */);
             break;
         case 16 /* Action.Getup */:
             f.actionFrame++;
-            if (f.actionFrame >= TUNING.getupTicks)
+            if (f.actionFrame >= (ch.b.tuning?.getupTicks ?? TUNING.getupTicks))
                 setAction(f, 0 /* Action.Idle */);
             break;
         case 18 /* Action.Thrown */:
@@ -1303,7 +1340,7 @@ const updateFighter = (s, f, other, ch, io) => {
         }
         case 4 /* Action.JumpSquat */:
             f.actionFrame++;
-            if (f.actionFrame >= TUNING.jumpSquatTicks) {
+            if (f.actionFrame >= (ch.b.tuning?.jumpSquatTicks ?? TUNING.jumpSquatTicks)) {
                 setAction(f, 5 /* Action.Air */);
                 f.velY = fp(f.superJumped ? ch.b.superJumpVelY : ch.b.jumpVelY);
                 const dir = (held(io.input, 2 /* Btn.Right */) ? 1 : 0) - (held(io.input, 1 /* Btn.Left */) ? 1 : 0);
@@ -1804,7 +1841,7 @@ const resolveGrabs = (s) => {
             setAction(vic, 0 /* Action.Idle */);
             continue;
         }
-        if (att.actionFrame >= TUNING.grabTicks) {
+        if (att.actionFrame >= (ch.b.tuning?.grabTicks ?? TUNING.grabTicks)) {
             // Throw connects: damage + untechable toss.
             const dir = att.throwBack ? -att.facing : att.facing;
             vic.techLeft = 0;
@@ -2228,9 +2265,23 @@ const skillRamp = (ai, floor) => {
     return Math.trunc((t * t) / 100); // squared
 };
 const pxDist = (a, b) => Math.abs(fpToPx(a.x - b.x));
-const aiGrounded = (f) => f.y >= fp(460);
+const aiGrounded = (f) => f.y >= fp(STAGE.floorYPx);
 const actionable = (f) => f.action === 0 /* Action.Idle */ || f.action === 1 /* Action.WalkF */
     || f.action === 2 /* Action.WalkB */ || f.action === 3 /* Action.Crouch */;
+/** Does any hitbox in this move guard as `kind`? Lets the AI learn low vs
+ *  overhead pressure from the connecting move's own data (no per-char code). */
+const moveHasGuard = (mv, kind) => {
+    if (!mv)
+        return false;
+    for (const step of mv.steps) {
+        if (!step.hitboxes)
+            continue;
+        for (const hb of step.hitboxes)
+            if (hb.guard === kind)
+                return true;
+    }
+    return false;
+};
 // ---------------------------------------------------------------- meter
 /**
  * Below this skill an agent never cashes a bar out of a CONFIRMED chain or a
@@ -2309,8 +2360,7 @@ const createAi = (side, skill, seed, personality) => {
         reacted: 1,
         moveDir: 0,
         moveTicks: 0,
-        guardHigh: 0,
-        eatJump: 0, eatLow: 0, eatOverhead: 0, eatThrow: 0, eatProj: 0,
+        eatJump: 0, eatLow: 0, eatThrow: 0, eatProj: 0,
         lastHealth: -1,
         airAttackDone: 0,
         bookGround: [], bookLauncher: -1, bookAir: [],
@@ -2466,10 +2516,13 @@ const aiPoll = (ai, g) => {
         else if (op.action === 17 /* Action.Grab */ || me.action === 18 /* Action.Thrown */)
             ai.eatThrow = Math.min(9, ai.eatThrow + 1);
         else if (op.action === 3 /* Action.Crouch */ || op.action === 9 /* Action.Attack */) {
-            // crude read: low pokes come from crouch-stance moves
+            // Learn low pressure from the CONNECTING move's own guard (stance is the
+            // fallback for an untagged move). Feeds the Defend appetite below.
+            // (Every overhead in this roster is a jump-in — already counted as
+            // eatJump above, so there is no separate grounded-overhead counter.)
             const opCh = characters[(1 - ai.side)];
             const mv = op.moveIdx >= 0 ? opCh.b.moves[op.moveIdx] : null;
-            if (mv?.stance === 'crouch')
+            if (moveHasGuard(mv, 'low') || mv?.stance === 'crouch')
                 ai.eatLow = Math.min(9, ai.eatLow + 1);
         }
         ai.lastHealth = me.health;
@@ -2643,7 +2696,8 @@ const pickIntent = (ai, g, me, op, dist) => {
         w.push([3 /* Intent.Pressure */, ai.p.aggression + (losing ? 40 : 0)]);
         w.push([0 /* Intent.Observe */, 60]);
         w.push([2 /* Intent.Retreat */, 70 - Math.trunc(ai.p.aggression / 4)]);
-        w.push([7 /* Intent.Defend */, 50 + ai.eatThrow * 10]);
+        // Being thrown OR lowed repeatedly makes the AI want to block more.
+        w.push([7 /* Intent.Defend */, 50 + ai.eatThrow * 10 + ai.eatLow * 8]);
     }
     else if (dist < 260) {
         w.push([1 /* Intent.Approach */, ai.p.aggression]);
@@ -2722,8 +2776,11 @@ const actIntent = (ai, g, me, op, ch, dist) => {
             return emit(me, null, 0, false);
         }
         case 7 /* Intent.Defend */: {
-            // Hold guard. Default crouch-block; stand vs remembered overheads/jumpers.
-            const standGuard = ai.eatOverhead >= 2 || (!aiGrounded(op) && chance(ai, 200));
+            // Hold guard. Default crouch-block (beats lows); stand only vs an airborne
+            // attacker (jump-in overheads). eatLow doesn't belong here — it must not
+            // reduce anti-overhead standing; it feeds the appetite for Defend itself
+            // (pickIntent), so a low-pressured AI simply chooses to block more.
+            const standGuard = !aiGrounded(op) && chance(ai, 200);
             return emit(me, null, -1, !standGuard);
         }
         case 8 /* Intent.Oki */: {
@@ -2821,6 +2878,628 @@ const comboNext = (ai, ch, me, op, dist) => {
         return true;
     }
     return false;
+};
+
+// ---- core/src/arcade-map.js ----
+/**
+ * AGENT ARCADE v2 — the gauntlet map (ADR 0008). PURE DATA + PURE GRAPH MATH.
+ *
+ * This module is the shared vocabulary for the arcade board: the server
+ * GENERATES boards (packages/server/src/arcade-board.ts — templates, seeded
+ * shuffling, validation) and the client RENDERS them and shows route stats.
+ * Both ends need the same types and the same route arithmetic, and
+ * `@af/core` is the only package both already depend on — exactly the
+ * precedent `items.ts` set (data the sim never reads, living in core because
+ * everyone shares it).
+ *
+ * THE SIM NEVER READS ANY OF THIS. No GameState field, no input bit, no
+ * ENGINE_VERSION bump, goldens untouched. A board decides WHICH matches get
+ * played, never what happens inside one.
+ *
+ * Nothing here is random or stateful: every function is a pure query over a
+ * Board the caller already has. The server is the only authority on where a
+ * player actually IS (`ArcadeRun.at`) and what they picked up — the client's
+ * copy of the board is for drawing and for arithmetic it is welcome to get
+ * wrong, because the server never reads it back.
+ */
+/** Lattice size. 32 × 32 is the board's coordinate space, not its node count. */
+const BOARD_W = 32;
+const BOARD_H = 32;
+/** Zone names + AI skill bands. Skill ramps by DEPTH, never by fight count —
+ *  otherwise a long, safe, low-tier detour would be free money. */
+const REGION_NAME = {
+    1: 'SCRAPYARD ROW',
+    2: 'THE STACKS',
+    3: 'THE CORE',
+};
+const REGION_SKILL = {
+    1: [35, 50],
+    2: [50, 70],
+    3: [70, 95],
+};
+/** Base extraction bonus by exit tier (ADR 0008: 2 / 8 / 18). */
+const EXIT_BONUS = { 1: 2, 2: 8, 3: 18 };
+/**
+ * The fight FLOOR each exit must sit behind. This is the contract the whole
+ * mode rests on — every template is validated against it, so "2 / 4 / 7
+ * fights" is a structural guarantee, not a tuning value someone can drift.
+ */
+const EXIT_FIGHT_FLOOR = { 1: 2, 2: 4, 3: 7 };
+/** Credits in one pile, by region. */
+const REGION_CREDITS = { 1: 2, 2: 6, 3: 12 };
+/** True when standing on this node costs a match. */
+const isFightNode = (n) => n.kind === 'fight' || n.kind === 'gate' || n.kind === 'boss';
+const nodeById = (b, id) => b.nodes.find((n) => n.id === id);
+/** Node ids reachable in ONE step from `from` — the legal moves. */
+const successors = (b, from) => b.edges.filter(([a]) => a === from).map(([, to]) => to);
+/** Node ids with an edge INTO `to`. */
+const predecessors = (b, to) => b.edges.filter(([, t]) => t === to).map(([f]) => f);
+/** Is this move legal? The server asks this before applying any pickup. */
+const isLegalMove = (b, from, to) => b.edges.some(([a, t]) => a === from && t === to);
+/**
+ * Topological order (parents before children). Returns null if the graph has
+ * a cycle — which validateBoard treats as a hard template bug, because the
+ * whole no-backtracking economy assumes a DAG (a cycle would let a player
+ * farm the same loot node forever).
+ */
+const topoOrder = (b) => {
+    const indeg = new Map();
+    for (const n of b.nodes)
+        indeg.set(n.id, 0);
+    for (const [, to] of b.edges)
+        indeg.set(to, (indeg.get(to) ?? 0) + 1);
+    const queue = b.nodes.filter((n) => (indeg.get(n.id) ?? 0) === 0).map((n) => n.id);
+    const out = [];
+    while (queue.length > 0) {
+        const id = queue.shift();
+        out.push(id);
+        for (const s of successors(b, id)) {
+            const d = (indeg.get(s) ?? 0) - 1;
+            indeg.set(s, d);
+            if (d === 0)
+                queue.push(s);
+        }
+    }
+    return out.length === b.nodes.length ? out : null;
+};
+const EMPTY_ROUTE = { fights: 0, credits: 0, drinks: 0, reachable: false };
+/**
+ * One forward DP pass over the DAG from `from`: for every reachable node,
+ * the cheapest-in-fights route to it and the predecessor that achieved it.
+ * Ties break toward MORE loot — of two equally short lines the player would
+ * obviously take the richer one, so that is the one worth quoting.
+ *
+ * Display only. The server recomputes nothing from this; it just walks the
+ * moves the player actually makes.
+ */
+const solveFrom = (b, from) => {
+    const out = new Map();
+    const order = topoOrder(b);
+    if (!order)
+        return out;
+    out.set(from, { stat: { fights: 0, credits: 0, drinks: 0, reachable: true }, prev: -1 });
+    let seenFrom = false;
+    for (const id of order) {
+        if (id === from) {
+            seenFrom = true;
+            continue;
+        }
+        if (!seenFrom)
+            continue; // nodes before `from` in topo order are behind us
+        const node = nodeById(b, id);
+        if (!node)
+            continue;
+        let acc = null;
+        for (const p of predecessors(b, id)) {
+            const prev = out.get(p);
+            if (!prev?.stat.reachable)
+                continue;
+            const stat = {
+                reachable: true,
+                fights: prev.stat.fights + (isFightNode(node) ? 1 : 0),
+                credits: prev.stat.credits + (node.loot?.kind === 'credits' ? node.loot.amount : 0),
+                drinks: prev.stat.drinks + (node.loot?.kind === 'drink' ? 1 : 0),
+            };
+            const better = !acc
+                || stat.fights < acc.stat.fights
+                || (stat.fights === acc.stat.fights
+                    && stat.credits + stat.drinks * 5 > acc.stat.credits + acc.stat.drinks * 5);
+            if (better)
+                acc = { stat, prev: p };
+        }
+        if (acc)
+            out.set(id, acc);
+    }
+    return out;
+};
+/** Cheapest-in-fights route from `from` to `to`, and what it collects. */
+const routeTo = (b, from, to) => solveFrom(b, from).get(to)?.stat ?? EMPTY_ROUTE;
+/**
+ * The actual node sequence of that cheapest route, `from` exclusive and `to`
+ * inclusive. Empty when unreachable. The map screen highlights this; a
+ * player following it step by step walks exactly the quoted fight count.
+ */
+const pathTo = (b, from, to) => {
+    const solved = solveFrom(b, from);
+    if (!solved.get(to)?.stat.reachable)
+        return [];
+    const out = [];
+    for (let id = to; id !== from && id >= 0;) {
+        out.unshift(id);
+        const step = solved.get(id)?.prev;
+        if (step === undefined || step < 0)
+            break;
+        id = step;
+    }
+    return out;
+};
+/**
+ * Fewest fights from `from` to `to`, or -1 when unreachable. The validator's
+ * workhorse: every exit's floor is asserted against this.
+ */
+const minFights = (b, from, to) => {
+    const r = routeTo(b, from, to);
+    return r.reachable ? r.fights : -1;
+};
+/** Every exit node, shallowest first. */
+const exitNodes = (b) => b.nodes.filter((n) => n.kind === 'exit').sort((a, c) => (a.exitTier ?? 0) - (c.exitTier ?? 0));
+/**
+ * The map screen's headline numbers: for each exit, what it costs from where
+ * the player is standing right now. Unreachable exits (already routed past)
+ * come back with reachable:false so the UI can grey them out — a real state,
+ * since the board is one-way.
+ */
+const exitRoutes = (b, from) => exitNodes(b).map((node) => ({ node, route: routeTo(b, from, node.id) }));
+/** Total credits sitting on the board (balance sanity + the run summary). */
+const boardCredits = (b) => b.nodes.reduce((sum, n) => sum + (n.loot?.kind === 'credits' ? n.loot.amount : 0), 0);
+
+// ---- core/src/arcade-board.js ----
+/**
+ * AGENT ARCADE v2 — board GENERATION (ADR 0008).
+ *
+ * Lives in `@af/core` for the same reason `items.ts` does: it is pure data
+ * plus pure functions that BOTH ends need. In a ranked run the server is the
+ * only authority — it picks the seed, keeps the board, and validates every
+ * move against its own copy — but the client also needs to generate boards
+ * outright for the guest/offline PRACTICE gauntlet, which never touches a
+ * server. One generator, one set of templates, no drift.
+ *
+ * The sim never reads any of this: no GameState field, no ENGINE_VERSION
+ * bump, goldens untouched. `seed` is a REQUIRED argument precisely so this
+ * module stays free of ambient randomness (see core's determinism guards).
+ *
+ * ## The shape, and why it is this shape
+ *
+ * Every board is a **spine + spurs** DAG. The SPINE is the mandatory line —
+ * region gatekeepers and exit guards — and it is what pins the 2 / 4 / 7
+ * fight floors. A SPUR is a side loop carrying one pickup with **one extra
+ * fighter standing in front of it**, rejoining the spine afterwards.
+ *
+ * So: **every pickup costs exactly one more fight.** That single rule is the
+ * whole mode. Two earlier shapes were tried and both collapse:
+ *   · loot as free lateral nodes → with no step budget, loot is free, you
+ *     take all of it, and greed-vs-speed stops being a decision;
+ *   · a fighter on every branch → route choice never changes the fight
+ *     count, so only exit depth matters and the map is decoration.
+ *
+ * ## Why the spine is a fixed 7 rungs
+ *
+ * The rung sequence [fight, fight, GATE, fight, GATE, fight, BOSS] is not a
+ * tuning value — it IS the 2 / 4 / 7 contract, and `validateBoard` asserts
+ * each exit sits at EXACTLY its floor. Variety lives in the branching
+ * (forks, spur count/side/length, exit sides) and in the seeded shuffle of
+ * which fighter guards what and which spur holds which pickup. Templates
+ * that drift the floors fail their test rather than quietly changing the
+ * economy.
+ */
+
+
+/** The mandatory line. Changing this changes the 2/4/7 contract — don't. */
+const SPINE_KINDS = ['fight', 'fight', 'gate', 'fight', 'gate', 'fight', 'boss'];
+const SPINE_REGIONS = [1, 1, 2, 2, 3, 3, 3];
+const RUNGS = SPINE_KINDS.length;
+/** Lattice geometry. Display only — the sim and the economy never read x/y. */
+const SPINE_X = Math.floor(BOARD_W / 2);
+const START_Y = BOARD_H - 1;
+const rungY = (i) => START_Y - 3 - i * 4; // 28 … 4
+const EXIT3_Y = 1;
+/**
+ * The authored templates. Eight skeletons, all honouring the same floors.
+ * Read them as a picture: rung index = how deep, `side` = which way a branch
+ * leans, `chain` = how many guarded pickups deep the detour goes.
+ */
+const TEMPLATES = [
+    {
+        id: 'scrap-run',
+        rungs: [
+            { spurs: [{ side: -1, chain: ['cr'] }] },
+            { exit: { tier: 1, side: 1 } },
+            { spurs: [{ side: 1, chain: ['drink'] }] },
+            { spurs: [{ side: 1, chain: ['cr'] }], exit: { tier: 2, side: -1 } },
+            { spurs: [{ side: -1, chain: ['cr'] }] },
+            { spurs: [{ side: 1, chain: ['drink'] }] },
+            { exit: { tier: 3, side: 1 } },
+        ],
+    },
+    {
+        id: 'twin-stacks',
+        rungs: [
+            { fork: -1 },
+            { spurs: [{ side: 1, chain: ['cr'] }], exit: { tier: 1, side: -1 } },
+            {},
+            { fork: 1, spurs: [{ side: -1, chain: ['cr'] }], exit: { tier: 2, side: 1 } },
+            { spurs: [{ side: -1, chain: ['drink'] }] },
+            { fork: -1, spurs: [{ side: 1, chain: ['cr'] }] },
+            { exit: { tier: 3, side: 1 } },
+        ],
+    },
+    {
+        id: 'deep-vault',
+        rungs: [
+            { spurs: [{ side: 1, chain: ['cr'] }] },
+            { exit: { tier: 1, side: -1 } },
+            { spurs: [{ side: -1, chain: ['cr', 'drink'] }] },
+            { exit: { tier: 2, side: 1 } },
+            { spurs: [{ side: 1, chain: ['cr'] }] },
+            { spurs: [{ side: -1, chain: ['cr', 'drink'] }] },
+            { exit: { tier: 3, side: 1 } },
+        ],
+    },
+    {
+        id: 'lean-line',
+        rungs: [
+            {},
+            { exit: { tier: 1, side: 1 } },
+            { spurs: [{ side: -1, chain: ['drink'] }] },
+            { exit: { tier: 2, side: -1 } },
+            {},
+            { spurs: [{ side: 1, chain: ['cr'] }] },
+            { exit: { tier: 3, side: 1 } },
+        ],
+    },
+    {
+        id: 'both-sides',
+        rungs: [
+            { spurs: [{ side: -1, chain: ['cr'] }, { side: 1, chain: ['cr'] }] },
+            { exit: { tier: 1, side: 1 } },
+            { spurs: [{ side: -1, chain: ['drink'] }, { side: 1, chain: ['cr'] }] },
+            { exit: { tier: 2, side: -1 } },
+            { spurs: [{ side: 1, chain: ['cr'] }] },
+            { spurs: [{ side: -1, chain: ['drink'] }, { side: 1, chain: ['cr'] }] },
+            { exit: { tier: 3, side: 1 } },
+        ],
+    },
+    {
+        id: 'gauntlet-fork',
+        rungs: [
+            { fork: 1 },
+            { spurs: [{ side: -1, chain: ['cr'] }], exit: { tier: 1, side: 1 } },
+            { fork: -1 },
+            { spurs: [{ side: 1, chain: ['drink'] }], exit: { tier: 2, side: -1 } },
+            { fork: 1 },
+            { spurs: [{ side: -1, chain: ['cr', 'drink'] }] },
+            { exit: { tier: 3, side: 1 } },
+        ],
+    },
+    {
+        id: 'core-rush',
+        rungs: [
+            { spurs: [{ side: 1, chain: ['cr'] }] },
+            { exit: { tier: 1, side: -1 } },
+            {},
+            { spurs: [{ side: -1, chain: ['cr'] }], exit: { tier: 2, side: 1 } },
+            { spurs: [{ side: -1, chain: ['drink'] }, { side: 1, chain: ['cr'] }] },
+            { spurs: [{ side: 1, chain: ['cr', 'drink'] }] },
+            { exit: { tier: 3, side: 1 } },
+        ],
+    },
+    {
+        id: 'the-long-way',
+        rungs: [
+            { spurs: [{ side: -1, chain: ['cr'] }] },
+            { fork: 1, exit: { tier: 1, side: -1 } },
+            { spurs: [{ side: 1, chain: ['cr'] }] },
+            { spurs: [{ side: -1, chain: ['drink'] }], exit: { tier: 2, side: 1 } },
+            { fork: -1 },
+            { spurs: [{ side: 1, chain: ['cr'] }, { side: -1, chain: ['drink'] }] },
+            { exit: { tier: 3, side: 1 } },
+        ],
+    },
+];
+const templateIds = () => TEMPLATES.map((t) => t.id);
+// ------------------------------------------------------------------- rng
+/**
+ * xorshift32 — seeded, dependency-free, and deliberately NOT Math.random:
+ * a board must be exactly reproducible from (templateId, seed) so a support
+ * question or a test can rebuild the exact run a player saw.
+ */
+const rng = (seed) => {
+    let s = seed >>> 0 || 0x9e3779b9;
+    return () => {
+        s ^= s << 13;
+        s >>>= 0;
+        s ^= s >>> 17;
+        s ^= s << 5;
+        s >>>= 0;
+        return s / 0x1_0000_0000;
+    };
+};
+const shuffled = (items, rand) => {
+    const out = items.slice();
+    for (let i = out.length - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1));
+        [out[i], out[j]] = [out[j], out[i]];
+    }
+    return out;
+};
+/**
+ * AI skill for a rung: interpolated across ITS REGION's band, so difficulty
+ * tracks DEPTH rather than how many optional fights the player has taken.
+ * A long, safe, low-tier detour must never be free money.
+ */
+const rungSkill = (i) => {
+    const region = SPINE_REGIONS[i];
+    const first = SPINE_REGIONS.indexOf(region);
+    const last = SPINE_REGIONS.lastIndexOf(region);
+    const [lo, hi] = REGION_SKILL[region];
+    const t = last === first ? 1 : (i - first) / (last - first);
+    return Math.round(lo + (hi - lo) * t);
+};
+/** Board drinks roll HERE, at generation — never in the sim (ADR 0007). */
+const rollDrink = (region, rand) => {
+    const tier = region === 1 ? 1
+        : region === 2 ? (rand() < 0.7 ? 1 : 2)
+            : (rand() < 0.6 ? 2 : 3);
+    const pool = ITEMS.filter((i) => i.tier === tier);
+    const def = pool[Math.floor(rand() * pool.length)] ?? ITEMS[0];
+    return { itemId: def.id, tier: def.tier };
+};
+/**
+ * Stamp one run's board. Throws if the produced graph fails validation —
+ * a template bug must be loud at generation time, never a silently
+ * unwinnable (or silently free) run in a player's hands.
+ */
+const generateBoard = (opts) => {
+    const seed = opts.seed | 0;
+    const rand = rng(seed);
+    const template = opts.templateId
+        ? TEMPLATES.find((t) => t.id === opts.templateId)
+        : TEMPLATES[Math.floor(rand() * TEMPLATES.length)];
+    if (!template)
+        throw new Error(`unknown arcade template "${opts.templateId}"`);
+    const nodes = [];
+    const edges = [];
+    const add = (n) => {
+        nodes.push({ ...n, id: nodes.length });
+        return nodes.length - 1;
+    };
+    const link = (from, to) => { edges.push([from, to]); };
+    const start = add({ x: SPINE_X, y: START_Y, kind: 'start', region: 1 });
+    /** Nodes you can be standing on at rung i (spine + optional fork). */
+    const rungEntries = [];
+    /**
+     * Spurs hanging off rung i: enter at `head`, rejoin the next rung from any
+     * `tail`. EVERY pickup in a chain is a tail, not just the last one — a
+     * 2-deep spur must let you bank the first pickup and bail back to the
+     * spine, or "go one deeper?" stops being a decision and becomes a trap.
+     */
+    const rungSpurs = [];
+    /** The exit hanging off rung i, if any. */
+    const rungExit = [];
+    for (let i = 0; i < RUNGS; i++) {
+        const spec = template.rungs[i] ?? {};
+        const region = SPINE_REGIONS[i];
+        const skill = rungSkill(i);
+        const y = rungY(i);
+        const entries = [
+            add({ x: SPINE_X, y, kind: SPINE_KINDS[i], region, skill }),
+        ];
+        if (spec.fork !== undefined) {
+            entries.push(add({ x: SPINE_X + spec.fork * 5, y, kind: 'fight', region, skill }));
+        }
+        rungEntries.push(entries);
+        // Spurs: a chain of (fighter → pickup) pairs that rejoins the next rung.
+        // Geometry is fixed per chain length so nothing overlaps — validateBoard
+        // asserts coordinate uniqueness, so a bad offset fails loudly.
+        const spurs = [];
+        for (const spur of spec.spurs ?? []) {
+            const s = spur.side;
+            const single = spur.chain.length === 1;
+            const tails = [];
+            let head = -1;
+            let prevLoot = -1;
+            spur.chain.forEach((pickup, k) => {
+                const fx = SPINE_X + s * (single ? 7 : k === 0 ? 6 : 13);
+                const fy = y - (single ? 1 : k === 0 ? 1 : 3);
+                const lx = SPINE_X + s * (single ? 11 : k === 0 ? 10 : 9);
+                const ly = y - (single ? 3 : k === 0 ? 2 : 4);
+                const fight = add({ x: fx, y: fy, kind: 'fight', region, skill });
+                const loot = add({
+                    x: lx, y: ly, kind: 'loot', region,
+                    loot: pickup === 'cr'
+                        ? { kind: 'credits', amount: REGION_CREDITS[region] }
+                        : { kind: 'drink', ...rollDrink(region, rand) },
+                });
+                link(fight, loot);
+                if (prevLoot >= 0)
+                    link(prevLoot, fight);
+                if (head < 0)
+                    head = fight;
+                prevLoot = loot;
+                tails.push(loot);
+            });
+            if (head >= 0)
+                spurs.push({ head, tails });
+        }
+        rungSpurs.push(spurs);
+        rungExit.push(spec.exit
+            ? add({
+                x: spec.exit.tier === 3 ? SPINE_X : SPINE_X + spec.exit.side * 11,
+                y: spec.exit.tier === 3 ? EXIT3_Y : y - 2,
+                kind: 'exit', region, exitTier: spec.exit.tier,
+            })
+            : null);
+    }
+    // ---- wire it up. A rung's fight nodes lead to: the next rung, this
+    // rung's spur heads, and this rung's exit. Spur tails rejoin the next rung.
+    for (const e of rungEntries[0])
+        link(start, e);
+    for (let i = 0; i < RUNGS; i++) {
+        const next = rungEntries[i + 1];
+        const ex = rungExit[i];
+        for (const from of rungEntries[i]) {
+            if (next)
+                for (const to of next)
+                    link(from, to);
+            for (const spur of rungSpurs[i])
+                link(from, spur.head);
+            if (ex !== null && ex !== undefined)
+                link(from, ex);
+        }
+        if (next) {
+            for (const spur of rungSpurs[i])
+                for (const t of spur.tails)
+                    for (const to of next)
+                        link(t, to);
+        }
+    }
+    // ---- populate the fighters. Shuffled roster, no repeats until it runs out.
+    const pool = opts.roster.length > 0 ? shuffled(opts.roster, rand) : [];
+    let pick = 0;
+    for (const n of nodes) {
+        if (!isFightNode(n))
+            continue;
+        n.charId = pool.length > 0 ? pool[pick++ % pool.length] : '';
+    }
+    const board = { templateId: template.id, seed, nodes, edges, start };
+    const problems = validateBoard(board);
+    if (problems.length > 0) {
+        throw new Error(`arcade template "${template.id}" produced an invalid board:\n  ${problems.join('\n  ')}`);
+    }
+    return board;
+};
+// ------------------------------------------------------------- validation
+/**
+ * Structural audit of a generated board. Returns human-readable problems;
+ * empty means the board honours every rule the economy depends on.
+ *
+ * These are not style checks. Each one, if violated, breaks real money:
+ * a cycle lets a player farm one loot node forever; an unguarded pickup is
+ * a credit printer; a short path to a deep exit sells 18 credits for two
+ * fights.
+ */
+const validateBoard = (b) => {
+    const problems = [];
+    const say = (m) => { problems.push(m); };
+    // ---- ids, coordinates, uniqueness
+    const seenIds = new Set();
+    const seenXY = new Set();
+    for (const n of b.nodes) {
+        if (seenIds.has(n.id))
+            say(`duplicate node id ${n.id}`);
+        seenIds.add(n.id);
+        if (n.x < 0 || n.x >= BOARD_W || n.y < 0 || n.y >= BOARD_H) {
+            say(`node ${n.id} is off the ${BOARD_W}×${BOARD_H} lattice at (${n.x},${n.y})`);
+        }
+        const xy = `${n.x},${n.y}`;
+        if (seenXY.has(xy))
+            say(`two nodes occupy (${xy}) — they would draw on top of each other`);
+        seenXY.add(xy);
+    }
+    for (const [from, to] of b.edges) {
+        if (!seenIds.has(from) || !seenIds.has(to))
+            say(`edge ${from}→${to} references a missing node`);
+        if (from === to)
+            say(`node ${from} links to itself`);
+    }
+    // ---- it must be a DAG: backtracking would make loot farmable
+    const order = topoOrder(b);
+    if (!order) {
+        say('board contains a cycle — one-way progression is what makes loot finite');
+        return problems; // every check below assumes a DAG
+    }
+    // ---- reachability + no dead ends
+    const reached = new Set([b.start]);
+    for (const id of order) {
+        if (!reached.has(id))
+            continue;
+        for (const s of successors(b, id))
+            reached.add(s);
+    }
+    for (const n of b.nodes) {
+        if (!reached.has(n.id))
+            say(`node ${n.id} (${n.kind}) is unreachable from the start`);
+        if (n.kind !== 'exit' && successors(b, n.id).length === 0) {
+            say(`node ${n.id} (${n.kind}) is a dead end — only exits may terminate`);
+        }
+        if (isFightNode(n) && (n.skill === undefined || n.skill <= 0)) {
+            say(`fight node ${n.id} has no skill`);
+        }
+    }
+    // ---- THE rule: every pickup is guarded
+    for (const n of b.nodes) {
+        if (n.kind !== 'loot')
+            continue;
+        if (!n.loot) {
+            say(`loot node ${n.id} carries nothing`);
+            continue;
+        }
+        const preds = predecessors(b, n.id);
+        if (preds.length === 0)
+            say(`loot node ${n.id} has no predecessor`);
+        for (const p of preds) {
+            const pn = nodeById(b, p);
+            if (!pn || !isFightNode(pn)) {
+                say(`loot node ${n.id} can be reached without a fight (via ${p}) — free credits`);
+            }
+        }
+        if (successors(b, n.id).length === 0)
+            say(`loot node ${n.id} does not rejoin the board`);
+    }
+    // ---- the 2 / 4 / 7 contract, asserted EXACTLY
+    const exits = exitNodes(b);
+    const tiers = new Set(exits.map((e) => e.exitTier));
+    for (const tier of [1, 2, 3]) {
+        if (!tiers.has(tier))
+            say(`board has no tier-${tier} exit`);
+    }
+    for (const e of exits) {
+        const tier = e.exitTier;
+        const floor = EXIT_FIGHT_FLOOR[tier];
+        const got = minFights(b, b.start, e.id);
+        if (got !== floor) {
+            say(`exit tier ${tier} sits ${got} fights from the start — the contract is exactly ${floor}`);
+        }
+    }
+    // ---- the boss guards the deep exit, and nothing else does
+    const boss = b.nodes.filter((n) => n.kind === 'boss');
+    if (boss.length !== 1)
+        say(`expected exactly 1 boss node, found ${boss.length}`);
+    const deep = exits.find((e) => e.exitTier === 3);
+    if (boss[0] && deep && !predecessors(b, deep.id).includes(boss[0].id)) {
+        say('the tier-3 exit is not behind the boss');
+    }
+    return problems;
+};
+/**
+ * Validate every authored template at boot (cheap — eight small graphs). A
+ * template that drifts out of contract should stop the server, not quietly
+ * mis-price a run. Returns problems keyed by template id.
+ */
+const validateAllTemplates = (roster) => {
+    const out = {};
+    for (const t of TEMPLATES) {
+        try {
+            const b = generateBoard({ roster, templateId: t.id, seed: 12345 });
+            const p = validateBoard(b);
+            if (p.length > 0)
+                out[t.id] = p;
+        }
+        catch (e) {
+            out[t.id] = [String(e instanceof Error ? e.message : e)];
+        }
+    }
+    return out;
 };
 
 // ---- client/src/atlas.js ----
@@ -3600,7 +4279,7 @@ Object.assign(globalThis, {
  * (the classic GGPO throttle) rather than drift.
  */
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 6;
+const NET_PROTOCOL = 7;
 const MAX_AHEAD = 15;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -4070,9 +4749,11 @@ class SoloSession {
     retryTimer = null;
     constructor(url, name, character, bundleHash, authToken, email, ref, // stashed dare code (?ref=) — redeemed server-side once
     /**
-     * AGENT ARCADE (v4): queue the ranked gauntlet instead of a single solo
-     * match. `runToken` (from the previous battle's setup.arcade.token)
-     * continues an existing run; omitted = start a new run (entry fee).
+     * AGENT ARCADE v2 (v7, ADR 0008): queue one battle of a gauntlet run
+     * instead of a single solo match. `runToken` continues the run (minted
+     * by POST /arcade/enter, re-armed by every verified win) and `node` is
+     * the board node the player chose to move to — THE MOVE IS THE QUEUE.
+     * Omitting `node` puts the server on autopilot (headless agents only).
      */
     arcadeQueue, 
     /**
@@ -4105,6 +4786,7 @@ class SoloSession {
                     t: 'queue', character: this.character, bundleHash: this.bundleHash,
                     mode: this.arcadeQueue ? 'arcade' : 'solo',
                     runToken: this.arcadeQueue?.runToken || undefined,
+                    arcadeNode: this.arcadeQueue?.node,
                     agentOf: this.arcadeQueue ? undefined : this.agentOf || undefined,
                 });
                 this.status = 'queued';
@@ -8590,6 +9272,228 @@ const drawOpponentGone = (ctx, secsLeft, friendly, tick) => {
         ? "IF THEY DON'T RETURN, THE ROUND IS YOURS — NOTHING WAS STAKED"
         : "IF THEY DON'T RETURN, YOU WIN BY FORFEIT", VW / 2, boxY + 146, 11, '#ffd166');
 };
+const NODE_STROKE = {
+    start: '#e9e4f5',
+    fight: '#e2564a',
+    gate: '#f0a93b',
+    boss: '#ff5d3b',
+    loot: '#f2c14e',
+    exit: '#5cb85c',
+};
+/** Board lattice to screen pixels. One place, so hit-testing always agrees. */
+const MAP_X0 = 26;
+const MAP_Y0 = 92;
+const MAP_CELL = 13;
+const drawMap = (ctx, tick, v) => {
+    drawMenuBackdrop(ctx);
+    ctx.fillStyle = 'rgba(6,4,14,0.80)';
+    ctx.fillRect(0, 0, VW, VH);
+    const { board, at } = v;
+    const here = nodeById(board, at);
+    const options = successors(board, at)
+        .map((id) => nodeById(board, id))
+        .filter((n) => !!n);
+    display(ctx, 'GAUNTLET MAP', 26, 56, 34, { align: 'left', glow: 'rgba(255,209,102,0.45)' });
+    label(ctx, v.practice
+        ? 'PRACTICE RUN · NO ENTRY · NO REWARDS'
+        : `${REGION_NAME[here ? here.region : 1]} · ${v.fights} FIGHT${v.fights === 1 ? '' : 'S'} DEEP`, 26, 76, 12, '#ffd166cc', 'left');
+    const px = (x) => MAP_X0 + x * MAP_CELL;
+    const py = (y) => MAP_Y0 + y * MAP_CELL;
+    // The board needs its OWN dark plate. Without one the menu backdrop art
+    // reads straight through the lattice and the routes become unreadable —
+    // which is fatal for the one screen whose entire job is legibility.
+    const boardX = MAP_X0 - 10;
+    const boardW = 32 * MAP_CELL + 20;
+    ctx.fillStyle = 'rgba(8,5,18,0.86)';
+    ctx.fillRect(boardX, 92, boardW, VH - 92 - 24);
+    ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(boardX + 0.5, 92.5, boardW - 1, VH - 92 - 25);
+    // Region bands, so depth reads at a glance. Labels sit INSIDE the plate,
+    // right-aligned, so they never collide with the panel beside it.
+    const bands = [[1, '#e2564a'], [2, '#f0a93b'], [3, '#8b5cf6']];
+    for (const [region, color] of bands) {
+        const ys = board.nodes.filter((n) => n.region === region).map((n) => n.y);
+        if (ys.length === 0)
+            continue;
+        const top = Math.max(93, py(Math.min(...ys) - 1));
+        const bot = Math.min(VH - 25, py(Math.max(...ys) + 1));
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.12;
+        ctx.fillRect(boardX + 1, top, boardW - 2, bot - top);
+        ctx.globalAlpha = 1;
+        label(ctx, REGION_NAME[region], boardX + boardW - 8, top + 12, 9, `${color}ee`, 'right');
+    }
+    // Edges. The ones leaving HERE are lit; the rest are structure.
+    for (const [from, to] of board.edges) {
+        const a = nodeById(board, from);
+        const b = nodeById(board, to);
+        if (!a || !b)
+            continue;
+        const live = from === at;
+        ctx.strokeStyle = live ? 'rgba(255,209,102,0.85)' : 'rgba(255,255,255,0.14)';
+        ctx.lineWidth = live ? 2.2 : 1;
+        ctx.beginPath();
+        ctx.moveTo(px(a.x), py(a.y));
+        ctx.lineTo(px(b.x), py(b.y));
+        ctx.stroke();
+    }
+    for (const n of board.nodes) {
+        const cx = px(n.x);
+        const cy = py(n.y);
+        const isHere = n.id === at;
+        const reachable = options.some((o) => o.id === n.id);
+        const r = n.kind === 'boss' ? 8 : n.kind === 'exit' ? 7.5 : 6;
+        ctx.globalAlpha = isHere || reachable ? 1 : 0.5;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(10,7,20,0.9)';
+        ctx.fill();
+        ctx.strokeStyle = NODE_STROKE[n.kind] ?? '#ffffff';
+        ctx.lineWidth = reachable ? 2.6 : 1.6;
+        ctx.stroke();
+        if (n.loot && n.loot.kind === 'credits') {
+            label(ctx, `${n.loot.amount}`, cx, cy + 3, 9, '#f2c14e');
+        }
+        else if (n.loot && n.loot.kind === 'drink') {
+            label(ctx, '▯', cx, cy + 3.5, 10, '#4fc4d6');
+        }
+        else if (n.kind === 'exit') {
+            label(ctx, `${n.exitTier ?? 1}`, cx, cy + 3.5, 10, '#7ee85a');
+        }
+        else if (n.kind === 'boss') {
+            label(ctx, '☠', cx, cy + 4, 10, '#ff9d7a');
+        }
+        ctx.globalAlpha = 1;
+        // Reachable routes get a tap target far bigger than the dot.
+        if (reachable && !v.busy)
+            tapZone(cx - 13, cy - 13, 26, 26, `map:go:${n.id}`);
+    }
+    // "You are here" — the only animated thing on the screen.
+    if (here) {
+        const pulse = 10 + Math.sin(tick / 7) * 2;
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(px(here.x), py(here.y), pulse, 0, Math.PI * 2);
+        ctx.stroke();
+    }
+    // ---- the panel -----------------------------------------------------------
+    const panelX = 480;
+    const panelW = VW - panelX - 24;
+    ctx.fillStyle = 'rgba(10,6,22,0.66)';
+    ctx.fillRect(panelX, 92, panelW, VH - 92 - 24);
+    ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(panelX + 0.5, 92.5, panelW - 1, VH - 92 - 25);
+    let y = 118;
+    label(ctx, 'CARRYING', panelX + 16, y, 12, '#ffffff88', 'left');
+    const bagText = `${v.bag.credits} CR`
+        + (v.bag.drinks > 0 ? `  ·  ${v.bag.drinks} DRINK${v.bag.drinks === 1 ? '' : 'S'}` : '');
+    label(ctx, bagText, panelX + panelW - 16, y, 15, v.bag.credits > 0 ? '#f2c14e' : '#ffffff55', 'right');
+    y += 16;
+    label(ctx, v.bag.credits + v.bag.drinks > 0
+        ? 'LOSE A FIGHT AND THIS IS GONE'
+        : 'NOTHING TO LOSE YET', panelX + 16, y, 10, '#ff9d9d', 'left');
+    // Exit routes — the greed/speed decision, priced.
+    y += 26;
+    label(ctx, 'EXITS FROM HERE', panelX + 16, y, 12, '#ffffff88', 'left');
+    for (const { node, route } of exitRoutes(board, at)) {
+        y += 19;
+        const tier = node.exitTier ?? 1;
+        const gone = !route.reachable;
+        label(ctx, `EXIT ${tier}  ·  +${EXIT_BONUS[tier]} CR`, panelX + 16, y, 13, gone ? '#ffffff33' : '#7ee85a', 'left');
+        label(ctx, gone ? 'ROUTED PAST' : `${route.fights} FIGHT${route.fights === 1 ? '' : 'S'}`, panelX + panelW - 16, y, 13, gone ? '#ffffff33' : '#ffffffcc', 'right');
+    }
+    // Moves — one row per legal route, quoting cost and prize.
+    y += 30;
+    label(ctx, 'YOUR MOVE', panelX + 16, y, 12, '#ffffff88', 'left');
+    let slot = 0;
+    for (const n of options) {
+        y += 30;
+        slot++;
+        const rowY = y - 20;
+        const hot = !v.busy;
+        ctx.fillStyle = hot ? 'rgba(255,209,102,0.10)' : 'rgba(255,255,255,0.04)';
+        ctx.fillRect(panelX + 12, rowY, panelW - 24, 26);
+        if (hot)
+            tapZone(panelX + 12, rowY, panelW - 24, 26, `map:go:${n.id}`);
+        if (n.kind === 'exit') {
+            const tier = n.exitTier ?? 1;
+            label(ctx, `${slot}  EXTRACT HERE`, panelX + 20, y - 2, 13, '#7ee85a', 'left');
+            label(ctx, `+${EXIT_BONUS[tier]} CR`, panelX + panelW - 20, y - 2, 13, '#7ee85a', 'right');
+            continue;
+        }
+        // A guarded pickup: name the prize, because the prize IS the offer.
+        const behind = successors(board, n.id)
+            .map((s) => nodeById(board, s))
+            .filter((b) => !!b);
+        const prize = behind.length === 1 ? behind[0].loot : undefined;
+        const who = v.nameOf(n.charId ?? '').toUpperCase().slice(0, 14);
+        const kindTag = n.kind === 'boss' ? 'BOSS · ' : n.kind === 'gate' ? 'GATE · ' : '';
+        label(ctx, `${slot}  ${kindTag}${who}`, panelX + 20, y - 2, 13, '#ffffffdd', 'left');
+        label(ctx, prize && prize.kind === 'credits' ? `+${prize.amount} CR · 1 FIGHT`
+            : prize && prize.kind === 'drink' ? '+1 DRINK · 1 FIGHT'
+                : '1 FIGHT', panelX + panelW - 20, y - 2, 12, prize ? '#f2c14e' : '#ffffff77', 'right');
+    }
+    if (options.length === 0) {
+        y += 26;
+        label(ctx, 'NO ROUTES LEFT — THIS RUN IS OVER', panelX + 16, y, 12, '#ff9d9d', 'left');
+    }
+    if (v.busy)
+        label(ctx, 'WORKING…', panelX + panelW / 2, VH - 44, 13, '#ffd166');
+    if (v.toast)
+        label(ctx, v.toast.slice(0, 46), VW / 2, VH - 32, 12, '#ffd166');
+    label(ctx, '1-4 / TAP: TAKE A ROUTE      ESC: ABANDON THE RUN', 26, VH - 14, 11, '#ffffff66', 'left');
+};
+const drawExtract = (ctx, tick, v) => {
+    drawMenuBackdrop(ctx);
+    ctx.fillStyle = 'rgba(4,10,6,0.84)';
+    ctx.fillRect(0, 0, VW, VH);
+    const cx = VW / 2;
+    display(ctx, 'EXTRACTED', cx, 150, 64, {
+        from: '#e8ffe6', mid: '#7ee85a', to: '#2e7a39', glow: 'rgba(126,232,90,0.45)',
+    });
+    label(ctx, `EXIT ${v.exitTier} · ${v.fights} FIGHT${v.fights === 1 ? '' : 'S'} SURVIVED`, cx, 178, 14, '#ffffffcc');
+    // The receipt gets its own plate. This is the one screen where a player
+    // checks arithmetic against what the board promised — the backdrop art
+    // reads straight through otherwise and the numbers stop being numbers.
+    const rows = 2
+        + (!v.practice && v.multiplierPct < 100 ? 1 : 0)
+        + (v.drinks > 0 ? 1 : 0)
+        + (v.drinksLeftBehind > 0 ? 1 : 0);
+    const plateH = 26 * rows + 62;
+    ctx.fillStyle = 'rgba(6,12,8,0.88)';
+    ctx.fillRect(cx - 214, 208, 428, plateH);
+    ctx.strokeStyle = 'rgba(126,232,90,0.28)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(cx - 213.5, 208.5, 427, plateH - 1);
+    let y = 236;
+    const row = (k, val, color = '#ffffffdd') => {
+        label(ctx, k, cx - 190, y, 14, '#ffffff88', 'left');
+        label(ctx, val, cx + 190, y, 16, color, 'right');
+        y += 26;
+    };
+    row('PICKED UP', `${v.bag} CR`);
+    row(`EXIT ${v.exitTier} BONUS`, `+${v.bonus} CR`);
+    if (!v.practice && v.multiplierPct < 100)
+        row("TODAY'S RATE", `x${v.multiplierPct}%`, '#ffd166');
+    if (v.drinks > 0)
+        row('DRINKS BANKED', `${v.drinks}`, '#4fc4d6');
+    if (v.drinksLeftBehind > 0)
+        row('OVER DAILY DRINK CAP', `${v.drinksLeftBehind} LOST`, '#ff9d9d');
+    y += 8;
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cx - 190, y - 18);
+    ctx.lineTo(cx + 190, y - 18);
+    ctx.stroke();
+    label(ctx, v.practice ? 'PRACTICE — NOTHING BANKED' : 'BANKED', cx - 190, y, 15, '#ffffff', 'left');
+    label(ctx, v.practice ? '0 CR' : `+${v.granted} CR`, cx + 190, y, 26, v.practice ? '#ffffff55' : '#7ee85a', 'right');
+    label(ctx, 'TAP / ENTER: TITLE', cx, VH - 40, 13, `rgba(255,255,255,${0.55 + Math.sin(tick / 10) * 0.25})`);
+    tapZone(0, 0, VW, VH, 'start');
+};
 
 // ---- client/src/autospecial.js ----
 /**
@@ -9235,6 +10139,33 @@ try {
     addEventListener('unhandledrejection', (e) => reportClientError('unhandledrejection', e.reason));
 }
 catch { /* addEventListener unavailable in this context — non-fatal */ }
+// Storage that never throws (audit 2026-07-18 client #1). localStorage access
+// raises SecurityError in sandboxed iframes / hardened-privacy contexts — and
+// this module reads it at TOP LEVEL (the remembered fighter, below). An
+// unguarded throw there aborts the whole bundle at eval time, before any error
+// UI exists → a permanent white screen, in exactly the embed contexts the game
+// is shared into (dare / share links). These wrappers degrade storage to a
+// no-op instead of crashing the app.
+const safeGetItem = (k) => {
+    try {
+        return localStorage.getItem(k);
+    }
+    catch {
+        return null;
+    }
+};
+const safeSetItem = (k, v) => {
+    try {
+        localStorage.setItem(k, v);
+    }
+    catch { /* storage unavailable — non-fatal */ }
+};
+const safeRemoveItem = (k) => {
+    try {
+        localStorage.removeItem(k);
+    }
+    catch { /* storage unavailable — non-fatal */ }
+};
 // fetch with a hard timeout (audit 2026-07-18 client #4). Browser fetch has no
 // default timeout — minutes on a stalled mobile connection — and a hung request
 // SOFT-LOCKS UI flows that gate on it (the shop reel spins until its buy
@@ -9369,7 +10300,7 @@ let practiceFree = false; // offline-fallback match: no fee, no XP, no records
 // ---- P0 loop redesign: quick play, VS card, wallet strip.
 // The remembered fighter makes the title's ENTER a one-input path to a match.
 const LAST_FIGHTER_KEY = 'af-last-fighter';
-let lastFighter = localStorage.getItem(LAST_FIGHTER_KEY) ?? '';
+let lastFighter = safeGetItem(LAST_FIGHTER_KEY) ?? '';
 /** Title-screen Music/SFX/Hits dropdown (speaker chip always visible). */
 let audioMenuOpen = false;
 /** Ambient menu video — paused during fights to free its decoder (iOS memory). */
@@ -9401,7 +10332,7 @@ const toggleSignIn = () => {
 // redeems it server-side (+25 credits each, once ever, new accounts only).
 const REF_CODE_KEY = 'af-ref-code';
 const DARE_LINK_BASE = 'https://agent-fighter-web.vercel.app/dare';
-const storedRef = () => localStorage.getItem(REF_CODE_KEY) ?? undefined;
+const storedRef = () => safeGetItem(REF_CODE_KEY) ?? undefined;
 let referralToastAge = -1; // ≥0 → the "+25 DARE ACCEPTED" toast is animating
 // ---- Invite screen ("PUT A BOUNTY ON YOUR OWN HEAD") — the sender side of
 // the dare loop. The chosen taunt rides the link as ?t= so the landing page
@@ -9668,7 +10599,7 @@ const fetchAccount = async () => {
         // The server has now decided the referral (granted or ineligible) —
         // either way the code is spent for this account. Stop resending it.
         if (ref)
-            localStorage.removeItem(REF_CODE_KEY);
+            safeRemoveItem(REF_CODE_KEY);
         accountFetch = 'done';
         // TRAIN MY AGENT (ADR 0006): the coached config gates + drives AUTO
         // (hands-free) mode. Best-effort — no config just leaves AUTO locked.
@@ -10009,20 +10940,22 @@ const ARCADE_RUN_KEY = 'af-arcade-run';
 const storeArcadeRun = (r) => {
     try {
         if (r)
-            localStorage.setItem(ARCADE_RUN_KEY, JSON.stringify(r));
+            safeSetItem(ARCADE_RUN_KEY, JSON.stringify(r));
         else
-            localStorage.removeItem(ARCADE_RUN_KEY);
+            safeRemoveItem(ARCADE_RUN_KEY);
     }
     catch { /* private mode — resume is best-effort */ }
 };
 /** The stored run, if it's fresh enough for the server to still hold it. */
 const storedArcadeRun = () => {
     try {
-        const raw = localStorage.getItem(ARCADE_RUN_KEY);
+        const raw = safeGetItem(ARCADE_RUN_KEY);
         if (!raw)
             return null;
         const r = JSON.parse(raw);
-        if (!r.token || !r.charId || Date.now() - r.ts > 4 * 60_000)
+        // Kept just inside the server's ARCADE_NEXT_GRACE_MS (30min, ADR 0008) so
+        // the RESUME pill never offers a run the server has already swept.
+        if (!r.token || !r.charId || Date.now() - r.ts > 25 * 60_000)
             return null;
         return r;
     }
@@ -10213,7 +11146,7 @@ const applyBootDeepLink = () => {
     // the AIR dialog round-trip and redeems on the first signed-in contact.
     const refQ = q.get('ref');
     if (refQ && /^[A-Za-z0-9-]{3,40}$/.test(refQ)) {
-        localStorage.setItem(REF_CODE_KEY, refQ.toUpperCase());
+        safeSetItem(REF_CODE_KEY, refQ.toUpperCase());
     }
     // Live challenge (?room=): remember it in-memory only — it's a "fight me
     // RIGHT NOW" invitation, not a durable coupon. The title branch auto-joins
@@ -10294,10 +11227,12 @@ const resetMatchFx = (g) => {
  * 'friendly' = private challenge (v5): PvP paired by `friendlyRoom` instead
  *   of the public queue. FREE and UNRANKED — verified winner, nothing else.
  */
-const startOnline = (m, runToken, agentOf) => {
+const startOnline = (m, runToken, agentOf, 
+/** ARCADE v2: the board node being moved to — the move IS the queue. */
+arcadeNode) => {
     const roster = allRosters[picks[0]];
     lastFighter = roster.id;
-    localStorage.setItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
+    safeSetItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
     queuedMode = m;
     queuedAgentOf = m === 'solo' ? agentOf ?? '' : ''; // rematch re-queues the same agent
     // CONSUMABLES (ADR 0007 final shape): nothing to send — the server reads
@@ -10318,7 +11253,7 @@ const startOnline = (m, runToken, agentOf) => {
         // solo house AI for the trained agent behind a dare code.
         net = m === 'wager' || m === 'friendly'
             ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(), m === 'friendly' ? friendlyRoom : undefined)
-            : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(), m === 'arcade' ? { runToken } : undefined, m === 'solo' ? agentOf : undefined);
+            : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(), m === 'arcade' ? { runToken, node: arcadeNode } : undefined, m === 'solo' ? agentOf : undefined);
     });
 };
 /**
@@ -10383,22 +11318,23 @@ const installOnlineMatch = () => {
     netInstalled = true;
     quitConfirm = false; // fresh match — clear any stale quit prompt
     screen = 'fight';
-    // AGENT ARCADE: adopt the SERVER's run position — it owns the sequencing.
+    // AGENT ARCADE v2: the SERVER owns the run position — adopt, never assert.
+    // The BOARD is not in this message (it never changes mid-run and is far too
+    // big to repeat); it was fetched once from POST /arcade/run.
     if (s.mode === 'arcade' && s.arcade) {
-        arcade = {
-            practice: false,
-            stage: s.arcade.battle,
-            total: s.arcade.total,
-            opponents: [],
-            runToken: s.arcade.token,
-        };
-        // Crash insurance (ADR 0007): entries are non-refundable now, so the run
-        // token must survive a killed PWA — the title offers RESUME within the
-        // server's grace window instead of silently eating the credit.
+        if (arcade && !arcade.practice) {
+            arcade.pending = s.arcade.node;
+            arcade.fights = s.arcade.fights;
+            arcade.total = s.arcade.total;
+            arcade.runToken = s.arcade.token;
+        }
+        // Crash insurance (ADR 0007): entries are non-refundable, so the run token
+        // must survive a killed PWA — the title offers RESUME within the server's
+        // grace window instead of silently eating the credit.
         storeArcadeRun({
             token: s.arcade.token,
             charId: s.chars[0].id,
-            battle: s.arcade.battle,
+            battle: s.arcade.fights,
             total: s.arcade.total,
             ts: Date.now(),
         });
@@ -10410,8 +11346,12 @@ const installOnlineMatch = () => {
     vsCardAge = 0;
     vsStakes = s.mode === 'arcade'
         ? [
-            `BATTLE ${(s.arcade?.battle ?? 0) + 1} OF ${s.arcade?.total ?? 0}${(s.fee ?? 0) > 0 ? `      ENTRY −${s.fee} CR` : ''}`,
-            "RANKED GAUNTLET · SERVER-VERIFIED · LOSE ONCE AND IT'S GAME OVER",
+            `${arcade ? REGION_NAME[nodeById(arcade.board, s.arcade?.node ?? -1)?.region ?? 1] : 'GAUNTLET'}`
+                + `      ${s.arcade?.fights ?? 0} FIGHT${(s.arcade?.fights ?? 0) === 1 ? '' : 'S'} DEEP`
+                + (arcade && arcade.bag.credits > 0 ? `      CARRYING ${arcade.bag.credits} CR` : ''),
+            arcade && arcade.bag.credits + arcade.bag.drinks.length > 0
+                ? 'LOSE AND THE BAG IS GONE · SERVER-VERIFIED'
+                : "RANKED GAUNTLET · SERVER-VERIFIED · LOSE ONCE AND IT'S GAME OVER",
         ]
         : s.mode === 'solo'
             ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP',
@@ -10426,7 +11366,7 @@ const installOnlineMatch = () => {
     if (myDrinks.length > 0) {
         vsStakes.push(`🥤 ${myDrinks.map((d) => d.name).join(' · ')} — TAP A CAN OR PRESS R TO DRINK`);
     }
-    const newChallenger = s.mode === 'arcade' && (s.arcade?.battle ?? 0) > 0;
+    const newChallenger = s.mode === 'arcade' && (s.arcade?.fights ?? 0) > 0;
     void audio.playStinger(newChallenger ? 'here_comes_a_new_challenger' : 'vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
 const startFight = () => {
@@ -10452,52 +11392,244 @@ const startFight = () => {
     void audio.playStinger('vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
 // ---------------------------------------------------------------- arcade
+// AGENT ARCADE v2 (ADR 0008): a RUN is a walk across a generated 32x32 board.
+// Wins pay XP; credits come ONLY from board pickups banked by reaching an exit
+// alive. RANKED runs are server-authoritative — this module draws the board and
+// asks; the server owns where you stand and what you carry. PRACTICE runs
+// (guest / server-offline) use the identical generator locally, reward-free.
+let mapBusy = false; // an /arcade/* request is in flight
+let mapToast = '';
+/** Escape was pressed once with a loaded bag — the next one really quits. */
+let mapAbandonArmed = false;
+let extractView = null;
+/** The roster ids a board may be populated from (never the player's own). */
+const arcadeRoster = () => allRosters
+    .filter((r, i) => !r.disabled && i !== picks[0])
+    .map((r) => r.id);
+const rosterName = (charId) => allRosters.find((r) => r.id === charId)?.bundle.name ?? charId;
 /**
- * AI skill ramp across the gauntlet: the first battle is winnable by a
- * newcomer, the last one plays at near-max skill. (The 0-100 lever is
- * @af/core's createAi knob.)
- */
-const ARCADE_SKILL_MIN = 35, ARCADE_SKILL_MAX = 95;
-const arcadeSkill = (stage, total) => Math.round(ARCADE_SKILL_MIN
-    + (ARCADE_SKILL_MAX - ARCADE_SKILL_MIN) * (total <= 1 ? 1 : stage / (total - 1)));
-/**
- * PRACTICE gauntlet — the offline fallback when the match server is
- * unreachable. Same run structure as ranked arcade, fully local: no fee,
- * no XP, no records.
+ * PRACTICE gauntlet — guests, and the fallback when the match server is
+ * unreachable. Same board generator, same rules, fully local: no entry, no
+ * XP, no records, and an extraction that banks nothing.
  */
 const startArcadePractice = () => {
-    const me = picks[0];
-    const roster = allRosters[me];
+    const roster = allRosters[picks[0]];
     lastFighter = roster.id;
-    localStorage.setItem(LAST_FIGHTER_KEY, lastFighter);
-    // Every enabled agent except the player's own — shuffled so each run has a
-    // fresh order. A roster of one still works: it becomes a mirror match.
-    const opponents = allRosters
-        .map((r, i) => (!r.disabled && i !== me ? i : -1))
-        .filter((i) => i >= 0);
-    for (let i = opponents.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1)); // client-only — the sim gets its own seeds
-        [opponents[i], opponents[j]] = [opponents[j], opponents[i]];
-    }
-    if (opponents.length === 0)
-        opponents.push(me);
-    arcade = { practice: true, opponents, stage: 0, total: opponents.length };
-    startArcadeFight();
+    safeSetItem(LAST_FIGHTER_KEY, lastFighter);
+    const pool = arcadeRoster();
+    const board = generateBoard({
+        roster: pool.length > 0 ? pool : [roster.id],
+        seed: (Math.random() * 0x7fffffff) | 0,
+    });
+    arcade = {
+        practice: true, board, at: board.start, pending: -1,
+        fights: 0, total: EXIT_FIGHT_FLOOR[3], bag: { credits: 0, drinks: [] },
+    };
+    enterMap();
 };
-/** Begin the current PRACTICE stage — a fully local fight vs the next agent. */
-const startArcadeFight = () => {
+/** Show the board. Every route decision in the mode is made on this screen. */
+const enterMap = () => {
+    mapToast = '';
+    mapBusy = false;
+    mapAbandonArmed = false;
+    net = null;
+    cpuAi = null;
+    screen = 'map';
+    void audio.playBgm('player_select', { fadeInSec: 0.5 });
+};
+/**
+ * Walk a PRACTICE run onto `to` and sweep up what it lands on — the exact
+ * mirror of the server's advanceRun (server.ts). Auto-collect exists because
+ * a guarded pickup's fighter has the pickup as its ONLY successor: once the
+ * guard is beaten there is no decision left to make, so a manual step there
+ * could only ever go wrong.
+ */
+const practiceAdvance = (run, to) => {
+    run.at = to;
+    for (;;) {
+        const outs = successors(run.board, run.at);
+        if (outs.length !== 1)
+            break;
+        const next = nodeById(run.board, outs[0]);
+        if (!next || next.kind !== 'loot' || !next.loot)
+            break;
+        if (next.loot.kind === 'credits')
+            run.bag.credits += next.loot.amount;
+        else
+            run.bag.drinks.push({ itemId: next.loot.itemId, tier: next.loot.tier });
+        run.at = next.id;
+    }
+};
+/** POST /arcade/run — locks the fighter on the first call, resumes after. */
+const fetchArcadeRun = async (token, character) => {
+    const headers = await agentAuthHeaders();
+    if (!headers)
+        return false;
+    const res = await fetchT(`${matchHttpUrl()}/arcade/run`, {
+        method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token, character }),
+    });
+    const body = (await res.json().catch(() => ({})));
+    if (!res.ok || !body.board) {
+        mapToast = (body.error ?? 'RUN NOT FOUND').toUpperCase().slice(0, 46);
+        return false;
+    }
+    arcade = {
+        practice: false,
+        board: body.board,
+        at: body.at ?? body.board.start,
+        pending: body.pending ?? -1,
+        fights: body.fights ?? 0,
+        total: body.total ?? EXIT_FIGHT_FLOOR[3],
+        bag: body.bag ?? { credits: 0, drinks: [] },
+        runToken: token,
+    };
+    // Crash insurance: entries are non-refundable, so the token must survive a
+    // killed PWA — the title offers RESUME inside the server's grace window.
+    storeArcadeRun({
+        token,
+        charId: body.character ?? allRosters[picks[0]].id,
+        battle: arcade.fights,
+        total: arcade.total,
+        ts: Date.now(),
+    });
+    return true;
+};
+/** Start a RANKED run: lock the fighter, mint the board, show the map. */
+const startArcadeRanked = (token) => {
+    mapBusy = true;
+    mapToast = '';
+    screen = 'map';
+    void (async () => {
+        let ok = false;
+        try {
+            ok = await fetchArcadeRun(token, allRosters[picks[0]].id);
+        }
+        catch {
+            mapToast = 'SERVER UNREACHABLE';
+        }
+        mapBusy = false;
+        if (ok) {
+            enterMap();
+            return;
+        }
+        storeArcadeRun(null);
+        screen = 'title';
+        showToast(mapToast || 'ARCADE RUN FAILED');
+    })();
+};
+/** Refresh the run from the server after a battle — it owns the position. */
+const refreshArcadeRun = () => {
     const run = arcade;
-    const opp = run.opponents[run.stage];
-    picks[1] = opp;
-    fighters = [allRosters[picks[0]], allRosters[opp]];
+    if (!run || run.practice || !run.runToken)
+        return;
+    mapBusy = true;
+    const token = run.runToken;
+    void (async () => {
+        let ok = false;
+        try {
+            ok = await fetchArcadeRun(token);
+        }
+        catch {
+            mapToast = 'SERVER UNREACHABLE';
+        }
+        mapBusy = false;
+        if (!ok)
+            endArcade();
+    })();
+};
+/** Take a route: fight the chosen node, or extract through the chosen exit. */
+const arcadeGo = (nodeId) => {
+    const run = arcade;
+    if (!run || mapBusy)
+        return;
+    if (!isLegalMove(run.board, run.at, nodeId))
+        return;
+    const node = nodeById(run.board, nodeId);
+    if (!node)
+        return;
+    if (node.kind === 'exit') {
+        arcadeExtract(node);
+        return;
+    }
+    run.pending = nodeId;
+    if (run.practice) {
+        startPracticeFight(node);
+        return;
+    }
+    startOnline('arcade', run.runToken, undefined, nodeId);
+};
+/** Bank the bag and end the run — the only way credits leave the board. */
+const arcadeExtract = (node) => {
+    const run = arcade;
+    if (!run || mapBusy)
+        return;
+    const tier = (node.exitTier ?? 1);
+    if (run.practice) {
+        extractView = {
+            exitTier: tier, bonus: EXIT_BONUS[tier], bag: run.bag.credits,
+            granted: 0, multiplierPct: 0, drinks: run.bag.drinks.length,
+            drinksLeftBehind: 0, fights: run.fights, practice: true,
+        };
+        screen = 'extract';
+        return;
+    }
+    mapBusy = true;
+    void (async () => {
+        try {
+            const headers = await agentAuthHeaders();
+            if (!headers)
+                return;
+            const res = await fetchT(`${matchHttpUrl()}/arcade/extract`, {
+                method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token: run.runToken, node: node.id }),
+            });
+            const body = (await res.json().catch(() => ({})));
+            if (!res.ok) {
+                mapToast = (body.error ?? 'EXTRACTION FAILED').toUpperCase().slice(0, 46);
+                return;
+            }
+            if (typeof body.credits === 'number' && account) {
+                account = { ...account, credits: body.credits };
+            }
+            extractView = {
+                exitTier: body.exitTier ?? tier,
+                bonus: body.bonus ?? EXIT_BONUS[tier],
+                bag: body.bag ?? run.bag.credits,
+                granted: body.granted ?? 0,
+                multiplierPct: body.multiplierPct ?? 100,
+                drinks: body.drinks?.length ?? 0,
+                drinksLeftBehind: body.drinksLeftBehind ?? 0,
+                fights: body.fights ?? run.fights,
+                practice: false,
+            };
+            storeArcadeRun(null); // banked — nothing left to resume
+            screen = 'extract';
+        }
+        catch {
+            mapToast = 'SERVER UNREACHABLE — THE RUN IS STILL YOURS';
+        }
+        finally {
+            mapBusy = false;
+        }
+    })();
+};
+/** Begin a PRACTICE fight against the fighter standing on `node`. */
+const startPracticeFight = (node) => {
+    const run = arcade;
+    const opp = allRosters.findIndex((r) => r.id === node.charId);
+    picks[1] = opp >= 0 ? opp : picks[0];
+    fighters = [allRosters[picks[0]], allRosters[picks[1]]];
     setCharacters(fighters[0].ch, fighters[1].ch);
-    // Rotate the stage art each battle so the run tours the whole game.
+    // Rotate the stage art each battle so a run tours the whole game.
     if (stageAssets.length > 0) {
-        stageCursor = (seed + run.stage) % stageAssets.length;
+        stageCursor = (seed + run.fights) % stageAssets.length;
         setStageAsset(stageAssets[stageCursor] ?? null);
     }
     game = createGameState(seed++, currentStageBounds());
-    cpuAi = createAi(1, arcadeSkill(run.stage, run.total), seed * 31 + 7);
+    // The BOARD sets the difficulty (region band), not the fight count — a long
+    // safe detour must never be free money.
+    cpuAi = createAi(1, node.skill ?? 50, seed * 31 + 7);
     statDmg = 0;
     statBestCombo = 0;
     xpBanner = null;
@@ -10507,10 +11639,11 @@ const startArcadeFight = () => {
     screen = 'fight';
     vsCardAge = 0;
     vsStakes = [
-        `BATTLE ${run.stage + 1} OF ${run.total}`,
+        `${REGION_NAME[node.region]} · ${run.fights} FIGHT${run.fights === 1 ? '' : 'S'} DEEP`
+            + (run.bag.credits > 0 ? `      CARRYING ${run.bag.credits} CR` : ''),
         'PRACTICE GAUNTLET · NO FEE · NO XP · NO RECORDS',
     ];
-    void audio.playStinger(run.stage === 0 ? 'vs' : 'here_comes_a_new_challenger', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
+    void audio.playStinger(run.fights === 0 ? 'vs' : 'here_comes_a_new_challenger', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
 /** Leave the gauntlet (quit, GAME OVER, or full clear) → back to the title. */
 const endArcade = () => {
@@ -10867,12 +12000,12 @@ const renderFight = (g) => {
             // Arcade: the HUD prefixes the character name itself, so the server
             // name ("ELON · 1/8") would double it — show just the run position.
             `${arcade && !arcade.practice
-                ? `BATTLE ${arcade.stage + 1}/${arcade.total}`
+                ? `${arcade.fights + 1}/${arcade.total} DEEP`
                 : net.setup.names[1]}${net.setup.agents[1] ? ' · AGENT' : ''}${net.side === 1 ? ' (YOU)' : ''}`,
         ]
         : cpuAi
             ? ['', arcade
-                    ? `BATTLE ${arcade.stage + 1}/${arcade.total}`
+                    ? `${arcade.fights + 1}/${arcade.total} DEEP`
                     : `AGENT LV ${cpuLevelFor(profile, lever)}`]
             : undefined, autoSpecialCharged(g.fighters[localSide()]), hudIds(), 
     // CONSUMABLES: which side is the human's, so drawHud makes only YOUR can
@@ -10990,12 +12123,17 @@ const tickSelect = () => {
                     startArcadePractice();
                     return;
                 }
-                // SIGNED-IN (ADR 0007): a pre-paid run token queues battle 1 (fee
-                // already taken at /arcade/enter). No token = legacy path (escrow at
-                // battle 1). Either way the run is RANKED and server-verified.
-                const token = pendingArcadeToken || undefined;
+                // SIGNED-IN (ADR 0008): the pre-paid token now LOCKS the fighter and
+                // mints the board, then the map screen takes over. No token means the
+                // entry never landed — bounce to the title rather than play unpaid.
+                const token = pendingArcadeToken;
                 pendingArcadeToken = '';
-                startOnline('arcade', token);
+                if (!token) {
+                    screen = 'title';
+                    showToast('ENTER AGENT ARCADE FROM THE TITLE');
+                    return;
+                }
+                startArcadeRanked(token);
             }
             else if (!isSignedIn()) {
                 // WAGER needs the account for escrow — a guest who reached select via
@@ -11273,7 +12411,9 @@ const frame = (steps = 1) => {
             if (idx >= 0) {
                 picks = [idx, idx];
                 mode = 'cpu';
-                startOnline('arcade', resumable.token);
+                // The board lives server-side, so resuming is a plain read: the run
+                // comes back standing exactly where it fell.
+                startArcadeRanked(resumable.token);
             }
             else {
                 storeArcadeRun(null);
@@ -11385,6 +12525,71 @@ const frame = (steps = 1) => {
         }
         else if (pressedThisFrame.has('Escape') || taps.has('back')) {
             screen = 'title';
+        }
+    }
+    else if (screen === 'map' && arcade) {
+        // AGENT ARCADE v2 (ADR 0008): the board is the whole between-fights loop.
+        // Every credit in this mode is decided here — take the short line to an
+        // exit, or spend another fight on a guarded pile.
+        drawMap(ctx, uiTick, {
+            board: arcade.board,
+            at: arcade.at,
+            fights: arcade.fights,
+            total: arcade.total,
+            bag: { credits: arcade.bag.credits, drinks: arcade.bag.drinks.length },
+            practice: arcade.practice,
+            nameOf: rosterName,
+            busy: mapBusy,
+            toast: mapToast || undefined,
+        });
+        drawWalletStrip();
+        if (!mapBusy) {
+            // Taps carry the node id, so a mis-drawn row can never move the run
+            // somewhere illegal — arcadeGo re-checks the edge either way.
+            let chosen = -1;
+            for (const t of taps) {
+                if (t.startsWith('map:go:')) {
+                    const id = Number(t.slice(7));
+                    if (Number.isFinite(id))
+                        chosen = id;
+                }
+            }
+            // Keyboard 1-4 mirror the panel rows, in the same order they are drawn.
+            const options = successors(arcade.board, arcade.at);
+            for (let i = 0; i < Math.min(options.length, 4); i++) {
+                if (pressedThisFrame.has(`Digit${i + 1}`))
+                    chosen = options[i];
+            }
+            if (chosen >= 0) {
+                audio.playSfx('select_confirm');
+                arcadeGo(chosen);
+            }
+            else if (pressedThisFrame.has('Escape') || taps.has('back')) {
+                // Abandoning forfeits the bag exactly like dying does. When there IS
+                // a bag, say what it costs and make them mean it — one stray Escape
+                // must not be able to throw away credits they fought for.
+                const carrying = arcade.bag.credits + arcade.bag.drinks.length;
+                if (carrying > 0 && !mapAbandonArmed) {
+                    mapAbandonArmed = true;
+                    mapToast = `ESC AGAIN TO ABANDON — YOU LOSE ${arcade.bag.credits} CR`
+                        + (arcade.bag.drinks.length > 0 ? ` + ${arcade.bag.drinks.length} DRINK` : '');
+                }
+                else {
+                    endArcade();
+                }
+            }
+            else if (mapAbandonArmed && (pressedThisFrame.size > 0 || taps.size > 0)) {
+                mapAbandonArmed = false; // any other input stands the prompt down
+                mapToast = '';
+            }
+        }
+    }
+    else if (screen === 'extract' && extractView) {
+        drawExtract(ctx, uiTick, extractView);
+        drawWalletStrip();
+        if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('start')) {
+            extractView = null;
+            endArcade();
         }
     }
     else if (screen === 'shop') {
@@ -11904,11 +13109,24 @@ const frame = (steps = 1) => {
             resultsAge = 0;
             const lostIt = net.result.winner === 1 - localSide() || net.result.winner === -1;
             if (arcade) {
-                // Whatever ended it, the run is over server-side → GAME OVER card.
-                gameOverAge = 0;
-                screen = 'gameover';
-                audio.playSfx('you_lose', { volume: 0.8 });
-                void audio.playStinger('game_over');
+                if (net.result.reason === 'incomplete' && !arcade.practice) {
+                    // NO-CONTEST (network blip / pace flag): the server kept the run,
+                    // the position AND the bag. Showing GAME OVER here would tell a
+                    // player they lost a loaded run that is in fact still theirs —
+                    // send them back to the map and re-read the truth from the server.
+                    net.close();
+                    net = null;
+                    enterMap(); // clears the toast, so set it after
+                    mapToast = 'NO CONTEST — THE RUN AND YOUR BAG ARE INTACT';
+                    refreshArcadeRun();
+                }
+                else {
+                    // A real loss: the run is over server-side and the bag is gone.
+                    gameOverAge = 0;
+                    screen = 'gameover';
+                    audio.playSfx('you_lose', { volume: 0.8 });
+                    void audio.playStinger('game_over');
+                }
             }
             else {
                 screen = 'results';
@@ -11932,11 +13150,16 @@ const frame = (steps = 1) => {
                 // practice runs pay nothing by design.
                 if (game.winner === 0) {
                     screen = 'results';
-                    // Clearing the FINAL battle rolls the (very unserious) end credits
-                    // instead of the usual between-battles ranking loop.
-                    const cleared = arcade.stage + 1 >= arcade.total;
+                    // PRACTICE runs advance locally the way the server advances a ranked
+                    // one (practiceAdvance mirrors advanceRun, auto-collect included).
+                    // Ranked runs wait for the verdict and then re-read the server.
+                    if (arcade.practice && arcade.pending >= 0) {
+                        arcade.fights++;
+                        practiceAdvance(arcade, arcade.pending);
+                        arcade.pending = -1;
+                    }
                     void audio.playStinger('win', {
-                        onEnded: () => void audio.playBgm(cleared ? 'credits' : 'ranking', { fadeInSec: 1 }),
+                        onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
                     });
                 }
                 else {
@@ -12023,11 +13246,9 @@ const frame = (steps = 1) => {
         // Arcade: this screen is the between-battles interstitial. The run only
         // moves FORWARD (next challenger) or ENDS (quit to title) — there is no
         // path back to the select screen mid-run.
-        const arcadeDone = arcade ? arcade.stage + 1 >= arcade.total : false;
         drawResults(ctx, game, fighters, uiTick, resultsAge, xpBanner, arcade
-            ? (arcadeDone
-                ? `ARCADE COMPLETE — ALL ${arcade.total} AGENTS DOWN!        TAP / ENTER: TITLE`
-                : `BATTLE ${arcade.stage + 1} OF ${arcade.total} CLEARED        TAP / ENTER: NEXT CHALLENGER        ESC: QUIT`)
+            ? (`${arcade.bag.credits > 0 ? `CARRYING ${arcade.bag.credits} CR — UNBANKED` : 'ROUTE CLEARED'}`
+                + '        TAP / ENTER: BACK TO THE MAP        ESC: QUIT')
             : net
                 ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : queuedMode === 'friendly' ? 'FREE' : '10 CR'}        ESC: CHANGE FIGHTER`
                 : undefined, canDare, net?.result?.winner);
@@ -12081,22 +13302,14 @@ const frame = (steps = 1) => {
         }
         else if (pressedThisFrame.has('Enter') || taps.has('start')) {
             if (arcade) {
-                // Forward through the gauntlet — same fighter, next challenger.
-                if (arcadeDone) {
-                    endArcade();
-                }
-                else if (arcade.practice) {
-                    arcade.stage++;
-                    startArcadeFight();
-                }
-                else {
-                    // RANKED: re-queue with the run token — the server owns the next
-                    // battle (opponent, skill, position) and re-validates the token.
-                    const token = arcade.runToken;
-                    net?.close();
-                    net = null;
-                    startOnline('arcade', token);
-                }
+                // Forward is the MAP: the next decision is a route, not a rematch.
+                // Ranked runs re-read the server first — it, not this client, owns
+                // where the run now stands and what ended up in the bag.
+                net?.close();
+                net = null;
+                enterMap();
+                if (!arcade.practice)
+                    refreshArcadeRun();
             }
             else if (net) {
                 // INSTANT REMATCH (P0): one input → straight back into the queue
@@ -12128,7 +13341,7 @@ const frame = (steps = 1) => {
         renderFight(game);
         drawGameOver(ctx, uiTick, gameOverAge, {
             by: fighters?.[1]?.bundle.name ?? 'THE HOUSE',
-            stage: (arcade?.stage ?? 0) + 1,
+            stage: (arcade?.fights ?? 0) + 1,
             total: arcade?.total ?? 1,
         });
         // Ranked run: the server's verdict (and the XP burn) land moments after
@@ -12309,6 +13522,29 @@ Object.assign(globalThis, {
     // Sever the live socket WITHOUT the leave-intent flag — simulates a wifi
     // blip so the reconnect path can be tested from the console/automation.
     afNetDrop: () => { net?.debugDrop(); },
+    /**
+     * AGENT ARCADE v2 run state. Exposed deliberately: the last time a new
+     * field was verified live it was missing from the hooks, so the browser
+     * probe read `undefined` and a working feature looked broken for ten
+     * cycles. Anything automation needs to assert about a run goes HERE.
+     */
+    afArcade: () => (arcade ? {
+        practice: arcade.practice,
+        templateId: arcade.board.templateId,
+        seed: arcade.board.seed,
+        nodes: arcade.board.nodes.length,
+        at: arcade.at,
+        pending: arcade.pending,
+        fights: arcade.fights,
+        total: arcade.total,
+        bag: { credits: arcade.bag.credits, drinks: arcade.bag.drinks.length },
+        moves: successors(arcade.board, arcade.at).map((id) => {
+            const n = nodeById(arcade.board, id);
+            return { id, kind: n.kind, charId: n.charId, exitTier: n.exitTier };
+        }),
+        busy: mapBusy,
+        toast: mapToast,
+    } : null),
 });
 // Actions that open an OS / OAuth surface (share sheet, clipboard, the AIR
 // sign-in dialog) MUST run in the same turn as the pointer event. The menu

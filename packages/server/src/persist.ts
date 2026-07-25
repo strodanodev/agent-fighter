@@ -18,13 +18,13 @@
  *  · solo (single match vs house bot): fee 1 → escrowed at match start.
  *    Win: +2 back (net +1) and +60 XP. Loss: fee burned, −15 XP (clamped at
  *    the level floor — no de-leveling). Draw/incomplete: fee refunded.
- *  · arcade (AGENT ARCADE — the RANKED gauntlet, one run = ARCADE_FEE 1):
- *    the fee escrows on battle 1 and is CONSUMED by playing (never returned
- *    on a win); battles 2+ carry fee 0. Per battle: win +60 XP, loss −15 XP
- *    (no de-level), draw 0 XP + fee refund, incomplete refund. Credits pay
- *    only via the explicit `payout` the server computes: +1 at the ⅓ and ⅔
- *    milestones, +5 for a full clear (ARCADE_MILESTONE_CREDITS /
- *    ARCADE_CLEAR_CREDITS).
+ *  · arcade (AGENT ARCADE — the RANKED gauntlet MAP, one run = ARCADE_FEE 1,
+ *    ADR 0008): the entry is a non-refundable debit taken by POST
+ *    /arcade/enter before character select; battles themselves carry fee 0.
+ *    Per battle: win +60 XP, loss −15 XP (no de-level), draw/incomplete 0.
+ *    **A WIN PAYS NO CREDITS.** Credits come only from board pickups banked
+ *    by reaching an exit alive (arcadeExtract) — fighting is the cost, the
+ *    board is the earning. Dying forfeits everything not yet extracted.
  *  · wager (ONLINE): fee 10 each → 20 pot. Winner takes the pot (net +10).
  *    Draw/undecided/incomplete: both refunded. A hash-flagged DEVIATOR
  *    forfeits: the pot goes to the opponent regardless of the sim outcome.
@@ -46,12 +46,28 @@ export const REFERRAL_CREDITS = 25;
 export const REFERRAL_WEEKLY_CAP = 10;
 export const SOLO_FEE = 1;
 export const WAGER_FEE = 10;
-/** AGENT ARCADE: one credit buys one RUN (escrowed with battle 1, consumed). */
+/** AGENT ARCADE: one credit buys one RUN (non-refundable, POST /arcade/enter). */
 export const ARCADE_FEE = 1;
-/** Credits paid for clearing the ⅓ and ⅔ milestone battles of a run. */
-export const ARCADE_MILESTONE_CREDITS = 1;
-/** Credits paid for beating EVERY agent in the run (on top of milestones). */
-export const ARCADE_CLEAR_CREDITS = 5;
+/**
+ * AGENT ARCADE v2 diminishing returns (ADR 0008). Index = how many runs this
+ * account has ENTERED today (UTC), 1-based; past the end, the last value
+ * repeats forever. Counting ENTRIES rather than survivals is deliberate:
+ * dying must not reset the ladder, or the cheapest farm is to die instantly.
+ *
+ * A wall ("no more credits today") would just switch a paying player off
+ * mid-session; a taper keeps them playing for XP and rank while capping a
+ * grinder near two good runs' worth of credits. Mirrored in
+ * 0017_arcade_extract.sql — change BOTH.
+ */
+export const ARCADE_DR_PCT: readonly number[] = [100, 75, 50, 25];
+export const arcadeMultiplierPct = (runsToday: number): number =>
+  ARCADE_DR_PCT[Math.min(Math.max(runsToday, 1), ARCADE_DR_PCT.length) - 1]!;
+/**
+ * Extracted energy drinks per account per UTC day. A drink is worth
+ * ITEM_COST (5) credits, so without its own valve drink extraction would
+ * route straight around the credit multiplier above.
+ */
+export const ARCADE_DRINK_DAY_CAP = 3;
 /** Solo winner gets the fee back + this profit. */
 export const SOLO_WIN_NET = 1;
 /** XP burned by LOSING a ranked solo match (the user-facing "loser loses XP"). */
@@ -299,6 +315,31 @@ export interface Persistence {
    */
   debitCredits: (sub: string, amount: number, reason: string, key: string) =>
     Promise<{ credits: number; duplicate: boolean }>;
+  /**
+   * AGENT ARCADE v2 extraction (ADR 0008): bank a surviving run's credit
+   * bag. `runToken` is the idempotency key — a retried extract pays once.
+   * Applies the day's diminishing-returns multiplier and reports how many
+   * board drinks may still be granted today (the caller grants them through
+   * buyItem at cost 0; see ARCADE_DRINK_DAY_CAP).
+   *
+   * Deliberately NOT part of recordMatch: an extraction is not a match, has
+   * no ledger 'fee' row, and must stay invisible to the escrow sweeper.
+   */
+  arcadeExtract: (sub: string, runToken: string, credits: number) => Promise<ArcadeExtract>;
+}
+
+/** What banking a run bag actually paid (ADR 0008). */
+export interface ArcadeExtract {
+  /** New balance after the payout. */
+  credits: number;
+  /** Credits actually paid — the bag AFTER the day's multiplier. */
+  granted: number;
+  /** The multiplier applied, as a percentage (100 / 75 / 50 / 25). */
+  multiplierPct: number;
+  /** How many board drinks the caller may still grant today. */
+  drinkBudget: number;
+  /** True when this run token had already extracted (nothing moved). */
+  duplicate: boolean;
 }
 
 /** One granted (not yet consumed) consumable in a player's inventory. */
@@ -379,10 +420,12 @@ const settleSide = (
     payout = won ? r.fee * 2 : draw ? r.fee : 0;
     xpDelta = iDeviated ? 0 : won ? XP_WIN : draw ? XP_DRAW : XP_LOSS;
   } else if (r.mode === 'arcade') {
-    // AGENT ARCADE battle: the entry fee is consumed by playing (a win does
-    // NOT return it); credits move only via the explicit milestone payout.
-    // A draw still refunds the fee (battle 1 only carries one) — the run
-    // ends, but nothing was decided against the player dishonestly.
+    // AGENT ARCADE battle (ADR 0008): a win pays XP and NOTHING ELSE — the
+    // board pays credits, not the fights, so `payout` is 0 for every normal
+    // battle. (The field survives only for the legacy pre-map settlement
+    // path and for tests that assert it stays zero.) The entry fee lives
+    // outside the match entirely, so `r.fee` is 0 here in practice; a draw
+    // still refunds whatever was escrowed by an old-style battle.
     payout = won ? (r.payout ?? 0) : draw ? r.fee : 0;
     xpDelta = iDeviated ? 0 : won ? XP_WIN : draw ? 0 : -SOLO_LOSS_XP;
   } else { // solo — this side is the human; the house side has no account
@@ -419,6 +462,15 @@ export const memoryPersistence = (): Persistence => {
   let nextItemRow = 1;
   /** Idempotency keys of non-refundable debits (`sub|reason|key`) — ADR 0007. */
   const debits = new Set<string>();
+  /**
+   * AGENT ARCADE v2 valves (ADR 0008), mirroring what 0017_arcade_extract.sql
+   * reads back out of credit_ledger: UTC day stamps of every run ENTERED
+   * (the diminishing-returns ladder) and of every board drink extracted
+   * (the daily drink cap).
+   */
+  const arcadeEntries = new Map<string, string[]>();
+  const extractedDrinks = new Map<string, string[]>();
+  const utcDay = (): string => new Date().toISOString().slice(0, 10);
   /** Newest-first ring of settled matches (GET /agent/matches food). */
   const matchRows: MatchRow[] = [];
   const agentOf = (sub: string): { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null } => {
@@ -661,6 +713,12 @@ export const memoryPersistence = (): Persistence => {
         createdAt: new Date().toISOString(),
       };
       ownedItems.unshift(row);
+      // Board drinks ride the same free-grant path as level-up pulls; the
+      // 'xtr:' nonce prefix is how BOTH impls count them against the daily
+      // cap (0017 reads the same prefix back out of credit_ledger).
+      if (nonce.startsWith('xtr:')) {
+        extractedDrinks.set(sub, [...(extractedDrinks.get(sub) ?? []), utcDay()]);
+      }
       return {
         rowId: row.rowId, itemId: row.itemId, tier: row.tier,
         createdAt: row.createdAt, credits: p.credits, duplicate: false,
@@ -715,7 +773,35 @@ export const memoryPersistence = (): Persistence => {
       if (p.credits < amount) throw new InsufficientCredits(0);
       p.credits -= amount;
       debits.add(dedup);
+      // The DR ladder counts ENTRIES, so remember when each one happened.
+      if (reason === 'arcade') {
+        arcadeEntries.set(sub, [...(arcadeEntries.get(sub) ?? []), utcDay()]);
+      }
       return { credits: p.credits, duplicate: false };
+    },
+    // Mirrors 0017_arcade_extract.sql arcade_extract — keep in sync.
+    arcadeExtract: async (sub, runToken, credits) => {
+      const p = prof(sub);
+      const key = `${sub}|arcade_extract|${runToken}`;
+      if (debits.has(key)) {
+        return {
+          credits: p.credits, granted: 0, multiplierPct: 0,
+          drinkBudget: 0, duplicate: true,
+        };
+      }
+      const today = utcDay();
+      const runsToday = (arcadeEntries.get(sub) ?? []).filter((d) => d === today).length;
+      const pct = arcadeMultiplierPct(runsToday);
+      // Floor, never round — the house never rounds a payout up.
+      const granted = Math.floor((Math.max(0, credits) * pct) / 100);
+      p.credits += granted;
+      debits.add(key);
+      const drinksToday = (extractedDrinks.get(sub) ?? []).filter((d) => d === today).length;
+      return {
+        credits: p.credits, granted, multiplierPct: pct,
+        drinkBudget: Math.max(0, ARCADE_DRINK_DAY_CAP - drinksToday),
+        duplicate: false,
+      };
     },
   };
 };
@@ -1003,6 +1089,20 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
       })) as Array<Record<string, unknown>>;
       const row = rows?.[0] ?? {};
       return { credits: Number(row.credits ?? 0), duplicate: Boolean(row.duplicate) };
+    },
+    arcadeExtract: async (sub, runToken, credits) => {
+      const rows = (await call('/rest/v1/rpc/arcade_extract', {
+        method: 'POST',
+        body: JSON.stringify({ _profile: sub, _key: runToken, _credits: Math.max(0, credits | 0) }),
+      })) as Array<Record<string, unknown>>;
+      const row = rows?.[0] ?? {};
+      return {
+        credits: Number(row.credits ?? 0),
+        granted: Number(row.granted ?? 0),
+        multiplierPct: Number(row.multiplier_pct ?? 0),
+        drinkBudget: Number(row.drink_budget ?? 0),
+        duplicate: Boolean(row.duplicate),
+      };
     },
     settleItems: async (matchId, drunkRowIds) => {
       // Release everything this match claimed EXCEPT the drunk rows.

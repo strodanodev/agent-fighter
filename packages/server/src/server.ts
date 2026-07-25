@@ -16,11 +16,15 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
-  AI_PERSONALITY_RANGES, ENGINE_VERSION, ITEMS, ITEM_COST, ITEM_TIER_ODDS,
-  Phase, aiPoll, createAi, createGameState, itemById,
-  loadCharacter, setCharacters, setMatchItems, stateHash, step,
+  AI_PERSONALITY_RANGES, ENGINE_VERSION, EXIT_BONUS, EXIT_FIGHT_FLOOR, ITEMS,
+  ITEM_COST, ITEM_TIER_ODDS, Phase, REGION_NAME, aiPoll, createAi,
+  createGameState, exitNodes, generateBoard, isFightNode, isLegalMove, itemById,
+  loadCharacter, minFights, nodeById, setCharacters, setMatchItems,
+  stateHash, step, successors, validateAllTemplates,
 } from '@af/core';
-import type { CharacterBundle, GameState, ItemDef, ItemEffect } from '@af/core';
+import type {
+  Board, BoardNode, CharacterBundle, GameState, ItemDef, ItemEffect,
+} from '@af/core';
 import {
   ARCADE_NEXT_GRACE_MS, DEFAULT_PORT, FORFEIT_GRACE_MS, IDLE_FORFEIT_MS, INPUT_DELAY,
   INPUT_DELAY_MAX, INPUT_DELAY_MIN, PING_INTERVAL_MS, PROTOCOL_VERSION,
@@ -30,10 +34,10 @@ import type { ClientMsg, ItemPin, SMatch, SResult, ServerMsg } from './protocol.
 import { verifyAirToken } from './airjwt.js';
 import type { AirIdentity } from './airjwt.js';
 import {
-  ARCADE_CLEAR_CREDITS, ARCADE_FEE,
+  ARCADE_FEE,
   InsufficientCredits, SOLO_FEE, WAGER_FEE, createPersistence, loadDotEnv,
 } from './persist.js';
-import type { Account, MatchMode, Persistence } from './persist.js';
+import type { Account, ArcadeExtract, MatchMode, Persistence } from './persist.js';
 import { createAirIssuer, loadIssuerConfig } from './air-issuer.js';
 import type { AirIssuer } from './air-issuer.js';
 import { connectPageHtml } from './connect-page.js';
@@ -216,54 +220,56 @@ interface SoloPin {
 }
 
 /**
- * AGENT ARCADE run state (v4). Server-authoritative: the opponent order, the
- * skill ramp, and the milestone payouts all live HERE — a hacked client can't
- * pick easy opponents, replay a battle, or claim a deeper position. The token
- * is a bearer secret issued in the battle-1 setup and re-armed per win; it is
- * additionally pinned to the account that started the run.
+ * AGENT ARCADE v2 run state (v7, ADR 0008). Server-authoritative in every
+ * respect that costs money: the BOARD, where the player is STANDING, and
+ * what is in the BAG all live here. A hacked client can propose a move; it
+ * can never assert a position or a pickup.
+ *
+ * The token is a bearer secret minted at POST /arcade/enter, re-armed after
+ * every verified win, and additionally pinned to the account that paid.
  */
 interface ArcadeRun {
   token: string;
   /** Owner identity sub ('' when persistence is off — tests). */
   sub: string;
   /** The fighter locked for the whole run. '' = paid via /arcade/enter but
-   *  not yet at character select — locked by the first battle's queue. */
+   *  not yet through character select — locked by POST /arcade/run. */
   charId: string;
-  /** Shuffled opponent character ids — built when the fighter locks. */
-  opponents: string[];
-  /** 0-based index of the battle currently being played (or up next). */
-  battle: number;
-  /** True between a verified win and the next battle's queue. */
+  /**
+   * The generated board. Null until the fighter locks: the roster a board is
+   * populated from excludes the player's own character, which is not known
+   * until select. Minted exactly once per run.
+   */
+  board: Board | null;
+  /** Node the player is STANDING on (board.start until the first win). */
+  at: number;
+  /** The node currently being fought, or -1. Set at queue, cleared at result. */
+  pending: number;
+  /** UNBANKED pickups. Evaporates on any loss — that is the whole mode. */
+  bag: { credits: number; drinks: { itemId: string; tier: number }[] };
+  /** Every node entered, in order (forensics + the run summary). */
+  path: number[];
+  /** Fights WON this run. */
+  fights: number;
+  /** True between a verified win and the next move's queue. */
   awaitingNext: boolean;
+  /** Set once the bag has been banked — the run is over, token spent. */
+  extracted: boolean;
   /**
    * Entry PRE-PAID via POST /arcade/enter (ADR 0007 credits rework): a
    * consented, NON-refundable debit taken BEFORE character select. Paid
-   * runs never escrow at battle 0. Legacy clients (and free agent-class
-   * runs) still take the old inline path with paid=false.
+   * runs never escrow per battle. Free agent-class runs also arrive here.
    */
   paid: boolean;
   lastActive: number;
 }
 
 /**
- * Credits due for a verified battle win (ADR 0007 credits rework):
- * +1 EVERY win, +ARCADE_CLEAR_CREDITS bonus on the full clear. Replaces the
- * old ceil(N/3)/ceil(2N/3) milestone drip — a 10-battle clear now pays
- * 10 + 5 against the 1-credit non-refundable entry.
+ * Fights on the cheapest line to the deep exit — the "7" the HUD counts
+ * against. A structural constant of every board (validateBoard asserts it),
+ * not a tuning knob.
  */
-export const arcadeWinPayout = (cleared: number, total: number): number =>
-  1 + (cleared === total ? ARCADE_CLEAR_CREDITS : 0);
-
-/**
- * The gauntlet difficulty ramp: battle 1 is winnable by a newcomer, the last
- * battle plays near the AI's ceiling. Deliberately NOT level-scaled — every
- * player faces the same ramp, so ranked arcade records are comparable.
- */
-const ARCADE_SKILL_MIN = 35;
-const ARCADE_SKILL_MAX = 95;
-export const defaultArcadeSkill = (battle: number, total: number): number =>
-  Math.round(ARCADE_SKILL_MIN
-    + (ARCADE_SKILL_MAX - ARCADE_SKILL_MIN) * (total <= 1 ? 1 : battle / (total - 1)));
+const ARCADE_TOTAL = EXIT_FIGHT_FLOOR[3];
 
 /**
  * Arcade opponents all share ONE moveset (the roster is a single archetype), so
@@ -438,7 +444,12 @@ export const createMatchServer = (opts: {
   noPaceCheck?: boolean;
   /** Test hook: overrides the env-configured AIR issuer (null = off). */
   airIssuer?: AirIssuer | null;
-  /** Test hook: overrides the arcade difficulty ramp (battle, total) → skill. */
+  /**
+   * Test hook: overrides the arcade difficulty. Called with (fights won so
+   * far, ARCADE_TOTAL). Unset = the BOARD decides — every fight node carries
+   * the skill of its region, so difficulty tracks depth rather than how many
+   * optional detours the player took.
+   */
   arcadeSkill?: (battle: number, total: number) => number;
   /** Test hook: shorten the input-silence forfeit window (default 30s). */
   idleForfeitMs?: number;
@@ -520,7 +531,19 @@ export const createMatchServer = (opts: {
     const meta = (bundleOf(id) as { meta?: { disabled?: boolean } }).meta;
     return !meta?.disabled;
   });
-  const arcadeSkill = opts.arcadeSkill ?? defaultArcadeSkill;
+  const arcadeSkillOverride = opts.arcadeSkill ?? null;
+
+  // A template that has drifted out of contract must stop the server, not
+  // quietly mis-price runs. Eight small graphs — cheap enough to check at boot.
+  {
+    const problems = validateAllTemplates(enabledCharacterIds.slice(0, 12));
+    for (const [id, list] of Object.entries(problems)) {
+      console.error(`[arcade] template "${id}" is INVALID:\n  ${list.join('\n  ')}`);
+    }
+    if (Object.keys(problems).length > 0) {
+      throw new Error('arcade board templates failed validation — refusing to start');
+    }
+  }
 
   const clients = new Set<Client>();
   // CONNECTION CAPS (v1.02_scale). The clients set was previously unbounded: a
@@ -543,8 +566,90 @@ export const createMatchServer = (opts: {
   const liveMatches = new Map<string, Match>();
   /** True once shutdown() starts — new queues/entries are refused. */
   let draining = false;
-  /** AGENT ARCADE runs by token (v4). */
+  /** AGENT ARCADE runs by token (v7 — each holds a whole board). */
   const arcadeRuns = new Map<string, ArcadeRun>();
+
+  /**
+   * Board seed. `generateBoard` deliberately REFUSES to invent one (core has
+   * no ambient randomness), so the choice is made here — and logged with the
+   * template id, which is what makes any run a player reports reproducible.
+   */
+  const newBoardSeed = (): number => (Math.random() * 0x7fffffff) | 0;
+
+  /**
+   * Step a run onto `to` and sweep up anything it lands on (ADR 0008).
+   *
+   * AUTO-COLLECT is the reason moving is not its own endpoint: a guarded
+   * pickup's fighter has the pickup as its ONLY successor, so after winning
+   * that fight there is no decision left to make — walking it manually would
+   * be a round trip that can only fail (a dropped request between the win
+   * and the pickup would silently rob the player). So: after a win we walk
+   * forward through any single-successor loot node, banking it into the bag,
+   * and stop the moment a real choice appears.
+   *
+   * Everything here is server-side arithmetic over the server's own board.
+   * The client is told what it got; it never says what it took.
+   */
+  const advanceRun = (run: ArcadeRun, to: number): void => {
+    const board = run.board;
+    if (!board || to < 0) return;
+    run.at = to;
+    run.path.push(to);
+    for (;;) {
+      const outs = successors(board, run.at);
+      if (outs.length !== 1) break;
+      const next = nodeById(board, outs[0]!);
+      if (!next || next.kind !== 'loot' || !next.loot) break;
+      if (next.loot.kind === 'credits') run.bag.credits += next.loot.amount;
+      else run.bag.drinks.push({ itemId: next.loot.itemId, tier: next.loot.tier });
+      run.at = next.id;
+      run.path.push(next.id);
+    }
+  };
+
+  /**
+   * The whole client-facing picture of a run: the board (so the map screen
+   * can draw it and do its own route arithmetic) plus the authoritative
+   * position and bag. Returned by POST /arcade/run on both the locking call
+   * and every later resume.
+   */
+  const arcadeRunState = (run: ArcadeRun): Record<string, unknown> => ({
+    token: run.token,
+    character: run.charId,
+    board: run.board,
+    at: run.at,
+    pending: run.pending,
+    fights: run.fights,
+    total: ARCADE_TOTAL,
+    bag: run.bag,
+    awaitingNext: run.awaitingNext,
+    extracted: run.extracted,
+  });
+
+  /**
+   * AUTOPILOT (headless agents): the next fight node on the cheapest line to
+   * the deep exit. Human clients always name their own node — this exists so
+   * `npm run agent` / `npm run fleet` keep working without teaching them to
+   * read a map. They are agent-class and economically inert, so the loot
+   * they walk past is nobody's money.
+   */
+  const autopilotNode = (run: ArcadeRun): number => {
+    const board = run.board;
+    if (!board) return -1;
+    const deep = exitNodes(board).find((e) => e.exitTier === 3);
+    const options = successors(board, run.at)
+      .map((id) => nodeById(board, id))
+      .filter((n): n is BoardNode => !!n && isFightNode(n));
+    if (options.length === 0) return -1;
+    if (!deep) return options[0]!.id;
+    let best = options[0]!;
+    let bestCost = Infinity;
+    for (const n of options) {
+      const cost = minFights(board, n.id, deep.id);
+      if (cost >= 0 && cost < bestCost) { bestCost = cost; best = n; }
+    }
+    return best.id;
+  };
   // Free-tier abuse valves (agent class): per-sub battles, per-IP signups.
   const agentBattleCap = dayCounter();
   const signupCap = dayCounter();
@@ -623,32 +728,36 @@ export const createMatchServer = (opts: {
       }
     }
 
-    // AGENT ARCADE run bookkeeping — decided BEFORE the async persistence so
-    // the per-win payout rides the same record_match settlement.
-    let arcadePayout = 0;
+    // AGENT ARCADE v2 run bookkeeping (ADR 0008) — decided BEFORE the async
+    // persistence. A win pays NO credits: it moves you on the board, and the
+    // board is where credits live.
+    const arcadePayout = 0;
     const run = m.arcadeRun;
     if (run) {
       const wonBattle = result.reason === 'verified' && result.winner === 0
         && result.deviator !== 0;
       if (wonBattle) {
-        run.battle++;
-        // Agent-class runs never pay credits — the rank IS the prize.
-        arcadePayout = isAgentClassSub(run.sub) ? 0
-          : arcadeWinPayout(run.battle, run.opponents.length);
-        if (run.battle >= run.opponents.length) {
-          arcadeRuns.delete(run.token); // FULL CLEAR — the run is complete
-          console.log(`[arcade] ${m.clients[0].name} CLEARED the gauntlet (${run.opponents.length} battles)`);
-        } else {
-          run.awaitingNext = true; // token re-armed for the next battle
-          run.lastActive = Date.now();
-        }
+        run.fights++;
+        advanceRun(run, run.pending);
+        run.pending = -1;
+        run.awaitingNext = true; // token re-armed for the next MOVE
+        run.lastActive = Date.now();
       } else if (result.reason === 'incomplete') {
-        // No-contest (network/pace): fee refunded by settlement; the run may
-        // RETRY the same battle until it expires — a blip never burns a run.
+        // No-contest (network/pace): nothing was decided, so the run keeps
+        // its position and may RETRY the same node until it expires. A blip
+        // must never cost a player a loaded bag.
+        run.pending = -1;
         run.awaitingNext = true;
         run.lastActive = Date.now();
       } else {
-        arcadeRuns.delete(run.token); // loss, draw, or forfeit — GAME OVER
+        // Loss, draw, or forfeit: GAME OVER, and the bag evaporates. This is
+        // the deterrent the whole extraction loop rests on — nothing banks
+        // until the player reaches an exit alive.
+        const lost = run.bag.credits + run.bag.drinks.length;
+        if (lost > 0) {
+          console.log(`[arcade] ${m.clients[0].name} WIPED at node ${run.pending} — lost ${run.bag.credits} CR + ${run.bag.drinks.length} drink(s)`);
+        }
+        arcadeRuns.delete(run.token);
       }
     }
 
@@ -815,9 +924,15 @@ export const createMatchServer = (opts: {
     itemRows: [number[], number[]] = [[], []],
   ): void => {
     // Arcade battles bill as the character, not "HOUSE": the run IS the mode.
+    // The suffix is the ZONE rather than a battle counter — with a branching
+    // board there is no "n of N" any more, and where you are matters more
+    // than how far you've come.
     // Trained-agent opponents (dare/spar) bill as their owner's agent.
+    const arcadeZone = arcadeRun?.board
+      ? REGION_NAME[nodeById(arcadeRun.board, arcadeRun.pending)?.region ?? 1]
+      : '';
     const houseName = arcadeRun
-      ? `${(bundleOf(solo!.character) as { name?: string }).name ?? solo!.character} · ${arcadeRun.battle + 1}/${arcadeRun.opponents.length}`.toUpperCase()
+      ? `${(bundleOf(solo!.character) as { name?: string }).name ?? solo!.character} · ${arcadeZone}`.toUpperCase()
       : solo?.agentName ?? `HOUSE LV${solo?.level ?? 1}`;
     const m: Match = {
       id: id ?? newMatchId(),
@@ -866,7 +981,10 @@ export const createMatchServer = (opts: {
         mode, fee,
         solo: m.solo ?? undefined,
         arcade: arcadeRun
-          ? { battle: arcadeRun.battle, total: arcadeRun.opponents.length, token: arcadeRun.token }
+          ? {
+            token: arcadeRun.token, node: arcadeRun.pending,
+            fights: arcadeRun.fights, total: ARCADE_TOTAL,
+          }
           : undefined,
         items: m.items[0].length > 0 || m.items[1].length > 0 ? m.items : undefined,
         resume: m.resumeTokens[c.side],
@@ -1178,33 +1296,24 @@ export const createMatchServer = (opts: {
   };
 
   /**
-   * AGENT ARCADE (v4): start the run's CURRENT battle. PRE-PAID runs
-   * (POST /arcade/enter, ADR 0007 credits rework) never escrow — the
-   * non-refundable entry was debited before character select. Legacy runs
-   * (old clients) still escrow battle 1's fee here; battles 2+ are always
-   * free. Each battle is mechanically a local-sim solo match (pinned AI,
-   * ledger re-sim) — only the fee, opponent sequencing, and payouts differ.
+   * AGENT ARCADE v2 (v7, ADR 0008): fight the node the player moved to.
+   * Battles never escrow — the non-refundable entry was debited at
+   * /arcade/enter, before character select — so a battle costs nothing and
+   * a no-contest refunds nothing. Mechanically each one is a local-sim solo
+   * match (pinned AI, ledger re-sim); only the opponent sourcing differs.
    */
-  const startArcadeBattle = async (c: Client, run: ArcadeRun): Promise<void> => {
-    // Agent-class runs are FREE (inert economy — XP/rank only).
-    const fee = run.battle === 0 && !run.paid && persistence && !isAgentClassSub(run.sub)
-      ? ARCADE_FEE : 0;
+  const startArcadeBattle = async (c: Client, run: ArcadeRun, node: BoardNode): Promise<void> => {
     const matchId = newMatchId();
-    if (fee > 0) {
-      try {
-        await persistence!.escrowMatch(matchId, [c.identity?.sub ?? null, null], fee);
-      } catch {
-        arcadeRuns.delete(run.token);
-        c.state = 'lobby';
-        return send(c, { t: 'error', code: 'credits', msg: `AGENT ARCADE needs ${fee} credit` });
-      }
-    }
     run.awaitingNext = false;
+    run.pending = node.id;
     run.lastActive = Date.now();
-    const oppChar = run.opponents[run.battle]!;
+    const oppChar = node.charId || run.charId;
     const opts = {
       level: c.account?.level ?? 1,
-      skill: arcadeSkill(run.battle, run.opponents.length),
+      // The BOARD sets the difficulty (region band); the test hook can force it.
+      skill: arcadeSkillOverride
+        ? arcadeSkillOverride(run.fights, ARCADE_TOTAL)
+        : node.skill ?? 50,
       character: oppChar,
       aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
       // Personality from the character's CANONICAL style (its meta.style — the
@@ -1215,12 +1324,12 @@ export const createMatchServer = (opts: {
     const items: MatchItems = [claimed.pins, []];
     const itemRows: [number[], number[]] = [claimed.rows, []];
     if (c.ws.readyState !== WebSocket.OPEN) {
-      // Vanished after escrow → settle as incomplete so the fee refunds
-      // (the run stays retryable until it expires).
-      startMatch(c, null, 'arcade', fee, matchId, opts, run, items, itemRows);
+      // Vanished before the setup landed → settle as incomplete; the run
+      // keeps its position and its bag and stays retryable until it expires.
+      startMatch(c, null, 'arcade', 0, matchId, opts, run, items, itemRows);
       return finishMatch(c.match!, null);
     }
-    startMatch(c, null, 'arcade', fee, matchId, opts, run, items, itemRows);
+    startMatch(c, null, 'arcade', 0, matchId, opts, run, items, itemRows);
   };
 
   const onMessage = (c: Client, raw: string): void => {
@@ -1355,75 +1464,82 @@ export const createMatchServer = (opts: {
             return send(c, { t: 'queued' });
           }
           if (mode === 'arcade') {
-            // AGENT ARCADE continuation: a valid run token re-enters the run
-            // (fee already consumed). Everything about the token is
-            // validated — owner, phase, and the locked fighter.
-            const run = runToken ? arcadeRuns.get(runToken) : undefined;
+            // AGENT ARCADE v2 (ADR 0008): THE MOVE IS THE QUEUE. Choosing a
+            // route and starting the match are one action, so this handler
+            // is also the move validator — and it validates against the
+            // SERVER's board, never the client's copy.
+            let run = runToken ? arcadeRuns.get(runToken) : undefined;
             if (runToken && !run) {
               return send(c, { t: 'error', msg: 'arcade run is over — enter again from the title' });
             }
-            if (run) {
-              if (run.sub !== (c.identity?.sub ?? '')) {
-                return send(c, { t: 'error', code: 'auth', msg: 'not your arcade run' });
+            if (!run) {
+              // NO TOKEN = open a run right here. Reserved for players who
+              // cannot pay and therefore cannot be farming: agent-class
+              // accounts (0 credits forever, XP/rank only) and the
+              // persistence-off dev/test economy. Everyone else pre-pays at
+              // POST /arcade/enter, which is where the consented,
+              // non-refundable debit lives.
+              const agentClass = isAgentClassSub(c.identity?.sub);
+              if (persistence && !agentClass) {
+                return send(c, { t: 'error', msg: 'start AGENT ARCADE from the title (entry is paid up front)' });
               }
-              // PRE-PAID run's FIRST battle (ADR 0007): the fighter locks
-              // NOW — /arcade/enter charged before character select, so the
-              // run exists with charId '' until this queue.
-              if (run.charId === '' && run.battle === 0) {
-                run.charId = c.character;
-                const opps = enabledCharacterIds.filter((id) => id !== c.character);
-                for (let i = opps.length - 1; i > 0; i--) {
-                  const j = Math.floor(Math.random() * (i + 1));
-                  [opps[i], opps[j]] = [opps[j]!, opps[i]!];
-                }
-                if (opps.length === 0) opps.push(c.character); // roster of 1 → mirror
-                run.opponents = opps;
-              } else {
-                if (!run.awaitingNext) {
-                  return send(c, { t: 'error', msg: 'arcade run is not awaiting a battle' });
-                }
-                if (run.charId !== c.character) {
-                  return send(c, { t: 'error', msg: 'your fighter is locked for the whole arcade run' });
-                }
-              }
-              if (isAgentClassSub(c.identity?.sub)
-                && !agentBattleCap.bump(c.identity!.sub, AGENT_BATTLES_PER_DAY)) {
-                return send(c, { t: 'error', msg: `agent accounts get ${AGENT_BATTLES_PER_DAY} arcade battles/day — the run resumes tomorrow` });
-              }
-              c.state = 'queued';
-              send(c, { t: 'queued' });
-              return startArcadeBattle(c, run);
+              // (the per-day battle cap is bumped once, below — this path
+              // falls through to the same check every battle takes)
+              const roster = enabledCharacterIds.filter((id) => id !== c.character);
+              const board = generateBoard({ roster: roster.length > 0 ? roster : [c.character], seed: newBoardSeed() });
+              run = {
+                token: randomUUID(),
+                sub: c.identity?.sub ?? '',
+                charId: c.character,
+                board,
+                at: board.start,
+                pending: -1,
+                bag: { credits: 0, drinks: [] },
+                path: [board.start],
+                fights: 0,
+                awaitingNext: true,
+                extracted: false,
+                paid: false,
+                lastActive: Date.now(),
+              };
+              arcadeRuns.set(run.token, run);
             }
-            // LEGACY new run (old clients / free agent-class): 1 credit
-            // escrows with battle 1. New clients pre-pay via /arcade/enter
-            // and always arrive here WITH a runToken.
-            const agentClass = isAgentClassSub(c.identity?.sub);
-            if (agentClass && !agentBattleCap.bump(c.identity!.sub, AGENT_BATTLES_PER_DAY)) {
-              return send(c, { t: 'error', msg: `agent accounts get ${AGENT_BATTLES_PER_DAY} arcade battles/day — come back tomorrow` });
+            if (run.sub !== (c.identity?.sub ?? '')) {
+              return send(c, { t: 'error', code: 'auth', msg: 'not your arcade run' });
             }
-            if (!agentClass && persistence && (c.account?.credits ?? 0) < ARCADE_FEE) {
-              return send(c, { t: 'error', code: 'credits', msg: `AGENT ARCADE needs ${ARCADE_FEE} credit` });
+            if (run.extracted) {
+              return send(c, { t: 'error', msg: 'this run already extracted — enter again from the title' });
             }
-            const opponents = enabledCharacterIds.filter((id) => id !== c.character);
-            for (let i = opponents.length - 1; i > 0; i--) {
-              const j = Math.floor(Math.random() * (i + 1));
-              [opponents[i], opponents[j]] = [opponents[j]!, opponents[i]!];
+            if (!run.board || run.charId === '') {
+              return send(c, { t: 'error', msg: 'lock a fighter first (POST /arcade/run)' });
             }
-            if (opponents.length === 0) opponents.push(c.character); // roster of 1 → mirror
-            const fresh: ArcadeRun = {
-              token: randomUUID(),
-              sub: c.identity?.sub ?? '',
-              charId: c.character,
-              opponents,
-              battle: 0,
-              awaitingNext: false,
-              paid: false, // legacy path — battle 1 escrows the fee
-              lastActive: Date.now(),
-            };
-            arcadeRuns.set(fresh.token, fresh);
+            if (run.charId !== c.character) {
+              return send(c, { t: 'error', msg: 'your fighter is locked for the whole arcade run' });
+            }
+            if (!run.awaitingNext) {
+              return send(c, { t: 'error', msg: 'arcade run is not awaiting a battle' });
+            }
+            if (isAgentClassSub(c.identity?.sub)
+              && !agentBattleCap.bump(c.identity!.sub, AGENT_BATTLES_PER_DAY)) {
+              return send(c, { t: 'error', msg: `agent accounts get ${AGENT_BATTLES_PER_DAY} arcade battles/day — the run resumes tomorrow` });
+            }
+            // Headless agents don't read maps — autopilot them down the
+            // cheapest line to the deep exit (see autopilotNode).
+            const target = typeof msg.arcadeNode === 'number'
+              ? msg.arcadeNode | 0
+              : autopilotNode(run);
+            if (!isLegalMove(run.board, run.at, target)) {
+              return send(c, { t: 'error', msg: 'that route does not lead anywhere from where you are standing' });
+            }
+            const node = nodeById(run.board, target);
+            if (!node || !isFightNode(node)) {
+              // Exits are reached through POST /arcade/extract, and loot is
+              // auto-collected — the only thing you can QUEUE is a fight.
+              return send(c, { t: 'error', msg: 'that is not a fight — pick an opponent or extract' });
+            }
             c.state = 'queued';
             send(c, { t: 'queued' });
-            return startArcadeBattle(c, fresh);
+            return startArcadeBattle(c, run, node);
           }
           // Fast pre-check for a friendly error; escrow re-checks atomically.
           const fee = mode === 'solo' ? SOLO_FEE : WAGER_FEE;
@@ -1815,16 +1931,169 @@ export const createMatchServer = (opts: {
         const run: ArcadeRun = {
           token: randomUUID(),
           sub: identity.sub,
-          charId: '', // locks at the first battle's queue (post-select)
-          opponents: [],
-          battle: 0,
-          awaitingNext: false,
+          charId: '', // locks at POST /arcade/run, which also mints the board
+          board: null,
+          at: -1,
+          pending: -1,
+          bag: { credits: 0, drinks: [] },
+          path: [],
+          fights: 0,
+          awaitingNext: true,
+          extracted: false,
           paid: true,
           lastActive: Date.now(),
         };
         arcadeRuns.set(run.token, run);
         console.log(`[arcade] ${identity.sub} paid entry (nonce ${nonce.slice(0, 12)}…) → run ${run.token.slice(0, 8)}`);
         return json(res, 200, { token: run.token, fee: ARCADE_FEE, credits });
+      })().catch((e) => json(res, 502, { error: String(e) }));
+      return;
+    }
+    // ---- ARCADE RUN STATE (ADR 0008). One endpoint does two jobs, because
+    // they are the same job: given a run token, tell me everything about
+    // this run. Passing `character` on the first call LOCKS the fighter and
+    // MINTS the board (which needs the roster minus the player's own
+    // fighter, and so cannot be generated at /arcade/enter — that happens
+    // before character select). Every later call is a plain read, which is
+    // also the RESUME path: the board lives here, not in the client, so an
+    // iOS jetsam kill mid-run comes back standing exactly where it fell.
+    if (path === '/arcade/run') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'POST {token, character?}' });
+      const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '')?.[1];
+      const devName = persistence?.dev ? String(req.headers['x-dev-name'] ?? '') : '';
+      void (async () => {
+        const identity = bearer ? await verifyAirToken(bearer)
+          : devName ? { sub: `dev:${devName.slice(0, 24)}` }
+          : null;
+        if (!identity) return json(res, 401, { error: 'sign in required' });
+        const body = await readCappedBody(req, res);
+        if (body === null) return;
+        let payload: { token?: unknown; character?: unknown };
+        try { payload = JSON.parse(body || '{}') as typeof payload; }
+        catch { return json(res, 400, { error: 'bad json' }); }
+        const token = String(payload.token ?? '');
+        const run = arcadeRuns.get(token);
+        if (!run) return json(res, 404, { error: 'arcade run is over — enter again from the title' });
+        if (run.sub !== identity.sub) return json(res, 403, { error: 'not your arcade run' });
+
+        const character = String(payload.character ?? '');
+        if (run.charId === '') {
+          if (!character) return json(res, 400, { error: 'character required to start the run' });
+          if (!enabledCharacterIds.includes(character)) {
+            return json(res, 400, { error: `unknown or disabled character "${character}"` });
+          }
+          run.charId = character;
+          // Roster minus the player. A one-character roster falls back to a
+          // mirror match rather than an empty board.
+          const roster = enabledCharacterIds.filter((id) => id !== character);
+          run.board = generateBoard({ roster: roster.length > 0 ? roster : [character], seed: newBoardSeed() });
+          run.at = run.board.start;
+          run.path = [run.board.start];
+          console.log(`[arcade] run ${token.slice(0, 8)} board "${run.board.templateId}" seed ${run.board.seed} as ${character}`);
+        } else if (character && character !== run.charId) {
+          return json(res, 409, { error: 'your fighter is locked for the whole arcade run' });
+        }
+        run.lastActive = Date.now();
+        return json(res, 200, arcadeRunState(run));
+      })().catch((e) => json(res, 502, { error: String(e) }));
+      return;
+    }
+    // ---- ARCADE EXTRACTION (ADR 0008): bank the bag and end the run. This
+    // is the ONLY way credits ever leave the board — dying, quitting, or
+    // letting the run expire all forfeit everything carried.
+    if (path === '/arcade/extract') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'POST {token, node}' });
+      const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '')?.[1];
+      const devName = persistence?.dev ? String(req.headers['x-dev-name'] ?? '') : '';
+      void (async () => {
+        const identity = bearer ? await verifyAirToken(bearer)
+          : devName ? { sub: `dev:${devName.slice(0, 24)}` }
+          : null;
+        if (!identity) return json(res, 401, { error: 'sign in required' });
+        const body = await readCappedBody(req, res);
+        if (body === null) return;
+        let payload: { token?: unknown; node?: unknown };
+        try { payload = JSON.parse(body || '{}') as typeof payload; }
+        catch { return json(res, 400, { error: 'bad json' }); }
+        const token = String(payload.token ?? '');
+        const run = arcadeRuns.get(token);
+        if (!run) return json(res, 404, { error: 'arcade run is over — enter again from the title' });
+        if (run.sub !== identity.sub) return json(res, 403, { error: 'not your arcade run' });
+        if (run.extracted) return json(res, 409, { error: 'this run already extracted' });
+        if (!run.board) return json(res, 409, { error: 'this run has not started' });
+        if (!run.awaitingNext || run.pending >= 0) {
+          return json(res, 409, { error: 'finish the fight you are in first' });
+        }
+        // The exit must be one step from where the run is STANDING. This is
+        // the whole anti-cheat surface for extraction: a client can ask to
+        // walk out of any door it can actually reach, and no other.
+        const target = Number(payload.node ?? -1) | 0;
+        if (!isLegalMove(run.board, run.at, target)) {
+          return json(res, 400, { error: 'no exit from where you are standing' });
+        }
+        const node = nodeById(run.board, target);
+        if (!node || node.kind !== 'exit' || !node.exitTier) {
+          return json(res, 400, { error: 'that is not an extraction point' });
+        }
+
+        run.at = target;
+        run.path.push(target);
+        // Mark first, DELETE LAST. `extracted` is what stops a concurrent or
+        // double-tapped second extract (both the queue handler and the check
+        // above refuse it), while keeping the run addressable until the money
+        // has actually moved. Forgetting the run before the payout lands
+        // would strand a bag the ledger never paid for — the mirror of the
+        // orphaned-escrow gap ADR 0005 had to go back and sweep.
+        run.extracted = true;
+        run.lastActive = Date.now();
+
+        const bonus = EXIT_BONUS[node.exitTier];
+        const bagCredits = run.bag.credits + bonus;
+        // Agent-class accounts are economically inert by construction: they
+        // run the board for XP and rank only, and bank nothing.
+        if (!persistence || isAgentClassSub(run.sub)) {
+          arcadeRuns.delete(token);
+          return json(res, 200, {
+            exitTier: node.exitTier, bonus, bag: run.bag.credits,
+            granted: 0, multiplierPct: 0, credits: null, drinks: [],
+            drinksLeftBehind: 0, fights: run.fights,
+          });
+        }
+        let paid: ArcadeExtract;
+        try {
+          paid = await persistence.arcadeExtract(run.sub, token, bagCredits);
+        } catch (err) {
+          // The bank blipped. Re-arm the run so the player can extract again
+          // rather than losing a bag they earned — arcade_extract is
+          // idempotent by run token, so a retry can never double-pay.
+          run.extracted = false;
+          throw err;
+        }
+        // Board drinks ride the level-up free-pull path: cost 0, deterministic
+        // nonce, so a retried extraction re-reveals rather than re-grants.
+        const drinks: { itemId: string; tier: number }[] = [];
+        for (let i = 0; i < Math.min(run.bag.drinks.length, paid.drinkBudget); i++) {
+          const d = run.bag.drinks[i]!;
+          try {
+            const r = await persistence.buyItem(run.sub, 0, d.itemId, d.tier, `xtr:${token}:${i}`);
+            drinks.push({ itemId: r.itemId, tier: r.tier });
+          } catch (err) {
+            console.log(`[arcade] drink grant failed for ${run.sub}: ${String(err)}`);
+          }
+        }
+        arcadeRuns.delete(token); // paid and banked — now it is safe to forget
+        console.log(`[arcade] ${run.sub} EXTRACTED at tier ${node.exitTier} after ${run.fights} fights — ${bagCredits} CR × ${paid.multiplierPct}% = ${paid.granted}, ${drinks.length}/${run.bag.drinks.length} drink(s)`);
+        return json(res, 200, {
+          exitTier: node.exitTier,
+          bonus,
+          bag: run.bag.credits,
+          granted: paid.granted,
+          multiplierPct: paid.multiplierPct,
+          credits: paid.credits,
+          drinks,
+          drinksLeftBehind: Math.max(0, run.bag.drinks.length - drinks.length),
+          fights: run.fights,
+        });
       })().catch((e) => json(res, 502, { error: String(e) }));
       return;
     }

@@ -19,7 +19,7 @@ import type { AiState, GameState, InputFrame, ItemEffect } from '@af/core';
  */
 
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 6;
+const NET_PROTOCOL = 7;
 const MAX_AHEAD = 15;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -50,7 +50,7 @@ export interface NetSetup {
    * AGENT ARCADE (v4): run position + the bearer token that re-queues the
    * run for the next battle after a verified win.
    */
-  arcade?: { battle: number; total: number; token: string };
+  arcade?: { token: string; node: number; fights: number; total: number };
   /**
    * CONSUMABLES (ADR 0007 Phase 2): the server-pinned per-side drinks. The
    * sim applies items ONLY from this echo — never from what we asked for —
@@ -581,11 +581,13 @@ export class SoloSession {
     private email?: string,
     private ref?: string, // stashed dare code (?ref=) — redeemed server-side once
     /**
-     * AGENT ARCADE (v4): queue the ranked gauntlet instead of a single solo
-     * match. `runToken` (from the previous battle's setup.arcade.token)
-     * continues an existing run; omitted = start a new run (entry fee).
+     * AGENT ARCADE v2 (v7, ADR 0008): queue one battle of a gauntlet run
+     * instead of a single solo match. `runToken` continues the run (minted
+     * by POST /arcade/enter, re-armed by every verified win) and `node` is
+     * the board node the player chose to move to — THE MOVE IS THE QUEUE.
+     * Omitting `node` puts the server on autopilot (headless agents only).
      */
-    private arcadeQueue?: { runToken?: string },
+    private arcadeQueue?: { runToken?: string; node?: number },
     /**
      * DARE-VS-AGENT / SPARRING (ADR 0006): fight the TRAINED agent behind
      * this dare/ref code instead of the house AI (your own code = sparring).
@@ -613,6 +615,7 @@ export class SoloSession {
           t: 'queue', character: this.character, bundleHash: this.bundleHash,
           mode: this.arcadeQueue ? 'arcade' : 'solo',
           runToken: this.arcadeQueue?.runToken || undefined,
+          arcadeNode: this.arcadeQueue?.node,
           agentOf: this.arcadeQueue ? undefined : this.agentOf || undefined,
         });
         this.status = 'queued';

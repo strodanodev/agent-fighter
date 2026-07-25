@@ -1,11 +1,10 @@
 /**
- * AGENT ARCADE (protocol v4) — the ranked gauntlet.
+ * AGENT ARCADE v2 — the gauntlet map (protocol v7, ADR 0008).
  *
- * The economy under test: ONE ARCADE_FEE credit buys ONE RUN. The fee
- * escrows with battle 1 and is consumed by playing; battles 2+ are free.
- * Credits move only at the ⅓/⅔ milestones and the full clear; every battle
- * settles ranked XP/W-L. A loss kills the run token; tokens are pinned to
- * the account and the locked fighter.
+ * The economy under test, in one sentence: **fighting is the cost and the
+ * board is the earning.** One ARCADE_FEE credit buys one RUN; wins pay XP
+ * and NOTHING else; credits come only from pickups banked by reaching an
+ * exit alive; dying forfeits everything carried.
  *
  * The tests exploit the local-sim trust model honestly: the ledger is the
  * truth, so a test can sim battles OFFLINE first (retrying player-AI seeds
@@ -19,15 +18,14 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocket } from 'ws';
 import {
-  ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, loadCharacter,
-  setCharacters, step,
+  ENGINE_VERSION, EXIT_BONUS, EXIT_FIGHT_FLOOR, Phase, aiPoll, createAi,
+  createGameState, exitNodes, generateBoard, isFightNode, loadCharacter,
+  minFights, nodeById, pathTo, predecessors, setCharacters, step, successors,
+  templateIds, topoOrder, validateBoard,
 } from '@af/core';
-import type { CharacterBundle } from '@af/core';
-import {
-  ARCADE_CLEAR_CREDITS, ARCADE_FEE, DAILY_CREDITS,
-  memoryPersistence,
-} from '../src/persist.js';
-import { arcadeWinPayout, createMatchServer } from '../src/server.js';
+import type { Board, CharacterBundle } from '@af/core';
+import { ARCADE_FEE, DAILY_CREDITS, memoryPersistence } from '../src/persist.js';
+import { createMatchServer } from '../src/server.js';
 import { PROTOCOL_VERSION } from '../src/protocol.js';
 import type { SMatch, ServerMsg } from '../src/protocol.js';
 
@@ -77,17 +75,10 @@ const simBattle = (
 ): { winner: number; inputs: number[] } => {
   setCharacters(loadCharacter(bundleOf(setup.chars[0].id)), loadCharacter(bundleOf(setup.chars[1].id)));
   // Sim with the SAME per-stage playfield bounds the server verifies against
-  // (protocol SMatch.bounds → createGameState(seed, bounds)): omitting them
-  // would search for a winning line against default walls that then won't
-  // reproduce on the server for a view-locked stage. This is setup PARITY, not
-  // the old "flaky since af-core-6" symptom — that flake was the realtime idle
-  // sweep settling this offline-sim match as a no-contest while winningLine ran
-  // (fixed server-side: noPaceCheck now relaxes the idle window, server.ts).
+  // (protocol SMatch.bounds → createGameState(seed, bounds)) and the SAME
+  // pinned personality (SMatch.solo.personality) — anything less re-samples a
+  // different opponent whose ledger won't reproduce on the server's re-sim.
   const g = createGameState(setup.seed, setup.bounds);
-  // Build the house AI from the FULL pin — including the curated arcade
-  // personality (SMatch.solo.personality) — exactly as the real client does.
-  // Omitting it re-samples a random personality from the seed, whose ledger
-  // then won't reproduce on the server's re-sim (false deviator / wrong winner).
   const house = createAi(1, setup.solo!.skill, setup.solo!.aiSeed, setup.solo!.personality);
   const me = mySkill >= 0 ? createAi(0, mySkill, mySeed) : null;
   const inputs: number[] = [];
@@ -115,203 +106,434 @@ const submit = (c: ReturnType<typeof arcadeClient>, inputs: number[]): void => {
   c.send({ t: 'over', k: inputs.length });
 };
 
-test('ARCADE RUN: one entry fee, milestone + clear payouts, ranked W per battle', async (t) => {
+interface RunState {
+  token: string; character: string; board: Board; at: number;
+  fights: number; total: number;
+  bag: { credits: number; drinks: { itemId: string; tier: number }[] };
+  awaitingNext: boolean; extracted: boolean;
+}
+
+/** Open a paid run and lock a fighter — the real client's title→select flow. */
+const openRun = async (
+  http: string, H: Record<string, string>, character: string, nonce: string,
+): Promise<RunState> => {
+  const enter = await fetch(`${http}/arcade/enter`, {
+    method: 'POST', headers: H, body: JSON.stringify({ nonce }),
+  });
+  assert.equal(enter.status, 200, `entry failed: ${await enter.clone().text()}`);
+  const { token } = await enter.json() as { token: string };
+  const res = await fetch(`${http}/arcade/run`, {
+    method: 'POST', headers: H, body: JSON.stringify({ token, character }),
+  });
+  assert.equal(res.status, 200, `lock failed: ${await res.clone().text()}`);
+  return await res.json() as RunState;
+};
+
+const runState = async (http: string, H: Record<string, string>, token: string): Promise<RunState> => {
+  const res = await fetch(`${http}/arcade/run`, {
+    method: 'POST', headers: H, body: JSON.stringify({ token }),
+  });
+  return await res.json() as RunState;
+};
+
+/**
+ * Play one fight: queue the chosen node, submit a winning ledger, drain the
+ * result + xp. Returns the setup so callers can assert on it.
+ */
+const winFight = async (
+  c: ReturnType<typeof arcadeClient>, character: string, token: string, node: number,
+): Promise<{ setup: SMatch; xp: Extract<ServerMsg, { t: 'xp' }> }> => {
+  c.send({ t: 'queue', character, mode: 'arcade', runToken: token, arcadeNode: node });
+  const setup = await c.next<SMatch>('match');
+  submit(c, winningLine(setup));
+  const res = await c.next<Extract<ServerMsg, { t: 'result' }>>('result');
+  assert.equal(res.reason, 'verified');
+  assert.equal(res.winner, 0, 'the submitted ledger wins');
+  const xp = await c.next<Extract<ServerMsg, { t: 'xp' }>>('xp');
+  return { setup, xp };
+};
+
+// ---------------------------------------------------------------- the board
+
+test('BOARD TEMPLATES: every authored skeleton honours the 2/4/7 contract', () => {
+  const roster = enabledIds();
+  assert.ok(templateIds().length >= 6, 'a handful of skeletons, not one');
+  for (const id of templateIds()) {
+    // Several seeds each: the shuffle must not be able to break the shape.
+    for (const seed of [1, 7, 99, 12345, 88888]) {
+      const b = generateBoard({ roster, templateId: id, seed });
+      assert.deepEqual(validateBoard(b), [], `${id} @ ${seed}`);
+      assert.ok(topoOrder(b), `${id} is a DAG`);
+
+      for (const tier of [1, 2, 3] as const) {
+        const exit = exitNodes(b).find((e) => e.exitTier === tier)!;
+        assert.ok(exit, `${id} has a tier-${tier} exit`);
+        assert.equal(
+          minFights(b, b.start, exit.id), EXIT_FIGHT_FLOOR[tier],
+          `${id} @ ${seed}: exit ${tier} sits at exactly its fight floor`,
+        );
+      }
+
+      // THE rule the whole mode rests on: no pickup without a fight in front
+      // of it. If this ever passes, the board is a credit printer.
+      for (const n of b.nodes) {
+        if (n.kind !== 'loot') continue;
+        const preds = predecessors(b, n.id).map((p) => nodeById(b, p)!);
+        assert.ok(preds.length > 0, `loot ${n.id} is reachable`);
+        assert.ok(preds.every(isFightNode), `loot ${n.id} in ${id} is GUARDED`);
+      }
+    }
+  }
+});
+
+test('BOARD ROUTES: the fastest line is never the richest line', () => {
+  const roster = enabledIds();
+  for (const id of templateIds()) {
+    const b = generateBoard({ roster, templateId: id, seed: 4242 });
+    const deep = exitNodes(b).find((e) => e.exitTier === 3)!;
+    const fastest = pathTo(b, b.start, deep.id).map((n) => nodeById(b, n)!);
+    // The cheapest route to the deep exit is the pure SPINE: all fights, no
+    // pickups. Greed has to cost fights, or greed is free.
+    assert.equal(
+      fastest.filter((n) => n.kind === 'loot').length, 0,
+      `${id}: the cheapest deep line collects nothing`,
+    );
+    assert.equal(fastest.filter(isFightNode).length, EXIT_FIGHT_FLOOR[3]);
+    // …but the board is worth something to a player willing to detour.
+    assert.ok(
+      b.nodes.some((n) => n.kind === 'loot'),
+      `${id}: there is loot to detour for`,
+    );
+  }
+});
+
+test('BOARD REPRODUCIBILITY: (template, seed) rebuilds the exact same board', () => {
+  const roster = enabledIds();
+  const a = generateBoard({ roster, templateId: 'deep-vault', seed: 31337 });
+  const b = generateBoard({ roster, templateId: 'deep-vault', seed: 31337 });
+  assert.deepEqual(a, b, 'a support question can rebuild the run a player saw');
+});
+
+// ------------------------------------------------------------------- the run
+
+test('ARCADE RUN: entry is paid once, wins pay XP ONLY, extraction banks the bag', async (t) => {
   const persistence = memoryPersistence();
-  // Skill 0 house + skill 100 policy → winning lines are found immediately.
+  // Skill 0 house → winning lines are found on the first salt.
   const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true, arcadeSkill: () => 0 });
   t.after(() => server.close());
+  const http = `http://localhost:${server.port}`;
+  const H = { 'X-Dev-Name': 'Runner', 'Content-Type': 'application/json' };
+  await fetch(`${http}/me`, { headers: H }); // profile + daily 10
 
-  const enabled = enabledIds();
-  const player = enabled[0]!;
-  const total = enabled.filter((id) => id !== player).length;
-  assert.ok(total >= 3, `need ≥3 enabled opponents for milestones (got ${total})`);
+  const player = enabledIds()[0]!;
+  let state = await openRun(http, H, player, 'arcade-run-001');
+  assert.equal(state.character, player, 'fighter locks at /arcade/run');
+  assert.equal(state.at, state.board.start);
+  assert.equal(state.bag.credits, 0);
 
-  const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Gauntlet');
+  const acctAfterEntry = await persistence.getAccount({ sub: 'dev:Runner' }, 'Runner', false);
+  assert.equal(acctAfterEntry.credits, DAILY_CREDITS - ARCADE_FEE, 'charged up front');
+
+  // Walk the CHEAPEST line to the shallow exit — 2 fights, no pickups.
+  const exit1 = exitNodes(state.board).find((e) => e.exitTier === 1)!;
+  const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Runner');
   await c.ready;
-  c.send({ t: 'queue', character: player, mode: 'arcade' });
 
-  let token = '';
-  const seenOpponents = new Set<string>();
-  for (let b = 0; b < total; b++) {
-    const setup = await c.next<SMatch>('match');
-    assert.equal(setup.mode, 'arcade');
-    assert.equal(setup.arcade!.battle, b, 'server owns the battle index');
-    assert.equal(setup.arcade!.total, total);
-    assert.equal(setup.fee, b === 0 ? ARCADE_FEE : 0, 'one fee buys the whole run');
+  let fought = 0;
+  for (;;) {
+    state = await runState(http, H, state.token);
+    if (successors(state.board, state.at).includes(exit1.id)) break;
+    const next = pathTo(state.board, state.at, exit1.id)
+      .map((n) => nodeById(state.board, n)!)
+      .find(isFightNode)!;
+    const { setup, xp } = await winFight(c, player, state.token, next.id);
+    fought++;
+    assert.equal(setup.fee, 0, 'battles are free — the entry was the price');
     assert.equal(setup.chars[0].id, player, 'fighter locked for the run');
-    assert.ok(setup.chars[1].id !== player, 'no mirror in a full roster');
-    assert.ok(!seenOpponents.has(setup.chars[1].id), 'each agent appears once');
-    seenOpponents.add(setup.chars[1].id);
-    token = setup.arcade!.token;
-
-    submit(c, winningLine(setup));
-    const res = await c.next<Extract<ServerMsg, { t: 'result' }>>('result');
-    assert.equal(res.reason, 'verified');
-    assert.equal(res.winner, 0);
-    const xp = await c.next<Extract<ServerMsg, { t: 'xp' }>>('xp');
-    assert.equal(xp.gained, 60, 'every battle pays ranked XP');
-    // ADR 0007 credits rework: +1 EVERY win (+ clear bonus on the last),
-    // minus the legacy battle-1 escrow on this old-client path.
-    const expected = arcadeWinPayout(b + 1, total) - (b === 0 ? ARCADE_FEE : 0);
-    assert.equal(xp.creditsDelta, expected, `battle ${b + 1} creditsDelta`);
-
-    if (b + 1 < total) c.send({ t: 'queue', character: player, mode: 'arcade', runToken: token });
+    assert.equal(xp.gained, 60, 'every win pays ranked XP');
+    assert.equal(xp.creditsDelta, 0, 'A WIN PAYS NO CREDITS — the board pays');
+    assert.ok(fought <= EXIT_FIGHT_FLOOR[1], 'no more fights than the floor');
   }
+  assert.equal(fought, EXIT_FIGHT_FLOOR[1], 'shallow exit cost exactly 2 fights');
 
-  const acc = await persistence.getAccount({ sub: 'dev:Gauntlet' }, 'Gauntlet', false);
-  assert.equal(acc.wins, total, 'every battle books a ranked W');
+  // Extract. First run of the day → the full 100%.
+  const out = await fetch(`${http}/arcade/extract`, {
+    method: 'POST', headers: H, body: JSON.stringify({ token: state.token, node: exit1.id }),
+  });
+  assert.equal(out.status, 200);
+  const banked = await out.json() as {
+    exitTier: number; bonus: number; granted: number; multiplierPct: number; credits: number;
+  };
+  assert.equal(banked.exitTier, 1);
+  assert.equal(banked.bonus, EXIT_BONUS[1]);
+  assert.equal(banked.multiplierPct, 100, 'first run of the day pays full');
+  assert.equal(banked.granted, EXIT_BONUS[1], 'spine-only run banks the base bonus');
+
+  const acc = await persistence.getAccount({ sub: 'dev:Runner' }, 'Runner', false);
+  assert.equal(acc.wins, EXIT_FIGHT_FLOOR[1], 'each battle books a ranked W');
   assert.equal(acc.losses, 0);
-  assert.equal(
-    acc.credits,
-    DAILY_CREDITS - ARCADE_FEE + total + ARCADE_CLEAR_CREDITS,
-    'net = daily − entry + one credit per win + clear bonus',
-  );
+  assert.equal(acc.credits, DAILY_CREDITS - ARCADE_FEE + EXIT_BONUS[1]);
 
-  // The cleared run's token is spent — no free re-entry.
-  c.send({ t: 'queue', character: player, mode: 'arcade', runToken: token });
-  const err = await c.next<Extract<ServerMsg, { t: 'error' }>>('error');
-  assert.match(err.msg, /over/i);
+  // The extracted run is spent — no free re-entry, no double payout.
+  const replay = await fetch(`${http}/arcade/extract`, {
+    method: 'POST', headers: H, body: JSON.stringify({ token: state.token, node: exit1.id }),
+  });
+  assert.equal(replay.status, 404, 'the run is gone once it extracts');
   c.close();
 });
 
-test('PRE-PAID ENTRY (ADR 0007): /arcade/enter debits upfront, battle 1 is fee-free, a loss refunds NOTHING', async (t) => {
+test('GREED: a spur costs one extra fight and pays out on extraction', async (t) => {
   const persistence = memoryPersistence();
-  // Battle 1 vs skill 0 (winning lines found immediately); battle 2 vs
-  // skill 80 (an idle player is guaranteed to LOSE, not draw out the clock).
+  const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true, arcadeSkill: () => 0 });
+  t.after(() => server.close());
+  const http = `http://localhost:${server.port}`;
+  const H = { 'X-Dev-Name': 'Greedy', 'Content-Type': 'application/json' };
+  await fetch(`${http}/me`, { headers: H });
+
+  const player = enabledIds()[0]!;
+  let state = await openRun(http, H, player, 'greed-001');
+  const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Greedy');
+  await c.ready;
+
+  // Find a spur off the start: a fight whose only successor carries credits.
+  const board = state.board;
+  const spur = successors(board, state.at)
+    .map((id) => nodeById(board, id)!)
+    .find((n) => {
+      if (!isFightNode(n)) return false;
+      const outs = successors(board, n.id).map((o) => nodeById(board, o)!);
+      return outs.length === 1 && outs[0]!.loot?.kind === 'credits';
+    });
+  if (!spur) return c.close(); // this seed's template has no start-adjacent spur
+
+  const pile = nodeById(board, successors(board, spur.id)[0]!)!;
+  const worth = pile.loot && pile.loot.kind === 'credits' ? pile.loot.amount : 0;
+  assert.ok(worth > 0);
+
+  await winFight(c, player, state.token, spur.id);
+  state = await runState(http, H, state.token);
+  // AUTO-COLLECT: winning the guard sweeps up the pickup behind it, with no
+  // second round trip that a dropped request could lose.
+  assert.equal(state.at, pile.id, 'the run walked onto the pickup by itself');
+  assert.equal(state.bag.credits, worth, 'the pile is in the bag, UNBANKED');
+  assert.equal(state.fights, 1);
+
+  const acc = await persistence.getAccount({ sub: 'dev:Greedy' }, 'Greedy', false);
+  assert.equal(acc.credits, DAILY_CREDITS - ARCADE_FEE,
+    'nothing is banked until extraction — the bag is not money yet');
+  c.close();
+});
+
+test('WIPE: losing forfeits the whole bag and kills the run', async (t) => {
+  const persistence = memoryPersistence();
+  // Fight 1 vs skill 0 (win + collect), fight 2 vs skill 80 (idle = a real KO).
   const server = await createMatchServer({
     port: 0, persistence, noPaceCheck: true,
-    arcadeSkill: (battle) => (battle === 0 ? 0 : 80),
+    arcadeSkill: (fights) => (fights === 0 ? 0 : 80),
   });
   t.after(() => server.close());
   const http = `http://localhost:${server.port}`;
-  const H = { 'X-Dev-Name': 'Prepaid', 'Content-Type': 'application/json' };
+  const H = { 'X-Dev-Name': 'Wiped', 'Content-Type': 'application/json' };
+  await fetch(`${http}/me`, { headers: H });
 
-  await fetch(`${http}/me`, { headers: H }); // profile + daily 10
-
-  // Entry is debited BEFORE any battle — and the nonce makes retries safe.
-  const enter = await fetch(`${http}/arcade/enter`, {
-    method: 'POST', headers: H, body: JSON.stringify({ nonce: 'entry-001' }),
-  });
-  assert.equal(enter.status, 200);
-  const e1 = await enter.json() as { token: string; credits: number };
-  assert.equal(e1.credits, DAILY_CREDITS - ARCADE_FEE, 'charged at enter, not at battle 1');
-
-  const replay = await fetch(`${http}/arcade/enter`, {
-    method: 'POST', headers: H, body: JSON.stringify({ nonce: 'entry-001' }),
-  });
-  const e2 = await (replay.json() as Promise<{ token: string; credits: number }>);
-  assert.equal(e2.credits, DAILY_CREDITS - ARCADE_FEE, 'replayed nonce charges nothing');
-
-  // Broke wallet: a fresh account with 0 credits gets a clean 402.
-  const brokeH = { 'X-Dev-Name': 'BrokeEntry', 'Content-Type': 'application/json' };
-  await fetch(`${http}/me`, { headers: brokeH });
-  const acctB = await persistence.getAccount({ sub: 'dev:BrokeEntry' }, 'BrokeEntry', false);
-  await persistence.debitCredits('dev:BrokeEntry', acctB.credits, 'test', 'drain'); // drain to 0
-  const broke = await fetch(`${http}/arcade/enter`, {
-    method: 'POST', headers: brokeH, body: JSON.stringify({ nonce: 'entry-poor' }),
-  });
-  assert.equal(broke.status, 402);
-
-  // First battle queues WITH the token: the fighter locks now, fee is 0.
   const player = enabledIds()[0]!;
-  const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Prepaid');
+  let state = await openRun(http, H, player, 'wipe-001');
+  const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Wiped');
   await c.ready;
-  c.send({ t: 'queue', character: player, mode: 'arcade', runToken: e1.token });
+
+  // Win one fight to get SOMETHING in the bag (a spur if this board has one
+  // off the start, otherwise the spine — either way the run is alive).
+  const first = successors(state.board, state.at)
+    .map((id) => nodeById(state.board, id)!)
+    .find(isFightNode)!;
+  const { xp: xp1 } = await winFight(c, player, state.token, first.id);
+  assert.equal(xp1.creditsDelta, 0);
+  state = await runState(http, H, state.token);
+  const carried = state.bag.credits;
+
+  // Now lose. An idle player vs a skill-80 house is a guaranteed KO.
+  const next = successors(state.board, state.at)
+    .map((id) => nodeById(state.board, id)!)
+    .find(isFightNode)!;
+  c.send({ t: 'queue', character: player, mode: 'arcade', runToken: state.token, arcadeNode: next.id });
   const setup = await c.next<SMatch>('match');
-  assert.equal(setup.fee, 0, 'pre-paid run: battle 1 carries NO fee');
-  assert.equal(setup.arcade!.battle, 0);
-  assert.equal(setup.chars[0].id, player, 'fighter locked at first queue');
-
-  // Win battle 1 → +1 credit, clean (no fee riding the settlement).
-  submit(c, winningLine(setup));
-  const res = await c.next<Extract<ServerMsg, { t: 'result' }>>('result');
-  assert.equal(res.winner, 0);
-  const xp = await c.next<Extract<ServerMsg, { t: 'xp' }>>('xp');
-  assert.equal(xp.creditsDelta, 1, 'every arcade win pays +1');
-
-  // LOSE battle 2 → run dead, and the pre-paid entry is NOT refunded.
-  c.send({ t: 'queue', character: player, mode: 'arcade', runToken: setup.arcade!.token });
-  const setup2 = await c.next<SMatch>('match');
-  const lost = simBattle(setup2, -1, 0); // idle punching bag vs the house
+  const lost = simBattle(setup, -1, 0);
+  assert.equal(lost.winner, 1, 'the house must win this one');
   submit(c, lost.inputs);
-  const res2 = await c.next<Extract<ServerMsg, { t: 'result' }>>('result');
-  assert.equal(res2.winner, 1, 'the house wins');
-  await c.next<Extract<ServerMsg, { t: 'xp' }>>('xp');
-  const acc = await persistence.getAccount({ sub: 'dev:Prepaid' }, 'Prepaid', false);
-  assert.equal(acc.credits, DAILY_CREDITS - ARCADE_FEE + 1,
-    'entry stays spent on a loss — only the battle-1 win credit remains');
-  c.close();
-});
-
-test('ARCADE LOSS: run dies, entry burned, −15 XP, token unusable', async (t) => {
-  const persistence = memoryPersistence();
-  const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true, arcadeSkill: () => 80 });
-  t.after(() => server.close());
-
-  const player = enabledIds()[0]!;
-  const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'OneAndDone');
-  await c.ready;
-  c.send({ t: 'queue', character: player, mode: 'arcade' });
-  const setup = await c.next<SMatch>('match');
-  const token = setup.arcade!.token;
-
-  // An idle player vs a skill-80 house is a guaranteed KO — a real loss.
-  const { winner, inputs } = simBattle(setup, -1, 0);
-  assert.equal(winner, 1, 'the house must win this one');
-  submit(c, inputs);
   const res = await c.next<Extract<ServerMsg, { t: 'result' }>>('result');
-  assert.equal(res.reason, 'verified');
   assert.equal(res.winner, 1);
-  const xp = await c.next<Extract<ServerMsg, { t: 'xp' }>>('xp');
-  assert.equal(xp.creditsDelta, -ARCADE_FEE, 'the run entry is burned');
-  assert.equal(xp.gained, -15, 'arcade losses burn XP like ranked solo');
+  const xp2 = await c.next<Extract<ServerMsg, { t: 'xp' }>>('xp');
+  assert.equal(xp2.gained, -15, 'arcade losses burn XP like ranked solo');
+  assert.equal(xp2.creditsDelta, 0, 'nothing to lose at settlement — the bag was never banked');
 
-  c.send({ t: 'queue', character: player, mode: 'arcade', runToken: token });
-  const err = await c.next<Extract<ServerMsg, { t: 'error' }>>('error');
-  assert.match(err.msg, /over/i);
+  // The run and everything in it are gone.
+  const gone = await fetch(`${http}/arcade/run`, {
+    method: 'POST', headers: H, body: JSON.stringify({ token: state.token }),
+  });
+  assert.equal(gone.status, 404, 'the run token died with the run');
 
-  const acc = await persistence.getAccount({ sub: 'dev:OneAndDone' }, 'OneAndDone', false);
+  const acc = await persistence.getAccount({ sub: 'dev:Wiped' }, 'Wiped', false);
   assert.equal(acc.losses, 1);
-  assert.equal(acc.credits, DAILY_CREDITS - ARCADE_FEE);
+  assert.equal(acc.credits, DAILY_CREDITS - ARCADE_FEE,
+    `the ${carried} CR in the bag evaporated and the entry stays spent`);
   c.close();
 });
 
-test('ARCADE TOKEN ABUSE: wrong account and fighter swaps are rejected', async (t) => {
+test('MOVE LEGALITY: you can only fight what you can reach, and only fights', async (t) => {
   const persistence = memoryPersistence();
   const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true, arcadeSkill: () => 0 });
   t.after(() => server.close());
-  const url = `ws://127.0.0.1:${server.port}`;
+  const http = `http://localhost:${server.port}`;
+  const H = { 'X-Dev-Name': 'Cheat', 'Content-Type': 'application/json' };
+  await fetch(`${http}/me`, { headers: H });
 
-  const enabled = enabledIds();
-  const player = enabled[0]!;
-  const other = enabled[1]!;
+  const player = enabledIds()[0]!;
+  const state = await openRun(http, H, player, 'legal-001');
+  const board = state.board;
+  const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Cheat');
+  await c.ready;
 
-  const a = arcadeClient(url, 'Owner');
-  await a.ready;
-  a.send({ t: 'queue', character: player, mode: 'arcade' });
-  const setup = await a.next<SMatch>('match');
-  const token = setup.arcade!.token;
-  submit(a, winningLine(setup));
-  await a.next('result');
-  await a.next('xp');
+  // Teleporting to the boss (the richest node, 7 fights deep) is the obvious
+  // attack on this design — it must bounce off the server's own board.
+  const boss = board.nodes.find((n) => n.kind === 'boss')!;
+  c.send({ t: 'queue', character: player, mode: 'arcade', runToken: state.token, arcadeNode: boss.id });
+  const jump = await c.next<Extract<ServerMsg, { t: 'error' }>>('error');
+  assert.match(jump.msg, /does not lead anywhere/i);
+
+  // Queueing an EXIT is not a fight — exits go through /arcade/extract.
+  const deep = exitNodes(board).find((e) => e.exitTier === 3)!;
+  c.send({ t: 'queue', character: player, mode: 'arcade', runToken: state.token, arcadeNode: deep.id });
+  const notFight = await c.next<Extract<ServerMsg, { t: 'error' }>>('error');
+  assert.match(notFight.msg, /does not lead anywhere|not a fight/i);
+
+  // Extracting from an exit you are not standing next to pays nothing.
+  const far = await fetch(`${http}/arcade/extract`, {
+    method: 'POST', headers: H, body: JSON.stringify({ token: state.token, node: deep.id }),
+  });
+  assert.equal(far.status, 400);
+  assert.match((await far.json() as { error: string }).error, /no exit from where you are standing/i);
 
   // Another ACCOUNT cannot ride the token.
-  const b = arcadeClient(url, 'Thief');
-  await b.ready;
-  b.send({ t: 'queue', character: player, mode: 'arcade', runToken: token });
-  const stolen = await b.next<Extract<ServerMsg, { t: 'error' }>>('error');
+  const thief = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Thief');
+  await thief.ready;
+  const legal = successors(board, state.at).map((id) => nodeById(board, id)!).find(isFightNode)!;
+  thief.send({ t: 'queue', character: player, mode: 'arcade', runToken: state.token, arcadeNode: legal.id });
+  const stolen = await thief.next<Extract<ServerMsg, { t: 'error' }>>('error');
   assert.match(stolen.msg, /not your/i);
-  b.close();
+  thief.close();
 
-  // The owner cannot SWITCH FIGHTERS mid-run.
-  a.send({ t: 'queue', character: other, mode: 'arcade', runToken: token });
-  const swapped = await a.next<Extract<ServerMsg, { t: 'error' }>>('error');
+  // …nor can the owner switch fighters mid-run.
+  const other = enabledIds()[1]!;
+  c.send({ t: 'queue', character: other, mode: 'arcade', runToken: state.token, arcadeNode: legal.id });
+  const swapped = await c.next<Extract<ServerMsg, { t: 'error' }>>('error');
   assert.match(swapped.msg, /locked/i);
 
-  // With the locked fighter, the run continues into battle 2.
-  a.send({ t: 'queue', character: player, mode: 'arcade', runToken: token });
-  const b2 = await a.next<SMatch>('match');
-  assert.equal(b2.arcade!.battle, 1);
-  assert.equal(b2.fee, 0);
-  a.close();
+  // A legal move still works after all that.
+  const { setup } = await winFight(c, player, state.token, legal.id);
+  assert.equal(setup.arcade!.node, legal.id, 'the setup names the node being fought');
+  assert.equal(setup.arcade!.total, EXIT_FIGHT_FLOOR[3]);
+  c.close();
+});
+
+test('DIMINISHING RETURNS: the second run of the day banks 75%', async (t) => {
+  const persistence = memoryPersistence();
+  const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true, arcadeSkill: () => 0 });
+  t.after(() => server.close());
+  const http = `http://localhost:${server.port}`;
+  const H = { 'X-Dev-Name': 'Grinder', 'Content-Type': 'application/json' };
+  await fetch(`${http}/me`, { headers: H });
+
+  const player = enabledIds()[0]!;
+  const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Grinder');
+  await c.ready;
+
+  const runToShallowExit = async (nonce: string): Promise<number> => {
+    let state = await openRun(http, H, player, nonce);
+    const exit1 = exitNodes(state.board).find((e) => e.exitTier === 1)!;
+    for (;;) {
+      state = await runState(http, H, state.token);
+      if (successors(state.board, state.at).includes(exit1.id)) break;
+      const next = pathTo(state.board, state.at, exit1.id)
+        .map((n) => nodeById(state.board, n)!)
+        .find(isFightNode)!;
+      await winFight(c, player, state.token, next.id);
+    }
+    const out = await fetch(`${http}/arcade/extract`, {
+      method: 'POST', headers: H, body: JSON.stringify({ token: state.token, node: exit1.id }),
+    });
+    return (await out.json() as { multiplierPct: number }).multiplierPct;
+  };
+
+  assert.equal(await runToShallowExit('dimret-run-1'), 100, 'run 1 of the day');
+  assert.equal(await runToShallowExit('dimret-run-2'), 75, 'run 2 tapers');
+  assert.equal(await runToShallowExit('dimret-run-3'), 50, 'run 3 tapers further');
+  assert.equal(await runToShallowExit('dimret-run-4'), 25, 'and floors at 25%');
+  c.close();
+});
+
+test('AUTOPILOT: a headless agent with no board sense still walks the deep line', async (t) => {
+  // persistence OFF — the no-token path is reserved for players who cannot
+  // pay and therefore cannot farm: agent-class accounts and this dev economy.
+  const server = await createMatchServer({ port: 0, persistence: null, noPaceCheck: true, arcadeSkill: () => 0 });
+  t.after(() => server.close());
+
+  // No token, no node: the server opens a run and routes it. This is exactly
+  // what `npm run agent` / `npm run fleet` send.
+  const player = enabledIds()[0]!;
+  const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Headless');
+  await c.ready;
+  c.send({ t: 'queue', character: player, mode: 'arcade' });
+
+  const first = await c.next<SMatch>('match');
+  assert.ok(first.arcade, 'a run was opened for it');
+  assert.equal(first.arcade!.fights, 0);
+  submit(c, winningLine(first));
+  const r1 = await c.next<Extract<ServerMsg, { t: 'result' }>>('result');
+  assert.equal(r1.winner, 0);
+
+  // …and the token chains to a SECOND fight without the agent naming a node.
+  c.send({ t: 'queue', character: player, mode: 'arcade', runToken: first.arcade!.token });
+  const second = await c.next<SMatch>('match');
+  assert.equal(second.arcade!.fights, 1, 'the run advanced');
+  assert.notEqual(second.arcade!.node, first.arcade!.node, 'onto a different node');
+  c.close();
+});
+
+test('PAID ENTRY IS THE ONLY DOOR: a real account cannot open a run for free', async (t) => {
+  const persistence = memoryPersistence();
+  const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true, arcadeSkill: () => 0 });
+  t.after(() => server.close());
+  const http = `http://localhost:${server.port}`;
+  const H = { 'X-Dev-Name': 'Freeloader', 'Content-Type': 'application/json' };
+  await fetch(`${http}/me`, { headers: H });
+
+  const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Freeloader');
+  await c.ready;
+  c.send({ t: 'queue', character: enabledIds()[0]!, mode: 'arcade' });
+  const err = await c.next<Extract<ServerMsg, { t: 'error' }>>('error');
+  assert.match(err.msg, /from the title|paid up front/i);
+
+  // A broke wallet gets a clean 402 at the door rather than a half-open run.
+  const acct = await persistence.getAccount({ sub: 'dev:Freeloader' }, 'Freeloader', false);
+  await persistence.debitCredits('dev:Freeloader', acct.credits, 'test', 'drain-it-all');
+  const broke = await fetch(`${http}/arcade/enter`, {
+    method: 'POST', headers: H, body: JSON.stringify({ nonce: 'broke-entry-01' }),
+  });
+  assert.equal(broke.status, 402);
+  c.close();
+});
+
+test('ENTRY REPLAY: a retried nonce charges once (dropped response, double tap)', async (t) => {
+  const persistence = memoryPersistence();
+  const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true });
+  t.after(() => server.close());
+  const http = `http://localhost:${server.port}`;
+  const H = { 'X-Dev-Name': 'Retrier', 'Content-Type': 'application/json' };
+  await fetch(`${http}/me`, { headers: H });
+
+  const body = JSON.stringify({ nonce: 'retry-entry-001' });
+  const a = await (await fetch(`${http}/arcade/enter`, { method: 'POST', headers: H, body })).json() as { credits: number };
+  const b = await (await fetch(`${http}/arcade/enter`, { method: 'POST', headers: H, body })).json() as { credits: number };
+  assert.equal(a.credits, DAILY_CREDITS - ARCADE_FEE, 'charged at enter');
+  assert.equal(b.credits, DAILY_CREDITS - ARCADE_FEE, 'replayed nonce charges nothing');
 });

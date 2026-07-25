@@ -30,3 +30,16 @@ export {
 } from './items.js';
 export { ITEM_SLOTS, setMatchItems } from './state.js';
 export type { ItemDef, ItemEffect, ItemEffectKind, ItemTier } from './items.js';
+export {
+  BOARD_W, BOARD_H, REGION_NAME, REGION_SKILL, REGION_CREDITS,
+  EXIT_BONUS, EXIT_FIGHT_FLOOR,
+  isFightNode, nodeById, successors, predecessors, isLegalMove,
+  topoOrder, routeTo, pathTo, minFights, exitNodes, exitRoutes, boardCredits,
+} from './arcade-map.js';
+export type {
+  Board, BoardNode, BoardNodeKind, BoardRegion, BoardLoot, ExitTier, RouteStat,
+} from './arcade-map.js';
+export {
+  generateBoard, validateBoard, validateAllTemplates, templateIds,
+} from './arcade-board.js';
+export type { GenerateOptions } from './arcade-board.js';

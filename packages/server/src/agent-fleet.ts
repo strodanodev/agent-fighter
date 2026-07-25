@@ -164,12 +164,12 @@ const agentLoop = async (a: FleetAgent): Promise<void> => {
       backoffMs = 5_000; // a completed match (any outcome) resets the ladder
       battles++;
       const won = r.result.reason === 'verified' && r.result.winner === 0;
-      const pos = r.arcade ? `${r.arcade.battle + 1}/${r.arcade.total}` : '?';
-      log(a.name, `battle ${pos} · ${r.result.reason} · ${won ? 'WIN' : 'loss/nc'} · ${r.result.endTick} ticks (${battles} today)`);
-      if (won && r.arcade && r.arcade.battle + 1 < r.arcade.total) {
-        runToken = r.arcade.token; // next battle of the same run
+      const pos = r.arcade ? `${r.arcade.fights + 1}/${r.arcade.total}` : '?';
+      log(a.name, `fight ${pos} · ${r.result.reason} · ${won ? 'WIN' : 'loss/nc'} · ${r.result.endTick} ticks (${battles} today)`);
+      if (won && r.arcade && r.arcade.fights < r.arcade.total) {
+        runToken = r.arcade.token; // next node of the same run (autopiloted)
       } else {
-        if (won && r.arcade) log(a.name, `FULL CLEAR — ${r.arcade.total} battles`);
+        if (won && r.arcade) log(a.name, `REACHED THE DEEP EXIT — ${r.arcade.total} fights`);
         runToken = undefined; // loss / clear / nc without token → fresh run
         await sleep(2_000 + rand(8_000)); // breathe between runs
       }
