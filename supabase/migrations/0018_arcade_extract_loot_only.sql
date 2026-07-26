@@ -102,3 +102,22 @@ begin
 end $$;
 
 revoke execute on function arcade_extract from public, anon, authenticated;
+
+-- RELOAD POSTGREST'S SCHEMA CACHE. This is not optional here, and it cost a
+-- live outage to learn: this migration DROPS a function and recreates it with
+-- a different argument list, and PostgREST keeps serving its cached view of
+-- the old signature until told otherwise. The server's 4-argument call then
+-- matches nothing in the cache and comes back **404** — which reads like "the
+-- function doesn't exist" even though `\df arcade_extract` shows it right
+-- there. Every extraction on prod failed this way until the cache was
+-- reloaded.
+--
+-- Note a plain `create or replace` (same signature) does NOT need this; only
+-- a changed signature does. Cheap and harmless either way, so it belongs at
+-- the end of any migration that adds, drops, or re-signs a function.
+--
+-- Testing note for whoever writes the next one: `execute_sql` / psql call the
+-- function DIRECTLY and will happily pass while PostgREST 404s. A smoke test
+-- that doesn't go through /rest/v1/rpc proves nothing about what the server
+-- will see.
+notify pgrst, 'reload schema';
