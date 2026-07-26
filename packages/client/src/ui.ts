@@ -3895,9 +3895,13 @@ export const drawExtract = (ctx: CanvasRenderingContext2D, tick: number, v: Extr
     label(ctx, val, cx + 190, y, 16, color, 'right');
     y += 26;
   };
+  // Order matters: the rate sits DIRECTLY under the line it multiplies, so
+  // nobody has to guess whether their exit bonus got taxed. (It never does.)
   row('PICKED UP', `${v.bag} CR`);
-  row(`EXIT ${v.exitTier} BONUS`, `+${v.bonus} CR`);
-  if (!v.practice && v.multiplierPct < 100) row("TODAY'S RATE", `x${v.multiplierPct}%`, '#ffd166');
+  if (!v.practice && v.multiplierPct < 100) {
+    row("TODAY'S RATE · LOOT ONLY", `x${v.multiplierPct}%`, '#ffd166');
+  }
+  row(`EXIT ${v.exitTier} BONUS`, `+${v.bonus} CR`, '#7ee85a');
   if (v.drinks > 0) row('DRINKS BANKED', `${v.drinks}`, '#4fc4d6');
   if (v.drinksLeftBehind > 0) row('OVER DAILY DRINK CAP', `${v.drinksLeftBehind} LOST`, '#ff9d9d');
 

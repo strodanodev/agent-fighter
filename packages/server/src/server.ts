@@ -2048,7 +2048,6 @@ export const createMatchServer = (opts: {
         run.lastActive = Date.now();
 
         const bonus = EXIT_BONUS[node.exitTier];
-        const bagCredits = run.bag.credits + bonus;
         // Agent-class accounts are economically inert by construction: they
         // run the board for XP and rank only, and bank nothing.
         if (!persistence || isAgentClassSub(run.sub)) {
@@ -2061,7 +2060,9 @@ export const createMatchServer = (opts: {
         }
         let paid: ArcadeExtract;
         try {
-          paid = await persistence.arcadeExtract(run.sub, token, bagCredits);
+          // Loot and bonus go in SEPARATELY: the day's taper applies to the
+          // loot only, never to what you earned by surviving the run.
+          paid = await persistence.arcadeExtract(run.sub, token, run.bag.credits, bonus);
         } catch (err) {
           // The bank blipped. Re-arm the run so the player can extract again
           // rather than losing a bag they earned — arcade_extract is
@@ -2082,7 +2083,7 @@ export const createMatchServer = (opts: {
           }
         }
         arcadeRuns.delete(token); // paid and banked — now it is safe to forget
-        console.log(`[arcade] ${run.sub} EXTRACTED at tier ${node.exitTier} after ${run.fights} fights — ${bagCredits} CR × ${paid.multiplierPct}% = ${paid.granted}, ${drinks.length}/${run.bag.drinks.length} drink(s)`);
+        console.log(`[arcade] ${run.sub} EXTRACTED at tier ${node.exitTier} after ${run.fights} fights — loot ${run.bag.credits} × ${paid.multiplierPct}% + bonus ${bonus} = ${paid.granted} CR, ${drinks.length}/${run.bag.drinks.length} drink(s)`);
         return json(res, 200, {
           exitTier: node.exitTier,
           bonus,

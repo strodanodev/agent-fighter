@@ -6,7 +6,7 @@
  * mintable or burnable by yanking a cable at the right moment.
  */
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocket } from 'ws';
@@ -20,9 +20,48 @@ import type { ServerMsg } from '../src/protocol.js';
 const here = dirname(fileURLToPath(import.meta.url));
 const charactersDir = join(here, '..', '..', '..', 'characters');
 
+/**
+ * Every socket this file opens, so the run can ALWAYS drain them.
+ *
+ * Each test closes its own sockets on the happy path — but a failed assertion
+ * jumps over that `close()`, the socket stays open, and `node --test` then
+ * never exits. The suite doesn't report a failure, it HANGS: no tally, no
+ * diagnostic, process idle-alive. That has now eaten a full verify run and,
+ * worse, the failure detail with it. A blanket drain makes a failing test
+ * fail loudly instead of silently wedging the runner.
+ */
+const openSockets: WebSocket[] = [];
+after(() => {
+  for (const ws of openSockets) {
+    try { ws.close(); } catch { /* already gone — draining is best-effort */ }
+  }
+});
+
+/**
+ * Wait for the SETTLEMENT to land rather than sleeping and hoping.
+ *
+ * Persistence is fire-and-forget on purpose (server.ts: `void
+ * persistence.recordMatch(...)` — progression must never delay a verdict), so
+ * a fixed sleep here is a race that only loses on a loaded machine. It did:
+ * RAGEQUIT passed alone and failed inside a full parallel run. Polling makes
+ * these assertions depend on the outcome, not on the CPU.
+ */
+const settledAccount = async <T>(
+  read: () => Promise<T>, done: (v: T) => boolean, ms = 5_000,
+): Promise<T> => {
+  const deadline = Date.now() + ms;
+  let last = await read();
+  while (!done(last) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+    last = await read();
+  }
+  return last;
+};
+
 /** A raw protocol client — lets a test misbehave in ways the real one can't. */
 const rawClient = (url: string, name: string, mode: 'wager' | 'solo') => {
   const ws = new WebSocket(url);
+  openSockets.push(ws);
   const msgs: ServerMsg[] = [];
   const waiters: Array<{ t: string; go: (m: ServerMsg) => void }> = [];
   ws.on('message', (d) => {
@@ -67,8 +106,12 @@ test('LEDGER TRUTH: winning then dropping still WINS (no cable-pull escape eithe
   await new Promise((r) => setTimeout(r, 600));
   c.close(); // drop WITHOUT reporting 'over'
 
-  await new Promise((r) => setTimeout(r, 22_000)); // grace (20s) + settle
-  const acc = await persistence.getAccount({ sub: 'dev:Ghoster' }, 'Ghoster', false);
+  // Grace (20s) then settlement. Poll rather than sleep-and-hope: the write
+  // is fire-and-forget, so a fixed wait is a race on a loaded machine.
+  const acc = await settledAccount(
+    () => persistence.getAccount({ sub: 'dev:Ghoster' }, 'Ghoster', false),
+    (a) => a.wins + a.losses === 1,
+    30_000);
   // Decided by the ledger → a real W/L was booked, not a refund-y no-contest.
   assert.equal(acc.wins + acc.losses, 1, 'ledger-decided match must book a result');
 });
@@ -91,10 +134,13 @@ test('RAGEQUIT: dropping an UNDECIDED wager loses it; the pot goes to whoever st
 
   const res = await stayer.until<Extract<ServerMsg, { t: 'result' }>>('result', 30_000);
   assert.equal(res.reason, 'forfeit');
-  await new Promise((r) => setTimeout(r, 400));
 
-  const q = await persistence.getAccount({ sub: 'dev:Quitter' }, 'Quitter', false);
-  const s = await persistence.getAccount({ sub: 'dev:Stayer' }, 'Stayer', false);
+  const s = await settledAccount(
+    () => persistence.getAccount({ sub: 'dev:Stayer' }, 'Stayer', false),
+    (a) => a.wins === 1);
+  const q = await settledAccount(
+    () => persistence.getAccount({ sub: 'dev:Quitter' }, 'Quitter', false),
+    (a) => a.losses === 1);
   assert.equal(s.credits, DAILY_CREDITS + WAGER_FEE, 'stayer takes the pot');
   assert.equal(q.credits, DAILY_CREDITS - WAGER_FEE, 'quitter burns the entry');
   assert.equal(s.wins, 1);
@@ -117,9 +163,14 @@ test('NO CONTEST: both sides gone on an undecided wager refunds both (never an a
   a.close();
   b.close(); // both drop — e.g. a server-side network partition
 
-  await new Promise((r) => setTimeout(r, 22_000));
-  const accA = await persistence.getAccount({ sub: 'dev:GoneA' }, 'GoneA', false);
-  const accB = await persistence.getAccount({ sub: 'dev:GoneB' }, 'GoneB', false);
+  const accA = await settledAccount(
+    () => persistence.getAccount({ sub: 'dev:GoneA' }, 'GoneA', false),
+    (a) => a.credits === DAILY_CREDITS,
+    30_000);
+  const accB = await settledAccount(
+    () => persistence.getAccount({ sub: 'dev:GoneB' }, 'GoneB', false),
+    (a) => a.credits === DAILY_CREDITS,
+    30_000);
   assert.equal(accA.credits, DAILY_CREDITS, 'A refunded');
   assert.equal(accB.credits, DAILY_CREDITS, 'B refunded');
   assert.equal(accA.wins + accA.losses + accB.wins + accB.losses, 0, 'nobody is charged a loss');

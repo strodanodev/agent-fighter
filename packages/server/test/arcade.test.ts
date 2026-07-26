@@ -435,7 +435,48 @@ test('MOVE LEGALITY: you can only fight what you can reach, and only fights', as
   c.close();
 });
 
-test('DIMINISHING RETURNS: the second run of the day banks 75%', async (t) => {
+test('PAYOUT SHAPE: the taper touches LOOT ONLY, and never pays a survivor zero', async () => {
+  // Regression for the day-one economy bug: a live player banked 3 runs —
+  // including a 10-fight clear of the DEEP exit — for a net of ZERO credits,
+  // because the multiplier was eating the exit bonus too and the ladder had
+  // already bottomed out. These are the exact two receipts they saw.
+  const persistence = memoryPersistence();
+  await persistence.getAccount({ sub: 'dev:Shape' }, 'Shape', false);
+
+  // Extraction 1 of the day, shallow exit, no loot: (0 loot, +2 bonus).
+  const first = await persistence.arcadeExtract('dev:Shape', 'tok-a', 0, EXIT_BONUS[1]);
+  assert.equal(first.multiplierPct, 100, 'first three extractions are full rate');
+  assert.equal(first.granted, EXIT_BONUS[1], 'a survivor banks the whole bonus');
+  assert.ok(first.granted > 0, 'a SUCCESSFUL extraction never pays zero');
+
+  // Push to the floor: extractions 2..6 (the ladder counts banks, not entries).
+  for (const [n, expected] of [[2, 100], [3, 100], [4, 80], [5, 65], [6, 50]] as const) {
+    const r = await persistence.arcadeExtract('dev:Shape', `tok-${n}`, 0, EXIT_BONUS[1]);
+    assert.equal(r.multiplierPct, expected, `extraction ${n} of the day`);
+    assert.equal(r.granted, EXIT_BONUS[1], 'the bonus is never tapered, at any rate');
+  }
+
+  // At the 50% floor, the deep-clear receipt: 14 loot + 18 bonus.
+  const deep = await persistence.arcadeExtract('dev:Shape', 'tok-deep', 14, EXIT_BONUS[3]);
+  assert.equal(deep.multiplierPct, 50);
+  assert.equal(deep.granted, Math.floor(14 * 0.5) + EXIT_BONUS[3], 'loot tapered, bonus whole');
+  assert.equal(deep.granted, 25, 'a deep clear at the WORST rate still pays 25 CR (was 8)');
+});
+
+test('DYING DOES NOT BURN THE LADDER: only successful banks advance it', async () => {
+  // The original ladder counted ENTRIES, so wiping or abandoning taxed your
+  // next run. A wipe already forfeits the whole bag — that is the deterrent.
+  const persistence = memoryPersistence();
+  await persistence.getAccount({ sub: 'dev:Unlucky' }, 'Unlucky', false);
+  for (let i = 0; i < 6; i++) {
+    await persistence.debitCredits('dev:Unlucky', 1, 'arcade', `died-${i}`);
+  }
+  const r = await persistence.arcadeExtract('dev:Unlucky', 'finally', 10, EXIT_BONUS[2]);
+  assert.equal(r.multiplierPct, 100, 'six failed runs cost the bag, not the rate');
+  assert.equal(r.granted, 10 + EXIT_BONUS[2]);
+});
+
+test('DIMINISHING RETURNS: the fourth EXTRACTION of the day tapers the loot', async (t) => {
   const persistence = memoryPersistence();
   const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true, arcadeSkill: () => 0 });
   t.after(() => server.close());
@@ -447,7 +488,7 @@ test('DIMINISHING RETURNS: the second run of the day banks 75%', async (t) => {
   const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Grinder');
   await c.ready;
 
-  const runToShallowExit = async (nonce: string): Promise<number> => {
+  const runToShallowExit = async (nonce: string): Promise<{ pct: number; granted: number }> => {
     let state = await openRun(http, H, player, nonce);
     const exit1 = exitNodes(state.board).find((e) => e.exitTier === 1)!;
     for (;;) {
@@ -461,13 +502,21 @@ test('DIMINISHING RETURNS: the second run of the day banks 75%', async (t) => {
     const out = await fetch(`${http}/arcade/extract`, {
       method: 'POST', headers: H, body: JSON.stringify({ token: state.token, node: exit1.id }),
     });
-    return (await out.json() as { multiplierPct: number }).multiplierPct;
+    const body = await out.json() as { multiplierPct: number; granted: number };
+    return { pct: body.multiplierPct, granted: body.granted };
   };
 
-  assert.equal(await runToShallowExit('dimret-run-1'), 100, 'run 1 of the day');
-  assert.equal(await runToShallowExit('dimret-run-2'), 75, 'run 2 tapers');
-  assert.equal(await runToShallowExit('dimret-run-3'), 50, 'run 3 tapers further');
-  assert.equal(await runToShallowExit('dimret-run-4'), 25, 'and floors at 25%');
+  // Three full-rate banks before anything bites — a session, not a grind.
+  for (const nonce of ['dimret-run-1', 'dimret-run-2', 'dimret-run-3']) {
+    const r = await runToShallowExit(nonce);
+    assert.equal(r.pct, 100, `${nonce} is full rate`);
+    assert.equal(r.granted, EXIT_BONUS[1], 'spine-only run banks the whole bonus');
+  }
+  const fourth = await runToShallowExit('dimret-run-4');
+  assert.equal(fourth.pct, 80, 'the fourth extraction tapers');
+  // …but the taper is on LOOT, and this route carried none, so the survivor
+  // still banks the full exit bonus rather than a fraction of it.
+  assert.equal(fourth.granted, EXIT_BONUS[1], 'the bonus is never tapered');
   c.close();
 });
 

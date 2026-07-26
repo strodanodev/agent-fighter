@@ -93,7 +93,7 @@ low-tier detour would be free money.
 | Run length | **2 / 4 / 7 fights** (≈6 / 12 / 22 min) | Even the deep line fits one sitting; roughly halves today's 12-battle commitment. Matters on mobile, and matters given the iOS jetsam history |
 | Payout targets | **3 / 12 / 30 CR** typical haul by exit | Deep run ≈ 6 shop pulls, ≈2× today's +14 full clear, gated behind 7 escalating fights. Arcade stays a faucet that funds the shop without printing |
 | Board generation | **6–10 authored templates + seeded shuffle** of which fighter guards what and which spur holds which pickup | Every board is guaranteed solvable, readable and fair. Full procgen needs a validator and will ship unfun boards before tuning converges |
-| Farm guard | **Diminishing returns per UTC day**: run 1 100%, run 2 75%, run 3 50%, run 4+ 25% | Never hard-blocks play (a wall kills engagement) but caps a grinder near two good runs' worth. Same UTC-reset pattern as the daily grant |
+| Farm guard | **Diminishing returns per UTC day.** RETUNED after first live play (see below): the taper applies to **loot only**, counts **extractions** not entries, and runs 100/100/100/80/65/50 | Never hard-blocks play (a wall kills engagement) but caps a grinder. The first cut taxed the exit bonus and counted entries, which made a 10-fight deep clear pay 8 CR and taxed players for losing |
 | Found drinks | **Usable mid-run AND bankable.** They land in a run bag; tap on the map screen to load one into an empty or already-drunk slot | The best decision in the mode: drink it to survive, or carry it out for value. Combat HUD stays at 3 slots |
 | Route assist | **UI computes the math**: "FASTEST TO EXIT 2: 4 FIGHTS", each spur labelled "+6 CR · +1 FIGHT" | The board is revealed anyway; hiding arithmetic adds friction, not depth — especially on a 6-inch screen |
 | Narrative | **Light flavor per region**: three named zones with a one-line intro, gatekeeper taunts reusing `meta.motto`, an extraction sting | Cheap, ships with v1, makes the board feel like a place. Chapters and a persistent rival are a separate project |
@@ -252,6 +252,44 @@ determinism guarantee (no ambient randomness); the server picks the seed.
   stayed af-core-7, so goldens needed no re-bless — but a v6 client still
   gets a clean "protocol 7 required" until the client half lands, which is
   exactly why the two must ship together.
+
+## Day-one economy bug and retune (2026-07-26, migration 0018)
+
+The mode shipped and the payout was wrong. A live player's first evening:
+**8 entries, 3 extractions — including a 10-fight clear of the DEEP exit —
+for a net of ZERO credits.** The arithmetic was correct; the design was not.
+Three compounding mistakes, all in the diminishing-returns rule:
+
+1. **The multiplier taxed the exit bonus.** DR exists to bound *farming the
+   board*. Applying it to `loot + bonus` also taxed the guaranteed reward for
+   surviving, so the deeper and braver the run, the harder it was hit. That is
+   how a 10-fight deep clear (14 loot + 18 bonus) paid **8 CR**.
+2. **It counted ENTRIES.** The intent was "dying must not reset the ladder";
+   the effect was that dying and abandoning *burned* it — the player was taxed
+   for losing. Five of that evening's eight entries never reached an exit.
+3. **It bottomed out on the 4th run.** A run is 6–22 minutes, so one session
+   pinned the account at 25% permanently.
+
+Visible symptom, and the worst one: a legitimate 2-fight extraction paid
+**0 CR** — floor-rounding `(0 loot + 2 bonus) × 25%` — which is strictly worse
+than the `+1 CR`/win it replaced. The "reads as a nerf" risk, realised.
+
+**The fix** (`0018_arcade_extract_loot_only.sql`, owner-approved):
+
+| | Before | After |
+| --- | --- | --- |
+| Taper applies to | loot + exit bonus | **loot only** — the bonus is always paid whole |
+| Ladder counts | runs entered | **extractions banked** (a wipe costs the bag, not the rate) |
+| Ladder | 100 / 75 / 50 / 25 | **100 / 100 / 100 / 80 / 65 / 50** |
+| Minimum | could floor to 0 | a successful extraction **never** pays zero |
+
+Same two receipts under the new rule: the 2-fight shallow run pays **2 CR**
+(was 0); the 10-fight deep clear pays **25 CR even at the worst rate** (was 8).
+
+The lesson worth carrying: a taper meant to bound farming must never touch the
+part of the reward that represents *achievement*, or it punishes exactly the
+players you want. Locked by `PAYOUT SHAPE` and `DYING DOES NOT BURN THE LADDER`
+in `arcade.test.ts`.
 
 ## Still open
 - **`main.ts` accretion** was flagged in the 2026-07-18 audit and this added a

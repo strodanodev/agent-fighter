@@ -49,19 +49,30 @@ export const WAGER_FEE = 10;
 /** AGENT ARCADE: one credit buys one RUN (non-refundable, POST /arcade/enter). */
 export const ARCADE_FEE = 1;
 /**
- * AGENT ARCADE v2 diminishing returns (ADR 0008). Index = how many runs this
- * account has ENTERED today (UTC), 1-based; past the end, the last value
- * repeats forever. Counting ENTRIES rather than survivals is deliberate:
- * dying must not reset the ladder, or the cheapest farm is to die instantly.
+ * AGENT ARCADE v2 diminishing returns (ADR 0008, RETUNED after first live
+ * play). Index = which EXTRACTION of the UTC day this is, 1-based; past the
+ * end the last value repeats.
  *
- * A wall ("no more credits today") would just switch a paying player off
- * mid-session; a taper keeps them playing for XP and rank while capping a
- * grinder near two good runs' worth of credits. Mirrored in
- * 0017_arcade_extract.sql — change BOTH.
+ * Two things here were wrong in the first cut and cost a real player a real
+ * evening (8 entries, 3 extractions including a 10-fight deep clear, net
+ * ZERO credits):
+ *
+ *  1. It counted ENTRIES. The intent was "dying must not reset the ladder",
+ *     but the effect was that dying and abandoning BURNED it — you were
+ *     taxed for losing. Only a successful bank advances it now; a wipe
+ *     already costs you the whole bag, which is deterrent enough.
+ *  2. It bottomed out on the 4th run. A run is 6-22 minutes, so one evening
+ *     pinned you at the floor forever. Three full-rate extractions before
+ *     anything bites is the difference between "playing" and "grinding".
+ *
+ * And critically, this multiplier now applies to LOOT ONLY — never to the
+ * exit bonus (see arcadeExtract). Tapering the bonus punished the
+ * achievement rather than the farming. Mirrored in
+ * 0018_arcade_extract_loot_only.sql — change BOTH.
  */
-export const ARCADE_DR_PCT: readonly number[] = [100, 75, 50, 25];
-export const arcadeMultiplierPct = (runsToday: number): number =>
-  ARCADE_DR_PCT[Math.min(Math.max(runsToday, 1), ARCADE_DR_PCT.length) - 1]!;
+export const ARCADE_DR_PCT: readonly number[] = [100, 100, 100, 80, 65, 50];
+export const arcadeMultiplierPct = (extractionsToday: number): number =>
+  ARCADE_DR_PCT[Math.min(Math.max(extractionsToday, 1), ARCADE_DR_PCT.length) - 1]!;
 /**
  * Extracted energy drinks per account per UTC day. A drink is worth
  * ITEM_COST (5) credits, so without its own valve drink extraction would
@@ -316,25 +327,33 @@ export interface Persistence {
   debitCredits: (sub: string, amount: number, reason: string, key: string) =>
     Promise<{ credits: number; duplicate: boolean }>;
   /**
-   * AGENT ARCADE v2 extraction (ADR 0008): bank a surviving run's credit
-   * bag. `runToken` is the idempotency key — a retried extract pays once.
-   * Applies the day's diminishing-returns multiplier and reports how many
-   * board drinks may still be granted today (the caller grants them through
-   * buyItem at cost 0; see ARCADE_DRINK_DAY_CAP).
+   * AGENT ARCADE v2 extraction (ADR 0008): bank a surviving run's bag.
+   * `runToken` is the idempotency key — a retried extract pays once.
+   *
+   * `loot` and `bonus` are SEPARATE arguments on purpose. The day's
+   * diminishing-returns multiplier applies to LOOT ONLY; the exit bonus is
+   * the guaranteed reward for surviving the run and is always paid in full.
+   * Tapering it taxed the achievement instead of the farming, which is how a
+   * 10-fight deep clear ended up paying 8 credits on day one.
+   *
+   * Also reports how many board drinks may still be granted today (the
+   * caller grants them through buyItem at cost 0; see ARCADE_DRINK_DAY_CAP).
    *
    * Deliberately NOT part of recordMatch: an extraction is not a match, has
    * no ledger 'fee' row, and must stay invisible to the escrow sweeper.
    */
-  arcadeExtract: (sub: string, runToken: string, credits: number) => Promise<ArcadeExtract>;
+  arcadeExtract: (
+    sub: string, runToken: string, loot: number, bonus: number,
+  ) => Promise<ArcadeExtract>;
 }
 
 /** What banking a run bag actually paid (ADR 0008). */
 export interface ArcadeExtract {
   /** New balance after the payout. */
   credits: number;
-  /** Credits actually paid — the bag AFTER the day's multiplier. */
+  /** Credits actually paid = tapered LOOT + the untouched exit bonus. */
   granted: number;
-  /** The multiplier applied, as a percentage (100 / 75 / 50 / 25). */
+  /** The multiplier applied TO THE LOOT ONLY, as a percentage. */
   multiplierPct: number;
   /** How many board drinks the caller may still grant today. */
   drinkBudget: number;
@@ -463,12 +482,12 @@ export const memoryPersistence = (): Persistence => {
   /** Idempotency keys of non-refundable debits (`sub|reason|key`) — ADR 0007. */
   const debits = new Set<string>();
   /**
-   * AGENT ARCADE v2 valves (ADR 0008), mirroring what 0017_arcade_extract.sql
-   * reads back out of credit_ledger: UTC day stamps of every run ENTERED
-   * (the diminishing-returns ladder) and of every board drink extracted
-   * (the daily drink cap).
+   * AGENT ARCADE v2 valves (ADR 0008), mirroring what the SQL reads back out
+   * of credit_ledger: UTC day stamps of every successful EXTRACTION (the
+   * diminishing-returns ladder) and of every board drink extracted (the
+   * daily drink cap). Note extractions, not entries — see ARCADE_DR_PCT.
    */
-  const arcadeEntries = new Map<string, string[]>();
+  const arcadeBanks = new Map<string, string[]>();
   const extractedDrinks = new Map<string, string[]>();
   const utcDay = (): string => new Date().toISOString().slice(0, 10);
   /** Newest-first ring of settled matches (GET /agent/matches food). */
@@ -773,14 +792,10 @@ export const memoryPersistence = (): Persistence => {
       if (p.credits < amount) throw new InsufficientCredits(0);
       p.credits -= amount;
       debits.add(dedup);
-      // The DR ladder counts ENTRIES, so remember when each one happened.
-      if (reason === 'arcade') {
-        arcadeEntries.set(sub, [...(arcadeEntries.get(sub) ?? []), utcDay()]);
-      }
       return { credits: p.credits, duplicate: false };
     },
-    // Mirrors 0017_arcade_extract.sql arcade_extract — keep in sync.
-    arcadeExtract: async (sub, runToken, credits) => {
+    // Mirrors 0018_arcade_extract_loot_only.sql arcade_extract — keep in sync.
+    arcadeExtract: async (sub, runToken, loot, bonus) => {
       const p = prof(sub);
       const key = `${sub}|arcade_extract|${runToken}`;
       if (debits.has(key)) {
@@ -790,12 +805,21 @@ export const memoryPersistence = (): Persistence => {
         };
       }
       const today = utcDay();
-      const runsToday = (arcadeEntries.get(sub) ?? []).filter((d) => d === today).length;
-      const pct = arcadeMultiplierPct(runsToday);
-      // Floor, never round — the house never rounds a payout up.
-      const granted = Math.floor((Math.max(0, credits) * pct) / 100);
+      // The ladder counts EXTRACTIONS, not entries: dying already costs the
+      // whole bag, so it must not also cost you rate on your next run.
+      const priorBanks = (arcadeBanks.get(sub) ?? []).filter((d) => d === today).length;
+      const pct = arcadeMultiplierPct(priorBanks + 1);
+      // The taper touches LOOT ONLY. The exit bonus is what you earned by
+      // surviving and is always paid whole.
+      const safeLoot = Math.max(0, loot);
+      const safeBonus = Math.max(0, bonus);
+      // Floor the tapered loot — the house never rounds a payout up — but a
+      // SUCCESSFUL extraction must never come back as literally zero.
+      let granted = Math.floor((safeLoot * pct) / 100) + safeBonus;
+      if (granted < 1 && safeLoot + safeBonus > 0) granted = 1;
       p.credits += granted;
       debits.add(key);
+      arcadeBanks.set(sub, [...(arcadeBanks.get(sub) ?? []), today]);
       const drinksToday = (extractedDrinks.get(sub) ?? []).filter((d) => d === today).length;
       return {
         credits: p.credits, granted, multiplierPct: pct,
