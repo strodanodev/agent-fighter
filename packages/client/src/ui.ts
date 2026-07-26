@@ -523,9 +523,19 @@ export const drawStage = (ctx: CanvasRenderingContext2D, cam: Cam): void => {
 
 // ---------------------------------------------------------------- HUD
 /**
- * HUD layout (rows, top-down): health bar · nameplate · pips+meter.
+ * HUD layout (rows, top-down): health bar · nameplate+pips · meter, with the
+ * portrait outboard of the bars and the drink rack hanging under it.
  * Asset sizes derive from the SVG kit geometry (HUD_GEO), scaled to fit the
  * 960px frame: portrait(92) · bar(328) · timer(96) · bar · portrait.
+ *
+ * 2026-07 layout pass (phone-first). Two things swapped places:
+ *  · ROUND PIPS moved off the meter row (`pipY` 90 → 54). They used to sit at
+ *    y=90 on the rail that the 318px-wide meter also occupies, and since the
+ *    meter is drawn after them it painted straight over the top — the
+ *    match score was invisible for most of a fight.
+ *  · The DRINK RACK vacated that rail (it was the pips' new home) and moved
+ *    under the portrait, which is where a phone thumb can actually reach it
+ *    without crossing the fight, and reads as "this player's kit".
  */
 const HUD = {
   edge: 108, // inner start of the bars (portraits live outside this)
@@ -535,11 +545,21 @@ const HUD = {
   nameW: 226,
   nameH: 25,
   nameY: 56,
-  pipY: 90,
+  /** Gap from the nameplate's inner end to the pip rail. */
+  railGap: 22,
+  pipY: 54, // under the health bar, clear of the meter row
   meterY: 88,
   meterSegW: 102,
   meterSegH: 15,
+  /** Portrait thumbnail box — the drink rack is centred under it. */
+  portraitS: 92,
+  portraitPad: 8,
+  portraitY: 8,
 } as const;
+
+/** Left edge of player i's portrait thumbnail. */
+const portraitX = (i: 0 | 1): number =>
+  (i === 0 ? HUD.portraitPad : VW - HUD.portraitPad - HUD.portraitS);
 
 const drawHealthBar = (
   ctx: CanvasRenderingContext2D,
@@ -638,9 +658,9 @@ const drawMeter = (ctx: CanvasRenderingContext2D, i: 0 | 1, meter: number, tick:
 const drawPortraitFrame = (
   ctx: CanvasRenderingContext2D, i: 0 | 1, roster: Roster, lowHealth: boolean,
 ): void => {
-  const s = 92;
-  const x = i === 0 ? 8 : VW - 8 - s;
-  const y = 8;
+  const s = HUD.portraitS;
+  const x = portraitX(i);
+  const y = HUD.portraitY;
   const win = HUD_GEO.portraitWindow;
 
   ctx.save();
@@ -674,20 +694,24 @@ const drawNameplate = (ctx: CanvasRenderingContext2D, i: 0 | 1, name: string): v
     i === 0 ? 'left' : 'right');
 };
 
+/**
+ * Rounds won, on the rail just inside the nameplate's end and one row up from
+ * the meter. Pips fill outward from the screen edge like everything else in
+ * the block, so P1's score reads left→right and P2's right→left.
+ */
 const drawRoundPips = (ctx: CanvasRenderingContext2D, i: 0 | 1, wins: number): void => {
   const need = TUNING.roundsToWin;
   const g = HUD_GEO.pip;
   const gap = 7;
-  // Sits just inside the nameplate's outer end.
   for (let r = 0; r < need; r++) {
     const x = i === 0
-      ? HUD.edge + HUD.nameW + 14 + r * (g.w + gap)
-      : VW - HUD.edge - HUD.nameW - 14 - g.w - r * (g.w + gap);
+      ? HUD.edge + HUD.nameW + HUD.railGap + r * (g.w + gap)
+      : VW - HUD.edge - HUD.nameW - HUD.railGap - g.w - r * (g.w + gap);
     const on = r < wins;
     if (uiKit?.pipOn && uiKit.pipOff) {
       drawChrome(ctx, on ? uiKit.pipOn : uiKit.pipOff, x, HUD.pipY, g.w, g.h, i === 1);
     } else {
-      bevel(ctx, x, HUD.pipY, 14, 14, on ? GOLD : '#191524', on ? GOLD_LT : '#4a4260', GOLD_DK, 1);
+      bevel(ctx, x, HUD.pipY, g.w, g.h, on ? GOLD : '#191524', on ? GOLD_LT : '#4a4260', GOLD_DK, 1);
     }
   }
 };
@@ -845,19 +869,29 @@ const hudSlotKind = (f: GameState['fighters'][0], s: number): number =>
   s === 0 ? f.itemKind0 : s === 1 ? f.itemKind1 : f.itemKind2;
 
 /**
- * CONSUMABLES (ADR 0007): the energy-drink rack below each health bar — up
- * to 3 equipped cans side by side. The local player's carried cans are TAP
+ * CONSUMABLES (ADR 0007): the energy-drink rack under each player's PORTRAIT —
+ * up to 3 equipped cans side by side. The local player's carried cans are TAP
  * TARGETS ('item:use:N'); pressing R drinks the next un-drunk one. The
  * opponent's rack shows dimmed (open carry = informed stakes). Active
  * OVERCLOCK/FIREWALL buffs show countdown chips after their can is drunk.
+ *
+ * Under the portrait rather than under the health bar (2026-07): the rack is
+ * the only tappable thing in the fight HUD, and on a phone the screen corner
+ * is the one place a thumb reaches without covering the fighters. It also
+ * groups the cans with the face that owns them instead of floating them on the
+ * meter rail, which the round pips now use.
  */
 const drawItemSlot = (
   ctx: CanvasRenderingContext2D, i: 0 | 1, f: GameState['fighters'][0],
   tick: number, isLocal: boolean,
 ): void => {
   const w = 20, h = 28, gap = 10;
-  const baseX = i === 0 ? HUD.edge + HUD.nameW + 22 : VW - HUD.edge - HUD.nameW - 22 - (w + gap) * 3 + gap;
-  const y = HUD.barY + HUD.barH + 4;
+  const rackW = w * 3 + gap * 2;
+  const baseX = portraitX(i) + (HUD.portraitS - rackW) / 2; // centred under the thumbnail
+  // Clears the portrait's bottom edge with room for the 'R' key hint above the
+  // first can — the hint's baseline is y-3 and it is 10px tall, so this gap is
+  // load-bearing: drop it below ~13 and the glyph rides up onto the frame.
+  const y = HUD.portraitY + HUD.portraitS + 18;
   let firstCarried = true;
 
   for (let s = 0; s < 3; s++) {
@@ -982,8 +1016,11 @@ export const drawHud = (
     drawHealthBar(ctx, i, ratio, fx.flash[i], g.tick);
     drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
     drawNameplate(ctx, i, rosters[i].bundle.name + (tags?.[i] ? ` · ${tags[i]}` : ''));
-    drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
     drawMeter(ctx, i, f.meter, g.tick);
+    // After the meter, not before: the pips were painted over by it for the
+    // whole of the previous layout, and drawing them last makes that
+    // impossible to regress into again.
+    drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
     if (ids?.[i]) drawPlayerId(ctx, i, ids[i]!);
     drawItemSlot(ctx, i, f, g.tick, i === localSide);
     drawBuffState(ctx, i, f, g.tick);
@@ -4579,7 +4616,14 @@ export const drawMap = (ctx: CanvasRenderingContext2D, tick: number, v: MapView)
       }
       ctx.restore();
     }
-    const actX = inX + (guard ? btnH + 6 : 0) + (inW - (guard ? btnH + 6 : 0)) / 2;
+    // Centred on the BUTTON, not on the strip left over beside the portrait.
+    // Centring in the remainder pushed the label half the portrait's width
+    // (~29px) right of the button's midline, which reads as a misalignment
+    // because the portrait is a 44px badge pinned to the edge — it never looked
+    // like a column claiming its own half. The badge sits ~150px clear of even
+    // the longest verb ("BREAK THE GATE") at this width, so there is nothing to
+    // collide with.
+    const actX = inX + inW / 2;
     const verb = extract ? 'EXTRACT'
       : selNode.kind === 'boss' ? 'FIGHT THE BOSS'
         : selNode.kind === 'gate' ? 'BREAK THE GATE'

@@ -36,7 +36,7 @@ import type { NetAccount, Session } from './net.js';
 import {
   auraGlow, drawFx, emitAura, emitBurst, emitRing, fxPulse, updateFx,
 } from './fx.js';
-import { initTouchControls, setTouchScreen } from './touch.js';
+import { initTouchControls, setTouchCharged, setTouchScreen } from './touch.js';
 import {
   autoSpecialActive, autoSpecialCharged, cancelAutoSpecial, pollAutoSpecial, startAutoSpecial,
 } from './autospecial.js';
@@ -3241,6 +3241,10 @@ const frame = (steps = 1): void => {
   // The arcade overlay belongs to the match only — push the screen this frame
   // ended on, so it appears/disappears in lockstep with what was just drawn.
   setTouchScreen(screen);
+  // …and whether the phone's SPECIAL button has a bar to spend. Same source of
+  // truth as the brand badge's charged glow (drawHud), so the two cues can
+  // never disagree about whether the super is available.
+  setTouchCharged(screen === 'fight' && !!game && autoSpecialCharged(game.fighters[localSide()]));
 
   // The ambient menu video is invisible during fights but its decoder keeps
   // running — on a memory-tight phone that headroom matters (iOS jetsam guard,
@@ -3352,6 +3356,14 @@ Object.assign(globalThis, {
   afStep: (n = 1) => { for (let k = 0; k < n; k++) frame(); },
   afPress: (code: string) => { pressedThisFrame.add(code); keys.add(code); },
   afRelease: (code: string) => { keys.delete(code); },
+  /**
+   * Queue a semantic UI action as if the canvas had been tapped there. The
+   * phone overlay's SPECIAL button uses this (touch.ts) so a DOM control and a
+   * canvas tapZone converge on ONE handler — the alternative, having the
+   * overlay poke the sim directly, would fork the Auto-Special path and drift.
+   * Drained by the next frame, exactly like a real tap.
+   */
+  afTap: (action: string) => { taps.add(action); },
   afMode: (m?: Mode) => { if (m) mode = m; return mode; },
   afProfile: () => ({ ...profile, lever }),
   afAccount: () => (account ? { ...account, fetch: accountFetch } : { fetch: accountFetch }),

@@ -6680,9 +6680,19 @@ const drawStage = (ctx, cam) => {
 };
 // ---------------------------------------------------------------- HUD
 /**
- * HUD layout (rows, top-down): health bar · nameplate · pips+meter.
+ * HUD layout (rows, top-down): health bar · nameplate+pips · meter, with the
+ * portrait outboard of the bars and the drink rack hanging under it.
  * Asset sizes derive from the SVG kit geometry (HUD_GEO), scaled to fit the
  * 960px frame: portrait(92) · bar(328) · timer(96) · bar · portrait.
+ *
+ * 2026-07 layout pass (phone-first). Two things swapped places:
+ *  · ROUND PIPS moved off the meter row (`pipY` 90 → 54). They used to sit at
+ *    y=90 on the rail that the 318px-wide meter also occupies, and since the
+ *    meter is drawn after them it painted straight over the top — the
+ *    match score was invisible for most of a fight.
+ *  · The DRINK RACK vacated that rail (it was the pips' new home) and moved
+ *    under the portrait, which is where a phone thumb can actually reach it
+ *    without crossing the fight, and reads as "this player's kit".
  */
 const HUD = {
     edge: 108, // inner start of the bars (portraits live outside this)
@@ -6692,11 +6702,19 @@ const HUD = {
     nameW: 226,
     nameH: 25,
     nameY: 56,
-    pipY: 90,
+    /** Gap from the nameplate's inner end to the pip rail. */
+    railGap: 22,
+    pipY: 54, // under the health bar, clear of the meter row
     meterY: 88,
     meterSegW: 102,
     meterSegH: 15,
+    /** Portrait thumbnail box — the drink rack is centred under it. */
+    portraitS: 92,
+    portraitPad: 8,
+    portraitY: 8,
 };
+/** Left edge of player i's portrait thumbnail. */
+const portraitX = (i) => (i === 0 ? HUD.portraitPad : VW - HUD.portraitPad - HUD.portraitS);
 const drawHealthBar = (ctx, i, ratio, flashRatio, tick) => {
     const { barW, barH, barY: y } = HUD;
     const x = i === 0 ? HUD.edge : VW - HUD.edge - barW;
@@ -6785,9 +6803,9 @@ const drawMeter = (ctx, i, meter, tick) => {
     }
 };
 const drawPortraitFrame = (ctx, i, roster, lowHealth) => {
-    const s = 92;
-    const x = i === 0 ? 8 : VW - 8 - s;
-    const y = 8;
+    const s = HUD.portraitS;
+    const x = portraitX(i);
+    const y = HUD.portraitY;
     const win = HUD_GEO.portraitWindow;
     ctx.save();
     if (lowHealth)
@@ -6821,21 +6839,25 @@ const drawNameplate = (ctx, i, name) => {
     }
     label(ctx, name.toUpperCase(), i === 0 ? x + 16 : x + w - 16, y + h - 7, 15, '#e8e4da', i === 0 ? 'left' : 'right');
 };
+/**
+ * Rounds won, on the rail just inside the nameplate's end and one row up from
+ * the meter. Pips fill outward from the screen edge like everything else in
+ * the block, so P1's score reads left→right and P2's right→left.
+ */
 const drawRoundPips = (ctx, i, wins) => {
     const need = TUNING.roundsToWin;
     const g = HUD_GEO.pip;
     const gap = 7;
-    // Sits just inside the nameplate's outer end.
     for (let r = 0; r < need; r++) {
         const x = i === 0
-            ? HUD.edge + HUD.nameW + 14 + r * (g.w + gap)
-            : VW - HUD.edge - HUD.nameW - 14 - g.w - r * (g.w + gap);
+            ? HUD.edge + HUD.nameW + HUD.railGap + r * (g.w + gap)
+            : VW - HUD.edge - HUD.nameW - HUD.railGap - g.w - r * (g.w + gap);
         const on = r < wins;
         if (uiKit?.pipOn && uiKit.pipOff) {
             drawChrome(ctx, on ? uiKit.pipOn : uiKit.pipOff, x, HUD.pipY, g.w, g.h, i === 1);
         }
         else {
-            bevel(ctx, x, HUD.pipY, 14, 14, on ? GOLD : '#191524', on ? GOLD_LT : '#4a4260', GOLD_DK, 1);
+            bevel(ctx, x, HUD.pipY, g.w, g.h, on ? GOLD : '#191524', on ? GOLD_LT : '#4a4260', GOLD_DK, 1);
         }
     }
 };
@@ -6961,16 +6983,26 @@ const ITEM_KIND_UI = {
 /** Carried slot s of a fighter (mirrors core slotOf — HUD read only). */
 const hudSlotKind = (f, s) => s === 0 ? f.itemKind0 : s === 1 ? f.itemKind1 : f.itemKind2;
 /**
- * CONSUMABLES (ADR 0007): the energy-drink rack below each health bar — up
- * to 3 equipped cans side by side. The local player's carried cans are TAP
+ * CONSUMABLES (ADR 0007): the energy-drink rack under each player's PORTRAIT —
+ * up to 3 equipped cans side by side. The local player's carried cans are TAP
  * TARGETS ('item:use:N'); pressing R drinks the next un-drunk one. The
  * opponent's rack shows dimmed (open carry = informed stakes). Active
  * OVERCLOCK/FIREWALL buffs show countdown chips after their can is drunk.
+ *
+ * Under the portrait rather than under the health bar (2026-07): the rack is
+ * the only tappable thing in the fight HUD, and on a phone the screen corner
+ * is the one place a thumb reaches without covering the fighters. It also
+ * groups the cans with the face that owns them instead of floating them on the
+ * meter rail, which the round pips now use.
  */
 const drawItemSlot = (ctx, i, f, tick, isLocal) => {
     const w = 20, h = 28, gap = 10;
-    const baseX = i === 0 ? HUD.edge + HUD.nameW + 22 : VW - HUD.edge - HUD.nameW - 22 - (w + gap) * 3 + gap;
-    const y = HUD.barY + HUD.barH + 4;
+    const rackW = w * 3 + gap * 2;
+    const baseX = portraitX(i) + (HUD.portraitS - rackW) / 2; // centred under the thumbnail
+    // Clears the portrait's bottom edge with room for the 'R' key hint above the
+    // first can — the hint's baseline is y-3 and it is 10px tall, so this gap is
+    // load-bearing: drop it below ~13 and the glyph rides up onto the frame.
+    const y = HUD.portraitY + HUD.portraitS + 18;
     let firstCarried = true;
     for (let s = 0; s < 3; s++) {
         const kind = hudSlotKind(f, s);
@@ -7080,8 +7112,11 @@ localSide = -1) => {
         drawHealthBar(ctx, i, ratio, fx.flash[i], g.tick);
         drawPortraitFrame(ctx, i, rosters[i], ratio < 0.25);
         drawNameplate(ctx, i, rosters[i].bundle.name + (tags?.[i] ? ` · ${tags[i]}` : ''));
-        drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
         drawMeter(ctx, i, f.meter, g.tick);
+        // After the meter, not before: the pips were painted over by it for the
+        // whole of the previous layout, and drawing them last makes that
+        // impossible to regress into again.
+        drawRoundPips(ctx, i, i === 0 ? g.roundsWon0 : g.roundsWon1);
         if (ids?.[i])
             drawPlayerId(ctx, i, ids[i]);
         drawItemSlot(ctx, i, f, g.tick, i === localSide);
@@ -10167,7 +10202,14 @@ const drawMap = (ctx, tick, v) => {
             }
             ctx.restore();
         }
-        const actX = inX + (guard ? btnH + 6 : 0) + (inW - (guard ? btnH + 6 : 0)) / 2;
+        // Centred on the BUTTON, not on the strip left over beside the portrait.
+        // Centring in the remainder pushed the label half the portrait's width
+        // (~29px) right of the button's midline, which reads as a misalignment
+        // because the portrait is a 44px badge pinned to the edge — it never looked
+        // like a column claiming its own half. The badge sits ~150px clear of even
+        // the longest verb ("BREAK THE GATE") at this width, so there is nothing to
+        // collide with.
+        const actX = inX + inW / 2;
         const verb = extract ? 'EXTRACT'
             : selNode.kind === 'boss' ? 'FIGHT THE BOSS'
                 : selNode.kind === 'gate' ? 'BREAK THE GATE'
@@ -10542,16 +10584,27 @@ const initPwa = () => {
  * On-screen touch controls for phones/tablets. Auto-detects iOS/Android (or any
  * coarse-pointer device) and, when present, overlays an MvC-style pad: an 8-way
  * motion stick on the left (so quarter-circle / dragon-punch motions roll
- * naturally) and the six attack buttons on the right, plus START/BACK for menus.
+ * naturally) and — since the 2026-07 control redesign — a second, radial stick
+ * on the right that carries all six attacks, with a SPECIAL button above it.
+ *
+ * WHY A WHEEL AND NOT SIX BUTTONS. A 3×2 grid of round buttons is a keyboard
+ * drawn on glass: every magic-series link (LP→MP→HP) is a separate lift-and-
+ * re-aim, and a thumb that lands between two buttons presses nothing. The
+ * wheel is hit-tested by ANGLE from its center, so the whole disc is live —
+ * there is no dead gap to miss — and sliding one thumb around the rim rolls
+ * straight through a chain without ever leaving the glass.
  *
  * It is deliberately DECOUPLED from the game's input code: each control simply
- * dispatches synthetic `KeyboardEvent`s for Player-0's existing key bindings, so
- * the sim, audio-unlock, and menu handling all run through the exact same path
- * as a physical keyboard. Nothing in the deterministic core is touched.
+ * drives Player-0's existing key bindings (via the afPress/afRelease hooks, or
+ * synthetic `KeyboardEvent`s as a fallback), so the sim, audio-unlock, and menu
+ * handling all run through the exact same path as a physical keyboard. Nothing
+ * in the deterministic core is touched.
  *
- * Multi-touch is fully supported (throws = LP+LK, super = 2 punches, etc.) via
- * global pointer tracking keyed by pointerId.
+ * Multi-touch is fully supported and is what makes combos work: every pointer
+ * tracks its OWN wedge, so two thumbs on the wheel hold two attacks at once
+ * (throws = LP+LK, super = 2 punches) exactly like two fingers on a real pad.
  */
+
 
 /**
  * Set by initTouchControls once the overlay exists. Kept as a module-level
@@ -10563,6 +10616,15 @@ const initPwa = () => {
 let applyScreen = null;
 /** Tell the touch overlay which screen is live. No-op on desktop. */
 const setTouchScreen = (screen) => { applyScreen?.(screen); };
+/** Same one-clock arrangement as `applyScreen`, for the SPECIAL button. */
+let applyCharged = null;
+/**
+ * Tell the overlay whether the local fighter has at least one meter bar.
+ * SPECIAL is hidden without it: the button spends a bar, and a control that is
+ * present but inert teaches players to distrust the pad. Pushed per frame from
+ * main.ts (edge-triggered inside), so it appears the instant the bar fills.
+ */
+const setTouchCharged = (charged) => { applyCharged?.(charged); };
 /** True on iOS/iPadOS/Android or any primary coarse-pointer (touch) device. */
 const isMobileDevice = () => {
     // Manual override for touchscreen laptops / QA: ?touch=1 forces on, ?touch=0 off.
@@ -10585,6 +10647,125 @@ const K = {
     left: 'KeyA', right: 'KeyD', up: 'KeyW', down: 'KeyS',
     lp: 'KeyT', mp: 'KeyY', hp: 'KeyU', lk: 'KeyG', mk: 'KeyH', hk: 'KeyJ',
     start: 'Enter', back: 'Escape',
+};
+/**
+ * The attack wheel's six wedges, in ANGLE order (degrees, screen space: 0° =
+ * right, +90° = DOWN). Every wedge is 60° wide and the seams fall on the
+ * vertical axis, which is what puts punches on the left half and kicks on the
+ * right half — the same left/right split as the P/K columns of the old grid,
+ * so muscle memory carries over. Strength runs bottom→top: light at the
+ * bottom (where the thumb rests), heavy at the top (a deliberate reach, and
+ * the one you least want to fat-finger).
+ *
+ * Order matters: `wedgeAt` indexes this array directly from the angle.
+ */
+const WEDGES = [
+    { code: K.mk, label: 'MK', a0: -30, cls: 'k', str: 2 },
+    { code: K.lk, label: 'LK', a0: 30, cls: 'k', str: 1 },
+    { code: K.lp, label: 'LP', a0: 90, cls: 'p', str: 1 },
+    { code: K.mp, label: 'MP', a0: 150, cls: 'p', str: 2 },
+    { code: K.hp, label: 'HP', a0: 210, cls: 'p', str: 3 },
+    { code: K.hk, label: 'HK', a0: 270, cls: 'k', str: 3 },
+];
+const WEDGE_DEG = 60;
+/**
+ * ATTACK GLYPHS — a fist for punches, a boot for kicks, authored in a 24×24
+ * box. Letters ("LP", "MK") are a manual, not a control: they need reading,
+ * they're English, and at phone size six two-letter pairs turn into six
+ * identical grey smudges. A fist and a boot separate on SILHOUETTE alone, at
+ * any size, in any language — and strength is carried by the pip count under
+ * the glyph plus a size step, so the whole label is read, never parsed.
+ *
+ * Each glyph is a UNION of plain shapes with no strokes: stroking the parts
+ * would draw every internal seam between them. Separation from the stage art
+ * comes from a drop-shadow, which follows the union's own alpha.
+ */
+const GLYPH = {
+    // Fist, side-on, facing right: cuff, palm mass, three knuckle bumps, thumb.
+    // The cuts are what make it a FIST rather than a blob — a silhouette this
+    // small has no internal contrast of its own, so the knuckle gaps have to be
+    // drawn in as negative space.
+    p: {
+        body: '<rect x="1" y="9.6" width="5.6" height="6" rx="1.6"/>'
+            + '<rect x="4.6" y="6.6" width="12.6" height="12.4" rx="4.6"/>'
+            + '<circle cx="16.8" cy="9.6" r="2.7"/><circle cx="17.6" cy="13.2" r="2.8"/>'
+            + '<circle cx="16.8" cy="16.8" r="2.7"/>'
+            + '<circle cx="9.6" cy="18.4" r="3.1"/>',
+        cut: '<path d="M13.4,10.9 H19.2 M13.4,15.4 H19.4 M12.4,7.4 V18.2"/>',
+    },
+    // Boot in profile, toe right: shin, foot, rounded toe and heel + ankle cut.
+    k: {
+        body: '<rect x="5.2" y="2.2" width="6.8" height="11.4" rx="2.4"/>'
+            + '<rect x="4.2" y="11.2" width="14" height="6.9" rx="2.8"/>'
+            + '<circle cx="17.3" cy="14.6" r="3.5"/><circle cx="7.4" cy="14.7" r="3.4"/>',
+        cut: '<path d="M5.6,11.4 H12.2"/>',
+    },
+};
+/** Light→dark glass sheen, one per SVG so no id can collide document-wide. */
+const sheenDefs = (id) => `<defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">`
+    + '<stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>'
+    + '<stop offset="0.42" stop-color="#ffffff" stop-opacity="0.03"/>'
+    + '<stop offset="1" stop-color="#000000" stop-opacity="0.18"/>'
+    + '</linearGradient></defs>';
+/** A row of `n` gold diamonds — the strength read (1 = light, 3 = heavy). */
+const pips = (n, y) => {
+    const gap = 7.4;
+    const x0 = -((n - 1) * gap) / 2;
+    return Array.from({ length: n }, (_, i) => {
+        const x = x0 + i * gap;
+        return `<polygon class="pip" points="${x},${y - 2.8} ${x + 2.8},${y} ${x},${y + 2.8} ${x - 2.8},${y}"/>`;
+    }).join('');
+};
+/** Wheel geometry in SVG user units (viewBox 0 0 200 200). */
+const WHEEL = { cx: 100, cy: 100, r: 94, labelR: 58, hubR: 19 };
+/** Polar → cartesian in the wheel's own SVG space. */
+const wheelPt = (deg, rad) => {
+    const a = (deg * Math.PI) / 180;
+    return [WHEEL.cx + Math.cos(a) * rad, WHEEL.cy + Math.sin(a) * rad];
+};
+/**
+ * ---- ARCADE CHROME -------------------------------------------------------
+ * The pads are cut as POLYGONS, not circles, so they belong to the same world
+ * as the rest of the HUD: the fight timer is a gold-rimmed octagon (ui.ts
+ * drawTimer), the nameplates and pips are angular chrome, and real arcade
+ * sticks ship with octagonal gates. So the motion stick gets an octagon and
+ * the attack wheel a hexagon whose six flat faces are its six buttons — the
+ * shape states the input count before you read a single label.
+ *
+ * Everything stays translucent: gold hairlines and low-alpha fills over the
+ * fight, never a solid panel sitting on top of it.
+ */
+/** Vertices of a regular n-gon, first vertex at `start`°, in SVG units. */
+const ngon = (n, start, r, cx = 100, cy = 100) => Array.from({ length: n }, (_, k) => {
+    const a = ((start + (360 / n) * k) * Math.PI) / 180;
+    return [cx + Math.cos(a) * r, cy + Math.sin(a) * r];
+});
+/** n-gon as an SVG `points` attribute. */
+const poly = (n, start, r, cx = 100, cy = 100) => ngon(n, start, r, cx, cy).map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(' ');
+/**
+ * The same n-gon as a CSS `clip-path`, in percent. Used to clip each pad's
+ * backdrop blur to its silhouette — without it the blur would render as an
+ * obvious frosted SQUARE behind a polygonal frame.
+ */
+const padClip = (n, start) => `polygon(${ngon(n, start, 50, 50, 50).map(([x, y]) => `${x.toFixed(2)}% ${y.toFixed(2)}%`).join(',')})`;
+/** Octagon rotated 22.5° — flat top/sides, exactly like the fight timer. */
+const OCT_START = 22.5;
+/** Hexagon with a vertex on every wedge seam, so each wedge owns one face. */
+const HEX_START = 30;
+// HUD palette (ui.ts) — the pads must read as the same kit as the health bars.
+const PAD_GOLD = '#d9a441';
+const PAD_GOLD_LT = '#f7e0a3';
+/**
+ * Which wedge a touch at (dx, dy) from the wheel's center selects. Distance is
+ * IGNORED on purpose: the entire disc is live (no dead center to miss), and a
+ * thumb that slides past the rim mid-combo keeps holding its wedge instead of
+ * silently dropping the button.
+ */
+const wedgeAt = (dx, dy) => {
+    const deg = (Math.atan2(dy, dx) * 180) / Math.PI;
+    // Rotate so wedge 0 ([-30°,30°)) starts at 0, then bucket by 60°.
+    const rel = (((deg - WEDGES[0].a0) % 360) + 360) % 360;
+    return Math.min(WEDGES.length - 1, Math.floor(rel / WEDGE_DEG));
 };
 /** Install the overlay. No-op on desktop or if already installed. */
 const initTouchControls = () => {
@@ -10620,83 +10801,275 @@ const initTouchControls = () => {
     // ---- styles ------------------------------------------------------------
     const style = document.createElement('style');
     style.textContent = `
+    /* The overlay speaks the HUD's language: Anton (DISPLAY_FONT_STACK, the
+       same face as the nameplates, timer and announcements) instead of the
+       Courier it shipped with, which read like a terminal bolted to an arcade
+       cabinet. Anton is condensed titling, so labels get real tracking. */
     #af-touch{position:fixed;inset:0;z-index:50;pointer-events:none;
       touch-action:none;-webkit-user-select:none;user-select:none;
-      -webkit-tap-highlight-color:transparent;font-family:"Courier New",monospace}
+      -webkit-tap-highlight-color:transparent;font-family:${DISPLAY_FONT_STACK}}
     #af-touch.hidden{display:none}
     #af-touch .zone{position:absolute;bottom:0;pointer-events:none}
     #af-touch button,#af-touch .pad{pointer-events:auto;touch-action:none;
       -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
-    /* Frosted translucent white throughout — the controls must read clearly
-       over both the bright stage art and a dark KO screen without ever
-       becoming the thing you look at. Glass, not paint. */
-    /* motion stick */
+    /* Translucent throughout — gold hairlines and low-alpha fills, never a
+       solid panel. The controls must read over bright stage art AND a dark KO
+       screen without ever becoming the thing you look at. Glass, not paint.
+       Every pad is a POLYGON clipped to its own silhouette so the backdrop
+       blur can't show up as a frosted square behind an angular frame. */
+    /* NOTE: no position here. An id+class selector outranks a bare id, so a
+       position declared in this shared rule silently beats the motion stick's
+       own position:fixed and drops it into normal flow at the top-left of the
+       page. Each pad declares its own positioning. */
+    #af-touch .pad{
+      -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);
+      filter:drop-shadow(0 4px 14px rgba(0,0,0,0.42))}
+    #af-touch .pad>svg{position:absolute;inset:0;width:100%;height:100%;
+      pointer-events:none;overflow:visible}
+    /* Shared plate language: a gold rim, a darker inner keyline, and a fill
+       you can see the fight through. */
+    #af-touch .rim{fill:rgba(18,15,28,0.20);stroke:${PAD_GOLD};stroke-width:2.5;
+      stroke-linejoin:round;opacity:0.78}
+    #af-touch .rim-in{fill:none;stroke:rgba(255,255,255,0.20);stroke-width:1.25;
+      stroke-linejoin:round}
+    /* Lit from above, like every other piece of chrome in the HUD. Non-
+       interactive paint that only ever ADDS light at the top and shade at the
+       bottom, so the pads stay see-through. */
+    #af-touch .sheen{pointer-events:none}
+    /* Panel screws. Two-tone (bright core, dark ring) so they read as hardware
+       at 3px rather than as stray dots. */
+    #af-touch .rivet{fill:rgba(247,224,163,0.55);stroke:rgba(0,0,0,0.45);
+      stroke-width:1}
+    /* motion stick (left) — octagonal gate, like the fight timer and like the
+       real thing: an arcade stick's gate is what makes 236/623 motions roll. */
     #af-pad{position:fixed;left:max(3.5vmin,env(safe-area-inset-left));
       bottom:max(4vmin,env(safe-area-inset-bottom));
-      width:34vmin;height:34vmin;max-width:210px;max-height:210px;border-radius:50%;
-      background:rgba(255,255,255,0.08);border:2px solid rgba(255,255,255,0.28);
-      -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);
-      box-shadow:0 4px 18px rgba(0,0,0,0.28),inset 0 0 22px rgba(255,255,255,0.06)}
-    #af-pad .stick{position:absolute;left:50%;top:50%;width:44%;height:44%;
-      border-radius:50%;transform:translate(-50%,-50%);
-      background:rgba(255,255,255,0.30);border:2px solid rgba(255,255,255,0.55);
-      box-shadow:0 2px 10px rgba(0,0,0,0.30);transition:transform .04s linear}
-    #af-pad .ring{position:absolute;inset:14%;border-radius:50%;border:1px dashed rgba(255,255,255,0.16)}
-    /* attack cluster */
-    #af-atk{position:fixed;right:max(3vmin,env(safe-area-inset-right));
+      width:34vmin;height:34vmin;max-width:210px;max-height:210px;
+      clip-path:${padClip(8, OCT_START)}}
+    #af-pad .gate{fill:none;stroke:rgba(255,255,255,0.14);stroke-width:1;
+      stroke-dasharray:4 6;stroke-linejoin:round}
+    #af-pad .tick{stroke:rgba(255,255,255,0.34);stroke-width:1.6;stroke-linecap:round}
+    #af-pad .tick.major{stroke:${PAD_GOLD};stroke-width:2.6;opacity:0.75}
+    /* The knob is its own octagon, half a step brighter than the gate so the
+       eye tracks it against the fight behind. */
+    #af-pad .stick{position:absolute;left:50%;top:50%;width:46%;height:46%;
+      transform:translate(-50%,-50%);transition:transform .04s linear;
+      pointer-events:none;filter:drop-shadow(0 2px 6px rgba(0,0,0,0.5))}
+    #af-pad .stick svg{width:100%;height:100%;overflow:visible}
+    #af-pad .knob{fill:rgba(255,255,255,0.18);stroke:${PAD_GOLD_LT};stroke-width:3;
+      stroke-linejoin:round}
+    #af-pad .knob-sheen{pointer-events:none}
+    #af-pad .knob-in{fill:none;stroke:${PAD_GOLD};stroke-width:1.6;
+      stroke-linejoin:round;opacity:0.8}
+    #af-pad .knob-dot{fill:rgba(247,224,163,0.5);stroke:rgba(0,0,0,0.35);stroke-width:1}
+    /* right-hand column: SPECIAL stacked over the attack wheel. A flex column
+       (rather than two independently-positioned elements) is what keeps the
+       plate glued to the wheel's top edge across every phone size — the
+       wheel's vmin sizing would otherwise have to be duplicated in a calc(). */
+    #af-right{position:fixed;right:max(3vmin,env(safe-area-inset-right));
       bottom:max(4vmin,env(safe-area-inset-bottom));
-      display:grid;grid-template-columns:repeat(3,1fr);gap:1.6vmin}
-    #af-atk button{width:13.5vmin;height:13.5vmin;max-width:88px;max-height:88px;
-      border-radius:50%;border:2px solid rgba(255,255,255,0.34);
-      background:rgba(255,255,255,0.12);color:rgba(255,255,255,0.92);
-      -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);
-      font-weight:700;font-size:4.4vmin;line-height:1;letter-spacing:0.5px;
-      text-shadow:0 1px 3px rgba(0,0,0,0.55);
+      width:38vmin;max-width:232px;
+      display:flex;flex-direction:column;align-items:center;gap:2vmin;
+      pointer-events:none}
+    /* SPECIAL — hidden until the meter can actually pay for it (see
+       setTouchCharged). It fades in place rather than being display:none'd:
+       the row keeps its height either way, so the WHEEL never jumps under a
+       thumb the moment a bar fills. Red is already this client's "super
+       ready" colour (the brand badge over the timer goes red when charged),
+       so the two cues agree instead of competing. */
+    /* Selector carries #af-touch as well: the shared "#af-touch button" rule
+       above sets pointer-events:auto and outranks a bare #af-special, which
+       would leave an INVISIBLE but still-tappable SPECIAL sitting over the
+       wheel whenever the meter is empty. Same trap as .pad and position. */
+    #af-touch #af-special{position:relative;width:100%;height:9.5vmin;max-height:58px;
+      border:0;background:none;padding:0;color:${PAD_GOLD_LT};font-family:inherit;
+      font-size:4.2vmin;line-height:1;letter-spacing:3px;
+      text-shadow:0 2px 5px rgba(0,0,0,0.75);
       display:flex;align-items:center;justify-content:center;
-      box-shadow:0 3px 12px rgba(0,0,0,0.30);transition:transform .05s,background .05s}
-    #af-atk button:active,#af-atk button.on{transform:scale(.9);
-      background:rgba(255,255,255,0.42);border-color:rgba(255,255,255,0.85)}
-    /* Punch row reads slightly brighter than kicks — a hairline of hierarchy
+      opacity:0;transform:scale(0.84);pointer-events:none;
+      transition:opacity .16s ease-out,transform .16s ease-out;
+      filter:drop-shadow(0 3px 10px rgba(0,0,0,0.45))}
+    #af-touch #af-special.ready{opacity:1;transform:none;pointer-events:auto;
+      animation:af-charge 1.5s ease-in-out infinite}
+    #af-special svg{position:absolute;inset:0;width:100%;height:100%;
+      pointer-events:none;overflow:visible}
+    #af-special .plate{fill:rgba(214,46,52,0.52);stroke:${PAD_GOLD};stroke-width:2.5;
+      stroke-linejoin:round}
+    #af-special .plate-sheen{pointer-events:none}
+    #af-special .plate-in{fill:none;stroke:rgba(255,225,190,0.34);stroke-width:1.2;
+      stroke-linejoin:round}
+    /* The label sits above the plate art; the bolt is inline with the text and
+       inherits its colour, so the two can never drift apart. Overrides the
+       absolute-positioned rule for the plate SVGs above — hence the class. */
+    #af-special span{position:relative;display:inline-flex;align-items:center;
+      gap:0.34em}
+    #af-special svg.bolt{position:static;width:0.86em;height:0.86em;
+      fill:currentColor;flex:0 0 auto;
+      filter:drop-shadow(0 0 4px rgba(255,150,120,0.7))}
+    #af-touch #af-special.ready:active,#af-touch #af-special.on{
+      transform:scale(.94);animation:none}
+    #af-special.on .plate{fill:rgba(255,96,80,0.62);stroke:${PAD_GOLD_LT}}
+    @keyframes af-charge{
+      0%,100%{filter:drop-shadow(0 3px 10px rgba(0,0,0,0.45))}
+      50%{filter:drop-shadow(0 3px 10px rgba(0,0,0,0.45)) drop-shadow(0 0 9px rgba(233,69,96,0.85))}}
+    /* attack wheel (right) — hexagonal, one flat face per attack, so the
+       silhouette states "six buttons" before a single label is read. */
+    #af-atk{position:relative;width:100%;aspect-ratio:1/1;
+      clip-path:${padClip(6, HEX_START)}}
+    /* Punches read a step brighter than kicks — a hairline of hierarchy
        without reintroducing colour. */
-    #af-atk .p{background:rgba(255,255,255,0.17)}
-    #af-atk .k{background:rgba(255,255,255,0.10)}
+    #af-atk .w{transition:fill .05s;stroke:${PAD_GOLD};stroke-width:1.25;
+      stroke-linejoin:round;opacity:0.9}
+    #af-atk .w.p{fill:rgba(255,255,255,0.13)}
+    #af-atk .w.k{fill:rgba(255,255,255,0.07)}
+    /* Press feedback has to survive a bright stage behind 60%-transparent
+       glass, so the active wedge goes to a near-opaque gold with a light rim
+       rather than a polite tint — on a phone this flash IS the button. */
+    #af-atk .w.on{fill:rgba(247,224,163,0.72);stroke:#fff6df;stroke-width:3;
+      opacity:1}
+    /* The inset bevel that seats each wedge as its own plate. */
+    #af-atk .facet{fill:none;stroke:rgba(255,255,255,0.16);stroke-width:1;
+      stroke-linejoin:round;pointer-events:none}
+    #af-atk .hub{fill:rgba(18,15,28,0.34);stroke:${PAD_GOLD};stroke-width:2;
+      stroke-linejoin:round;opacity:0.85}
+    #af-atk .hub-in{fill:none;stroke:rgba(247,224,163,0.45);stroke-width:1}
+    /* Glyphs: bright, unstroked silhouettes lifted off the stage by a shadow
+       that follows their own alpha (a stroke would draw the seams between the
+       shapes each glyph is assembled from). */
+    #af-atk .glyph{fill:rgba(255,255,255,0.96);
+      filter:drop-shadow(0 1px 2px rgba(0,0,0,0.9))}
+    /* Negative-space detail drawn ON the silhouette (knuckle gaps, ankle). */
+    #af-atk .cut{fill:none;stroke:rgba(20,14,30,0.72);stroke-width:1.5;
+      stroke-linecap:round}
+    #af-atk .pip{fill:${PAD_GOLD_LT};stroke:rgba(0,0,0,0.5);stroke-width:0.9}
+    #af-atk .gl{pointer-events:none}
+    /* A pressed wedge INVERTS — the glyph goes dark on the lit gold plate.
+       Brightening the plate alone is easy to miss in peripheral vision; the
+       polarity flip is not. */
+    #af-atk .gl.on .glyph{fill:#2b1c05;filter:none}
+    #af-atk .gl.on .cut{stroke:rgba(247,224,163,0.9)}
+    #af-atk .gl.on .pip{fill:#2b1c05;stroke:none}
     /* in-match menu button (upper LEFT) + its popup */
     #af-pause{position:fixed;top:max(2vmin,env(safe-area-inset-top));
       left:max(2vmin,env(safe-area-inset-left));
-      min-width:11vmin;height:7.5vmin;max-height:44px;padding:0 2.4vmin;border-radius:10px;
-      border:2px solid rgba(255,255,255,0.30);background:rgba(255,255,255,0.12);
+      min-width:11vmin;height:7.5vmin;max-height:44px;padding:0 2.4vmin;border-radius:6px;
+      border:2px solid ${PAD_GOLD}99;background:rgba(18,15,28,0.28);
       -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);
-      color:rgba(255,255,255,0.92);font-weight:700;font-size:3.2vmin;letter-spacing:1px;
-      text-shadow:0 1px 3px rgba(0,0,0,0.55)}
-    #af-pause:active{background:rgba(255,255,255,0.34)}
+      color:${PAD_GOLD_LT};font-family:inherit;font-size:3.6vmin;letter-spacing:2px;
+      text-shadow:0 1px 3px rgba(0,0,0,0.6)}
+    #af-pause:active{background:rgba(217,164,65,0.34)}
     #af-menu{position:fixed;inset:0;z-index:60;display:flex;align-items:center;
       justify-content:center;background:rgba(7,5,13,0.62);
       -webkit-backdrop-filter:blur(5px);backdrop-filter:blur(5px);pointer-events:auto}
     #af-menu.hidden{display:none}
     #af-menu .card{display:flex;flex-direction:column;gap:2vmin;padding:4vmin 5vmin;
-      border-radius:16px;border:2px solid rgba(255,255,255,0.26);
-      background:rgba(255,255,255,0.10);text-align:center}
-    #af-menu h2{margin:0 0 1vmin;color:rgba(255,255,255,0.95);font-size:4vmin;letter-spacing:2px}
-    #af-menu button{min-width:44vmin;padding:2.4vmin 4vmin;border-radius:12px;
-      border:2px solid rgba(255,255,255,0.34);background:rgba(255,255,255,0.14);
-      color:rgba(255,255,255,0.95);font-family:inherit;font-weight:700;font-size:3.4vmin;
-      letter-spacing:1px}
-    #af-menu button:active{background:rgba(255,255,255,0.4)}
-    @media (max-width:520px){#af-atk button{font-size:5vmin}#af-pause{font-size:4vmin}}
+      border-radius:8px;border:2px solid ${PAD_GOLD}99;
+      background:rgba(18,15,28,0.55);text-align:center}
+    #af-menu h2{margin:0 0 1vmin;color:${PAD_GOLD_LT};font-size:4.6vmin;letter-spacing:3px;
+      font-weight:400}
+    #af-menu button{min-width:44vmin;padding:2.4vmin 4vmin;border-radius:6px;
+      border:2px solid ${PAD_GOLD}99;background:rgba(255,255,255,0.10);
+      color:rgba(255,255,255,0.95);font-family:inherit;font-size:3.8vmin;
+      letter-spacing:2px}
+    #af-menu button:active{background:rgba(217,164,65,0.38)}
+    @media (max-width:520px){#af-special{font-size:5vmin}#af-pause{font-size:4.4vmin}}
   `;
     document.head.appendChild(style);
     // ---- DOM ---------------------------------------------------------------
+    // Wedge geometry is generated rather than hand-written so the angles in
+    // WEDGES stay the single source of truth for BOTH the art and the hit test.
+    // A hexagon's vertices sit exactly on the wedge seams, so each wedge is a
+    // plain triangle out to one flat face — no arcs, and the seams double as the
+    // plate's own facets.
+    const wedgeSvg = WEDGES.map((w, i) => {
+        const [x0, y0] = wheelPt(w.a0, WHEEL.r);
+        const [x1, y1] = wheelPt(w.a0 + WEDGE_DEG, WHEEL.r);
+        return `<polygon class="w ${w.cls}" data-wedge="${i}" points="${WHEEL.cx},${WHEEL.cy} `
+            + `${x0.toFixed(2)},${y0.toFixed(2)} ${x1.toFixed(2)},${y1.toFixed(2)}"/>`;
+    }).join('');
+    // A second, inset copy of each wedge: the machined bevel that turns six flat
+    // fills into six seated PLATES. Purely decorative, drawn over the fill layer.
+    const facetSvg = WEDGES.map((w) => {
+        const tri = [
+            [WHEEL.cx, WHEEL.cy], wheelPt(w.a0, WHEEL.r), wheelPt(w.a0 + WEDGE_DEG, WHEEL.r),
+        ];
+        const gx = (tri[0][0] + tri[1][0] + tri[2][0]) / 3;
+        const gy = (tri[0][1] + tri[1][1] + tri[2][1]) / 3;
+        const p = tri
+            .map(([x, y]) => `${(gx + (x - gx) * 0.84).toFixed(2)},${(gy + (y - gy) * 0.84).toFixed(2)}`)
+            .join(' ');
+        return `<polygon class="facet" points="${p}"/>`;
+    }).join('');
+    // Glyph + strength pips per wedge, replacing the old two-letter labels.
+    const glyphSvg = WEDGES.map((w) => {
+        const [x, y] = wheelPt(w.a0 + WEDGE_DEG / 2, WHEEL.labelR);
+        // Heavier attack, bigger glyph. Sized so the largest still clears the
+        // hexagon's inradius once the pip row is added underneath.
+        const s = [0.96, 1.08, 1.22][w.str - 1];
+        const g = GLYPH[w.cls];
+        return `<g class="gl" transform="translate(${x.toFixed(2)},${y.toFixed(2)})">`
+            + `<g transform="translate(${(-12 * s).toFixed(2)},${(-12 * s - 5).toFixed(2)}) scale(${s})">`
+            + `<g class="glyph">${g.body}</g><g class="cut">${g.cut}</g></g>`
+            + `${pips(w.str, 12 * s)}</g>`;
+    }).join('');
+    // Panel screws at the plate corners — the cabinet cue that stops the pads
+    // reading as flat vector shapes.
+    const rivets = (n, start, r) => ngon(n, start, r).map(([x, y]) => `<circle class="rivet" cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="2.6"/>`).join('');
+    // Gate ticks: long on the four cardinals a fighting game actually cares about
+    // (jump, walk, crouch), short on the diagonals that complete the 8-way.
+    const tickSvg = [0, 45, 90, 135, 180, 225, 270, 315].map((deg) => {
+        const major = deg % 90 === 0;
+        const [x1, y1] = wheelPt(deg, major ? 68 : 76);
+        const [x2, y2] = wheelPt(deg, 86);
+        return `<line class="tick${major ? ' major' : ''}" x1="${x1.toFixed(2)}" y1="${y1.toFixed(2)}" `
+            + `x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}"/>`;
+    }).join('');
     const root = document.createElement('div');
     root.id = 'af-touch';
     root.innerHTML = `
-    <div id="af-pad" class="pad"><div class="ring"></div><div class="stick"></div></div>
-    <div id="af-atk">
-      <button class="p" data-code="${K.lp}">LP</button>
-      <button class="p" data-code="${K.mp}">MP</button>
-      <button class="p" data-code="${K.hp}">HP</button>
-      <button class="k" data-code="${K.lk}">LK</button>
-      <button class="k" data-code="${K.mk}">MK</button>
-      <button class="k" data-code="${K.hk}">HK</button>
+    <div id="af-pad" class="pad" role="group" aria-label="motion stick">
+      <svg viewBox="0 0 200 200" aria-hidden="true">
+        ${sheenDefs('af-g-pad')}
+        <polygon class="rim" points="${poly(8, OCT_START, 96)}"/>
+        <polygon class="sheen" fill="url(#af-g-pad)" points="${poly(8, OCT_START, 96)}"/>
+        <polygon class="rim-in" points="${poly(8, OCT_START, 84)}"/>
+        <polygon class="gate" points="${poly(8, OCT_START, 60)}"/>
+        ${tickSvg}
+        ${rivets(8, OCT_START, 90)}
+      </svg>
+      <div class="stick">
+        <svg viewBox="0 0 100 100" aria-hidden="true">
+          ${sheenDefs('af-g-knob')}
+          <polygon class="knob" points="${poly(8, OCT_START, 46, 50, 50)}"/>
+          <polygon class="knob-sheen" fill="url(#af-g-knob)" points="${poly(8, OCT_START, 46, 50, 50)}"/>
+          <polygon class="knob-in" points="${poly(8, OCT_START, 28, 50, 50)}"/>
+          <circle class="knob-dot" cx="50" cy="50" r="6"/>
+        </svg>
+      </div>
+    </div>
+    <div id="af-right">
+      <button id="af-special" aria-label="special attack">
+        <svg viewBox="0 0 200 48" preserveAspectRatio="none" aria-hidden="true">
+          ${sheenDefs('af-g-sp')}
+          <polygon class="plate" points="14,2 186,2 198,24 186,46 14,46 2,24"/>
+          <polygon class="plate-sheen" fill="url(#af-g-sp)" points="14,2 186,2 198,24 186,46 14,46 2,24"/>
+          <polygon class="plate-in" points="20,7 180,7 190,24 180,41 20,41 9,24"/>
+        </svg>
+        <span><svg class="bolt" viewBox="0 0 24 24" aria-hidden="true"><polygon points="13.6,1 4,13.4 10.4,13.4 8.6,23 18.6,10.2 12.2,10.2"/></svg>SPECIAL</span>
+      </button>
+      <div id="af-atk" class="pad" role="group" aria-label="attack wheel">
+        <svg viewBox="0 0 200 200" aria-hidden="true">
+          ${sheenDefs('af-g-atk')}
+          <g class="wedges">${wedgeSvg}</g>
+          <g class="facets">${facetSvg}</g>
+          <polygon class="sheen" fill="url(#af-g-atk)" points="${poly(6, HEX_START, WHEEL.r)}"/>
+          <polygon class="rim" style="fill:none" points="${poly(6, HEX_START, WHEEL.r)}"/>
+          ${rivets(6, HEX_START, WHEEL.r - 9)}
+          <polygon class="hub" points="${poly(8, OCT_START, WHEEL.hubR)}"/>
+          <polygon class="hub-in" points="${poly(8, OCT_START, WHEEL.hubR - 7)}"/>
+          ${glyphSvg}
+        </svg>
+      </div>
     </div>
     <button id="af-pause" aria-label="match menu">❚❚ MENU</button>
     <div id="af-menu" class="hidden">
@@ -10709,8 +11082,23 @@ const initTouchControls = () => {
     document.body.appendChild(root);
     const pad = root.querySelector('#af-pad');
     const stick = pad.querySelector('.stick');
+    const atk = root.querySelector('#af-atk');
     const menu = root.querySelector('#af-menu');
     const pauseBtn = root.querySelector('#af-pause');
+    const specialBtn = root.querySelector('#af-special');
+    // The plate and its glyph light up together — see the `.gl.on` rules, which
+    // invert the glyph rather than just brightening the plate under it.
+    const glEls = Array.from(atk.querySelectorAll('.gl'));
+    const wedgeEls = WEDGES.map((_, i) => {
+        const plate = atk.querySelector(`[data-wedge="${i}"]`);
+        const gl = glEls[i];
+        return {
+            lit: (on) => {
+                plate?.classList.toggle('on', on);
+                gl?.classList.toggle('on', on);
+            },
+        };
+    });
     const pointers = new Map();
     const padDirs = new Set();
     const clearPad = () => {
@@ -10719,17 +11107,76 @@ const initTouchControls = () => {
         padDirs.clear();
         stick.style.transform = 'translate(-50%,-50%)';
     };
+    // ---- attack wheel ------------------------------------------------------
+    /** Is any pointer OTHER than `except` still parked on this wedge? */
+    const wedgeHeld = (wedge, except) => {
+        for (const [id, t] of pointers)
+            if (id !== except && t.kind === 'atk' && t.wedge === wedge)
+                return true;
+        return false;
+    };
+    /**
+     * Point `id` at `wedge`, releasing whatever it held before. Sliding a thumb
+     * across the seams therefore plays a chain (LP→MP→HP) as clean press/release
+     * pairs, while a second thumb elsewhere on the disc keeps its own button
+     * down — that pair of behaviours is the whole reason for the wheel.
+     */
+    const setWedge = (id, wedge) => {
+        const prev = pointers.get(id);
+        const had = prev?.kind === 'atk' ? prev.wedge : -1;
+        if (had === wedge)
+            return;
+        pointers.set(id, { kind: 'atk', wedge });
+        if (had >= 0 && !wedgeHeld(had, id)) {
+            release(WEDGES[had].code);
+            wedgeEls[had]?.lit(false);
+        }
+        press(WEDGES[wedge].code);
+        wedgeEls[wedge]?.lit(true);
+    };
+    /** Lift pointer `id` off the wheel (nothing happens if it wasn't on it). */
+    const dropWedge = (id) => {
+        const t = pointers.get(id);
+        if (t?.kind !== 'atk')
+            return;
+        if (!wedgeHeld(t.wedge, id)) {
+            release(WEDGES[t.wedge].code);
+            wedgeEls[t.wedge]?.lit(false);
+        }
+    };
+    /** Wedge under a client-space point, measured from the wheel's live rect. */
+    const wedgeFor = (clientX, clientY) => {
+        const r = atk.getBoundingClientRect();
+        return wedgeAt(clientX - (r.left + r.width / 2), clientY - (r.top + r.height / 2));
+    };
+    /** Panic-release the wheel (menu opened, screen changed, app backgrounded). */
+    const clearAtk = () => {
+        for (const [, t] of pointers)
+            if (t.kind === 'atk')
+                release(WEDGES[t.wedge].code);
+        for (const el of wedgeEls)
+            el?.lit(false);
+        specialBtn.classList.remove('on');
+    };
+    /**
+     * Full stop: drop every control and every held key. Used everywhere a hold
+     * could otherwise be stranded (menu, screen change, backgrounding) — a stuck
+     * direction or attack outlives the overlay and is felt as "the game froze".
+     */
+    const resetControls = () => {
+        clearAtk();
+        clearPad();
+        pointers.clear();
+        releaseAll();
+    };
     // ---- match menu --------------------------------------------------------
     // NOTE: this does NOT freeze the simulation. Matches are server-verified
     // (ADR 0003) and a local pause would desync the running match, so this is
     // an overlay menu, not a true pause — the fight continues underneath it.
     const setMenu = (open) => {
         menu.classList.toggle('hidden', !open);
-        if (open) {
-            clearPad();
-            pointers.clear();
-            releaseAll();
-        } // never strand a held key behind the menu
+        if (open)
+            resetControls(); // never strand a held key behind the menu
     };
     pauseBtn.addEventListener('pointerdown', (e) => {
         e.preventDefault();
@@ -10737,6 +11184,23 @@ const initTouchControls = () => {
         audio.blip();
         setMenu(true);
     });
+    // ---- SPECIAL -----------------------------------------------------------
+    // Same action the brand badge over the timer fires on desktop: it queues the
+    // Auto Special macro, which then drives the pad for a few ticks (inputs only,
+    // so the server's re-sim still agrees — see autospecial.ts). Routed through
+    // the client's `afTap` hook so there is exactly ONE code path for 'special',
+    // rather than the overlay reaching into the sim behind main.ts's back.
+    specialBtn.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        audio.blip();
+        specialBtn.classList.add('on');
+        globalThis.afTap?.('special');
+    });
+    const specialUp = () => specialBtn.classList.remove('on');
+    specialBtn.addEventListener('pointerup', specialUp);
+    specialBtn.addEventListener('pointercancel', specialUp);
+    specialBtn.addEventListener('pointerleave', specialUp);
     menu.querySelector('.resume').addEventListener('pointerdown', (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -10783,16 +11247,13 @@ const initTouchControls = () => {
         stick.style.transform = `translate(calc(-50% + ${dx * rad * 0.6}px),calc(-50% + ${dy * rad * 0.6}px))`;
     };
     root.addEventListener('pointerdown', (e) => {
-        const btn = e.target.closest('[data-code]');
-        if (btn) {
-            const code = btn.dataset.code;
-            pointers.set(e.pointerId, { kind: 'btn', code });
-            btn.classList.add('on');
-            press(code);
+        const el = e.target;
+        if (el.closest('#af-atk')) {
+            setWedge(e.pointerId, wedgeFor(e.clientX, e.clientY));
             e.preventDefault();
             return;
         }
-        if (e.target.closest('#af-pad')) {
+        if (el.closest('#af-pad')) {
             pointers.set(e.pointerId, { kind: 'pad' });
             updatePad(e.clientX, e.clientY);
             e.preventDefault();
@@ -10804,20 +11265,21 @@ const initTouchControls = () => {
             updatePad(e.clientX, e.clientY);
             e.preventDefault();
         }
+        else if (t?.kind === 'atk') {
+            setWedge(e.pointerId, wedgeFor(e.clientX, e.clientY));
+            e.preventDefault();
+        }
     }, { passive: false });
     const endPointer = (e) => {
         const t = pointers.get(e.pointerId);
         if (!t)
             return;
-        pointers.delete(e.pointerId);
-        if (t.kind === 'btn') {
-            release(t.code);
-            // clear the .on highlight if no other pointer holds this code
-            const stillHeld = [...pointers.values()].some((p) => p.kind === 'btn' && p.code === t.code);
-            if (!stillHeld)
-                root.querySelectorAll(`[data-code="${t.code}"]`).forEach((el) => el.classList.remove('on'));
+        if (t.kind === 'atk') {
+            dropWedge(e.pointerId);
+            pointers.delete(e.pointerId);
         }
         else {
+            pointers.delete(e.pointerId);
             clearPad();
         }
     };
@@ -10831,11 +11293,12 @@ const initTouchControls = () => {
     root.addEventListener('dblclick', (e) => e.preventDefault());
     // ---- visibility: the arcade controls belong to the MATCH only ----------
     // Everywhere else (title, fighter/stage select, leaderboard, results) the
-    // canvas UI is directly tappable — see ui.ts tapZone / main.ts tapAt — so a
-    // stick and six buttons would just be clutter over the art.
+    // canvas UI is directly tappable — see ui.ts tapZone / main.ts tapAt — so two
+    // sticks and a SPECIAL button would just be clutter over the art.
     // Edge-triggered off the screen main.ts pushes each frame — no per-frame DOM
     // writes, and leaving a match always drops any key still held down.
     let wasFight = false;
+    let wasCharged = false;
     applyScreen = (screen) => {
         const fighting = screen === 'fight';
         if (fighting === wasFight)
@@ -10843,20 +11306,29 @@ const initTouchControls = () => {
         wasFight = fighting;
         root.classList.toggle('hidden', !fighting);
         if (!fighting) {
-            clearPad();
-            pointers.clear();
-            releaseAll();
+            resetControls();
             setMenu(false);
+            // Next match starts from an empty meter as far as the button knows —
+            // otherwise a stale `wasCharged` swallows the first real push.
+            wasCharged = false;
+            specialBtn.classList.remove('ready');
         }
     };
     root.classList.add('hidden'); // boots on the title screen — nothing to show yet
+    // SPECIAL appears only while the meter can pay for it. Edge-triggered so the
+    // per-frame push from main.ts costs nothing when the state hasn't moved.
+    applyCharged = (charged) => {
+        if (charged === wasCharged)
+            return;
+        wasCharged = charged;
+        specialBtn.classList.toggle('ready', charged);
+        if (!charged)
+            specialBtn.classList.remove('on');
+    };
     // Release everything if the app is backgrounded mid-hold (avoids stuck keys).
     document.addEventListener('visibilitychange', () => {
-        if (document.hidden) {
-            clearPad();
-            pointers.clear();
-            releaseAll();
-        }
+        if (document.hidden)
+            resetControls();
     });
 };
 
@@ -14189,6 +14661,10 @@ const frame = (steps = 1) => {
     // The arcade overlay belongs to the match only — push the screen this frame
     // ended on, so it appears/disappears in lockstep with what was just drawn.
     setTouchScreen(screen);
+    // …and whether the phone's SPECIAL button has a bar to spend. Same source of
+    // truth as the brand badge's charged glow (drawHud), so the two cues can
+    // never disagree about whether the super is available.
+    setTouchCharged(screen === 'fight' && !!game && autoSpecialCharged(game.fighters[localSide()]));
     // The ambient menu video is invisible during fights but its decoder keeps
     // running — on a memory-tight phone that headroom matters (iOS jetsam guard,
     // same fix family as the audio-cache eviction). Pause in-fight, resume on
@@ -14305,6 +14781,14 @@ Object.assign(globalThis, {
         frame(); },
     afPress: (code) => { pressedThisFrame.add(code); keys.add(code); },
     afRelease: (code) => { keys.delete(code); },
+    /**
+     * Queue a semantic UI action as if the canvas had been tapped there. The
+     * phone overlay's SPECIAL button uses this (touch.ts) so a DOM control and a
+     * canvas tapZone converge on ONE handler — the alternative, having the
+     * overlay poke the sim directly, would fork the Auto-Special path and drift.
+     * Drained by the next frame, exactly like a real tap.
+     */
+    afTap: (action) => { taps.add(action); },
     afMode: (m) => { if (m)
         mode = m; return mode; },
     afProfile: () => ({ ...profile, lever }),
