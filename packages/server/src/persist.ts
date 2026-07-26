@@ -1178,10 +1178,23 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
       const row = rows?.[0] ?? {};
       return { credits: Number(row.credits ?? 0), duplicate: Boolean(row.duplicate) };
     },
-    arcadeExtract: async (sub, runToken, credits) => {
+    // Mirrors 0018_arcade_extract_loot_only.sql arcade_extract — keep in sync.
+    // NOTE the four EXPLICIT parameters. This impl once declared only three
+    // (sub, runToken, credits) while the interface had grown to four, and
+    // TypeScript accepted it silently: a function of fewer parameters is
+    // assignable to a signature with more. `credits` bound to `loot`, `bonus`
+    // was dropped on the floor, and the posted body still said `_credits` —
+    // so every extraction on prod 404'd against the re-signed function. Never
+    // shorten this parameter list to "what the body happens to use".
+    arcadeExtract: async (sub, runToken, loot, bonus) => {
       const rows = (await call('/rest/v1/rpc/arcade_extract', {
         method: 'POST',
-        body: JSON.stringify({ _profile: sub, _key: runToken, _credits: Math.max(0, credits | 0) }),
+        body: JSON.stringify({
+          _profile: sub,
+          _key: runToken,
+          _loot: Math.max(0, loot | 0),
+          _bonus: Math.max(0, bonus | 0),
+        }),
       })) as Array<Record<string, unknown>>;
       const row = rows?.[0] ?? {};
       return {
