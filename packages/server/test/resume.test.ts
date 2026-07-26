@@ -82,7 +82,11 @@ test('RESUME: drop mid-wager, rejoin with the token, keep playing, then WIN by t
   assert.equal(result.winner, setupA.side, 'the resumed side takes the win');
   await new Promise((r) => setTimeout(r, 400));
   const acc = await persistence.getAccount({ sub: 'dev:Blinky' }, 'Blinky', false);
-  assert.equal(acc.credits, DAILY_CREDITS + WAGER_FEE, 'and the pot');
+  // ADR 0009: there is no pot — the entry burned. What surviving the drop and
+  // winning by forfeit earns is the TICKET (this client never declared itself
+  // an agent, so it counts as human hands).
+  assert.equal(acc.credits, DAILY_CREDITS - WAGER_FEE, 'the entry burned');
+  assert.equal(acc.tickets, 1, 'and the resumed side minted the ticket');
   a2.close();
 });
 

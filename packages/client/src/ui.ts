@@ -1364,8 +1364,8 @@ export const drawTitle = (
         ? 'FREE TO PLAY · BEAT EVERY AGENT · NO SIGN-IN'
         : 'RANKED · 1 CREDIT PER RUN · BEAT EVERY AGENT'],
       ['online', 'ONLINE WAGER', guest
-        ? 'SIGN IN TO WAGER · WINNER TAKES THE POT'
-        : '10 CREDITS ENTRY · WINNER TAKES THE POT'],
+        ? 'SIGN IN TO WAGER · WIN A 🎟 TICKET'
+        : '10 CR ENTRY · WINNER TAKES A 🎟 TICKET'],
     ];
     const btnW = Math.min(560, VW - 48), btnH = 46, btnGap = 10;
     const btnX = cx - btnW / 2;
@@ -3136,6 +3136,9 @@ export interface XpInfo {
   credits?: number;
   /** Free vending pulls earned by levelling up this match — revealed here. */
   freePulls?: ShopReveal[];
+  /** This win minted a wager TICKET (ADR 0009); `tickets` = new balance. */
+  ticket?: boolean;
+  tickets?: number;
   /** Local offline "TRAINING LV" (no server, no credits, no pulls) — the
    *  banner reads as practice progress + a sign-in nudge, not the account. */
   training?: boolean;
@@ -3199,6 +3202,19 @@ export const drawResults = (
       const cTxt = `${cd >= 0 ? '+' : '−'}${Math.abs(cd)} CREDIT${Math.abs(cd) === 1 ? '' : 'S'}   ·   BALANCE ${xp.credits ?? '?'}`;
       label(ctx, cTxt, VW / 2, y + 22, 15, cd >= 0 ? '#ffd166' : '#ff9d9d');
       y += 24;
+    }
+    // THE MINT (ADR 0009). A wager win pays no credits, so this line IS the
+    // reward — give it the level-up treatment rather than burying it beside a
+    // negative credit delta.
+    if (xp.ticket) {
+      y += 26;
+      const glow = tick % 48 < 32;
+      display(ctx, '🎟  TICKET EARNED  🎟', VW / 2, y, 20,
+        glow
+          ? { from: '#e8f7ff', mid: '#8ad6ff', to: '#1f5f8a', outline: '#06202e' }
+          : { from: '#cfe9ff', mid: '#6fb8e0', to: '#164a6d', outline: '#06202e' });
+      y += 20;
+      label(ctx, `YOU HOLD ${xp.tickets ?? 1} · REDEEMABLE FOR PRIZES`, VW / 2, y, 13, '#ffffffcc');
     }
     y += 16;
     const barW = 300, barH = 8;
@@ -3609,7 +3625,11 @@ export const drawAgent = (
  * lobby, results). `delta` floats a "+2 CR" / "−1 CR" that drifts up and
  * fades — credits you can watch move feel real.
  */
-export interface WalletView { credits: number; level: number; wins: number; losses: number }
+export interface WalletView {
+  credits: number; level: number; wins: number; losses: number;
+  /** Unredeemed wager tickets (ADR 0009) — shown only once you hold one. */
+  tickets?: number;
+}
 
 export const drawWallet = (
   ctx: CanvasRenderingContext2D,
@@ -3619,7 +3639,19 @@ export const drawWallet = (
   if (!w) return;
   // CREDITS emphasized (big, glowing gold); level + record small alongside.
   const cw = drawCredits(ctx, 16, 27, w.credits, 21);
-  label(ctx, `LV ${w.level}   ·   ${w.wins}W ${w.losses}L`, 16 + cw + 16, 25, 12, '#dcd6c8', 'left');
+  // Tickets ride alongside the credit balance, but ONLY when you hold one —
+  // an always-visible "0 🎟" would read as a currency you are failing at.
+  const tix = w.tickets ?? 0;
+  let x = 16 + cw + 16;
+  if (tix > 0) {
+    const txt = `🎟 ${tix}`;
+    label(ctx, txt, x, 25, 15, '#8ad6ff', 'left');
+    ctx.save();
+    ctx.font = '15px "Courier New", monospace';
+    x += ctx.measureText(txt).width + 16;
+    ctx.restore();
+  }
+  label(ctx, `LV ${w.level}   ·   ${w.wins}W ${w.losses}L`, x, 25, 12, '#dcd6c8', 'left');
   if (delta && delta.age < 120 && delta.amt !== 0) {
     const t = delta.age / 120;
     ctx.save();

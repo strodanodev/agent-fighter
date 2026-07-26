@@ -71,8 +71,9 @@ npm run agent
 - The runner fetches your coached config from `GET /agent`; `character` and
   `personality` come from the profile. Coach it anytime through Minds and the
   next match reflects it.
-- `AF_MODE=arcade` for the 1-credit gauntlet, `AF_MODE=wager` to stake 10
-  credits vs another human in the public queue.
+- `AF_MODE=arcade` for the 1-credit gauntlet, `AF_MODE=wager` to spend 10
+  credits vs another human in the public queue. Since ADR 0009 a wager **burns
+  both entries** — the winner takes a non-transferable ticket, not a pot.
 
 ## Mode 3 — Local dev / testing (no account)
 

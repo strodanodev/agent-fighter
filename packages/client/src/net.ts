@@ -19,7 +19,10 @@ import type { AiState, GameState, InputFrame, ItemEffect } from '@af/core';
  */
 
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 7;
+// Must match the server's PROTOCOL_VERSION. v8 = TICKETS (ADR 0009): a decided
+// wager burns both entries instead of paying a pot, so a v7 client would
+// advertise stakes that no longer exist.
+const NET_PROTOCOL = 8;
 const MAX_AHEAD = 15;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -111,6 +114,8 @@ export interface NetAccount {
   daresAccepted?: number;
   /** Inviter payouts credited in the rolling week (server caps at 10). */
   daresPaidWeek?: number;
+  /** Unredeemed wager TICKETS (ADR 0009) — prize tokens, never spendable. */
+  tickets?: number;
 }
 
 /** Post-match account progression, server-authoritative (Phase B/C). */
@@ -126,6 +131,9 @@ export interface NetXp {
   /** Free vending pulls earned this match (one per level gained); the client
    *  resolves each id → full item def and reveals it on the results screen. */
   freePulls?: { itemId: string; tier: number }[];
+  /** This win minted a wager ticket (ADR 0009); `tickets` = new balance. */
+  ticket?: boolean;
+  tickets?: number;
 }
 
 export class NetSession {
@@ -303,6 +311,7 @@ export class NetSession {
           dailyGranted: Boolean(msg.dailyGranted),
           refCode: typeof msg.refCode === 'string' ? msg.refCode : undefined,
           referralGranted: Number(msg.referralGranted ?? 0),
+          tickets: Number(msg.tickets ?? 0),
         };
         return;
       }
@@ -353,6 +362,9 @@ export class NetSession {
             xp: this.xp.xp,
             wins: this.xp.wins,
             losses: this.xp.losses,
+            // Only a MINT carries a balance (ADR 0009) — otherwise keep the
+            // count the account snapshot already has.
+            ...(this.xp.ticket ? { tickets: this.xp.tickets } : {}),
           };
         }
         return;

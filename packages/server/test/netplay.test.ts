@@ -75,6 +75,7 @@ describe('persistence hook (Phase B)', () => {
       getAccount: async () => ({
         credits: 100, level: 1, xp: 0, wins: 0, losses: 0, dailyGranted: false,
         refCode: 'TEST-0000', referralGranted: 0, daresAccepted: 0, daresPaidWeek: 0,
+        tickets: 0,
       }),
       escrowMatch: async () => {},
       recordMatch: async (r) => { records.push(r); return []; },

@@ -1184,7 +1184,8 @@ const resetMatchFx = (g: GameState): void => {
 
 /**
  * Queue for a server match (ADR 0003 + M5 credits).
- * 'wager'    = PvP, 10-credit entrance each, winner takes the pot.
+ * 'wager'    = PvP, 10-credit entrance each — both burn, winner takes a
+ *              TICKET (ADR 0009). No pot changes hands.
  * 'solo'     = a single match vs the HOUSE agent at your level, 1 credit.
  * 'arcade'   = AGENT ARCADE, the ranked gauntlet — 1 credit per RUN.
  *   `runToken` continues an existing run (the next battle); omitted = new run.
@@ -1326,7 +1327,10 @@ const installOnlineMatch = (): void => {
         s.solo?.personality ? 'VS A COACHED AGENT · RANKED · SERVER-VERIFIED' : 'RANKED · SERVER-VERIFIED']
       : s.mode === 'friendly'
         ? ['FRIENDLY CHALLENGE      NO FEE · NO POT · NO RECORDS', 'BRAGGING RIGHTS ONLY · SERVER-VERIFIED']
-        : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
+        // TICKETS (ADR 0009): both entries burn — say so plainly. Hiding the
+        // burn behind "winner takes all" would be lying about money.
+        : [`ENTRY −${s.fee ?? 10} CR      BOTH ENTRIES BURN      WINNER TAKES A 🎟 TICKET`,
+          'WAGER · SERVER-VERIFIED · TICKETS REDEEM FOR PRIZES'];
   // CONSUMABLES: the pinned loadout is part of the stakes — show what's
   // carried (server echo = the truth, not what the player asked for).
   const myDrinks = s.items?.[s.side] ?? [];
@@ -2683,7 +2687,7 @@ const frame = (steps = 1): void => {
         ? `FRIENDLY · FREE · NO POT · ROOM ${friendlyRoom}`
         : solo
           ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
-          : 'WAGER · 10 CREDITS ENTRY EACH · WINNER TAKES THE 20 POT', VW / 2, VH / 2 - 4);
+          : 'WAGER · 10 CR EACH · BOTH BURN · WINNER TAKES A 🎟 TICKET', VW / 2, VH / 2 - 4);
     ctx.font = '13px "Courier New", monospace';
     ctx.fillStyle = '#ffffff88';
     ctx.fillText(failed
@@ -3083,6 +3087,7 @@ const frame = (steps = 1): void => {
         wins: net.xp.wins, losses: net.xp.losses,
         creditsDelta: net.xp.creditsDelta, credits: net.xp.credits,
         freePulls,
+        ticket: net.xp.ticket, tickets: net.xp.tickets,
       };
       // A fresh pull is now in inventory — refresh the shop list lazily so the
       // vending screen shows it without a manual re-fetch.
@@ -3092,6 +3097,7 @@ const frame = (steps = 1): void => {
         account = {
           ...account, credits: net.xp.credits, level: net.xp.level,
           xp: net.xp.xp, wins: net.xp.wins, losses: net.xp.losses,
+          ...(net.xp.ticket ? { tickets: net.xp.tickets } : {}),
         };
       }
     }

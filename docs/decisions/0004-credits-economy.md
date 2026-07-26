@@ -14,8 +14,8 @@ balance and nothing else.
 | Sign-in | **Required** to pass the title screen. The AIR account IS the wallet — there is nothing meaningful to do as a ghost. (`?dev=NAME` bypass exists for dev servers only.) |
 | Daily login bonus | **+10 credits**, once per UTC day, granted on the first authenticated contact with the match server (`/me` or WS hello — whichever lands first). |
 | VS AGENT (ranked solo) | Fee **1 credit** → escrowed at pair time. Win: 2 back (**net +1**) and +60 XP. **Loss: fee burned and −15 XP** (clamped at 0; never de-levels). Draw: refund, no XP. |
-| ONLINE (wager) | Fee **10 credits each** → 20-credit pot. **Winner takes the pot** (net +10). XP win 60 / loss 20 / draw 30. Draw/undecided/incomplete: both refunded. |
-| Deviator (hash-flagged cheat) | Forfeits the pot/award to the opponent **regardless of the sim outcome**, and books a loss. |
+| ONLINE (wager) | ⚠️ **SUPERSEDED BY [ADR 0009](0009-tickets.md)** — the pot no longer exists. Historical rule: fee **10 credits each** → 20-credit pot, **winner takes the pot** (net +10). Current rule: both fees **burn** and the winner mints a non-transferable **ticket**. XP (win 60 / loss 20 / draw 30) and the draw/undecided refund are unchanged. |
+| Deviator (hash-flagged cheat) | Forfeits the award to the opponent **regardless of the sim outcome**, and books a loss. (Post-0009 the award is the ticket, not the pot.) |
 | Rage-quit | Already a forfeit (ADR 0003): the quitter is the loser, settlement follows. |
 | Free play | 2P local and the offline VS AGENT fallback ("FREE PRACTICE") cost nothing and award nothing — no XP, no records. If it isn't server-verified, it doesn't pay. |
 

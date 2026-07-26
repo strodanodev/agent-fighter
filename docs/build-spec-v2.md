@@ -232,8 +232,9 @@ opponent-disconnect heads-up.
   keys); soft-fail to anonymous for unranked.
 - **Credits (off-chain, no cash-out):** +10/UTC day on first authed
   contact; ranked solo fee 1 (win +1 net, +60xp; loss burns fee, −15xp
-  floor-clamped); wager 10 each → winner takes 20; deviator forfeits pot;
-  draws/incompletes refund. Money logic lives twice in lockstep —
+  floor-clamped); wager 10 each → BOTH BURN, winner mints a non-transferable
+  TICKET (ADR 0009 — there is no pot); deviator forfeits the ticket to its
+  opponent; draws/incompletes refund. Money logic lives twice in lockstep —
   Supabase SQL RPCs (source of truth: `get_account`/`escrow_match`/
   `record_match` — atomic, idempotent by match id) and an in-memory dev
   mirror. **Rule learned in production: every money-path SQL change must be

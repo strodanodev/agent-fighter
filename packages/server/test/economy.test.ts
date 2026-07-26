@@ -58,7 +58,7 @@ test('escrow: atomic, idempotent, throws INSUFFICIENT with the broke side', asyn
   assert.equal((await p.getAccount(id('poor'), 'P', false)).credits, 0);
 });
 
-test('wager settle: winner takes the pot, loser XP still grows', async () => {
+test('wager settle: BOTH fees burn, the winner mints a ticket (ADR 0009)', async () => {
   const p = memoryPersistence();
   await p.getAccount(id('a'), 'A', false);
   await p.getAccount(id('b'), 'B', false);
@@ -66,17 +66,103 @@ test('wager settle: winner takes the pot, loser XP still grows', async () => {
   const awards = await p.recordMatch(baseRecord({}));
   const a = awards.find((x) => x.side === 0)!;
   const b = awards.find((x) => x.side === 1)!;
-  assert.equal(a.creditsDelta, WAGER_FEE); // net +10 (pot 20 − fee 10)
-  assert.equal(a.credits, DAILY_CREDITS + WAGER_FEE);
+  // THE CUTOVER: there is no pot. Winning costs the same as losing —
+  // the reward is the ticket, not credits.
+  assert.equal(a.creditsDelta, -WAGER_FEE, 'winner does NOT get paid credits');
+  assert.equal(a.credits, 0);
+  assert.equal(a.ticket, true, 'winner minted a ticket');
+  assert.equal(a.tickets, 1);
   assert.equal(a.gained, XP_WIN);
   assert.equal(a.wins, 1);
   assert.equal(b.creditsDelta, -WAGER_FEE);
   assert.equal(b.credits, 0);
+  assert.equal(b.ticket, false, 'the loser mints nothing');
   assert.equal(b.gained, XP_LOSS);
   assert.equal(b.losses, 1);
-  // Idempotent: replaying the settlement changes nothing.
+  // The pot is GONE, not moved: 20 credits left the economy entirely.
+  assert.equal(a.credits + b.credits, 0, 'both entries burned');
+  // Idempotent: replaying the settlement mints no second ticket.
   assert.deepEqual(await p.recordMatch(baseRecord({})), []);
-  assert.equal((await p.getAccount(id('a'), 'A', false)).credits, DAILY_CREDITS + WAGER_FEE);
+  const after = await p.getAccount(id('a'), 'A', false);
+  assert.equal(after.credits, 0);
+  assert.equal(after.tickets, 1, 'a settlement retry never mints twice');
+});
+
+test('a ticket needs a DECIDED win: draws and no-contests mint nothing', async () => {
+  const p = memoryPersistence();
+  await p.getAccount(id('a'), 'A', false);
+  await p.getAccount(id('b'), 'B', false);
+  await p.escrowMatch('d1', ['a', 'b'], WAGER_FEE);
+  for (const x of await p.recordMatch(baseRecord({ matchId: 'd1', winner: 2 }))) {
+    assert.equal(x.ticket, false, 'a draw mints nothing');
+    assert.equal(x.creditsDelta, 0, 'a draw refunds the entry');
+  }
+  await p.escrowMatch('d2', ['a', 'b'], WAGER_FEE);
+  for (const x of await p.recordMatch(
+    baseRecord({ matchId: 'd2', winner: -1, reason: 'incomplete' }),
+  )) {
+    assert.equal(x.ticket, false, 'a no-contest mints nothing');
+  }
+  assert.equal((await p.getAccount(id('a'), 'A', false)).tickets, 0);
+});
+
+test('a FORFEIT win mints — a win is a win (owner decision 2026-07-26)', async () => {
+  const p = memoryPersistence();
+  await p.getAccount(id('a'), 'A', false);
+  await p.getAccount(id('b'), 'B', false);
+  await p.escrowMatch('f1', ['a', 'b'], WAGER_FEE);
+  const awards = await p.recordMatch(
+    baseRecord({ matchId: 'f1', winner: 0, reason: 'forfeit' }),
+  );
+  assert.equal(awards.find((x) => x.side === 0)!.ticket, true);
+  assert.equal(awards.find((x) => x.side === 1)!.ticket, false);
+  // Still a burn: the quitter's entry is not handed to the stayer.
+  assert.equal(awards.find((x) => x.side === 0)!.creditsDelta, -WAGER_FEE);
+});
+
+test('HUMAN HANDS ONLY: neither agent-class nor declared-agent wins mint', async () => {
+  const p = memoryPersistence();
+  // Gate 1 — the inert account CLASS.
+  const bot = 'agent:1111-2222';
+  await p.getAccount(id(bot), 'BOT', true);
+  await p.getAccount(id('h'), 'H', false);
+  await p.escrowMatch('ag1', [bot, 'h'], 0);
+  const cls = await p.recordMatch(baseRecord({
+    matchId: 'ag1', fee: 0, identities: [id(bot), id('h')], winner: 0,
+  }));
+  assert.equal(cls.find((x) => x.side === 0)!.ticket, false, 'a bot never mints');
+  assert.equal((await p.getAccount(id(bot), 'BOT', true)).tickets, 0);
+
+  // Gate 2 — the CONNECTION declared itself an agent. This sub is an
+  // ordinary human profile (a coached-owner headless runner plays AS its
+  // owner), so only the agents[] flag can stop it farming.
+  await p.getAccount(id('owner'), 'OWNER', false);
+  await p.getAccount(id('foe'), 'FOE', false);
+  await p.escrowMatch('ag2', ['owner', 'foe'], WAGER_FEE);
+  const hands = await p.recordMatch(baseRecord({
+    matchId: 'ag2', identities: [id('owner'), id('foe')],
+    agents: [true, false], winner: 0,
+  }));
+  assert.equal(hands.find((x) => x.side === 0)!.ticket, false,
+    'an owner\'s headless runner must not mint while they sleep');
+  assert.equal((await p.getAccount(id('owner'), 'OWNER', false)).tickets, 0);
+  // …but the win itself still counts: only the TICKET is withheld.
+  assert.equal(hands.find((x) => x.side === 0)!.wins, 1);
+});
+
+test('only WAGER mints: solo and arcade wins never do', async () => {
+  const p = memoryPersistence();
+  await p.getAccount(id('u'), 'U', false);
+  await p.escrowMatch('so1', ['u', null], SOLO_FEE);
+  const [solo] = await p.recordMatch(baseRecord({
+    matchId: 'so1', mode: 'solo', fee: SOLO_FEE, identities: [id('u'), null], winner: 0,
+  }));
+  assert.equal(solo!.ticket, false);
+  const [arc] = await p.recordMatch(baseRecord({
+    matchId: 'ar1', mode: 'arcade', fee: 0, identities: [id('u'), null], winner: 0,
+  }));
+  assert.equal(arc!.ticket, false);
+  assert.equal((await p.getAccount(id('u'), 'U', false)).tickets, 0);
 });
 
 test('wager draw/incomplete: both refunded', async () => {
@@ -93,7 +179,7 @@ test('wager draw/incomplete: both refunded', async () => {
   }
 });
 
-test('deviator forfeits the pot even when the re-sim says it won', async () => {
+test('deviator forfeits the TICKET even when the re-sim says it won', async () => {
   const p = memoryPersistence();
   await p.getAccount(id('cheat'), 'C', false);
   await p.getAccount(id('honest'), 'H', false);
@@ -106,7 +192,11 @@ test('deviator forfeits the pot even when the re-sim says it won', async () => {
   assert.equal(cheat.creditsDelta, -WAGER_FEE);
   assert.equal(cheat.gained, 0);
   assert.equal(cheat.losses, 1);
-  assert.equal(honest.creditsDelta, WAGER_FEE);
+  assert.equal(cheat.ticket, false, 'a deviator can never mint');
+  // The honest side takes the win (and the ticket) — but not the cheat's
+  // credits: those burned like everyone else's.
+  assert.equal(honest.creditsDelta, -WAGER_FEE);
+  assert.equal(honest.ticket, true);
   assert.equal(honest.wins, 1);
 });
 
@@ -172,7 +262,7 @@ test('LIVE ranked solo: house bot spawns, fee + settlement land on the account',
   assert.ok(!board.some((r) => r.name.startsWith('HOUSE')));
 });
 
-test('LIVE wager: pot settles winner +10 / loser −10; broke player is refused', async (t) => {
+test('LIVE wager: both entries burn, winner holds a ticket; broke player is refused', async (t) => {
   const persistence = memoryPersistence();
   const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true });
   t.after(() => server.close());
@@ -190,25 +280,33 @@ test('LIVE wager: pot settles winner +10 / loser −10; broke player is refused'
   const b = await persistence.getAccount({ sub: 'dev:BobBot' }, 'BobBot', true);
   if (ra.result.winner === 2) {
     assert.equal(a.credits + b.credits, DAILY_CREDITS * 2); // both refunded
+    assert.equal(a.tickets + b.tickets, 0, 'a draw mints nothing');
   } else {
     const [w, l] = ra.result.winner === 0 ? [a, b] : [b, a];
-    assert.equal(w.credits, DAILY_CREDITS + WAGER_FEE);
+    // ADR 0009: the pot is burned, so BOTH sides end at zero.
+    assert.equal(w.credits, 0, 'winning costs the same as losing');
     assert.equal(l.credits, 0);
     assert.equal(w.wins, 1);
     assert.equal(l.losses, 1);
+    // HUMAN HANDS ONLY: both sides here are headless runners (playOneMatch
+    // declares agent:true), so the win is recorded but NOTHING mints. This
+    // is the anti-farm valve, asserted on a real socket rather than a unit.
+    assert.equal(w.tickets, 0, 'a headless runner never mints, even winning');
+    assert.equal(l.tickets, 0);
 
-    // The loser is now broke — re-queueing must be refused, with no charge.
-    await assert.rejects(
-      playOneMatch({
-        url, name: ra.result.winner === 0 ? 'BobBot' : 'Alice',
-        character: 'vector', skill: 20, charactersDir, aiSeed: 11, paceMs: 1,
-      }),
-      /credit/,
-    );
-    assert.equal((await persistence.getAccount(
-      { sub: ra.result.winner === 0 ? 'dev:BobBot' : 'dev:Alice' },
-      'x', true,
-    )).credits, 0);
+    // BOTH players are now broke — re-queueing must be refused, no charge.
+    for (const who of ['Alice', 'BobBot'] as const) {
+      await assert.rejects(
+        playOneMatch({
+          url, name: who, character: 'vector', skill: 20,
+          charactersDir, aiSeed: 11, paceMs: 1,
+        }),
+        /credit/,
+      );
+      assert.equal((await persistence.getAccount(
+        { sub: `dev:${who}` }, 'x', true,
+      )).credits, 0);
+    }
   }
 });
 

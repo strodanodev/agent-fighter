@@ -116,7 +116,7 @@ test('LEDGER TRUTH: winning then dropping still WINS (no cable-pull escape eithe
   assert.equal(acc.wins + acc.losses, 1, 'ledger-decided match must book a result');
 });
 
-test('RAGEQUIT: dropping an UNDECIDED wager loses it; the pot goes to whoever stayed', async (t) => {
+test('RAGEQUIT: dropping an UNDECIDED wager loses it; the stayer mints the ticket', async (t) => {
   const persistence = memoryPersistence();
   const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true });
   t.after(() => server.close());
@@ -141,8 +141,12 @@ test('RAGEQUIT: dropping an UNDECIDED wager loses it; the pot goes to whoever st
   const q = await settledAccount(
     () => persistence.getAccount({ sub: 'dev:Quitter' }, 'Quitter', false),
     (a) => a.losses === 1);
-  assert.equal(s.credits, DAILY_CREDITS + WAGER_FEE, 'stayer takes the pot');
+  // ADR 0009: there is no pot to take. Both entries burn; the deterrent for
+  // leaving is the LOSS (and the forfeited ticket), not a credit transfer.
+  assert.equal(s.credits, DAILY_CREDITS - WAGER_FEE, 'stayer burns its entry too');
   assert.equal(q.credits, DAILY_CREDITS - WAGER_FEE, 'quitter burns the entry');
+  assert.equal(s.tickets, 1, 'a forfeit win is still a win — it mints');
+  assert.equal(q.tickets, 0);
   assert.equal(s.wins, 1);
   assert.equal(q.losses, 1);
   stayer.close();

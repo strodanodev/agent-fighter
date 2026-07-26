@@ -25,10 +25,16 @@
  *    **A WIN PAYS NO CREDITS.** Credits come only from board pickups banked
  *    by reaching an exit alive (arcadeExtract) — fighting is the cost, the
  *    board is the earning. Dying forfeits everything not yet extracted.
- *  · wager (ONLINE): fee 10 each → 20 pot. Winner takes the pot (net +10).
- *    Draw/undecided/incomplete: both refunded. A hash-flagged DEVIATOR
- *    forfeits: the pot goes to the opponent regardless of the sim outcome.
- *    Forfeit (rage-quit) already resolves winner = the non-quitter.
+ *  · wager (ONLINE): fee 10 each → BOTH BURN. There is no pot. The winner
+ *    mints one non-transferable TICKET (ADR 0009, 0020_tickets.sql) redeemable
+ *    for esports qualification / merch / vouchers. Credits never move between
+ *    players, which is what makes wager the economy's largest SINK instead of
+ *    a zero-sum transfer — and what kills sharking (the loser's credits went
+ *    to nobody). Draw/undecided/incomplete: both refunded, NO ticket. A
+ *    hash-flagged DEVIATOR forfeits: its opponent takes the win (and the
+ *    ticket) regardless of the sim outcome. Forfeit (rage-quit) already
+ *    resolves winner = the non-quitter, and DOES mint — a win is a win.
+ *    Agent-class subs never mint: inert is inert.
  *  · XP (wager): win 60 / loss 20 / draw 30 — unchanged from Phase B.
  *  · referral dares (0005): invitee +REFERRAL_CREDITS at first authenticated
  *    contact carrying a ?ref= code (new accounts only, once ever, never
@@ -119,6 +125,8 @@ export interface Account {
   daresAccepted: number;
   /** Inviter payouts credited in the rolling week (vs REFERRAL_WEEKLY_CAP). */
   daresPaidWeek: number;
+  /** UNREDEEMED wager tickets (ADR 0009). Non-transferable, prize-only. */
+  tickets: number;
 }
 
 export interface MatchRecord {
@@ -154,6 +162,10 @@ export interface XpAward {
   losses: number;
   creditsDelta: number; // net credits vs BEFORE the match fee
   credits: number; // balance after settlement
+  /** This settlement minted a wager ticket for this side (ADR 0009). */
+  ticket: boolean;
+  /** Unredeemed ticket balance after settlement (only meaningful if minted). */
+  tickets: number;
 }
 
 /** Thrown by escrowMatch when a side can't cover the fee. */
@@ -436,7 +448,12 @@ const settleSide = (
   if (undecided) {
     payout = r.fee; // refund
   } else if (r.mode === 'wager') {
-    payout = won ? r.fee * 2 : draw ? r.fee : 0;
+    // TICKETS (ADR 0009, 0020_tickets.sql): a DECIDED wager returns nothing —
+    // both entry fees burn and the winner mints a ticket instead of taking a
+    // pot. Only a draw (nothing decided) hands the entry back. The mint itself
+    // lives at the recordMatch call site, which knows the sub and can hold
+    // agent-class accounts inert.
+    payout = draw ? r.fee : 0;
     xpDelta = iDeviated ? 0 : won ? XP_WIN : draw ? XP_DRAW : XP_LOSS;
   } else if (r.mode === 'arcade') {
     // AGENT ARCADE battle (ADR 0008): a win pays XP and NOTHING ELSE — the
@@ -481,6 +498,18 @@ export const memoryPersistence = (): Persistence => {
   let nextItemRow = 1;
   /** Idempotency keys of non-refundable debits (`sub|reason|key`) — ADR 0007. */
   const debits = new Set<string>();
+  /**
+   * Wager TICKETS (ADR 0009), mirroring 0020_tickets.sql. Keyed by MATCH id,
+   * not by profile: one ticket per match ever, which is the same structural
+   * guard the SQL's unique(match_id) provides against a settlement retry
+   * minting a second one.
+   */
+  const tickets = new Map<string, { sub: string; season: number; redeemed: boolean }>();
+  const ticketsOf = (sub: string): number => {
+    let n = 0;
+    for (const t of tickets.values()) if (t.sub === sub && !t.redeemed) n++;
+    return n;
+  };
   /**
    * AGENT ARCADE v2 valves (ADR 0008), mirroring what the SQL reads back out
    * of credit_ledger: UTC day stamps of every successful EXTRACTION (the
@@ -554,6 +583,7 @@ export const memoryPersistence = (): Persistence => {
         dailyGranted, refCode: refCodeOf(identity.sub), referralGranted,
         daresAccepted: mine.length,
         daresPaidWeek: mine.filter((r) => r.released).length,
+        tickets: ticketsOf(identity.sub),
       };
     },
     escrowMatch: async (matchId, subs, fee) => {
@@ -589,10 +619,25 @@ export const memoryPersistence = (): Persistence => {
         if (!sub) continue;
         const p = prof(sub);
         const s = settleSide(p, r, side);
+        // THE MINT (ADR 0009). `won` already excludes deviators, draws and
+        // no-contests. Two more gates, closing different holes:
+        //  · `agent:` sub    — the inert account CLASS (fleet/house bots).
+        //  · r.agents[side]  — the CONNECTION declared itself an agent. A
+        //    coached-owner headless runner plays as its owner's ordinary
+        //    human profile, so only this flag stops an owner farming
+        //    tickets in their sleep. "Bots fill wallets; only hands fill
+        //    trophy cases."
+        let minted = false;
+        if (r.mode === 'wager' && s.won && !sub.startsWith('agent:') && !r.agents[side]
+          && !tickets.has(r.matchId)) {
+          tickets.set(r.matchId, { sub, season: 1, redeemed: false });
+          minted = true;
+        }
         out.push({
           side, gained: s.xpDelta, levelsUp: s.ups,
           level: p.level, xp: p.xp, wins: p.wins, losses: p.losses,
           creditsDelta: s.payout - r.fee, credits: p.credits,
+          ticket: minted, tickets: ticketsOf(sub),
         });
       }
       return out;
@@ -881,6 +926,18 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         }),
       })) as Array<Record<string, unknown>>;
       const row = rows[0] ?? {};
+      // Ticket balance is a SEPARATE rpc on purpose (0020_tickets.sql):
+      // get_account is the daily-bonus + referral-redemption path, and
+      // recreating it to add one column is real risk on a live money DB for
+      // no benefit. Best-effort — a ticket count must never block a login.
+      let tickets = 0;
+      try {
+        tickets = Number(await call('/rest/v1/rpc/ticket_count', {
+          method: 'POST', body: JSON.stringify({ _profile: identity.sub }),
+        }) ?? 0) | 0;
+      } catch (e) {
+        console.log(`[tickets] count failed for ${identity.sub}: ${String(e)}`);
+      }
       return {
         credits: Number(row.credits ?? 0), level: Number(row.level ?? 1),
         xp: Number(row.xp ?? 0), wins: Number(row.wins ?? 0), losses: Number(row.losses ?? 0),
@@ -889,6 +946,7 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         referralGranted: Number(row.referral_granted ?? 0),
         daresAccepted: Number(row.dares_accepted ?? 0),
         daresPaidWeek: Number(row.dares_paid_week ?? 0),
+        tickets,
       };
     },
     escrowMatch: async (matchId, subs, fee) => {
@@ -915,17 +973,23 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
           _engine: r.engine,
           _payout: r.payout ?? 0,
         }),
-      })) as Array<Record<string, number>>;
+        // `ticket` is a boolean column, so the row is no longer all-numbers.
+      })) as Array<Record<string, number | boolean | null>>;
+      const n = (v: number | boolean | null | undefined): number => Number(v ?? 0) | 0;
       return rows.map((row) => ({
-        side: (row.side! | 0) as 0 | 1,
-        gained: row.gained! | 0,
-        levelsUp: row.levels_up! | 0,
-        level: row.level! | 0,
-        xp: row.xp! | 0,
-        wins: row.wins! | 0,
-        losses: row.losses! | 0,
-        creditsDelta: row.credits_delta! | 0,
-        credits: row.credits! | 0,
+        side: n(row.side) as 0 | 1,
+        gained: n(row.gained),
+        levelsUp: n(row.levels_up),
+        level: n(row.level),
+        xp: n(row.xp),
+        wins: n(row.wins),
+        losses: n(row.losses),
+        creditsDelta: n(row.credits_delta),
+        credits: n(row.credits),
+        // A pre-ticket DB returns neither column; false/0 is the correct
+        // reading of "this settlement minted nothing".
+        ticket: row.ticket === true,
+        tickets: n(row.tickets),
       }));
     },
     sweepOrphanedEscrow: async (olderThanMinutes = 30) => {

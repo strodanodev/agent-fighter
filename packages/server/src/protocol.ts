@@ -7,7 +7,12 @@
  * server relays it and re-simulates the ledger to derive the result.
  */
 
-export const PROTOCOL_VERSION = 7; // v7: AGENT ARCADE gauntlet map (ADR 0008)
+// v8: TICKETS (ADR 0009). A DELIBERATE hard cutover, not an additive change:
+// a decided wager now burns both fees instead of paying a pot, so a v7 client
+// would show "WINNER TAKES 20" over a match that pays nothing. Lying to a
+// player about money is worse than forcing an update — old clients get a clean
+// "protocol 8 required" and must reload.
+export const PROTOCOL_VERSION = 8;
 export const DEFAULT_PORT = 8477;
 
 /**
@@ -137,7 +142,8 @@ export interface CHello {
 }
 /**
  * Queue modes (M5 credits):
- *  · 'wager'  — PvP. Entrance WAGER_FEE credits each; winner takes the pot.
+ *  · 'wager'  — PvP. Entrance WAGER_FEE credits each; BOTH BURN and the
+ *    winner mints a non-transferable TICKET (ADR 0009). There is no pot.
  *  · 'solo'   — a single match vs the HOUSE agent at your level. SOLO_FEE
  *    credits; win nets +1 credit, a loss burns the fee AND −15 XP.
  *  · 'arcade' — AGENT ARCADE, the RANKED gauntlet map (v7, ADR 0008):
@@ -366,13 +372,20 @@ export interface SAccount {
   daresAccepted: number;
   /** Inviter payouts credited in the rolling week (capped at 10). */
   daresPaidWeek: number;
+  /**
+   * Unredeemed wager TICKETS (ADR 0009). Non-transferable prize tokens minted
+   * by winning a decided wager; always 0 for agent-class accounts.
+   */
+  tickets: number;
 }
 /**
  * Post-match progression for YOUR account, sent after the result once the
  * server has persisted the verified outcome (authenticated players only).
  * Arrives asynchronously — persistence must never delay the result itself.
  * `gained` can be negative (ranked solo loss burns XP); `creditsDelta` is
- * net of the entrance fee (wager win = +fee, loss = −fee).
+ * net of the entrance fee. NOTE since ADR 0009 a DECIDED wager burns both
+ * fees, so `creditsDelta` is −fee for BOTH sides — the winner's reward is
+ * `ticket`, not credits.
  */
 export interface SXp {
   t: 'xp';
@@ -391,6 +404,13 @@ export interface SXp {
    * which never earns pulls). Each entry is the granted item's id + tier.
    */
   freePulls?: { itemId: string; tier: number }[];
+  /**
+   * TICKETS (ADR 0009): this settlement minted a wager ticket for you. Only
+   * ever true for a decided wager WIN by a non-agent account. `tickets` is
+   * the resulting unredeemed balance.
+   */
+  ticket?: boolean;
+  tickets?: number;
 }
 /** Server-side RTT probe / echo — same shape and rules as CPing/CPong. */
 export interface SPing { t: 'ping'; ts: number }

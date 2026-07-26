@@ -4326,7 +4326,10 @@ Object.assign(globalThis, {
  * (the classic GGPO throttle) rather than drift.
  */
 // Protocol constants — must match packages/server/src/protocol.ts.
-const NET_PROTOCOL = 7;
+// Must match the server's PROTOCOL_VERSION. v8 = TICKETS (ADR 0009): a decided
+// wager burns both entries instead of paying a pot, so a v7 client would
+// advertise stakes that no longer exist.
+const NET_PROTOCOL = 8;
 const MAX_AHEAD = 15;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -4530,6 +4533,7 @@ class NetSession {
                     dailyGranted: Boolean(msg.dailyGranted),
                     refCode: typeof msg.refCode === 'string' ? msg.refCode : undefined,
                     referralGranted: Number(msg.referralGranted ?? 0),
+                    tickets: Number(msg.tickets ?? 0),
                 };
                 return;
             }
@@ -4581,6 +4585,9 @@ class NetSession {
                         xp: this.xp.xp,
                         wins: this.xp.wins,
                         losses: this.xp.losses,
+                        // Only a MINT carries a balance (ADR 0009) — otherwise keep the
+                        // count the account snapshot already has.
+                        ...(this.xp.ticket ? { tickets: this.xp.tickets } : {}),
                     };
                 }
                 return;
@@ -7395,8 +7402,8 @@ const drawTitle = (ctx, rosters, tick, menu) => {
                     ? 'FREE TO PLAY · BEAT EVERY AGENT · NO SIGN-IN'
                     : 'RANKED · 1 CREDIT PER RUN · BEAT EVERY AGENT'],
             ['online', 'ONLINE WAGER', guest
-                    ? 'SIGN IN TO WAGER · WINNER TAKES THE POT'
-                    : '10 CREDITS ENTRY · WINNER TAKES THE POT'],
+                    ? 'SIGN IN TO WAGER · WIN A 🎟 TICKET'
+                    : '10 CR ENTRY · WINNER TAKES A 🎟 TICKET'],
         ];
         const btnW = Math.min(560, VW - 48), btnH = 46, btnGap = 10;
         const btnX = cx - btnW / 2;
@@ -8964,6 +8971,18 @@ serverWinner) => {
             label(ctx, cTxt, VW / 2, y + 22, 15, cd >= 0 ? '#ffd166' : '#ff9d9d');
             y += 24;
         }
+        // THE MINT (ADR 0009). A wager win pays no credits, so this line IS the
+        // reward — give it the level-up treatment rather than burying it beside a
+        // negative credit delta.
+        if (xp.ticket) {
+            y += 26;
+            const glow = tick % 48 < 32;
+            display(ctx, '🎟  TICKET EARNED  🎟', VW / 2, y, 20, glow
+                ? { from: '#e8f7ff', mid: '#8ad6ff', to: '#1f5f8a', outline: '#06202e' }
+                : { from: '#cfe9ff', mid: '#6fb8e0', to: '#164a6d', outline: '#06202e' });
+            y += 20;
+            label(ctx, `YOU HOLD ${xp.tickets ?? 1} · REDEEMABLE FOR PRIZES`, VW / 2, y, 13, '#ffffffcc');
+        }
         y += 16;
         const barW = 300, barH = 8;
         const bx = VW / 2 - barW / 2;
@@ -9287,7 +9306,19 @@ const drawWallet = (ctx, w, delta) => {
         return;
     // CREDITS emphasized (big, glowing gold); level + record small alongside.
     const cw = drawCredits(ctx, 16, 27, w.credits, 21);
-    label(ctx, `LV ${w.level}   ·   ${w.wins}W ${w.losses}L`, 16 + cw + 16, 25, 12, '#dcd6c8', 'left');
+    // Tickets ride alongside the credit balance, but ONLY when you hold one —
+    // an always-visible "0 🎟" would read as a currency you are failing at.
+    const tix = w.tickets ?? 0;
+    let x = 16 + cw + 16;
+    if (tix > 0) {
+        const txt = `🎟 ${tix}`;
+        label(ctx, txt, x, 25, 15, '#8ad6ff', 'left');
+        ctx.save();
+        ctx.font = '15px "Courier New", monospace';
+        x += ctx.measureText(txt).width + 16;
+        ctx.restore();
+    }
+    label(ctx, `LV ${w.level}   ·   ${w.wins}W ${w.losses}L`, x, 25, 12, '#dcd6c8', 'left');
     if (delta && delta.age < 120 && delta.amt !== 0) {
         const t = delta.age / 120;
         ctx.save();
@@ -12457,7 +12488,8 @@ const resetMatchFx = (g) => {
 };
 /**
  * Queue for a server match (ADR 0003 + M5 credits).
- * 'wager'    = PvP, 10-credit entrance each, winner takes the pot.
+ * 'wager'    = PvP, 10-credit entrance each — both burn, winner takes a
+ *              TICKET (ADR 0009). No pot changes hands.
  * 'solo'     = a single match vs the HOUSE agent at your level, 1 credit.
  * 'arcade'   = AGENT ARCADE, the ranked gauntlet — 1 credit per RUN.
  *   `runToken` continues an existing run (the next battle); omitted = new run.
@@ -12596,7 +12628,10 @@ const installOnlineMatch = () => {
                 s.solo?.personality ? 'VS A COACHED AGENT · RANKED · SERVER-VERIFIED' : 'RANKED · SERVER-VERIFIED']
             : s.mode === 'friendly'
                 ? ['FRIENDLY CHALLENGE      NO FEE · NO POT · NO RECORDS', 'BRAGGING RIGHTS ONLY · SERVER-VERIFIED']
-                : [`ENTRY −${s.fee ?? 10} CR      WINNER TAKES THE ${(s.fee ?? 10) * 2} CR POT`, 'WAGER · SERVER-VERIFIED'];
+                // TICKETS (ADR 0009): both entries burn — say so plainly. Hiding the
+                // burn behind "winner takes all" would be lying about money.
+                : [`ENTRY −${s.fee ?? 10} CR      BOTH ENTRIES BURN      WINNER TAKES A 🎟 TICKET`,
+                    'WAGER · SERVER-VERIFIED · TICKETS REDEEM FOR PRIZES'];
     // CONSUMABLES: the pinned loadout is part of the stakes — show what's
     // carried (server echo = the truth, not what the player asked for).
     const myDrinks = s.items?.[s.side] ?? [];
@@ -14069,7 +14104,7 @@ const frame = (steps = 1) => {
                 ? `FRIENDLY · FREE · NO POT · ROOM ${friendlyRoom}`
                 : solo
                     ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
-                    : 'WAGER · 10 CREDITS ENTRY EACH · WINNER TAKES THE 20 POT', VW / 2, VH / 2 - 4);
+                    : 'WAGER · 10 CR EACH · BOTH BURN · WINNER TAKES A 🎟 TICKET', VW / 2, VH / 2 - 4);
         ctx.font = '13px "Courier New", monospace';
         ctx.fillStyle = '#ffffff88';
         ctx.fillText(failed
@@ -14493,6 +14528,7 @@ const frame = (steps = 1) => {
                 wins: net.xp.wins, losses: net.xp.losses,
                 creditsDelta: net.xp.creditsDelta, credits: net.xp.credits,
                 freePulls,
+                ticket: net.xp.ticket, tickets: net.xp.tickets,
             };
             // A fresh pull is now in inventory — refresh the shop list lazily so the
             // vending screen shows it without a manual re-fetch.
@@ -14503,6 +14539,7 @@ const frame = (steps = 1) => {
                 account = {
                     ...account, credits: net.xp.credits, level: net.xp.level,
                     xp: net.xp.xp, wins: net.xp.wins, losses: net.xp.losses,
+                    ...(net.xp.ticket ? { tickets: net.xp.tickets } : {}),
                 };
             }
         }

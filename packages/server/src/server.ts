@@ -822,6 +822,7 @@ export const createMatchServer = (opts: {
             cl.account = {
               ...cl.account, credits: a.credits, level: a.level,
               xp: a.xp, wins: a.wins, losses: a.losses,
+              ...(a.ticket ? { tickets: a.tickets } : {}),
             };
           }
           // LEVEL-UP REWARD: one free vending pull per level gained (the
@@ -848,11 +849,15 @@ export const createMatchServer = (opts: {
               } catch { /* a lost free pull never blocks settlement */ }
             }
           }
+          if (a.ticket) {
+            console.log(`[ticket] ${cl.name} minted a ticket from ${m.id} (balance ${a.tickets})`);
+          }
           send(cl, {
             t: 'xp', gained: a.gained, levelsUp: a.levelsUp,
             level: a.level, xp: a.xp, wins: a.wins, losses: a.losses,
             creditsDelta: a.creditsDelta, credits: a.credits,
             ...(freePulls.length ? { freePulls } : {}),
+            ...(a.ticket ? { ticket: true, tickets: a.tickets } : {}),
           });
           // AIR reputation write-back (ADR 0004): best-effort, post-award,
           // real identities only (dev accounts have no AIR side), addressed
@@ -1389,6 +1394,9 @@ export const createMatchServer = (opts: {
                   wins: info?.wins ?? 0, losses: info?.losses ?? 0,
                   dailyGranted: false, refCode: '', referralGranted: 0,
                   daresAccepted: 0, daresPaidWeek: 0,
+                  // Inert extends to TICKETS (ADR 0009): agent-class accounts
+                  // never mint, so this is 0 by construction, not by lookup.
+                  tickets: 0,
                 };
                 if (info) c.name = info.name; // signup name wins over hello
                 send(c, { t: 'account', ...c.account });

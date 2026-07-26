@@ -252,11 +252,21 @@ describe('consumables in matches (ADR 0007 final shape)', () => {
   // Bank +20 credits via a fabricated settled wager win (the memory impl pays
   // fee*2 to the winner with no prior escrow) — a fresh account's daily 10
   // can't cover both a 5-CR drink AND the 10-CR wager fee in one day.
+  /**
+   * Mint test credits by settling a synthetic SOLO win: payout is fee + 1 and
+   * no escrow was ever taken, so the account nets +21.
+   *
+   * Deliberately NOT a wager. This used to record a fake wager WIN and collect
+   * the fee×2 pot — but since ADR 0009 a decided wager burns both entries and
+   * pays a TICKET, so that trick funded exactly zero and every test downstream
+   * went broke at queue time ("ranked match needs 1 credit"). Solo economics
+   * are untouched by the ticket cutover, which is why funding rides them now.
+   */
   const fund = async (who: string, matchId: string): Promise<void> => {
     await mem.recordMatch({
-      matchId, mode: 'wager', fee: 10,
-      identities: [{ sub: `dev:${who}` } as never, { sub: 'dev:Loser' } as never],
-      names: [who, 'Loser'], agents: [false, false], chars: ['analog', 'analog'],
+      matchId, mode: 'solo', fee: 20,
+      identities: [{ sub: `dev:${who}` } as never, null],
+      names: [who, 'HOUSE'], agents: [false, true], chars: ['analog', 'analog'],
       winner: 0, reason: 'verified', rounds: [2, 0], endTick: 1000, hash: 1,
       engine: ENGINE_VERSION,
     });
