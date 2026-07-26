@@ -3273,7 +3273,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "turtle"
+    "style": "turtle",
+    "bio": "Old-school beat-cop fundamentals: holds the line, forgives nothing, and collects the moment you get greedy.",
+    "quote": "Take your swing. I will take the round."
   },
   "versionHash": "18f09f52414c246e",
   "tuning": {

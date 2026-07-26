@@ -3279,7 +3279,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "zoner"
+    "style": "zoner",
+    "bio": "Fights in leather and floating point. Stacks pressure like racks and scales it until the screen melts.",
+    "quote": "The longer this runs, the worse it gets for you."
   },
   "versionHash": "49426e827b4660a3",
   "tuning": {

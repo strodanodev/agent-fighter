@@ -3638,6 +3638,53 @@ const drawFighter = (ctx, roster, f, tick, x, y, fallback, opts) => {
     ctx.fillRect(-26, -108, 52, 108);
     ctx.restore();
 };
+/**
+ * The looping IDLE frame for a character at `tick` — the menu equivalent of
+ * `spriteForFighter`, for screens that want a fighter breathing on them
+ * without a FighterState to ask about (the arcade map's route tokens).
+ *
+ * `spriteForFighter` is the only correct resolver for anything driven by the
+ * sim; this one deliberately covers the case where there IS no sim, so it
+ * resolves exactly one animation (`sys.idle`) and nothing else.
+ */
+const idleFrameName = (roster, tick) => {
+    const idx = roster.ch.moveIdxById['sys.idle'];
+    if (idx === undefined)
+        return null;
+    const move = roster.bundle.moves[idx];
+    if (!move)
+        return null;
+    const total = roster.ch.totalFrames[idx] ?? 0;
+    const frame = total > 0 ? Math.abs(Math.trunc(tick)) % total : 0;
+    let acc = 0;
+    for (const s of move.steps) {
+        acc += s.frames;
+        if (frame < acc)
+            return s.sprite ?? null;
+    }
+    return move.steps[move.steps.length - 1]?.sprite ?? null;
+};
+/**
+ * Blit a character's idle animation standing on (cx, footY), scaled to fit
+ * `maxH` tall. Returns false when the character has no atlas art, so callers
+ * can fall back to a portrait rather than drawing a hole.
+ */
+const drawIdleSprite = (ctx, roster, tick, cx, footY, maxH, alpha = 1) => {
+    const name = idleFrameName(roster, tick);
+    const atlas = roster.atlas;
+    const frame = name ? atlas?.frames[name] : undefined;
+    if (!atlas || !frame || !roster.sheet)
+        return false;
+    const s = (atlas.scale ?? 1) * Math.min(1, maxH / Math.max(1, frame.h * (atlas.scale ?? 1)));
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.imageSmoothingEnabled = atlas.smooth ?? false;
+    if (ctx.imageSmoothingEnabled)
+        ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(roster.sheet, frame.x, frame.y, frame.w, frame.h, cx - frame.pivotX * s, footY - frame.pivotY * s, frame.w * s, frame.h * s);
+    ctx.restore();
+    return true;
+};
 const drawPortrait = (ctx, roster, x, y, w, h, slot = 'select') => {
     const useVs = slot === 'vs' && !!roster.vsPortrait;
     const img = useVs ? roster.vsPortrait : roster.portrait;
@@ -8160,6 +8207,104 @@ const drawCpuBadge = (ctx, info, tick) => {
         label(ctx, opp.wallet, x + 10, y + 65, 9, '#8fb6d8', 'left', false);
     label(ctx, '[ / ] LV', x + w - 10, y + 64, 8, '#c8c4ba88', 'right', false);
 };
+/**
+ * AGENT ARCADE's replacement for the opponent card (ADR 0008). The gauntlet
+ * has no single opponent to name — the fighter you meet is whoever guards the
+ * node you choose, on a board that is not minted until the pick is locked —
+ * and no difficulty lever, because skill is pinned by REGION DEPTH server-side
+ * (`REGION_SKILL`), never by the player. So this card quotes the ramp: the one
+ * honest answer to "who am I fighting" that this screen can give.
+ */
+const drawGauntletOpposition = (ctx, tick) => {
+    const w = 244, h = 68;
+    const x = VW - 10 - w, y = 6;
+    const pulse = fxPulse(tick, 0.09);
+    const accent = AGENT_ACCENT;
+    ctx.save();
+    ctx.shadowColor = accent + 'aa';
+    ctx.shadowBlur = 10 + 6 * pulse;
+    const gp = ctx.createLinearGradient(0, y, 0, y + h);
+    gp.addColorStop(0, '#161a28f4');
+    gp.addColorStop(1, '#0b0d16f4');
+    rrect(ctx, x, y, w, h, 10);
+    ctx.fillStyle = gp;
+    ctx.fill();
+    ctx.restore();
+    ctx.save();
+    rrect(ctx, x + 1.5, y + 1.5, w - 3, h - 3, 9);
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 1.5;
+    ctx.shadowColor = accent;
+    ctx.shadowBlur = 5 + 5 * pulse;
+    ctx.stroke();
+    ctx.restore();
+    ctx.save();
+    rrect(ctx, x, y, w, h, 10);
+    ctx.clip();
+    const gh = ctx.createLinearGradient(x, 0, x + w, 0);
+    gh.addColorStop(0, tintHex(accent, -8));
+    gh.addColorStop(1, tintHex(accent, -52));
+    ctx.fillStyle = gh;
+    ctx.fillRect(x, y, w, 15);
+    ctx.restore();
+    label(ctx, 'THE OPPOSITION', x + 8, y + 12, 9, '#ffffff', 'left', true);
+    label(ctx, '◇ DEEPER = HARDER', x + w - 8, y + 12, 9, '#bfe0ff', 'right', true);
+    // One row per region: zone name and the AI skill band standing in it.
+    const regions = [1, 2, 3];
+    const tint = ['#8fe8a0', '#ffd99b', '#ff9d9d'];
+    regions.forEach((r, k) => {
+        const ry = y + 30 + k * 13;
+        label(ctx, REGION_NAME[r], x + 10, ry, 10, tint[k], 'left', true);
+        const [lo, hi] = REGION_SKILL[r];
+        label(ctx, `SKILL ${lo}–${hi}`, x + w - 10, ry, 10, '#c8c4bacc', 'right', false);
+    });
+};
+const loreOf = (r) => r.bundle.meta ?? {};
+/** What each archetype actually DOES, in the player's language. */
+const STYLE_INFO = {
+    rushdown: { label: 'RUSHDOWN', tag: 'CLOSE THE GAP AND NEVER LET GO', color: '#ff7a5c' },
+    zoner: { label: 'ZONER', tag: 'OWN THE SPACE · PUNISH THE APPROACH', color: '#6fd3ff' },
+    turtle: { label: 'TURTLE', tag: 'BLOCK · READ · PUNISH', color: '#8fd0ff' },
+    jumpy: { label: 'AERIAL', tag: 'ATTACK FROM ABOVE · NEVER STAND STILL', color: '#c39bff' },
+    grappler: { label: 'GRAPPLER', tag: 'WALK YOU DOWN AND TAKE YOU DOWN', color: '#ffb45c' },
+    'all-rounder': { label: 'ALL-ROUNDER', tag: 'NO BAD MATCHUP · NO FREE ROUND', color: '#8fe8a0' },
+};
+const styleInfo = (r) => STYLE_INFO[loreOf(r).style ?? ''] ?? { label: 'UNKNOWN', tag: 'AN UNFILED FIGHTING STYLE', color: '#c8c4ba' };
+/**
+ * Greedy word wrap in the display font, hard-capped at `maxLines` with an
+ * ellipsis when the text overruns — authored bios are free-form, so the panel
+ * must survive a long one rather than painting over its own frame.
+ */
+const wrapLines = (ctx, s, maxW, size, maxLines) => {
+    ctx.font = `${size}px ${DISPLAY_FONT_STACK}`;
+    const words = s.split(/\s+/).filter(Boolean);
+    const out = [];
+    let line = '';
+    let i = 0;
+    for (; i < words.length; i++) {
+        const next = line ? `${line} ${words[i]}` : words[i];
+        if (!line || ctx.measureText(next).width <= maxW) {
+            line = next;
+            continue;
+        }
+        out.push(line);
+        line = words[i];
+        if (out.length >= maxLines)
+            break;
+    }
+    if (out.length < maxLines && line) {
+        out.push(line);
+        i = words.length;
+    }
+    if (i < words.length && out.length > 0) {
+        // Ran out of lines mid-sentence: mark the truncation instead of hiding it.
+        let last = out[out.length - 1];
+        while (last.length > 1 && ctx.measureText(`${last}…`).width > maxW)
+            last = last.slice(0, -1);
+        out[out.length - 1] = `${last}…`;
+    }
+    return out;
+};
 /** Rounded-rectangle path (no fill/stroke — caller decides). */
 const rrect = (ctx, x, y, w, h, r) => {
     const rr = Math.max(0, Math.min(r, w / 2, h / 2));
@@ -8230,11 +8375,86 @@ const drawStatBar = (ctx, x, y, w, stat, accent, tick) => {
     }
 };
 /**
- * A player's fighter card: portrait + name + concrete numbers (HP, moves) +
- * the derived stat bars. Anchored to a screen corner and accent-colored per
- * player, so P1 (left) and the opponent (right) read as two facing corners.
+ * CHARACTER LEVEL / XP / W-L, as a compact three-part visual: a glowing level
+ * chip, the record with its win rate, and a charging XP bar toward the next
+ * level. Anchored inside a fighter card's info column.
+ *
+ * Returns the y it consumed down to, so the stat bars below can flow.
  */
-const drawFighterCard = (ctx, x, y, w, h, r, stats, accent, header, locked, tick) => {
+const drawRecordBand = (ctx, x, y, w, rec, accent, tick) => {
+    const pulse = fxPulse(tick, 0.07);
+    // 1) LEVEL chip — the loudest number on the band.
+    const chipW = 62, chipH = 18;
+    ctx.save();
+    const gchip = ctx.createLinearGradient(0, y, 0, y + chipH);
+    gchip.addColorStop(0, tintHex(accent, 30));
+    gchip.addColorStop(1, tintHex(accent, -60));
+    rrect(ctx, x, y, chipW, chipH, 5);
+    ctx.fillStyle = gchip;
+    ctx.shadowColor = accent;
+    ctx.shadowBlur = 6 + 5 * pulse;
+    ctx.fill();
+    ctx.restore();
+    rrect(ctx, x + 0.75, y + 0.75, chipW - 1.5, chipH - 1.5, 4.5);
+    ctx.strokeStyle = tintHex(accent, 85);
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    label(ctx, `LV ${rec.level}`, x + chipW / 2, y + 14, 13, '#ffffff', 'center', true);
+    // 2) W / L + win rate. Colored per outcome so the split reads at a glance.
+    const games = rec.wins + rec.losses;
+    const rate = games > 0 ? Math.round((rec.wins * 100) / games) : 0;
+    ctx.font = `12px ${DISPLAY_FONT_STACK}`;
+    const lossTxt = `${rec.losses}L`;
+    const rateTxt = games > 0 ? `  ·  ${rate}%` : '  ·  NO RECORD';
+    const rateW = ctx.measureText(rateTxt).width;
+    const lossW = ctx.measureText(lossTxt).width;
+    label(ctx, rateTxt, x + w, y + 14, 12, games > 0 ? '#ffd99b' : '#ffffff55', 'right', false);
+    label(ctx, lossTxt, x + w - rateW, y + 14, 12, '#ff9d9d', 'right', true);
+    label(ctx, `${rec.wins}W `, x + w - rateW - lossW, y + 14, 12, '#8fe8a0', 'right', true);
+    // 3) XP bar toward the next level (absent on a record with no XP source).
+    const barY = y + chipH + 5;
+    if (rec.xpNeed === undefined || rec.xp === undefined || rec.xpNeed <= 0)
+        return barY;
+    const barH = 9;
+    const frac = Math.max(0, Math.min(1, rec.xp / rec.xpNeed));
+    rrect(ctx, x, barY, w, barH, 4);
+    ctx.fillStyle = '#00000077';
+    ctx.fill();
+    ctx.strokeStyle = accent + '44';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    if (frac > 0) {
+        ctx.save();
+        rrect(ctx, x, barY, w, barH, 4);
+        ctx.clip();
+        const gxp = ctx.createLinearGradient(0, barY, 0, barY + barH);
+        gxp.addColorStop(0, tintHex(accent, 80));
+        gxp.addColorStop(0.5, accent);
+        gxp.addColorStop(1, tintHex(accent, -55));
+        ctx.fillStyle = gxp;
+        ctx.fillRect(x, barY, w * frac, barH);
+        // Energy sweep along the filled run — the same "charging" language as the
+        // stat bars, so the card reads as one system.
+        const sweep = ((tick / 70) % 1) * (w * frac + 60) - 30;
+        const gs = ctx.createLinearGradient(x + sweep - 26, 0, x + sweep + 26, 0);
+        gs.addColorStop(0, 'rgba(255,255,255,0)');
+        gs.addColorStop(0.5, 'rgba(255,255,255,0.35)');
+        gs.addColorStop(1, 'rgba(255,255,255,0)');
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.fillStyle = gs;
+        ctx.fillRect(x, barY, w * frac, barH);
+        ctx.restore();
+    }
+    label(ctx, `${rec.xp} / ${rec.xpNeed} XP`, x + w / 2, barY + barH - 1, 8.5, '#ffffffdd', 'center', true);
+    return barY + barH;
+};
+/**
+ * A player's fighter card: portrait + name + concrete numbers (HP, moves) +
+ * the derived stat bars, plus the pilot's LEVEL / XP / W-L when there is a
+ * record to show. Anchored to a screen corner and accent-colored per player,
+ * so P1 (left) and the opponent (right) read as two facing corners.
+ */
+const drawFighterCard = (ctx, x, y, w, h, r, stats, accent, header, locked, tick, record) => {
     const rad = 12;
     const pulse = fxPulse(tick, 0.08); // 0..1 breathing for the accent glow
     // 1) Panel: rounded, vertical gradient fill, cast on a soft accent glow that
@@ -8335,27 +8555,152 @@ const drawFighterCard = (ctx, x, y, w, h, r, stats, accent, header, locked, tick
     // 5) Name (with a matching glow) + concrete config numbers.
     const infoX = px2 + pSize + 14;
     const infoW = x + w - pad - infoX;
-    display(ctx, r.bundle.name.toUpperCase(), infoX, py2 + 16, 20, {
+    display(ctx, r.bundle.name.toUpperCase(), infoX, py2 + 15, 20, {
         align: 'left', glow: accent + 'aa', glowBlur: 12,
     });
-    label(ctx, `${stats.health.toLocaleString()} HP   ·   ${stats.moveCount} MOVES`, infoX, py2 + 34, 11, '#ffd99b', 'left', false);
-    // 6) Stat bars.
-    let by = py2 + 52;
+    label(ctx, `${stats.health.toLocaleString()} HP   ·   ${stats.moveCount} MOVES`, infoX, py2 + 31, 11, '#ffd99b', 'left', false);
+    // 6) LEVEL / XP / W-L, then the stat bars in whatever room is left. With no
+    // record (local P2, a friendly's opponent) the bars simply breathe wider
+    // rather than leaving a hole where the band would have been.
+    const bandEnd = record ? drawRecordBand(ctx, infoX, py2 + 38, infoW, record, accent, tick) : 0;
+    let by = record ? bandEnd + 6 : py2 + 46;
+    const step = record ? 19 : 24;
     for (const s of stats.bars) {
         drawStatBar(ctx, infoX, by, infoW, s, accent, tick);
-        by += 20;
+        by += step;
+    }
+};
+/**
+ * FIGHTER INFO — who this character actually is, in the slot the AGENT ARCADE
+ * rules panel used to occupy. The gauntlet's rules moved to the map screen
+ * (where the route decision is actually made); this screen's job is the pick,
+ * so it answers the pick's question instead: what does this fighter play like,
+ * and what do they have to say about it.
+ *
+ * Every line is authored character data (`meta.bio` / `meta.quote` /
+ * `meta.style`) — nothing here is re-typed prose that can drift from the
+ * bundle, and a character with no lore degrades to its art description.
+ */
+const drawFighterInfo = (ctx, x, y, w, h, r, tick) => {
+    const rad = 12;
+    const pulse = fxPulse(tick, 0.06);
+    const st = styleInfo(r);
+    const accent = st.color;
+    ctx.save();
+    ctx.shadowColor = accent + '77';
+    ctx.shadowBlur = 10 + 5 * pulse;
+    const gp = ctx.createLinearGradient(0, y, 0, y + h);
+    gp.addColorStop(0, '#1b1728f4');
+    gp.addColorStop(1, '#0c0a15f4');
+    rrect(ctx, x, y, w, h, rad);
+    ctx.fillStyle = gp;
+    ctx.fill();
+    ctx.restore();
+    ctx.save();
+    rrect(ctx, x + 1.5, y + 1.5, w - 3, h - 3, rad - 1);
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 1.6;
+    ctx.shadowColor = accent;
+    ctx.shadowBlur = 6 + 5 * pulse;
+    ctx.stroke();
+    ctx.restore();
+    // Header strip, same language as the fighter card opposite it.
+    ctx.save();
+    rrect(ctx, x, y, w, h, rad);
+    ctx.clip();
+    const gh = ctx.createLinearGradient(x, 0, x + w, 0);
+    gh.addColorStop(0, tintHex(accent, -20));
+    gh.addColorStop(1, tintHex(accent, -70));
+    ctx.fillStyle = gh;
+    ctx.fillRect(x, y, w, 22);
+    ctx.fillStyle = tintHex(accent, 70);
+    ctx.fillRect(x, y + 21, w, 1.5);
+    ctx.restore();
+    label(ctx, 'FIGHTER INFO', x + 10, y + 15, 12, '#ffffff', 'left', true);
+    label(ctx, r.bundle.name.toUpperCase().slice(0, 18), x + w - 10, y + 15, 12, '#ffffffcc', 'right', true);
+    const pad = 14;
+    const ix = x + pad;
+    const iw = w - pad * 2;
+    // FIGHTING STYLE — a chip in the archetype's own color plus what it means.
+    ctx.font = `13px ${DISPLAY_FONT_STACK}`;
+    const chipW = Math.min(iw, ctx.measureText(st.label).width + 22);
+    const chipY = y + 32;
+    ctx.save();
+    const gchip = ctx.createLinearGradient(0, chipY, 0, chipY + 20);
+    gchip.addColorStop(0, tintHex(accent, 10));
+    gchip.addColorStop(1, tintHex(accent, -70));
+    rrect(ctx, ix, chipY, chipW, 20, 5);
+    ctx.fillStyle = gchip;
+    ctx.shadowColor = accent;
+    ctx.shadowBlur = 6;
+    ctx.fill();
+    ctx.restore();
+    label(ctx, st.label, ix + chipW / 2, chipY + 15, 13, '#ffffff', 'center', true);
+    label(ctx, 'FIGHTING STYLE', ix + chipW + 10, chipY + 8, 9, '#ffffff77', 'left', false);
+    label(ctx, st.tag, ix + chipW + 10, chipY + 19, 10, accent, 'left', false);
+    const rule = (ry) => {
+        ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(ix, ry);
+        ctx.lineTo(ix + iw, ry);
+        ctx.stroke();
+    };
+    rule(chipY + 32);
+    // DESCRIPTION — the authored bio, falling back to the art description so a
+    // freshly generated character is never a blank panel.
+    const lore = loreOf(r);
+    const bio = (lore.bio ?? r.bundle.meta?.desc ?? '').trim();
+    let ty = chipY + 50;
+    label(ctx, 'DESCRIPTION', ix, ty, 9, '#ffffff77', 'left', false);
+    ty += 15;
+    const bioLines = bio
+        ? wrapLines(ctx, bio.toUpperCase(), iw, 12, 3)
+        : ['NO DOSSIER ON FILE.'];
+    for (const ln of bioLines) {
+        label(ctx, ln, ix, ty, 12, '#e6e1f0', 'left', false);
+        ty += 15;
+    }
+    // QUOTE — set apart by a colored spine and oversized quote marks, so it
+    // reads as the character talking rather than another stat line.
+    const qTop = y + h - 54;
+    rule(qTop - 10);
+    const quote = (lore.quote ?? '').trim();
+    if (quote) {
+        ctx.fillStyle = accent + '88';
+        ctx.fillRect(ix, qTop, 2.5, 40);
+        display(ctx, '“', ix + 12, qTop + 26, 30, {
+            align: 'left', alpha: 0.35, from: '#ffffff', mid: accent, to: accent,
+            outline: 'rgba(0,0,0,0)', rim: 'rgba(0,0,0,0)',
+        });
+        const qLines = wrapLines(ctx, quote.toUpperCase(), iw - 34, 13, 2);
+        let qy = qTop + (qLines.length === 1 ? 24 : 16);
+        for (const ln of qLines) {
+            label(ctx, ln, ix + 30, qy, 13, GOLD_LT, 'left', true);
+            qy += 16;
+        }
+    }
+    else {
+        label(ctx, 'SAYS NOTHING. LETS THE FRAME DATA TALK.', ix, qTop + 24, 12, '#ffffff55', 'left', false);
     }
 };
 const drawSelect = (ctx, rosters, cursors, locked, tick, cpuInfo, 
-/** Set = AGENT ARCADE entry: gauntlet size; swaps the P2 card for the rules panel. */
-arcadeTotal, 
+/**
+ * Set = AGENT ARCADE entry: swaps the P2 card for the gauntlet rules panel
+ * and the opponent card for the region ramp. `practice` = a guest's local,
+ * reward-free run — the panel must not quote a fee it will never charge.
+ */
+arcade, 
 /** Set = friendly challenge entry: retitles the screen (free, no stakes). */
-friendly) => {
+friendly, 
+/** The player's own progression (level / XP / W-L) for their card. */
+record) => {
     drawMenuBackdrop(ctx);
     ctx.fillStyle = '#0a0616d9';
     ctx.fillRect(0, 0, VW, VH);
     const stats = computeRosterStats(rosters);
-    const heading = arcadeTotal ? 'AGENT ARCADE — CHOOSE YOUR FIGHTER'
+    const heading = arcade
+        ? (arcade.practice ? 'AGENT ARCADE — PRACTICE RUN' : 'AGENT ARCADE — CHOOSE YOUR FIGHTER')
         : friendly ? 'FRIENDLY CHALLENGE — CHOOSE YOUR FIGHTER'
             : 'SELECT YOUR FIGHTER';
     display(ctx, heading, VW / 2, 46, 24);
@@ -8372,7 +8717,11 @@ friendly) => {
     ctx.strokeRect(backX + 0.5, backY + 0.5, backW - 1, backH - 1);
     ctx.lineWidth = 1;
     label(ctx, '‹ TITLE', backX + backW / 2, backY + backH / 2 + 4, 12, '#ffffffcc');
-    if (cpuInfo)
+    // Top-right: the gauntlet quotes its skill ramp (no one opponent, no lever);
+    // every other mode names the agent you are about to face.
+    if (arcade)
+        drawGauntletOpposition(ctx, tick);
+    else if (cpuInfo)
         drawCpuBadge(ctx, cpuInfo, tick);
     // Portrait grid — wraps past 6 columns. The fighter cards below own a FIXED
     // band at the bottom of the screen; the grid gets the fixed region between
@@ -8384,8 +8733,8 @@ friendly) => {
     const nameH = 20; // per-cell headroom for the name label under each portrait
     const maxGridW = 720;
     const rows = Math.ceil(rosters.length / cols);
-    const cardW = 448, cardH = 188;
-    const cardY = VH - cardH - 30; // fixed: the card band never moves
+    const cardW = 448, cardH = 206;
+    const cardY = VH - cardH - 26; // fixed: the card band never moves
     const gy = 74;
     const bandH = cardY - 6 - gy; // vertical room the grid must fit within
     const cellByW = Math.floor((maxGridW - (cols - 1) * gap) / cols);
@@ -8414,7 +8763,7 @@ friendly) => {
         // Selection cursors: smooth pulsing glow instead of a hard blink.
         // (Disabled fighters are skipped by the cursor, so none render here.)
         for (const i of [0, 1]) {
-            if (i === 1 && arcadeTotal)
+            if (i === 1 && arcade)
                 break; // arcade: only the player's cursor exists
             if (cursors[i] !== k)
                 continue;
@@ -8451,34 +8800,37 @@ friendly) => {
         drawFlag(ctx, 1, gx + gridW + 8, flagY, flagBoxW, flagH, tick, true);
     }
     const p2Header = cpuInfo ? `AGENT · LV ${cpuInfo.cpuLevel}` : 'PLAYER 2';
-    const cardHeaders = ['PLAYER 1', p2Header];
+    // Arcade has no player 2 to be the first of — the card is simply your run.
+    const cardHeaders = [arcade ? 'YOUR FIGHTER' : 'PLAYER 1', p2Header];
+    // The opponent card quotes the agent's OWN record (its level and W-L are
+    // real server data); a local P2 has none, and gets the wider bar layout.
+    const oppRecord = cpuInfo?.opp
+        ? { level: cpuInfo.opp.level, wins: cpuInfo.opp.wins, losses: cpuInfo.opp.losses }
+        : undefined;
     for (const i of [0, 1]) {
-        if (i === 1 && arcadeTotal)
-            break; // arcade: the rules panel takes P2's slot
+        if (i === 1 && arcade)
+            break; // arcade: the fighter-info panel takes P2's slot
         const r = rosters[cursors[i]];
         if (!r)
             continue;
         const cx = i === 0 ? 16 : VW - 16 - cardW;
-        drawFighterCard(ctx, cx, cardY, cardW, cardH, r, stats[cursors[i]], P_COLORS[i], cardHeaders[i], locked[i], tick);
+        drawFighterCard(ctx, cx, cardY, cardW, cardH, r, stats[cursors[i]], P_COLORS[i], cardHeaders[i], locked[i], tick, i === 0 ? record : oppRecord);
     }
-    // AGENT ARCADE rules panel — what the player is signing up for, where the
-    // opponent card would normally sit.
-    if (arcadeTotal) {
-        const rx = VW - 16 - cardW;
-        bevel(ctx, rx, cardY, cardW, cardH, PANEL, GOLD, GOLD_DK, 3);
-        display(ctx, 'THE GAUNTLET', rx + cardW / 2, cardY + 34, 20);
-        const lines = [
-            [`${arcadeTotal} AGENTS STAND IN YOUR WAY`, '#ffd166'],
-            ['RANKED · 1 CREDIT PER RUN · XP EVERY BATTLE', '#8fd0ff'],
-            ['CREDIT BONUSES AT MILESTONES + FULL CLEAR', '#ffffffcc'],
-            ['LOSE ONCE — GAME OVER', '#ff9d9d'],
-            ['NO CHARACTER SWITCHING MID-RUN', '#ffffff99'],
-        ];
-        lines.forEach(([txt, col], k) => label(ctx, txt, rx + cardW / 2, cardY + 62 + k * 22, 12, col));
+    // AGENT ARCADE: the mode's RULES now live on the map screen, where the route
+    // decision they describe is actually made. This slot answers the question
+    // this screen asks instead — who is this fighter.
+    if (arcade) {
+        const hovered = rosters[cursors[0]];
+        if (hovered)
+            drawFighterInfo(ctx, VW - 16 - cardW, cardY, cardW, cardH, hovered, tick);
     }
     const bothLocked = locked[0] && locked[1];
-    if (arcadeTotal) {
-        label(ctx, 'TAP TWICE / F  LOCK IN — YOUR FIGHTER RIDES THE WHOLE RUN', VW / 2, VH - 8, 12, '#ffffffaa');
+    if (arcade) {
+        // The one claim that MUST survive here is the money one — everything else
+        // about the gauntlet is explained on the board itself.
+        label(ctx, arcade.practice
+            ? 'FREE PRACTICE RUN · NOTHING BANKS · TAP TWICE / F  LOCK IN — YOUR PICK RIDES THE WHOLE RUN'
+            : '1 CREDIT ENTRY · TAP TWICE / F  LOCK IN — YOUR PICK MINTS THE BOARD AND RIDES THE WHOLE RUN', VW / 2, VH - 8, 12, '#ffffffaa');
     }
     else if (bothLocked) {
         const pulse = 1 + 0.04 * Math.sin(tick / 9);
@@ -9272,179 +9624,589 @@ const drawOpponentGone = (ctx, secsLeft, friendly, tick) => {
         ? "IF THEY DON'T RETURN, THE ROUND IS YOURS — NOTHING WAS STAKED"
         : "IF THEY DON'T RETURN, YOU WIN BY FORFEIT", VW / 2, boxY + 146, 11, '#ffd166');
 };
-const NODE_STROKE = {
-    start: '#e9e4f5',
-    fight: '#e2564a',
-    gate: '#f0a93b',
-    boss: '#ff5d3b',
-    loot: '#f2c14e',
-    exit: '#5cb85c',
+const NODE_SKIN = {
+    start: { w: 30, h: 26, stroke: '#e9e4f5', fill: '#232037' },
+    fight: { w: 34, h: 30, stroke: '#e2564a', fill: '#26141a' },
+    gate: { w: 36, h: 31, stroke: '#f0a93b', fill: '#2a1f10' },
+    boss: { w: 38, h: 33, stroke: '#ff5d3b', fill: '#2c1410' },
+    loot: { w: 24, h: 22, stroke: '#f2c14e', fill: '#2a2210' },
+    exit: { w: 32, h: 28, stroke: '#5cb85c', fill: '#12240f' },
 };
-/** Board lattice to screen pixels. One place, so hit-testing always agrees. */
-const MAP_X0 = 26;
-const MAP_Y0 = 92;
-const MAP_CELL = 13;
+/** The board plate and the route panel beside it. */
+const MAP_PLATE = { x: 16, y: 88, w: 452, h: VH - 88 - 22 };
+const MAP_PANEL = { x: 478, y: 88, w: VW - 478 - 14, h: VH - 88 - 22 };
+/**
+ * Path a single jigsaw piece centered on (cx, cy). Knobs point at the node's
+ * SUCCESSORS and sockets at its PREDECESSORS, so two connected nodes always
+ * present a matching knob/socket pair across their connector — the board reads
+ * as one interlocking puzzle rather than a scatter of dots, which is exactly
+ * what it is (ADR 0008: fully revealed, all variance in the fights).
+ */
+const puzzlePiece = (ctx, cx, cy, w, h, tabs) => {
+    const x = cx - w / 2, y = cy - h / 2;
+    const r = Math.min(w, h) * 0.18;
+    const t = Math.min(w, h) * 0.20; // half-width of the tab neck
+    const k = Math.min(w, h) * 0.26; // how far a knob reaches out
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    if (tabs.n !== 0) {
+        ctx.lineTo(cx - t, y);
+        ctx.bezierCurveTo(cx - t, y - k * tabs.n, cx + t, y - k * tabs.n, cx + t, y);
+    }
+    ctx.lineTo(x + w - r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    if (tabs.e !== 0) {
+        ctx.lineTo(x + w, cy - t);
+        ctx.bezierCurveTo(x + w + k * tabs.e, cy - t, x + w + k * tabs.e, cy + t, x + w, cy + t);
+    }
+    ctx.lineTo(x + w, y + h - r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    if (tabs.s !== 0) {
+        ctx.lineTo(cx + t, y + h);
+        ctx.bezierCurveTo(cx + t, y + h + k * tabs.s, cx - t, y + h + k * tabs.s, cx - t, y + h);
+    }
+    ctx.lineTo(x + r, y + h);
+    ctx.arcTo(x, y + h, x, y, r);
+    if (tabs.w !== 0) {
+        ctx.lineTo(x, cy + t);
+        ctx.bezierCurveTo(x - k * tabs.w, cy + t, x - k * tabs.w, cy - t, x, cy - t);
+    }
+    ctx.lineTo(x, y + r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+};
+/**
+ * Faint interlocking lattice behind the board — the "unsolved" half of the
+ * puzzle the route is cut out of. Purely decorative, deterministic (hash01),
+ * and clipped to the plate.
+ */
+const drawPuzzleField = (ctx, x, y, w, h, cell) => {
+    const cols = Math.ceil(w / cell), rows = Math.ceil(h / cell);
+    const t = cell * 0.13, k = cell * 0.17;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
+    ctx.strokeStyle = 'rgba(255,255,255,0.055)';
+    ctx.lineWidth = 1;
+    for (let r = 1; r < rows; r++) {
+        const ly = y + r * cell;
+        ctx.beginPath();
+        ctx.moveTo(x, ly);
+        for (let c = 0; c < cols; c++) {
+            const mid = x + c * cell + cell / 2;
+            const dir = hash01(r * 37 + c, 11) > 0.5 ? 1 : -1;
+            ctx.lineTo(mid - t, ly);
+            ctx.bezierCurveTo(mid - t, ly - k * dir, mid + t, ly - k * dir, mid + t, ly);
+            ctx.lineTo(x + (c + 1) * cell, ly);
+        }
+        ctx.stroke();
+    }
+    for (let c = 1; c < cols; c++) {
+        const lx = x + c * cell;
+        ctx.beginPath();
+        ctx.moveTo(lx, y);
+        for (let r = 0; r < rows; r++) {
+            const mid = y + r * cell + cell / 2;
+            const dir = hash01(c * 53 + r, 23) > 0.5 ? 1 : -1;
+            ctx.lineTo(lx, mid - t);
+            ctx.bezierCurveTo(lx - k * dir, mid - t, lx - k * dir, mid + t, lx, mid + t);
+            ctx.lineTo(lx, y + (r + 1) * cell);
+        }
+        ctx.stroke();
+    }
+    ctx.restore();
+};
+/** The prize sitting behind a guarded node (its only successor's loot). */
+const prizeBehind = (board, n) => {
+    const behind = successors(board, n.id)
+        .map((s) => nodeById(board, s))
+        .filter((b) => !!b);
+    return behind.length === 1 ? behind[0].loot : undefined;
+};
+/** What a route row / the action button offers, in one short phrase. */
+const routeOffer = (board, n) => {
+    if (n.kind === 'exit') {
+        return { text: `+${EXIT_BONUS[(n.exitTier ?? 1)]} CR`, color: '#7ee85a' };
+    }
+    const prize = prizeBehind(board, n);
+    return prize?.kind === 'credits' ? { text: `+${prize.amount} CR · 1 FIGHT`, color: '#f2c14e' }
+        : prize?.kind === 'drink' ? { text: '+1 DRINK · 1 FIGHT', color: '#4fc4d6' }
+            : { text: '1 FIGHT', color: '#ffffff77' };
+};
 const drawMap = (ctx, tick, v) => {
     drawMenuBackdrop(ctx);
-    ctx.fillStyle = 'rgba(6,4,14,0.80)';
+    ctx.fillStyle = 'rgba(6,4,14,0.82)';
     ctx.fillRect(0, 0, VW, VH);
     const { board, at } = v;
     const here = nodeById(board, at);
     const options = successors(board, at)
         .map((id) => nodeById(board, id))
         .filter((n) => !!n);
-    display(ctx, 'GAUNTLET MAP', 26, 56, 34, { align: 'left', glow: 'rgba(255,209,102,0.45)' });
+    const selNode = options.find((n) => n.id === v.sel) ?? null;
+    display(ctx, 'GAUNTLET MAP', 24, 54, 32, { align: 'left', glow: 'rgba(255,209,102,0.45)' });
     label(ctx, v.practice
         ? 'PRACTICE RUN · NO ENTRY · NO REWARDS'
-        : `${REGION_NAME[here ? here.region : 1]} · ${v.fights} FIGHT${v.fights === 1 ? '' : 'S'} DEEP`, 26, 76, 12, '#ffd166cc', 'left');
-    const px = (x) => MAP_X0 + x * MAP_CELL;
-    const py = (y) => MAP_Y0 + y * MAP_CELL;
-    // The board needs its OWN dark plate. Without one the menu backdrop art
-    // reads straight through the lattice and the routes become unreadable —
-    // which is fatal for the one screen whose entire job is legibility.
-    const boardX = MAP_X0 - 10;
-    const boardW = 32 * MAP_CELL + 20;
-    ctx.fillStyle = 'rgba(8,5,18,0.86)';
-    ctx.fillRect(boardX, 92, boardW, VH - 92 - 24);
-    ctx.strokeStyle = 'rgba(255,255,255,0.16)';
-    ctx.lineWidth = 1.5;
-    ctx.strokeRect(boardX + 0.5, 92.5, boardW - 1, VH - 92 - 25);
-    // Region bands, so depth reads at a glance. Labels sit INSIDE the plate,
-    // right-aligned, so they never collide with the panel beside it.
-    const bands = [[1, '#e2564a'], [2, '#f0a93b'], [3, '#8b5cf6']];
-    for (const [region, color] of bands) {
-        const ys = board.nodes.filter((n) => n.region === region).map((n) => n.y);
-        if (ys.length === 0)
-            continue;
-        const top = Math.max(93, py(Math.min(...ys) - 1));
-        const bot = Math.min(VH - 25, py(Math.max(...ys) + 1));
-        ctx.fillStyle = color;
-        ctx.globalAlpha = 0.12;
-        ctx.fillRect(boardX + 1, top, boardW - 2, bot - top);
-        ctx.globalAlpha = 1;
-        label(ctx, REGION_NAME[region], boardX + boardW - 8, top + 12, 9, `${color}ee`, 'right');
+        : `${REGION_NAME[here ? here.region : 1]} · ${v.fights} FIGHT${v.fights === 1 ? '' : 'S'} DEEP`, 24, 74, 12, '#ffd166cc', 'left');
+    // ---- the board -----------------------------------------------------------
+    // Its OWN dark plate: without one the menu backdrop art reads straight
+    // through the lattice and the routes become unreadable, which is fatal for
+    // the one screen whose entire job is legibility.
+    const P = MAP_PLATE;
+    ctx.save();
+    rrect(ctx, P.x, P.y, P.w, P.h, 10);
+    ctx.fillStyle = 'rgba(8,5,18,0.88)';
+    ctx.fill();
+    ctx.restore();
+    // Projection: the lattice is 32×32 but a board only ever occupies part of
+    // it, so fit the ACTUAL extent to the plate. Pieces are then scaled to the
+    // tightest node spacing this particular board produced, which is what keeps
+    // every template (some pack loot two rows apart) collision-free.
+    const xs = board.nodes.map((n) => n.x);
+    const ys = board.nodes.map((n) => n.y);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    // Asymmetric margins: a wider LEFT gutter for the region spines (so a zone
+    // name can never be buried under a piece) and a deeper BOTTOM one for the
+    // "YOU" marker under the piece the run is standing on.
+    const insetL = 42, insetR = 26, insetT = 26, insetB = 34;
+    const sx = (P.w - insetL - insetR) / Math.max(1, maxX - minX);
+    const sy = (P.h - insetT - insetB) / Math.max(1, maxY - minY);
+    const px = (x) => P.x + insetL + (x - minX) * sx;
+    const py = (y) => P.y + insetT + (y - minY) * sy;
+    let gap = Infinity;
+    for (let i = 0; i < board.nodes.length; i++) {
+        for (let j = i + 1; j < board.nodes.length; j++) {
+            const a = board.nodes[i], b = board.nodes[j];
+            gap = Math.min(gap, Math.hypot(px(a.x) - px(b.x), py(a.y) - py(b.y)));
+        }
     }
-    // Edges. The ones leaving HERE are lit; the rest are structure.
+    const fit = Math.max(0.6, Math.min(1.1, gap / 40));
+    // Region bands (depth at a glance) under the puzzle lattice.
+    const bands = [[1, '#e2564a'], [2, '#f0a93b'], [3, '#8b5cf6']];
+    ctx.save();
+    rrect(ctx, P.x, P.y, P.w, P.h, 10);
+    ctx.clip();
+    for (const [region, color] of bands) {
+        const rys = board.nodes.filter((n) => n.region === region).map((n) => n.y);
+        if (rys.length === 0)
+            continue;
+        const top = Math.max(P.y, py(Math.min(...rys)) - 18);
+        const bot = Math.min(P.y + P.h, py(Math.max(...rys)) + 18);
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.11;
+        ctx.fillRect(P.x, top, P.w, bot - top);
+        ctx.globalAlpha = 0.5;
+        ctx.fillRect(P.x, top, 3, bot - top); // zone spine down the gutter
+        ctx.globalAlpha = 1;
+        // The zone name runs UP its own spine, in the left gutter no piece uses.
+        ctx.save();
+        ctx.translate(P.x + 17, (top + bot) / 2);
+        ctx.rotate(-Math.PI / 2);
+        label(ctx, REGION_NAME[region], 0, 0, 10, `${color}ee`, 'center', false);
+        ctx.restore();
+    }
+    ctx.restore();
+    drawPuzzleField(ctx, P.x, P.y, P.w, P.h, 44);
+    ctx.save();
+    rrect(ctx, P.x + 0.75, P.y + 0.75, P.w - 1.5, P.h - 1.5, 10);
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.restore();
+    // Which side of a piece faces a neighbour — knobs out toward successors,
+    // sockets in from predecessors. Both ends of an edge derive the side from
+    // the same delta, so a knob always lands opposite its socket.
+    const tabs = new Map();
+    for (const n of board.nodes)
+        tabs.set(n.id, { n: 0, e: 0, s: 0, w: 0 });
+    const setTab = (id, dx, dy, val) => {
+        const t = tabs.get(id);
+        if (!t)
+            return;
+        const side = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'e' : 'w') : (dy > 0 ? 's' : 'n');
+        if (t[side] === 0 || val > 0)
+            t[side] = val; // a knob wins a contested side
+    };
     for (const [from, to] of board.edges) {
-        const a = nodeById(board, from);
-        const b = nodeById(board, to);
+        const a = nodeById(board, from), b = nodeById(board, to);
+        if (!a || !b)
+            continue;
+        const dx = px(b.x) - px(a.x), dy = py(b.y) - py(a.y);
+        setTab(from, dx, dy, 1);
+        setTab(to, -dx, -dy, -1);
+    }
+    // Connectors: a dark channel with a bright core. The routes leaving HERE are
+    // lit gold and carry a flowing pulse toward their destination.
+    for (const [from, to] of board.edges) {
+        const a = nodeById(board, from), b = nodeById(board, to);
         if (!a || !b)
             continue;
         const live = from === at;
-        ctx.strokeStyle = live ? 'rgba(255,209,102,0.85)' : 'rgba(255,255,255,0.14)';
-        ctx.lineWidth = live ? 2.2 : 1;
+        const ax = px(a.x), ay = py(a.y), bx = px(b.x), by = py(b.y);
+        ctx.lineCap = 'round';
+        ctx.strokeStyle = 'rgba(4,2,10,0.75)';
+        ctx.lineWidth = live ? 8 : 5;
         ctx.beginPath();
-        ctx.moveTo(px(a.x), py(a.y));
-        ctx.lineTo(px(b.x), py(b.y));
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
         ctx.stroke();
+        ctx.strokeStyle = live ? 'rgba(255,209,102,0.9)' : 'rgba(255,255,255,0.24)';
+        ctx.lineWidth = live ? 2.6 : 1.5;
+        ctx.stroke();
+        if (live) {
+            // Energy flowing along the offered route — the map's "these are yours".
+            const t = ((tick / 46) + (to % 5) * 0.2) % 1;
+            const ex = ax + (bx - ax) * t, ey = ay + (by - ay) * t;
+            ctx.save();
+            ctx.globalCompositeOperation = 'lighter';
+            ctx.fillStyle = 'rgba(255,229,160,0.85)';
+            ctx.beginPath();
+            ctx.arc(ex, ey, 2.6, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
+        ctx.lineCap = 'butt';
     }
+    // Pieces.
     for (const n of board.nodes) {
-        const cx = px(n.x);
-        const cy = py(n.y);
+        const cx = px(n.x), cy = py(n.y);
+        const skin = NODE_SKIN[n.kind];
         const isHere = n.id === at;
         const reachable = options.some((o) => o.id === n.id);
-        const r = n.kind === 'boss' ? 8 : n.kind === 'exit' ? 7.5 : 6;
-        ctx.globalAlpha = isHere || reachable ? 1 : 0.5;
-        ctx.beginPath();
-        ctx.arc(cx, cy, r, 0, Math.PI * 2);
-        ctx.fillStyle = 'rgba(10,7,20,0.9)';
+        const isSel = selNode?.id === n.id;
+        const hot = isHere || reachable;
+        const pop = isSel ? 1.16 + 0.03 * Math.sin(tick / 8) : reachable ? 1.06 : 1;
+        const w = skin.w * fit * pop, h = skin.h * fit * pop;
+        const t = tabs.get(n.id) ?? { n: 0, e: 0, s: 0, w: 0 };
+        const guard = n.charId ? v.rosterOf(n.charId) : undefined;
+        ctx.save();
+        ctx.globalAlpha = hot ? 1 : 0.5;
+        // Body: piece fill, then the guard's portrait clipped INTO the piece so
+        // every fight on the board wears the face you'd be fighting.
+        puzzlePiece(ctx, cx, cy, w, h, t);
+        ctx.save();
+        ctx.shadowColor = 'rgba(0,0,0,0.6)';
+        ctx.shadowBlur = 6;
+        ctx.shadowOffsetY = 2;
+        ctx.fillStyle = skin.fill;
         ctx.fill();
-        ctx.strokeStyle = NODE_STROKE[n.kind] ?? '#ffffff';
-        ctx.lineWidth = reachable ? 2.6 : 1.6;
-        ctx.stroke();
-        if (n.loot && n.loot.kind === 'credits') {
-            label(ctx, `${n.loot.amount}`, cx, cy + 3, 9, '#f2c14e');
+        ctx.restore();
+        if (guard?.portrait) {
+            ctx.save();
+            ctx.clip();
+            ctx.globalAlpha = (hot ? 1 : 0.5) * (isHere ? 0.45 : 0.95);
+            drawPortrait(ctx, guard, cx - w / 2, cy - h / 2, w, h);
+            // Darken the lower third so the kind badge stays readable on any art.
+            const gsh = ctx.createLinearGradient(0, cy, 0, cy + h / 2);
+            gsh.addColorStop(0, 'rgba(6,4,12,0)');
+            gsh.addColorStop(1, 'rgba(6,4,12,0.75)');
+            ctx.fillStyle = gsh;
+            ctx.fillRect(cx - w / 2, cy, w, h / 2);
+            ctx.restore();
         }
-        else if (n.loot && n.loot.kind === 'drink') {
-            label(ctx, '▯', cx, cy + 3.5, 10, '#4fc4d6');
+        // Rim.
+        puzzlePiece(ctx, cx, cy, w, h, t);
+        ctx.save();
+        ctx.strokeStyle = skin.stroke;
+        ctx.lineWidth = reachable || isHere ? 2.2 : 1.3;
+        if (reachable) {
+            ctx.shadowColor = skin.stroke;
+            ctx.shadowBlur = 6 + 4 * fxPulse(tick, 0.1);
+        }
+        ctx.stroke();
+        ctx.restore();
+        // Face: what this piece IS.
+        if (n.loot?.kind === 'credits') {
+            label(ctx, `${n.loot.amount}`, cx, cy + h * 0.16, 11 * fit, '#ffe28c', 'center', true);
+        }
+        else if (n.loot?.kind === 'drink') {
+            label(ctx, '▯', cx, cy + h * 0.18, 13 * fit, '#4fc4d6', 'center', true);
         }
         else if (n.kind === 'exit') {
-            label(ctx, `${n.exitTier ?? 1}`, cx, cy + 3.5, 10, '#7ee85a');
+            label(ctx, 'EXIT', cx, cy - h * 0.02, 9 * fit, '#c9ffc9', 'center', true);
+            label(ctx, `${n.exitTier ?? 1}`, cx, cy + h * 0.34, 12 * fit, '#7ee85a', 'center', true);
         }
         else if (n.kind === 'boss') {
-            label(ctx, '☠', cx, cy + 4, 10, '#ff9d7a');
+            label(ctx, '☠ BOSS', cx, cy + h * 0.40, 9 * fit, '#ffc9b4', 'center', true);
         }
-        ctx.globalAlpha = 1;
-        // Reachable routes get a tap target far bigger than the dot.
-        if (reachable && !v.busy)
-            tapZone(cx - 13, cy - 13, 26, 26, `map:go:${n.id}`);
+        else if (n.kind === 'gate') {
+            label(ctx, 'GATE', cx, cy + h * 0.40, 8.5 * fit, '#ffd9a0', 'center', true);
+        }
+        else if (n.kind === 'start') {
+            label(ctx, 'START', cx, cy + h * 0.16, 9 * fit, '#e9e4f5', 'center', true);
+        }
+        ctx.restore();
+        if (isSel) {
+            marchingOutline(ctx, cx - w / 2 - 5, cy - h / 2 - 5, w + 10, h + 10, tick, GOLD_LT, 9, 0.85);
+            // Name the fighter you just chose, right where you chose them — ABOVE
+            // the piece, because below it is where the player token stands.
+            const who = n.kind === 'exit' ? 'EXTRACTION POINT'
+                : v.nameOf(n.charId ?? '').toUpperCase().slice(0, 16);
+            label(ctx, who, cx, cy - h / 2 - 12, 11, GOLD_LT, 'center', true);
+        }
+        // The whole piece is the tap target for reachable routes.
+        if (reachable && !v.busy) {
+            tapZone(cx - w / 2 - 6, cy - h / 2 - 6, w + 12, h + 12, `map:sel:${n.id}`);
+        }
     }
-    // "You are here" — the only animated thing on the screen.
+    // YOU ARE HERE: the run's own fighter, idling ON the piece it stands on.
+    // Feet sit on the piece's lower edge and the figure is kept short enough
+    // that its head never reaches the next piece up (verified against every
+    // template's tightest spacing).
     if (here) {
-        const pulse = 10 + Math.sin(tick / 7) * 2;
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 2;
+        const cx = px(here.x), cy = py(here.y);
+        const skin = NODE_SKIN[here.kind];
+        const footY = cy + (skin.h * fit) / 2;
+        const bob = Math.sin(tick / 22) * 1.5;
+        // Ground marker: a shadow plus a breathing ring AT THE FEET, so the
+        // fighter reads as standing on the board rather than caged in a circle.
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
         ctx.beginPath();
-        ctx.arc(px(here.x), py(here.y), pulse, 0, Math.PI * 2);
+        ctx.ellipse(cx, footY, 13 * fit, 4.5 * fit, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.ellipse(cx, footY, (15 + Math.sin(tick / 7) * 1.5) * fit, 5.2 * fit, 0, 0, Math.PI * 2);
         ctx.stroke();
+        ctx.restore();
+        const drawn = v.player
+            ? drawIdleSprite(ctx, v.player, tick, cx, footY + bob, 40 * fit, 0.97)
+            : false;
+        if (!drawn && v.player) {
+            // No atlas art for this fighter: a portrait medallion still says "you".
+            const s = 26 * fit;
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(cx, footY - s / 2 + bob, s / 2, 0, Math.PI * 2);
+            ctx.clip();
+            drawPortrait(ctx, v.player, cx - s / 2, footY - s + bob, s, s);
+            ctx.restore();
+            ctx.strokeStyle = '#ffffffaa';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(cx, footY - s / 2 + bob, s / 2, 0, Math.PI * 2);
+            ctx.stroke();
+        }
+        label(ctx, 'YOU', cx, footY + 13, 10, '#ffffffcc', 'center', true);
     }
     // ---- the panel -----------------------------------------------------------
-    const panelX = 480;
-    const panelW = VW - panelX - 24;
-    ctx.fillStyle = 'rgba(10,6,22,0.66)';
-    ctx.fillRect(panelX, 92, panelW, VH - 92 - 24);
+    const N = MAP_PANEL;
+    ctx.save();
+    rrect(ctx, N.x, N.y, N.w, N.h, 10);
+    ctx.fillStyle = 'rgba(10,6,22,0.72)';
+    ctx.fill();
     ctx.strokeStyle = 'rgba(255,255,255,0.16)';
     ctx.lineWidth = 1.5;
-    ctx.strokeRect(panelX + 0.5, 92.5, panelW - 1, VH - 92 - 25);
-    let y = 118;
-    label(ctx, 'CARRYING', panelX + 16, y, 12, '#ffffff88', 'left');
+    ctx.stroke();
+    ctx.restore();
+    const inX = N.x + 16;
+    const inW = N.w - 32;
+    const rule = (ry) => {
+        ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(inX, ry);
+        ctx.lineTo(inX + inW, ry);
+        ctx.stroke();
+    };
+    // CARRYING — the thing a loss would take away.
+    label(ctx, 'CARRYING', inX, 112, 12, '#ffffff88', 'left');
     const bagText = `${v.bag.credits} CR`
         + (v.bag.drinks > 0 ? `  ·  ${v.bag.drinks} DRINK${v.bag.drinks === 1 ? '' : 'S'}` : '');
-    label(ctx, bagText, panelX + panelW - 16, y, 15, v.bag.credits > 0 ? '#f2c14e' : '#ffffff55', 'right');
-    y += 16;
+    label(ctx, bagText, inX + inW, 112, 16, v.bag.credits > 0 ? '#f2c14e' : '#ffffff55', 'right');
     label(ctx, v.bag.credits + v.bag.drinks > 0
         ? 'LOSE A FIGHT AND THIS IS GONE'
-        : 'NOTHING TO LOSE YET', panelX + 16, y, 10, '#ff9d9d', 'left');
-    // Exit routes — the greed/speed decision, priced.
-    y += 26;
-    label(ctx, 'EXITS FROM HERE', panelX + 16, y, 12, '#ffffff88', 'left');
-    for (const { node, route } of exitRoutes(board, at)) {
-        y += 19;
-        const tier = node.exitTier ?? 1;
+        : 'NOTHING TO LOSE YET', inX, 128, 10, '#ff9d9d', 'left');
+    rule(138);
+    // EXITS FROM HERE — the greed/speed decision, priced, from where you stand.
+    label(ctx, 'EXITS FROM HERE', inX, 156, 12, '#ffffff88', 'left');
+    const routes = exitRoutes(board, at);
+    const colW = inW / 3;
+    routes.forEach(({ node, route }, k) => {
+        const cxc = inX + colW * k + colW / 2;
+        const tier = (node.exitTier ?? 1);
         const gone = !route.reachable;
-        label(ctx, `EXIT ${tier}  ·  +${EXIT_BONUS[tier]} CR`, panelX + 16, y, 13, gone ? '#ffffff33' : '#7ee85a', 'left');
-        label(ctx, gone ? 'ROUTED PAST' : `${route.fights} FIGHT${route.fights === 1 ? '' : 'S'}`, panelX + panelW - 16, y, 13, gone ? '#ffffff33' : '#ffffffcc', 'right');
-    }
-    // Moves — one row per legal route, quoting cost and prize.
-    y += 30;
-    label(ctx, 'YOUR MOVE', panelX + 16, y, 12, '#ffffff88', 'left');
-    let slot = 0;
-    for (const n of options) {
-        y += 30;
-        slot++;
-        const rowY = y - 20;
-        const hot = !v.busy;
-        ctx.fillStyle = hot ? 'rgba(255,209,102,0.10)' : 'rgba(255,255,255,0.04)';
-        ctx.fillRect(panelX + 12, rowY, panelW - 24, 26);
-        if (hot)
-            tapZone(panelX + 12, rowY, panelW - 24, 26, `map:go:${n.id}`);
-        if (n.kind === 'exit') {
-            const tier = n.exitTier ?? 1;
-            label(ctx, `${slot}  EXTRACT HERE`, panelX + 20, y - 2, 13, '#7ee85a', 'left');
-            label(ctx, `+${EXIT_BONUS[tier]} CR`, panelX + panelW - 20, y - 2, 13, '#7ee85a', 'right');
-            continue;
+        label(ctx, `EXIT ${tier}`, cxc, 176, 12, gone ? '#ffffff33' : '#7ee85a', 'center');
+        label(ctx, gone ? 'ROUTED PAST' : `${route.fights} FIGHT${route.fights === 1 ? '' : 'S'}`, cxc, 191, 11, gone ? '#ffffff33' : '#ffffffcc', 'center');
+        label(ctx, `+${EXIT_BONUS[tier]} CR`, cxc, 207, 13, gone ? '#ffffff33' : '#f2c14e', 'center');
+    });
+    rule(218);
+    // YOUR MOVE — one row per legal route. Selecting is free; the action button
+    // below is the only thing that spends a fight.
+    label(ctx, 'YOUR MOVE', inX, 238, 12, '#ffffff88', 'left');
+    const rowH = 30;
+    options.forEach((n, k) => {
+        const rowY = 244 + k * rowH;
+        const on = n.id === v.sel;
+        ctx.save();
+        rrect(ctx, inX, rowY, inW, rowH - 4, 6);
+        ctx.fillStyle = on ? 'rgba(255,209,102,0.16)' : 'rgba(255,255,255,0.05)';
+        ctx.fill();
+        if (on) {
+            ctx.strokeStyle = GOLD_LT;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
         }
-        // A guarded pickup: name the prize, because the prize IS the offer.
-        const behind = successors(board, n.id)
-            .map((s) => nodeById(board, s))
-            .filter((b) => !!b);
-        const prize = behind.length === 1 ? behind[0].loot : undefined;
-        const who = v.nameOf(n.charId ?? '').toUpperCase().slice(0, 14);
-        const kindTag = n.kind === 'boss' ? 'BOSS · ' : n.kind === 'gate' ? 'GATE · ' : '';
-        label(ctx, `${slot}  ${kindTag}${who}`, panelX + 20, y - 2, 13, '#ffffffdd', 'left');
-        label(ctx, prize && prize.kind === 'credits' ? `+${prize.amount} CR · 1 FIGHT`
-            : prize && prize.kind === 'drink' ? '+1 DRINK · 1 FIGHT'
-                : '1 FIGHT', panelX + panelW - 20, y - 2, 12, prize ? '#f2c14e' : '#ffffff77', 'right');
-    }
+        ctx.restore();
+        if (!v.busy)
+            tapZone(inX, rowY, inW, rowH - 4, `map:sel:${n.id}`);
+        // Thumbnail: the guard's face, or the exit's mark.
+        const th = rowH - 12;
+        const tx = inX + 8, ty = rowY + 4;
+        const guard = n.charId ? v.rosterOf(n.charId) : undefined;
+        ctx.save();
+        rrect(ctx, tx, ty, th, th, 4);
+        ctx.fillStyle = n.kind === 'exit' ? '#12240f' : '#0c0a14';
+        ctx.fill();
+        ctx.save();
+        ctx.clip();
+        if (guard)
+            drawPortrait(ctx, guard, tx, ty, th, th);
+        ctx.restore();
+        ctx.strokeStyle = NODE_SKIN[n.kind].stroke;
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+        ctx.restore();
+        if (n.kind === 'exit')
+            label(ctx, '↥', tx + th / 2, ty + th - 5, 15, '#7ee85a', 'center', true);
+        const labelX = tx + th + 10;
+        const who = n.kind === 'exit' ? `EXTRACT · EXIT ${n.exitTier ?? 1}`
+            : v.nameOf(n.charId ?? '').toUpperCase().slice(0, 16);
+        const kindTag = n.kind === 'boss' ? 'BOSS' : n.kind === 'gate' ? 'GATE' : '';
+        label(ctx, `${k + 1}`, labelX, rowY + 19, 12, on ? GOLD_LT : '#ffffff66', 'left', false);
+        label(ctx, who, labelX + 14, rowY + 19, 13, on ? '#ffffff' : '#ffffffdd', 'left', true);
+        if (kindTag) {
+            ctx.font = `13px ${DISPLAY_FONT_STACK}`;
+            const wWidth = ctx.measureText(who).width;
+            label(ctx, kindTag, labelX + 20 + wWidth, rowY + 19, 9, n.kind === 'boss' ? '#ff9d7a' : '#ffd9a0', 'left', false);
+        }
+        const offer = routeOffer(board, n);
+        label(ctx, offer.text, inX + inW - 10, rowY + 19, 12, offer.color, 'right', false);
+    });
     if (options.length === 0) {
-        y += 26;
-        label(ctx, 'NO ROUTES LEFT — THIS RUN IS OVER', panelX + 16, y, 12, '#ff9d9d', 'left');
+        label(ctx, 'NO ROUTES LEFT — THIS RUN IS OVER', inX, 264, 12, '#ff9d9d', 'left');
     }
+    // NEXT UP — the dossier on the highlighted fighter, in whatever room the
+    // route list left behind. A short list leaves a hole; this fills it with the
+    // one thing a player still wants before committing: who that is.
+    const rowsEnd = 244 + options.length * rowH;
+    const nextUp = selNode && selNode.kind !== 'exit' && selNode.charId
+        ? v.rosterOf(selNode.charId) : undefined;
+    if (nextUp && 368 - rowsEnd >= 50) {
+        const cardY2 = rowsEnd + 8;
+        const cardH2 = Math.min(74, 368 - cardY2 - 10);
+        const st = styleInfo(nextUp);
+        ctx.save();
+        rrect(ctx, inX, cardY2, inW, cardH2, 8);
+        ctx.fillStyle = 'rgba(255,255,255,0.045)';
+        ctx.fill();
+        ctx.strokeStyle = st.color + '55';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.restore();
+        const pS = cardH2 - 16;
+        ctx.save();
+        rrect(ctx, inX + 8, cardY2 + 8, pS, pS, 6);
+        ctx.clip();
+        drawPortrait(ctx, nextUp, inX + 8, cardY2 + 8, pS, pS);
+        ctx.restore();
+        const tX = inX + 8 + pS + 12;
+        const tW = inW - (tX - inX) - 10;
+        // Deliberately identity-only (no bio): the full dossier is the select
+        // screen's job, and a variable-height block here would fight the button
+        // anchored below it.
+        const mid = cardY2 + cardH2 / 2;
+        label(ctx, 'NEXT UP', tX, mid - 14, 9, '#ffffff77', 'left', false);
+        display(ctx, nextUp.bundle.name.toUpperCase().slice(0, 16), tX, mid + 6, 18, {
+            align: 'left', glow: st.color + '99', glowBlur: 10,
+        });
+        const styleTxt = wrapLines(ctx, `${st.label}  ·  ${st.tag}`, tW, 9.5, 1)[0] ?? st.label;
+        label(ctx, styleTxt, tX, mid + 19, 9.5, st.color, 'left', false);
+    }
+    // ---- ACTION BUTTON -------------------------------------------------------
+    // Bottom-anchored so it never moves with the route count: the one control
+    // that commits, always in the same place under the thumb.
+    const btnY = 368, btnH = 52;
+    const extract = selNode?.kind === 'exit';
+    const armed = !!selNode && !v.busy;
+    const accent = extract ? '#5cb85c' : '#e2564a';
+    const btnPulse = fxPulse(tick, 0.09);
+    ctx.save();
+    if (armed) {
+        ctx.shadowColor = accent;
+        ctx.shadowBlur = 12 + 8 * btnPulse;
+    }
+    const gb = ctx.createLinearGradient(0, btnY, 0, btnY + btnH);
+    gb.addColorStop(0, armed ? tintHex(accent, 10) : '#20202c');
+    gb.addColorStop(1, armed ? tintHex(accent, -78) : '#131320');
+    rrect(ctx, inX, btnY, inW, btnH, 9);
+    ctx.fillStyle = gb;
+    ctx.fill();
+    ctx.restore();
+    ctx.save();
+    rrect(ctx, inX + 1, btnY + 1, inW - 2, btnH - 2, 8);
+    ctx.strokeStyle = armed ? tintHex(accent, 95) : '#ffffff22';
+    ctx.lineWidth = 1.6;
+    ctx.stroke();
+    ctx.restore();
+    if (selNode) {
+        // The opponent you are about to meet, idling inside the button — the
+        // screen's hand-off to the VS card.
+        const guard = selNode.charId ? v.rosterOf(selNode.charId) : undefined;
+        if (guard) {
+            ctx.save();
+            rrect(ctx, inX + 4, btnY + 4, btnH - 8, btnH - 8, 7);
+            ctx.clip();
+            ctx.fillStyle = 'rgba(0,0,0,0.35)';
+            ctx.fillRect(inX + 4, btnY + 4, btnH - 8, btnH - 8);
+            if (!drawIdleSprite(ctx, guard, tick, inX + 4 + (btnH - 8) / 2, btnY + btnH - 6 + Math.sin(tick / 20) * 1.5, btnH - 10)) {
+                drawPortrait(ctx, guard, inX + 4, btnY + 4, btnH - 8, btnH - 8);
+            }
+            ctx.restore();
+        }
+        const actX = inX + (guard ? btnH + 6 : 0) + (inW - (guard ? btnH + 6 : 0)) / 2;
+        const verb = extract ? 'EXTRACT'
+            : selNode.kind === 'boss' ? 'FIGHT THE BOSS'
+                : selNode.kind === 'gate' ? 'BREAK THE GATE'
+                    : 'FIGHT NOW';
+        display(ctx, verb, actX, btnY + 28, 24, {
+            scale: 1 + 0.02 * btnPulse,
+            ...(extract ? { from: '#eaffe6', mid: '#7ee85a', to: '#2e7a39' } : {}),
+        });
+        const offer = routeOffer(board, selNode);
+        label(ctx, extract ? `BANK ${v.bag.credits} CR  ·  ${offer.text} BONUS` : offer.text, actX, btnY + 44, 12, '#ffffffcc', 'center', true);
+        if (!v.busy)
+            tapZone(inX, btnY, inW, btnH, 'map:act');
+    }
+    else {
+        label(ctx, options.length === 0 ? 'NO ROUTES LEFT' : 'CHOOSE A ROUTE', inX + inW / 2, btnY + 34, 16, '#ffffff66', 'center', true);
+    }
+    rule(btnY + btnH + 12);
+    // ---- THE GAUNTLET --------------------------------------------------------
+    // The mode's rules, moved off the character-select screen to the place the
+    // decision they describe is actually made. Every claim is derived from the
+    // shipped constants (EXIT_FIGHT_FLOOR / EXIT_BONUS), never re-typed — the
+    // old copy outlived its ruleset once already.
+    const floors = [1, 2, 3].map((t) => EXIT_FIGHT_FLOOR[t]).join(' / ');
+    label(ctx, 'THE GAUNTLET', inX, btnY + btnH + 30, 12, '#ffffff88', 'left');
+    label(ctx, 'ONE BOARD · PICK YOUR ROUTE AFTER EVERY WIN', inX + inW, btnY + btnH + 30, 10, '#ffd166aa', 'right');
+    const lines = [
+        ['WINS PAY XP — THE BOARD PAYS CREDITS', '#8fd0ff'],
+        ['EVERY PICKUP COSTS ONE EXTRA FIGHT', '#ffffffcc'],
+        ['EXTRACT TO BANK THE BAG — LOSE OR QUIT AND IT IS GONE', '#ff9d9d'],
+        [v.practice
+                ? 'PRACTICE RUN · NOTHING BANKS · SIGN IN TO PLAY FOR CREDITS'
+                : `EXITS SIT ${floors} FIGHTS DEEP · DEEPER PAYS MORE`, '#ffffff99'],
+    ];
+    lines.forEach(([txt, col], k) => label(ctx, txt, inX, btnY + btnH + 44 + k * 13, 11, col, 'left'));
     if (v.busy)
-        label(ctx, 'WORKING…', panelX + panelW / 2, VH - 44, 13, '#ffd166');
+        label(ctx, 'WORKING…', N.x + N.w / 2, VH - 30, 13, '#ffd166');
     if (v.toast)
-        label(ctx, v.toast.slice(0, 46), VW / 2, VH - 32, 12, '#ffd166');
-    label(ctx, '1-4 / TAP: TAKE A ROUTE      ESC: ABANDON THE RUN', 26, VH - 14, 11, '#ffffff66', 'left');
+        label(ctx, v.toast.slice(0, 46), P.x + P.w / 2, VH - 30, 12, '#ffd166');
+    label(ctx, '1-4 / TAP  CHOOSE A ROUTE      ENTER  GO      ESC  ABANDON THE RUN', 24, VH - 8, 11, '#ffffff66', 'left');
 };
 const drawExtract = (ctx, tick, v) => {
     drawMenuBackdrop(ctx);
@@ -11404,6 +12166,12 @@ let mapBusy = false; // an /arcade/* request is in flight
 let mapToast = '';
 /** Escape was pressed once with a loaded bag — the next one really quits. */
 let mapAbandonArmed = false;
+/**
+ * The HIGHLIGHTED route (-1 = none). Choosing and committing are separate on
+ * the map: a route costs a fight or ends the run, so it must never be one
+ * stray tap away. The action button is the only thing that spends it.
+ */
+let mapSel = -1;
 let extractView = null;
 /** The roster ids a board may be populated from (never the player's own). */
 const arcadeRoster = () => allRosters
@@ -11425,7 +12193,7 @@ const startArcadePractice = () => {
         seed: (Math.random() * 0x7fffffff) | 0,
     });
     arcade = {
-        practice: true, board, at: board.start, pending: -1,
+        practice: true, board, at: board.start, pending: -1, charId: roster.id,
         fights: 0, total: EXIT_FIGHT_FLOOR[3], bag: { credits: 0, drinks: [] },
     };
     enterMap();
@@ -11435,6 +12203,7 @@ const enterMap = () => {
     mapToast = '';
     mapBusy = false;
     mapAbandonArmed = false;
+    mapSel = -1; // re-armed against the CURRENT node's routes on the next frame
     net = null;
     cpuAi = null;
     screen = 'map';
@@ -11482,6 +12251,7 @@ const fetchArcadeRun = async (token, character) => {
         board: body.board,
         at: body.at ?? body.board.start,
         pending: body.pending ?? -1,
+        charId: body.character ?? allRosters[picks[0]].id,
         fights: body.fights ?? 0,
         total: body.total ?? EXIT_FIGHT_FLOOR[3],
         bag: body.bag ?? { credits: 0, drinks: [] },
@@ -11491,7 +12261,7 @@ const fetchArcadeRun = async (token, character) => {
     // killed PWA — the title offers RESUME inside the server's grace window.
     storeArcadeRun({
         token,
-        charId: body.character ?? allRosters[picks[0]].id,
+        charId: arcade.charId,
         battle: arcade.fights,
         total: arcade.total,
         ts: Date.now(),
@@ -12020,10 +12790,6 @@ const renderFight = (g) => {
     drawFx(ctx, 'screen');
 };
 // ---------------------------------------------------------------- screens
-/** Ranked modes carry the equipped loadout (friendly stays dry) — the
- *  select screen only DISPLAYS it; equipping happens in the shop. */
-const carryEligible = () => equippedInv.length > 0 && !selectingFriendly
-    && (mode === 'cpu' || mode === 'online' || Boolean(selectingAgentOf));
 const tickSelect = () => {
     const n = allRosters.length;
     const enabled = (i) => !allRosters[i]?.disabled;
@@ -12534,6 +13300,11 @@ const frame = (steps = 1) => {
         // AGENT ARCADE v2 (ADR 0008): the board is the whole between-fights loop.
         // Every credit in this mode is decided here — take the short line to an
         // exit, or spend another fight on a guarded pile.
+        const options = successors(arcade.board, arcade.at);
+        // The highlight always points at a LEGAL route: the server owns where we
+        // stand, so a refresh can move us and strand a stale selection.
+        if (!options.includes(mapSel))
+            mapSel = options[0] ?? -1;
         drawMap(ctx, uiTick, {
             board: arcade.board,
             at: arcade.at,
@@ -12542,26 +13313,53 @@ const frame = (steps = 1) => {
             bag: { credits: arcade.bag.credits, drinks: arcade.bag.drinks.length },
             practice: arcade.practice,
             nameOf: rosterName,
+            rosterOf: (charId) => allRosters.find((r) => r.id === charId),
+            player: allRosters.find((r) => r.id === arcade.charId),
+            sel: mapSel,
             busy: mapBusy,
             toast: mapToast || undefined,
         });
         drawWalletStrip();
         if (!mapBusy) {
-            // Taps carry the node id, so a mis-drawn row can never move the run
-            // somewhere illegal — arcadeGo re-checks the edge either way.
+            // Taps carry the node id, so a mis-drawn row can never highlight
+            // something illegal — arcadeGo re-checks the edge either way.
             let chosen = -1;
             for (const t of taps) {
-                if (t.startsWith('map:go:')) {
-                    const id = Number(t.slice(7));
-                    if (Number.isFinite(id))
-                        chosen = id;
+                if (t.startsWith('map:sel:')) {
+                    const id = Number(t.slice(8));
+                    // Tap-to-choose, tap-again-to-commit — the same two-step the
+                    // character select uses, so one touch never spends a fight.
+                    if (Number.isFinite(id) && options.includes(id)) {
+                        if (id === mapSel)
+                            chosen = id;
+                        else {
+                            mapSel = id;
+                            audio.blip({ freq: 720, volume: 0.28 });
+                        }
+                    }
                 }
             }
             // Keyboard 1-4 mirror the panel rows, in the same order they are drawn.
-            const options = successors(arcade.board, arcade.at);
             for (let i = 0; i < Math.min(options.length, 4); i++) {
-                if (pressedThisFrame.has(`Digit${i + 1}`))
-                    chosen = options[i];
+                if (pressedThisFrame.has(`Digit${i + 1}`)) {
+                    mapSel = options[i];
+                    audio.blip({ freq: 720, volume: 0.28 });
+                }
+            }
+            const step = (d) => {
+                if (options.length === 0)
+                    return;
+                const at = Math.max(0, options.indexOf(mapSel));
+                mapSel = options[(at + d + options.length) % options.length];
+                audio.blip({ freq: 720, volume: 0.28 });
+            };
+            if (pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS'))
+                step(1);
+            if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW'))
+                step(-1);
+            if (taps.has('map:act') || pressedThisFrame.has('Enter') || pressedThisFrame.has('Space')) {
+                if (mapSel >= 0)
+                    chosen = mapSel;
             }
             if (chosen >= 0) {
                 audio.playSfx('select_confirm');
@@ -12740,30 +13538,27 @@ const frame = (steps = 1) => {
         // The upper-right AGENT OPPONENT card: who you're about to fight (level,
         // W-L, streak, wallet) — a live roster agent when one exists (same pick
         // ranked solo pins server-side), else the house agent. PvP-friendly
-        // select has no CPU.
-        const badge = !selectingFriendly
+        // select has no CPU. AGENT ARCADE has no single opponent either: the
+        // board (minted at lock-in) decides who guards each node and pins the
+        // skill by region, so it draws the ramp instead of a named agent.
+        const badge = !selectingFriendly && mode !== 'cpu'
             ? { cpuLevel: cpuLevelFor(profile, lever), lever, opp: resolveAgentOpp() }
             : undefined;
-        drawSelect(ctx, allRosters, picks, locked, uiTick, badge, mode === 'cpu' ? Math.max(1, allRosters.filter((r) => !r.disabled).length - 1) : undefined, selectingFriendly);
+        // A guest's gauntlet runs locally, reward-free — the rules panel must say
+        // so rather than quoting the 1-credit entry it will never charge them.
+        // CHARACTER LEVEL / XP / W-L on the player's own card: the signed-in
+        // account when there is one (server-authoritative), else the local
+        // profile — the same pair the results screen animates.
+        drawSelect(ctx, allRosters, picks, locked, uiTick, badge, mode === 'cpu' ? { practice: !isSignedIn() } : undefined, selectingFriendly, account
+            ? {
+                level: account.level, xp: account.xp, xpNeed: xpForNext(account.level),
+                wins: account.wins, losses: account.losses,
+            }
+            : {
+                level: profile.level, xp: profile.xp, xpNeed: xpForNext(profile.level),
+                wins: profile.wins, losses: profile.losses,
+            });
         drawWalletStrip();
-        // CONSUMABLES: read-only EQUIPPED indicator (equipping lives in the
-        // vending-machine screen — visual only here, per the UX decision).
-        if (carryEligible()) {
-            const names = equippedInv.map((it) => `${it.name} LV${it.tier}`).join(' · ');
-            const w = 380, h = 30, x = 14, y = VH - 78;
-            ctx.fillStyle = 'rgba(24,44,26,0.88)';
-            ctx.fillRect(x, y, w, h);
-            ctx.strokeStyle = '#7ddf8a';
-            ctx.lineWidth = 1.5;
-            ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
-            ctx.fillStyle = '#c8ffd0';
-            ctx.font = '600 12px system-ui, sans-serif';
-            ctx.textAlign = 'left';
-            ctx.fillText(`🥤 CARRYING ${names}`, x + 10, y + 19, w - 20);
-            ctx.fillStyle = '#ffffff66';
-            ctx.fillText('EQUIP IN THE SHOP (B)', x + w + 10, y + 19);
-            ctx.textAlign = 'center';
-        }
     }
     else if (screen === 'stageSelect') {
         tickStageSelect();

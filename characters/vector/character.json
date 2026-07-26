@@ -3248,7 +3248,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "rushdown"
+    "style": "rushdown",
+    "bio": "Runs the room on rhythm. Every hit lands on the beat and every gap is a bar you missed.",
+    "quote": "Stay on beat or stay down."
   },
   "versionHash": "fc80dcede362a4bf",
   "tuning": {

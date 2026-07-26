@@ -3279,7 +3279,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "turtle"
+    "style": "turtle",
+    "bio": "Plays the whole match on read. Blocks what you have not thrown yet and answers before you commit.",
+    "quote": "I heard that combo three frames ago."
   },
   "versionHash": "ad15991ca489fdaa",
   "tuning": {

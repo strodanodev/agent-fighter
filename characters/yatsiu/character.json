@@ -3279,7 +3279,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "all-rounder"
+    "style": "all-rounder",
+    "bio": "Builds an empire out of small advantages, then cashes every one of them in a single round.",
+    "quote": "Every frame is an asset. I own them all."
   },
   "versionHash": "167c7c84e9d71a76"
 }

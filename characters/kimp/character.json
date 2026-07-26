@@ -3279,7 +3279,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "jumpy"
+    "style": "jumpy",
+    "bio": "Grapple hook, cargo pants, zero hesitation. Turns the entire stage into a route and takes all of it.",
+    "quote": "Call me when you wake up."
   },
   "versionHash": "e8eb35379ca68995",
   "tuning": {

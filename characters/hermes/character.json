@@ -3279,7 +3279,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "jumpy"
+    "style": "jumpy",
+    "bio": "Winged messenger on a fight stick. Lives in the air and delivers the bad news on the way down.",
+    "quote": "You will get the message. Airmail."
   },
   "versionHash": "5875ce7eee38c723",
   "tuning": {

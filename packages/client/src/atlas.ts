@@ -237,6 +237,57 @@ export const drawFighter = (
 };
 
 /**
+ * The looping IDLE frame for a character at `tick` — the menu equivalent of
+ * `spriteForFighter`, for screens that want a fighter breathing on them
+ * without a FighterState to ask about (the arcade map's route tokens).
+ *
+ * `spriteForFighter` is the only correct resolver for anything driven by the
+ * sim; this one deliberately covers the case where there IS no sim, so it
+ * resolves exactly one animation (`sys.idle`) and nothing else.
+ */
+const idleFrameName = (roster: Roster, tick: number): string | null => {
+  const idx = roster.ch.moveIdxById['sys.idle'];
+  if (idx === undefined) return null;
+  const move = roster.bundle.moves[idx];
+  if (!move) return null;
+  const total = roster.ch.totalFrames[idx] ?? 0;
+  const frame = total > 0 ? Math.abs(Math.trunc(tick)) % total : 0;
+  let acc = 0;
+  for (const s of move.steps) {
+    acc += s.frames;
+    if (frame < acc) return s.sprite ?? null;
+  }
+  return move.steps[move.steps.length - 1]?.sprite ?? null;
+};
+
+/**
+ * Blit a character's idle animation standing on (cx, footY), scaled to fit
+ * `maxH` tall. Returns false when the character has no atlas art, so callers
+ * can fall back to a portrait rather than drawing a hole.
+ */
+export const drawIdleSprite = (
+  ctx: CanvasRenderingContext2D,
+  roster: Roster, tick: number, cx: number, footY: number, maxH: number, alpha = 1,
+): boolean => {
+  const name = idleFrameName(roster, tick);
+  const atlas = roster.atlas;
+  const frame = name ? atlas?.frames[name] : undefined;
+  if (!atlas || !frame || !roster.sheet) return false;
+  const s = (atlas.scale ?? 1) * Math.min(1, maxH / Math.max(1, frame.h * (atlas.scale ?? 1)));
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.imageSmoothingEnabled = atlas.smooth ?? false;
+  if (ctx.imageSmoothingEnabled) ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(
+    roster.sheet,
+    frame.x, frame.y, frame.w, frame.h,
+    cx - frame.pivotX * s, footY - frame.pivotY * s, frame.w * s, frame.h * s,
+  );
+  ctx.restore();
+  return true;
+};
+
+/**
  * Draw a character portrait into (x, y, w, h).
  *  - Dedicated portrait (_select.png / _vs.png): composed art → cover-fit (fill
  *    the frame, center-crop the overflow), no alpha cropping.

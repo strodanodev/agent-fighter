@@ -3292,7 +3292,9 @@
       "rotate": 0,
       "flipH": true
     },
-    "style": "zoner"
+    "style": "zoner",
+    "bio": "Wrote the whitepaper nobody read and the exploit everybody felt. Fights at arm’s length and lets the screen do the work.",
+    "quote": "I never have to touch you to take the round."
   },
   "versionHash": "35300cac67561f0a",
   "tuning": {

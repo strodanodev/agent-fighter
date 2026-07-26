@@ -3296,7 +3296,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "rushdown"
+    "style": "rushdown",
+    "bio": "A stuntman’s timing in a street brawler’s body. Turns every whiff into a setup and every prop into a hitbox.",
+    "quote": "You blink once. I am already behind you."
   },
   "versionHash": "56ffaf656b44b489",
   "tuning": {

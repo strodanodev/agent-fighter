@@ -3279,7 +3279,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "all-rounder"
+    "style": "all-rounder",
+    "bio": "Parade-ground posture, arcade-hall fundamentals. Nothing flashy, nothing wasted, nothing forgiven.",
+    "quote": "The record will say I have never lost."
   },
   "versionHash": "451b35ee5d5b977a"
 }

@@ -3245,7 +3245,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "turtle"
+    "style": "turtle",
+    "bio": "Metaverse overlord, commander of legions. Holds ground like a land claim and taxes every approach.",
+    "quote": "This square is mine. So is the next one."
   },
   "versionHash": "4a8798b678e46c1f",
   "tuning": {

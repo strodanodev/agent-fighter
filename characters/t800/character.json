@@ -3279,7 +3279,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "grappler"
+    "style": "grappler",
+    "bio": "Industrial servo torque in a walking chassis. Does not flinch, does not tire, does not stop.",
+    "quote": "Your health bar is a countdown."
   },
   "versionHash": "91286285d151d9da",
   "tuning": {

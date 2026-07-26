@@ -3279,7 +3279,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "all-rounder"
+    "style": "all-rounder",
+    "bio": "An agent framework that learned to throw hands. Reads your habits, then patches you out of the meta.",
+    "quote": "Tell me more about that pattern you keep repeating."
   },
   "versionHash": "0f033acf9ff171ca"
 }

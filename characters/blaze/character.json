@@ -3245,7 +3245,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "grappler"
+    "style": "grappler",
+    "bio": "Runs a fight like a challenge video — huge grabs, bigger stakes, and a crowd that never stops counting.",
+    "quote": "Last one standing takes the prize."
   },
   "versionHash": "937d3c636f51066b",
   "tuning": {

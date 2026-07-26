@@ -3279,7 +3279,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "zoner"
+    "style": "zoner",
+    "bio": "Ships hitboxes straight to production. Fires on a cadence nobody asked for and nobody can walk through.",
+    "quote": "The next patch fixes you."
   },
   "versionHash": "2e088e396b274dbf",
   "tuning": {

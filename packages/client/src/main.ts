@@ -866,6 +866,12 @@ interface ArcadeRun {
   total: number;
   /** UNBANKED pickups — what a loss takes away. */
   bag: { credits: number; drinks: { itemId: string; tier: number }[] };
+  /**
+   * The fighter SEALED into this run. Ranked runs take it from the server
+   * (it is the server that locked it), so a resume draws the right fighter on
+   * the board even when the local pick has since moved.
+   */
+  charId: string;
   /** RANKED only: bearer token that continues the run after a win. */
   runToken?: string;
 }
@@ -1365,6 +1371,12 @@ let mapBusy = false; // an /arcade/* request is in flight
 let mapToast = '';
 /** Escape was pressed once with a loaded bag — the next one really quits. */
 let mapAbandonArmed = false;
+/**
+ * The HIGHLIGHTED route (-1 = none). Choosing and committing are separate on
+ * the map: a route costs a fight or ends the run, so it must never be one
+ * stray tap away. The action button is the only thing that spends it.
+ */
+let mapSel = -1;
 let extractView: ExtractView | null = null;
 
 /** The roster ids a board may be populated from (never the player's own). */
@@ -1390,7 +1402,7 @@ const startArcadePractice = (): void => {
     seed: (Math.random() * 0x7fffffff) | 0,
   });
   arcade = {
-    practice: true, board, at: board.start, pending: -1,
+    practice: true, board, at: board.start, pending: -1, charId: roster.id,
     fights: 0, total: EXIT_FIGHT_FLOOR[3], bag: { credits: 0, drinks: [] },
   };
   enterMap();
@@ -1401,6 +1413,7 @@ const enterMap = (): void => {
   mapToast = '';
   mapBusy = false;
   mapAbandonArmed = false;
+  mapSel = -1; // re-armed against the CURRENT node's routes on the next frame
   net = null;
   cpuAi = null;
   screen = 'map';
@@ -1449,6 +1462,7 @@ const fetchArcadeRun = async (token: string, character?: string): Promise<boolea
     board: body.board,
     at: body.at ?? body.board.start,
     pending: body.pending ?? -1,
+    charId: body.character ?? allRosters[picks[0]]!.id,
     fights: body.fights ?? 0,
     total: body.total ?? EXIT_FIGHT_FLOOR[3],
     bag: body.bag ?? { credits: 0, drinks: [] },
@@ -1458,7 +1472,7 @@ const fetchArcadeRun = async (token: string, character?: string): Promise<boolea
   // killed PWA — the title offers RESUME inside the server's grace window.
   storeArcadeRun({
     token,
-    charId: body.character ?? allRosters[picks[0]]!.id,
+    charId: arcade.charId,
     battle: arcade.fights,
     total: arcade.total,
     ts: Date.now(),
@@ -1987,12 +2001,6 @@ const renderFight = (g: GameState): void => {
 };
 
 // ---------------------------------------------------------------- screens
-/** Ranked modes carry the equipped loadout (friendly stays dry) — the
- *  select screen only DISPLAYS it; equipping happens in the shop. */
-const carryEligible = (): boolean =>
-  equippedInv.length > 0 && !selectingFriendly
-  && (mode === 'cpu' || mode === 'online' || Boolean(selectingAgentOf));
-
 const tickSelect = (): void => {
   const n = allRosters.length;
   const enabled = (i: number): boolean => !allRosters[i]?.disabled;
@@ -2413,6 +2421,10 @@ const frame = (steps = 1): void => {
     // AGENT ARCADE v2 (ADR 0008): the board is the whole between-fights loop.
     // Every credit in this mode is decided here — take the short line to an
     // exit, or spend another fight on a guarded pile.
+    const options = successors(arcade.board, arcade.at);
+    // The highlight always points at a LEGAL route: the server owns where we
+    // stand, so a refresh can move us and strand a stale selection.
+    if (!options.includes(mapSel)) mapSel = options[0] ?? -1;
     drawMap(ctx, uiTick, {
       board: arcade.board,
       at: arcade.at,
@@ -2421,24 +2433,45 @@ const frame = (steps = 1): void => {
       bag: { credits: arcade.bag.credits, drinks: arcade.bag.drinks.length },
       practice: arcade.practice,
       nameOf: rosterName,
+      rosterOf: (charId) => allRosters.find((r) => r.id === charId),
+      player: allRosters.find((r) => r.id === arcade!.charId),
+      sel: mapSel,
       busy: mapBusy,
       toast: mapToast || undefined,
     });
     drawWalletStrip();
     if (!mapBusy) {
-      // Taps carry the node id, so a mis-drawn row can never move the run
-      // somewhere illegal — arcadeGo re-checks the edge either way.
+      // Taps carry the node id, so a mis-drawn row can never highlight
+      // something illegal — arcadeGo re-checks the edge either way.
       let chosen = -1;
       for (const t of taps) {
-        if (t.startsWith('map:go:')) {
-          const id = Number(t.slice(7));
-          if (Number.isFinite(id)) chosen = id;
+        if (t.startsWith('map:sel:')) {
+          const id = Number(t.slice(8));
+          // Tap-to-choose, tap-again-to-commit — the same two-step the
+          // character select uses, so one touch never spends a fight.
+          if (Number.isFinite(id) && options.includes(id)) {
+            if (id === mapSel) chosen = id;
+            else { mapSel = id; audio.blip({ freq: 720, volume: 0.28 }); }
+          }
         }
       }
       // Keyboard 1-4 mirror the panel rows, in the same order they are drawn.
-      const options = successors(arcade.board, arcade.at);
       for (let i = 0; i < Math.min(options.length, 4); i++) {
-        if (pressedThisFrame.has(`Digit${i + 1}`)) chosen = options[i]!;
+        if (pressedThisFrame.has(`Digit${i + 1}`)) {
+          mapSel = options[i]!;
+          audio.blip({ freq: 720, volume: 0.28 });
+        }
+      }
+      const step = (d: number): void => {
+        if (options.length === 0) return;
+        const at = Math.max(0, options.indexOf(mapSel));
+        mapSel = options[(at + d + options.length) % options.length]!;
+        audio.blip({ freq: 720, volume: 0.28 });
+      };
+      if (pressedThisFrame.has('ArrowDown') || pressedThisFrame.has('KeyS')) step(1);
+      if (pressedThisFrame.has('ArrowUp') || pressedThisFrame.has('KeyW')) step(-1);
+      if (taps.has('map:act') || pressedThisFrame.has('Enter') || pressedThisFrame.has('Space')) {
+        if (mapSel >= 0) chosen = mapSel;
       }
       if (chosen >= 0) {
         audio.playSfx('select_confirm');
@@ -2590,32 +2623,30 @@ const frame = (steps = 1): void => {
     // The upper-right AGENT OPPONENT card: who you're about to fight (level,
     // W-L, streak, wallet) — a live roster agent when one exists (same pick
     // ranked solo pins server-side), else the house agent. PvP-friendly
-    // select has no CPU.
-    const badge = !selectingFriendly
+    // select has no CPU. AGENT ARCADE has no single opponent either: the
+    // board (minted at lock-in) decides who guards each node and pins the
+    // skill by region, so it draws the ramp instead of a named agent.
+    const badge = !selectingFriendly && mode !== 'cpu'
       ? { cpuLevel: cpuLevelFor(profile, lever), lever, opp: resolveAgentOpp() }
       : undefined;
+    // A guest's gauntlet runs locally, reward-free — the rules panel must say
+    // so rather than quoting the 1-credit entry it will never charge them.
+    // CHARACTER LEVEL / XP / W-L on the player's own card: the signed-in
+    // account when there is one (server-authoritative), else the local
+    // profile — the same pair the results screen animates.
     drawSelect(ctx, allRosters, picks, locked, uiTick, badge,
-      mode === 'cpu' ? Math.max(1, allRosters.filter((r) => !r.disabled).length - 1) : undefined,
-      selectingFriendly);
+      mode === 'cpu' ? { practice: !isSignedIn() } : undefined,
+      selectingFriendly,
+      account
+        ? {
+          level: account.level, xp: account.xp, xpNeed: xpForNext(account.level),
+          wins: account.wins, losses: account.losses,
+        }
+        : {
+          level: profile.level, xp: profile.xp, xpNeed: xpForNext(profile.level),
+          wins: profile.wins, losses: profile.losses,
+        });
     drawWalletStrip();
-    // CONSUMABLES: read-only EQUIPPED indicator (equipping lives in the
-    // vending-machine screen — visual only here, per the UX decision).
-    if (carryEligible()) {
-      const names = equippedInv.map((it) => `${it.name} LV${it.tier}`).join(' · ');
-      const w = 380, h = 30, x = 14, y = VH - 78;
-      ctx.fillStyle = 'rgba(24,44,26,0.88)';
-      ctx.fillRect(x, y, w, h);
-      ctx.strokeStyle = '#7ddf8a';
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
-      ctx.fillStyle = '#c8ffd0';
-      ctx.font = '600 12px system-ui, sans-serif';
-      ctx.textAlign = 'left';
-      ctx.fillText(`🥤 CARRYING ${names}`, x + 10, y + 19, w - 20);
-      ctx.fillStyle = '#ffffff66';
-      ctx.fillText('EQUIP IN THE SHOP (B)', x + w + 10, y + 19);
-      ctx.textAlign = 'center';
-    }
   } else if (screen === 'stageSelect') {
     tickStageSelect();
     drawStageSelect(ctx, stageIds, stageCursor, uiTick);

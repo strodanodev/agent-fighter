@@ -3292,7 +3292,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "grappler"
+    "style": "grappler",
+    "bio": "Half mascot suit, half hydraulic press. Once the claws close the combo is a formality.",
+    "quote": "Pinch first. Ask never."
   },
   "versionHash": "23fb9aff666ae332",
   "tuning": {

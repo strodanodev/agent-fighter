@@ -27,6 +27,16 @@ import type { KeySettings, NormalizedFrame, QCResult, RGB } from './pipeline.js'
 
 interface StudioMeta {
   desc?: string;
+  /** Select-screen dossier: who this fighter is, and their pre-fight line. */
+  bio?: string;
+  quote?: string;
+  /**
+   * Canonical archetype (rushdown / zoner / turtle / jumpy / grappler /
+   * all-rounder). The match server builds arcade opponents' personalities from
+   * it and the select screen shows it as the FIGHTING STYLE chip; written by
+   * tools/apply-char-tuning.mjs alongside the per-fighter feel knobs.
+   */
+  style?: string;
   palette?: RGB[];
   refBodyW?: number;
   refMask?: number[]; // 16×16 silhouette of the reference (facing detection)
@@ -1045,7 +1055,51 @@ const renderCharacterTab = (): HTMLElement => {
       : 'active — selectable on the character-select screen.'),
   );
 
-  return mkEl('div', { class: 'pane' }, disableRow, portraitSection, grid);
+  // FIGHTER INFO — the select screen's dossier panel (bio + quote), plus the
+  // canonical archetype it reads for the FIGHTING STYLE chip. All of it lives
+  // in `meta`, which bundle-hash.mjs strips before the sim pin, so editing it
+  // can never bump versionHash or desync a match.
+  //
+  // `style` is READ-ONLY here on purpose: the match server derives an arcade
+  // opponent's whole personality from it AND tools/apply-char-tuning.mjs
+  // writes the matching per-fighter feel knobs at the same time. Editing it
+  // here alone would change how a character PLAYS without changing how it
+  // FEELS — run that tool instead.
+  const m = meta();
+  const loreRow = mkEl('div', {
+    style: 'margin-bottom:14px;padding:10px 12px;background:#141724;border:1px solid #232840;'
+      + 'border-radius:6px;max-width:1100px',
+  },
+    mkEl('h3', { style: 'margin:0 0 8px' }, 'fighter info (character select)'),
+    mkEl('label', { class: 'field', style: 'display:block;margin-bottom:8px' }, 'bio',
+      mkEl('textarea', {
+        value: m.bio ?? '',
+        rows: 2,
+        placeholder: 'One or two sentences on who this fighter is.',
+        style: 'width:760px;display:block',
+        onchange: (e: Event) => {
+          const v = (e.target as HTMLTextAreaElement).value.trim();
+          if (v) meta().bio = v; else delete meta().bio;
+          stDirty = true;
+        },
+      })),
+    mkEl('label', { class: 'field', style: 'display:block;margin-bottom:8px' }, 'quote',
+      mkEl('input', {
+        value: m.quote ?? '',
+        placeholder: 'What they say before the bell.',
+        style: 'width:760px',
+        onchange: (e: Event) => {
+          const v = (e.target as HTMLInputElement).value.trim();
+          if (v) meta().quote = v; else delete meta().quote;
+          stDirty = true;
+        },
+      })),
+    mkEl('span', { class: 'hint' },
+      `fighting style: ${m.style ?? '(unset)'} — set by tools/apply-char-tuning.mjs, `
+      + 'which writes the AI personality and the matching feel knobs together.'),
+  );
+
+  return mkEl('div', { class: 'pane' }, disableRow, portraitSection, loreRow, grid);
 };
 
 // ------------------------------------------------------------------ frames tab

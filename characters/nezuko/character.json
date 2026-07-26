@@ -3292,7 +3292,9 @@
       "rotate": 0,
       "flipH": false
     },
-    "style": "jumpy"
+    "style": "jumpy",
+    "bio": "Small frame, terrifying gearbox. Bounces off every surface and arrives with the hit already active.",
+    "quote": "You will not hear me land."
   },
   "versionHash": "467eb27eb872f7de",
   "tuning": {
