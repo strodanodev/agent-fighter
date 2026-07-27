@@ -153,7 +153,12 @@ export interface Account {
   daresAccepted: number;
   /** Inviter payouts credited in the rolling week (vs REFERRAL_WEEKLY_CAP). */
   daresPaidWeek: number;
-  /** UNREDEEMED wager tickets (ADR 0009). Non-transferable, prize-only. */
+  /**
+   * Wager tickets (ADR 0009) — a COSMETIC collectible (owner decision
+   * 2026-07-27): non-transferable, never spendable, no redemption catalog.
+   * Displayed on the wallet strip and as a leaderboard column; never part of
+   * any ranking sort.
+   */
   tickets: number;
 }
 
@@ -795,6 +800,8 @@ export const memoryPersistence = (): Persistence => {
         .map(([id, p], i) => ({
           id, name: names.get(id)?.name ?? 'anon', is_agent: names.get(id)?.agent ?? false,
           level: p.level, xp: p.xp, wins: p.wins, losses: p.losses, rank: i + 1,
+          // Cosmetic collectible (0022) — displayed, never part of the sort.
+          tickets: ticketsOf(id),
         })),
     // Dev economy has no durable match history; the client falls back to a
     // client-simulated house agent when these come back empty/zero.

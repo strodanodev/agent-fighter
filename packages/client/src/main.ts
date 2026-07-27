@@ -1330,7 +1330,7 @@ const installOnlineMatch = (): void => {
         // TICKETS (ADR 0009): both entries burn — say so plainly. Hiding the
         // burn behind "winner takes all" would be lying about money.
         : [`ENTRY −${s.fee ?? 10} CR      BOTH ENTRIES BURN      WINNER TAKES A 🎟 TICKET`,
-          'WAGER · SERVER-VERIFIED · TICKETS REDEEM FOR PRIZES'];
+          'WAGER · SERVER-VERIFIED · TICKETS SHOW ON THE LEADERBOARD'];
   // CONSUMABLES: the pinned loadout is part of the stakes — show what's
   // carried (server echo = the truth, not what the player asked for).
   const myDrinks = s.items?.[s.side] ?? [];

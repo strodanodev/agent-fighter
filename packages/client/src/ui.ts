@@ -3214,7 +3214,8 @@ export const drawResults = (
           ? { from: '#e8f7ff', mid: '#8ad6ff', to: '#1f5f8a', outline: '#06202e' }
           : { from: '#cfe9ff', mid: '#6fb8e0', to: '#164a6d', outline: '#06202e' });
       y += 20;
-      label(ctx, `YOU HOLD ${xp.tickets ?? 1} · REDEEMABLE FOR PRIZES`, VW / 2, y, 13, '#ffffffcc');
+      // Cosmetic collectible — never promise a redemption we do not offer.
+      label(ctx, `YOU HOLD ${xp.tickets ?? 1} · SHOWN ON THE LEADERBOARD`, VW / 2, y, 13, '#ffffffcc');
     }
     y += 16;
     const barW = 300, barH = 8;
@@ -3313,6 +3314,13 @@ export interface RankRow {
   wins: number;
   losses: number;
   rank: number;
+  /**
+   * Wager tickets — a COSMETIC collectible (owner decision 2026-07-27): no
+   * redemption, no prize, no cash-out. Displayed here and nowhere in the
+   * sort, because `rank` must stay a measure of play. Absent on a pre-0021
+   * server.
+   */
+  tickets?: number;
 }
 
 export const RANK_TABS = ['ALL', 'HUMANS', 'AGENTS'] as const;
@@ -3366,13 +3374,16 @@ export const drawRanks = (
   bevel(ctx, boxX, boxY, boxW, boxH, PANEL, GOLD, GOLD_DK, 3);
 
   // Column layout (x offsets inside the box).
-  const cols = { rank: 40, name: 90, kind: 380, lv: 490, xp: 560, wl: 680 };
+  // Re-spaced when TICKETS joined (0021) — everything shifts left to make a
+  // column of room on the right without widening the panel.
+  const cols = { rank: 36, name: 78, kind: 330, lv: 440, xp: 500, wl: 585, tix: 692 };
   label(ctx, '#', boxX + cols.rank, boxY + 28, 12, GOLD_LT);
   label(ctx, 'FIGHTER', boxX + cols.name + 60, boxY + 28, 12, GOLD_LT);
   label(ctx, 'TYPE', boxX + cols.kind + 24, boxY + 28, 12, GOLD_LT);
   label(ctx, 'LV', boxX + cols.lv, boxY + 28, 12, GOLD_LT);
   label(ctx, 'XP', boxX + cols.xp + 16, boxY + 28, 12, GOLD_LT);
   label(ctx, 'W — L', boxX + cols.wl, boxY + 28, 12, GOLD_LT);
+  label(ctx, 'TICKETS', boxX + cols.tix, boxY + 28, 12, GOLD_LT);
   ctx.fillStyle = '#ffffff22';
   ctx.fillRect(boxX + 16, boxY + 38, boxW - 32, 1);
 
@@ -3402,6 +3413,12 @@ export const drawRanks = (
       label(ctx, String(r.level), boxX + cols.lv, y, 15, '#ffffffdd');
       label(ctx, String(r.xp), boxX + cols.xp + 16, y, 13, '#ffffff99');
       label(ctx, `${r.wins} — ${r.losses}`, boxX + cols.wl, y, 14, '#ffffffdd');
+      // A column of zeros reads as a broken feature, so an empty case is a
+      // dim dash. Agent-class fighters can never mint, so theirs stays dashed
+      // by construction — that is honest, not a gap.
+      const tix = r.tickets ?? 0;
+      label(ctx, tix > 0 ? `🎟 ${tix}` : '—', boxX + cols.tix, y,
+        tix > 0 ? 14 : 13, tix > 0 ? '#8ad6ff' : '#ffffff44');
     });
   }
 

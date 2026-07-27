@@ -21,6 +21,42 @@ Builds on: 0003 (agents-first online), 0004 (credits), 0006 (train my agent),
 Supersedes: the winner-takes-pot half of 0004's wager economy (on cutover);
 the fleet-as-24/7-grinders framing of `agent-fleet.ts`
 
+## AMENDMENT 2026-07-27 — tickets are COSMETIC
+
+Owner decision, after the burn+mint shipped: **tickets are a cosmetic
+collectible.** No redemption catalog, no esports seats, no merch, no vouchers,
+no tokens — ever. The reward for winning a wager is a 🎟 count beside your
+name on the leaderboard (migration 0021) and on your wallet strip.
+
+This is a simplification, and it retires most of what the rest of this ADR
+worries about:
+
+- **Farming defences stop being load-bearing.** With nothing to redeem, a
+  colluded ticket buys bragging rights for 20 burned credits. The weekly mint
+  cap in "Open questions" can stay closed; Elo-banded matchmaking is no longer
+  needed *as an anti-farm measure* (it remains a good matchmaking idea).
+- **The legal posture is now trivial.** Not "tournament/redemption model" —
+  just a skill game with a credit sink and a scoreboard. The three-shop
+  problem cannot arise, because there is no shop.
+- **"Ticket form: soulbound AIR credential" is moot** as a transferability
+  guard (a DB row is equally non-transferable). A credential mirror is now
+  optional flavour — provenance for its own sake — not a control.
+
+Two rules survive the change and are *more* important now, not less:
+
+1. **Tickets never feed rank.** They are a display column; `rank` stays
+   ordered by level/xp/wins. Currency-as-status turns the ladder into "who
+   wagered most". Credits = utility, tickets = flair, Elo = status.
+2. **Human hands only.** Still enforced, now purely for scoreboard integrity
+   rather than fraud: a leaderboard column that a headless runner could farm
+   overnight is a worthless column.
+
+The honest cost: a cosmetic prize motivates less than 20 credits did, so
+wager's pull now rests entirely on the column being visible and scarce. If
+wager volume drops after the cutover, that is the reason — and the fix is
+making the count *legible* (season badges, top-holder callouts), not
+reintroducing a payout.
+
 ## The feature in one line
 
 House/fleet agents become a **stable of pinned identities** (data, not
@@ -60,7 +96,7 @@ Consequences:
 | Ticket form | **Soulbound via AIR credential** (issue-on-behalf pipeline already built, 0004/M5 write-back). Non-transferable by construction — no token contract | The rail exists; a credential has no transfer path to close |
 | Who can mint tickets | **Human hands only**: `agent:true` connections (already forced for agent-key auth) can never mint; agent-class inertness extends to tickets | "Bots fill wallets; only hands fill trophy cases." Residual: raw-JWT headless looks human but is realtime-paced + Elo-banded — accepted |
 | PvE tickets | **NONE** (owner decision). Tickets are human-vs-human wager only | A PvE ticket lane is exactly what a JWT-headless bot would farm |
-| Ticket catalog | Esports seats + non-cash perks (merch/vouchers after ops review). **Sponsored-token redemptions DEFERRED** (owner decision) pending real legal review | A ticket redeemable for a tradeable token is cash-equivalent and reopens the gambling classification the burn just closed |
+| Ticket catalog | ~~Esports seats + non-cash perks (merch/vouchers after ops review). Sponsored-token redemptions DEFERRED pending real legal review~~ → **SUPERSEDED 2026-07-27: there is no catalog. Tickets are a COSMETIC COLLECTIBLE** — see the amendment below | A ticket redeemable for a tradeable token is cash-equivalent and reopens the gambling classification the burn just closed |
 | Seasons | **Two tracks.** Lifetime level/XP NEVER resets (drives `skillForLevel`, AIR reputation creds, CPU calibration — 0006's skill-from-level rule stays intact). New **season score** (seasonal Elo) resets per season and drives the prize ladder, ticket season, gate assignments | A raw XP reset would floor every trained agent's skill quarterly and overwrite LV38 credentials with LV1 |
 | Season length | **Placeholder 21 days** (owner: set properly later). Tickets, season score, and gate rotation share ONE boundary | One boundary, one announcement, one reset |
 | Rating design | Elo as the spine; activity gate (~10 decided matches to fully count, idle decay); level as tiebreaker. Formula lives in **ONE SQL view** (the `agent_roster`/`player_stats` pattern) | Reweighting = a migration, not a paired deploy; three display surfaces can never drift. Credits and tickets NEVER feed rank (currency ≠ status) |

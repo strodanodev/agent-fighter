@@ -114,7 +114,7 @@ export interface NetAccount {
   daresAccepted?: number;
   /** Inviter payouts credited in the rolling week (server caps at 10). */
   daresPaidWeek?: number;
-  /** Unredeemed wager TICKETS (ADR 0009) — prize tokens, never spendable. */
+  /** Wager TICKETS (ADR 0009) — a cosmetic collectible, never spendable. */
   tickets?: number;
 }
 
