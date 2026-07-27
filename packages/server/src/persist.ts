@@ -95,6 +95,34 @@ export const XP_DRAW = 30;
 export const MAX_LEVEL = 40;
 const xpForNext = (level: number): number => 80 + level * 45;
 
+// ---------------------------------------------------------------- ELO (ADR 0009)
+// The skill spine. Level/XP measure playtime and credits/tickets measure the
+// economy; neither is skill. MIRRORS supabase/migrations/0021_elo.sql — every
+// constant and branch below has a twin there. Change both or the dev economy
+// lies about production.
+/** Starting rating, and the floor a season resets to. */
+export const ELO_BASE = 1200;
+/** Ratings never go below this — a losing run parks you, it never inverts you. */
+export const ELO_FLOOR = 100;
+/** Rated matches before the provisional (fast-converging) K-factor retires. */
+export const ELO_PROVISIONAL = 10;
+/**
+ * Season 1 opens at this instant; 21 days is the ADR 0009 PLACEHOLDER length
+ * (owner sets the real cadence before season 1 closes). Seasons are pure
+ * arithmetic over a fixed epoch — no cron, no season table, no ops.
+ */
+export const SEASON_EPOCH_MS = Date.UTC(2026, 6, 27); // 2026-07-27T00:00:00Z
+export const SEASON_DAYS = 21;
+export const currentSeason = (now: number = Date.now()): number =>
+  1 + Math.floor((now - SEASON_EPOCH_MS) / (SEASON_DAYS * 86_400_000));
+
+/** Standard Elo expectation. Float math is fine — determinism binds @af/core only. */
+export const eloShift = (mine: number, theirs: number, score: number, k: number): number =>
+  Math.round(k * (score - 1 / (1 + Math.pow(10, (theirs - mine) / 400))));
+/** K-factor from the rating and the rated count BEFORE this match. */
+export const eloK = (elo: number, rated: number): number =>
+  rated < ELO_PROVISIONAL ? 40 : elo >= 2400 ? 10 : 20;
+
 /** Parse `KEY=value` lines from the repo-root .env into process.env (no dep). */
 export const loadDotEnv = (root: string): void => {
   const file = join(root, '.env');
@@ -166,6 +194,13 @@ export interface XpAward {
   ticket: boolean;
   /** Unredeemed ticket balance after settlement (only meaningful if minted). */
   tickets: number;
+  /** Lifetime rating after settlement (ADR 0009). Never resets. */
+  elo: number;
+  /** Rating movement from THIS match — 0 for every unrated mode. */
+  eloDelta: number;
+  /** Rating in the current season's own pool (resets each season). */
+  seasonElo: number;
+  seasonEloDelta: number;
 }
 
 /** Thrown by escrowMatch when a side can't cover the fee. */
@@ -408,6 +443,10 @@ export interface MatchRow {
 // ---------------------------------------------------------------- shared math
 interface ProfileRow {
   credits: number; level: number; xp: number; wins: number; losses: number;
+  /** Ratings (ADR 0009). `rated` counts matches that MOVED the rating — it is
+   *  not wins+losses, and it is what the provisional K-factor keys on. */
+  elo: number; rated: number;
+  seasonElo: number; seasonRated: number; season: number;
 }
 
 /** Apply an XP delta with level-ups (positive) or a clamped burn (negative). */
@@ -530,7 +569,11 @@ export const memoryPersistence = (): Persistence => {
   const prof = (sub: string): ProfileRow & { lastDaily: string } => {
     let p = profiles.get(sub);
     if (!p) {
-      p = { credits: 0, level: 1, xp: 0, wins: 0, losses: 0, lastDaily: '' };
+      p = {
+        credits: 0, level: 1, xp: 0, wins: 0, losses: 0, lastDaily: '',
+        elo: ELO_BASE, rated: 0,
+        seasonElo: ELO_BASE, seasonRated: 0, season: currentSeason(),
+      };
       profiles.set(sub, p);
     }
     return p;
@@ -613,12 +656,72 @@ export const memoryPersistence = (): Persistence => {
         rounds0: r.rounds[0], rounds1: r.rounds[1], end_tick: r.endTick,
       });
       if (matchRows.length > 500) matchRows.pop();
+
+      // RATINGS (ADR 0009), mirroring 0021_elo.sql. Everything here has a twin
+      // in that migration's rating pre-pass.
+      const subs = [r.identities[0]?.sub, r.identities[1]?.sub] as const;
+      const season = currentSeason();
+      // Lazy season rollover, BEFORE any rating is read: a new season's first
+      // match must never be scored against last season's numbers. Runs for
+      // every mode, so an arcade-only player still gets stamped in.
+      for (const sub of subs) {
+        if (!sub) continue;
+        const p = prof(sub);
+        if (p.season !== season) {
+          p.seasonElo = ELO_BASE; p.seasonRated = 0; p.season = season;
+        }
+      }
+      const undecided = r.winner < 0 || r.reason === 'incomplete';
+      // Only a DECIDED WAGER between two human hands is rated. Bots have no
+      // rating to play against yet (that arrives with the stable + defend-Elo),
+      // and the `agents[]` flag is the load-bearing gate: a coached-owner
+      // headless runner plays as its owner's ordinary human profile.
+      let isRated = r.mode === 'wager' && !undecided
+        && !!subs[0] && !!subs[1]
+        && !subs[0]!.startsWith('agent:') && !subs[1]!.startsWith('agent:')
+        && !r.agents[0] && !r.agents[1];
+      // A deviator can never win a settlement (ADR 0003/0005), so it takes the
+      // rating loss and its opponent takes the win — matching `won` below.
+      let scores: [number, number] = [0, 0];
+      if (isRated) {
+        if (r.deviator === 0) scores = [0, 1];
+        else if (r.deviator === 1) scores = [1, 0];
+        else if (r.winner === 2) scores = [0.5, 0.5];
+        else if (r.winner === 0) scores = [1, 0];
+        else if (r.winner === 1) scores = [0, 1];
+        else isRated = false; // unknown winner code: refuse to guess
+      }
+      const deltas: [number, number] = [0, 0];
+      const seasonDeltas: [number, number] = [0, 0];
+      if (isRated) {
+        // Read BOTH ratings before writing either — settling side 0 first and
+        // then reading side 1 would score the second player against an
+        // already-updated opponent, breaking Elo's zero-sum property.
+        const a = prof(subs[0]!);
+        const b = prof(subs[1]!);
+        const before = [
+          { elo: a.elo, rated: a.rated, sElo: a.seasonElo, sRated: a.seasonRated },
+          { elo: b.elo, rated: b.rated, sElo: b.seasonElo, sRated: b.seasonRated },
+        ] as const;
+        for (const side of [0, 1] as const) {
+          const me = before[side];
+          const opp = before[side === 0 ? 1 : 0];
+          deltas[side] = eloShift(me.elo, opp.elo, scores[side], eloK(me.elo, me.rated));
+          // The season pool is scored against SEASON ratings, not lifetime
+          // ones — else a fresh season just re-derives the lifetime ladder.
+          seasonDeltas[side] = eloShift(me.sElo, opp.sElo, scores[side], eloK(me.sElo, me.sRated));
+        }
+      }
+
       const out: XpAward[] = [];
       for (const side of [0, 1] as const) {
         const sub = r.identities[side]?.sub;
         if (!sub) continue;
         const p = prof(sub);
         const s = settleSide(p, r, side);
+        p.elo = Math.max(ELO_FLOOR, p.elo + deltas[side]);
+        p.seasonElo = Math.max(ELO_FLOOR, p.seasonElo + seasonDeltas[side]);
+        if (isRated) { p.rated++; p.seasonRated++; }
         // THE MINT (ADR 0009). `won` already excludes deviators, draws and
         // no-contests. Two more gates, closing different holes:
         //  · `agent:` sub    — the inert account CLASS (fleet/house bots).
@@ -638,6 +741,8 @@ export const memoryPersistence = (): Persistence => {
           level: p.level, xp: p.xp, wins: p.wins, losses: p.losses,
           creditsDelta: s.payout - r.fee, credits: p.credits,
           ticket: minted, tickets: ticketsOf(sub),
+          elo: p.elo, eloDelta: deltas[side],
+          seasonElo: p.seasonElo, seasonEloDelta: seasonDeltas[side],
         });
       }
       return out;
@@ -740,7 +845,11 @@ export const memoryPersistence = (): Persistence => {
       if (!owner || owner.startsWith('agent:')) return false;
       // Same shape as prof(), but lastDaily is pre-stamped FOREVER: agent-
       // class accounts never claim the daily grant (economically inert).
-      profiles.set(sub, { credits: 0, level: 1, xp: 0, wins: 0, losses: 0, lastDaily: '9999-12-31' });
+      profiles.set(sub, {
+        credits: 0, level: 1, xp: 0, wins: 0, losses: 0, lastDaily: '9999-12-31',
+        elo: ELO_BASE, rated: 0,
+        seasonElo: ELO_BASE, seasonRated: 0, season: currentSeason(),
+      });
       names.set(sub, { name, agent: true });
       owners.set(sub, owner);
       const a = agentOf(sub);
@@ -990,6 +1099,13 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         // reading of "this settlement minted nothing".
         ticket: row.ticket === true,
         tickets: n(row.tickets),
+        // A pre-0021 DB returns no rating columns. Reading that as ELO_BASE
+        // with a 0 delta is the honest "this DB does not rate yet" — never
+        // 0, which would read as a real rating of zero.
+        elo: row.elo == null ? ELO_BASE : n(row.elo),
+        eloDelta: n(row.elo_delta),
+        seasonElo: row.season_elo == null ? ELO_BASE : n(row.season_elo),
+        seasonEloDelta: n(row.season_elo_delta),
       }));
     },
     sweepOrphanedEscrow: async (olderThanMinutes = 30) => {

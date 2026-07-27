@@ -1,11 +1,18 @@
 # 0009 — House agents are pins, tickets are the prize: the stable, defend-Elo, seasons, and the burn economy
 
 Status: ACCEPTED — design locked with the owner 2026-07-27.
-PARTIALLY BUILT: the **wager burn + ticket mint** half shipped 2026-07-27
-(protocol v7→v8, `supabase/migrations/0020_tickets.sql`, `ENGINE_VERSION`
-unchanged — `@af/core` is untouched). Everything else here — the stable /
-pinned-identity arcade, defend-Elo, seasons, rank views, the payout-table
-economy lever, the farm cap — is still DESIGN ONLY.
+PARTIALLY BUILT:
+· the **wager burn + ticket mint** half shipped 2026-07-27 (protocol v7→v8,
+  `supabase/migrations/0020_tickets.sql`);
+· **build step 1 — Elo ratings + seasons** shipped 2026-07-27
+  (`supabase/migrations/0021_elo.sql`, mirrored in `persist.ts`,
+  `packages/server/test/elo.test.ts`). Ratings are STORED and LOGGED, not yet
+  surfaced: the rank/season views + leaderboard (step 2) are next.
+  **0021 is NOT YET APPLIED to prod** — it drops/recreates `record_match`
+  with a widened return, so it lands in the same window as the paired deploy.
+`ENGINE_VERSION` unchanged throughout — `@af/core` is untouched.
+Everything else here — the stable / pinned-identity arcade, defend-Elo, rank
+views, the payout-table economy lever, the farm cap — is still DESIGN ONLY.
 Date: 2026-07-27
 Builds on: 0003 (agents-first online), 0004 (credits), 0006 (train my agent),
 0007 (consumable items), 0008 (arcade gauntlet map)
@@ -85,15 +92,26 @@ Consequences:
 ## Build order
 
 ```
-1. Elo in record_match          (same idempotent-by-match-id txn → crash-safe free)
-2. rank/season SQL views        (leaderboard reads the view; client renders)
+1. Elo in record_match          DONE 2026-07-27 (0021_elo.sql, not yet applied)
+2. rank/season SQL views        (leaderboard reads the view; client renders)  ← NEXT
 3. Stable table + identity pinning into arcade nodes   ← biggest felt win
 4. Defend-Elo + AGENTS-tab defend columns
 5. economy_daily view + payout knobs
-6. TICKETS cutover (season 1, esports-only catalog) + farm cap  [together]
+6. TICKETS cutover              DONE 2026-07-27 (0020_tickets.sql; farm cap
+                                deliberately deferred — the 20-CR burn is the
+                                v1 limiter, revisit when data says otherwise)
 7. Gatekeepers
 8. Habit-vector "it remembers you"
 ```
+
+**What step 1 actually rates (narrow on purpose):** a DECIDED WAGER between
+two human hands, and nothing else. Arcade/solo are PvE against pinned AI with
+no rating of their own — players start rating against bots at steps 3-4, when
+the stable gives those bots a rating to play against. Agent-involved wagers
+are unrated for BOTH sides rather than half-applied, since the separate agent
+rating does not exist yet. Two tracks are live: lifetime `elo` (never resets)
+and `season_elo` (own pool, lazy rollover via `current_season()` — pure
+arithmetic over a fixed epoch, no cron and no season table).
 
 Nothing touches `@af/core` except the AI drink logic; goldens stay green
 through steps 1–7. Ticket settlement changes `record_match`'s payout branch

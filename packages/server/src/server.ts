@@ -813,6 +813,16 @@ export const createMatchServer = (opts: {
         deviator: result.deviator,
         engine: ENGINE_VERSION,
       }).then(async (awards) => {
+        // RATINGS (ADR 0009): logged rather than pushed. Step 1 gives the
+        // ladder its number; surfacing it to players is the rank-view lane,
+        // so until then the server log is how a rating change is observed in
+        // production. Only rated matches move, so this stays quiet for PvE.
+        for (const a of awards) {
+          if (a.eloDelta === 0) continue;
+          const who = m.clients[a.side]?.name ?? `side ${a.side}`;
+          const signed = (n: number): string => (n > 0 ? `+${n}` : `${n}`);
+          console.log(`[elo] ${who} ${signed(a.eloDelta)} → ${a.elo} (season ${signed(a.seasonEloDelta)} → ${a.seasonElo})`);
+        }
         for (const a of awards) {
           const cl = m.clients[a.side];
           if (!cl) continue; // the house side never has an account
