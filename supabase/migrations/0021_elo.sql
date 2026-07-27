@@ -37,13 +37,19 @@
 -- season. A player who skips a season simply has a stale `season` stamp and
 -- does not appear on that season's ladder, which is exactly right.
 --
--- APPLY ORDER — THIS ONE BITES (same as 0020). record_match's RETURN TYPE
--- changes, so it must DROP and recreate; a deployed older server calling the
--- old signature fails loudly at PostgREST rather than silently settling on
--- stale rules. NOT YET APPLIED: this must land in the same window as the
--- paired Railway + Vercel deploy that ships the matching server build.
--- (Reminder from 0017/ef753c8: after changing an RPC signature, reload
--- PostgREST's schema cache or the first callers get a 404.)
+-- APPLIED to prod 2026-07-27, AHEAD of the paired deploy — and unlike 0020
+-- that is safe. Read this before assuming the next record_match change is:
+--  · the ARGUMENT LIST is unchanged, so every deployed caller still resolves;
+--  · the return table only GAINS columns, and persist.ts maps by name, so an
+--    older server ignores them;
+--  · no money rule moves. 0020 needed the paired window because it changed
+--    what money DOES (a client advertising "winner takes 20" would have been
+--    lying); ratings are additive and invisible until the rank views ship.
+-- Applied as two migrations for reviewability: `elo_ratings_and_seasons_schema`
+-- then `elo_ratings_and_seasons_record_match`.
+-- The 0017/ef753c8 lesson still applies and is handled at the bottom of this
+-- file: after changing an RPC signature, reload PostgREST's schema cache or
+-- the first callers get a 404.
 --
 -- The `NULL = s` lesson from 0002 applies throughout: coalesce() every
 -- comparison against the nullable `_deviator`.
@@ -360,3 +366,7 @@ begin
 end $$;
 
 revoke execute on function record_match from public, anon, authenticated;
+
+-- The 0017/ef753c8 lesson: a changed RPC signature must be followed by a
+-- PostgREST schema-cache reload or the first callers get a 404.
+notify pgrst, 'reload schema';

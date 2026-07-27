@@ -8,8 +8,10 @@ PARTIALLY BUILT:
   (`supabase/migrations/0021_elo.sql`, mirrored in `persist.ts`,
   `packages/server/test/elo.test.ts`). Ratings are STORED and LOGGED, not yet
   surfaced: the rank/season views + leaderboard (step 2) are next.
-  **0021 is NOT YET APPLIED to prod** — it drops/recreates `record_match`
-  with a widened return, so it lands in the same window as the paired deploy.
+  **0021 IS APPLIED to prod** (2026-07-27, ahead of any deploy — safe because
+  the argument list is unchanged and no money rule moves; see the migration
+  header). Elo math verified against real Postgres and matches the TS mirror
+  exactly (20/−20 even, 22/−22 upset, K 40/20/10).
 `ENGINE_VERSION` unchanged throughout — `@af/core` is untouched.
 Everything else here — the stable / pinned-identity arcade, defend-Elo, rank
 views, the payout-table economy lever, the farm cap — is still DESIGN ONLY.
