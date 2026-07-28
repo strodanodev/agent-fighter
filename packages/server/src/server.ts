@@ -696,7 +696,7 @@ export const createMatchServer = (opts: {
    * generated (anonymous archetypes), never an error: casting is flavor,
    * entering the arcade is money.
    */
-  const castBoard = async (board: Board, playerSub: string): Promise<void> => {
+  const castBoard = async (board: Board, playerSub: string, playerChar: string): Promise<void> => {
     if (!persistence) return;
     let stable: StableRow[];
     try { stable = await persistence.stable(); } catch { return; }
@@ -707,29 +707,75 @@ export const createMatchServer = (opts: {
     const fights = board.nodes
       .filter(isFightNode)
       .sort((p, q) => p.region - q.region || p.id - q.id);
-    const used = new Map<string, number>();
-    fights.forEach((n, i) => {
+    // ONE GUARD PER FIGHTER PER BOARD (owner rule 2026-07-29): the generator
+    // promises "shuffled roster, no repeats until it runs out", and the first
+    // cast quietly broke it — two stable agents maining BLAZE put two BLAZEs
+    // in one gauntlet. A run must never show the same fighter twice, so:
+    //  · pass 1 casts at most ONE agent per character (level-banded pick,
+    //    searching outward from the band for the nearest agent whose fighter
+    //    is still free — a second BLAZE main just doesn't guard this board);
+    //  · pass 2 repairs the remaining ANONYMOUS nodes, whose generated
+    //    character may now collide with a cast one, from the unused roster.
+    const usedChars = new Set<string>();
+    const usedAgents = new Set<string>();
+    for (let i = 0; i < fights.length; i++) {
+      const n = fights[i]!;
       const t = fights.length <= 1 ? 0 : i / (fights.length - 1);
       const center = Math.round(t * (byLevel.length - 1));
-      let best = center;
-      for (const cand of [center - 1, center + 1]) {
-        if (cand < 0 || cand >= byLevel.length) continue;
-        if ((used.get(byLevel[cand]!.id) ?? 0) < (used.get(byLevel[best]!.id) ?? 0)) best = cand;
+      let pick: StableRow | undefined;
+      for (let d = 0; d < byLevel.length && !pick; d++) {
+        for (const cand of d === 0 ? [center] : [center - d, center + d]) {
+          if (cand < 0 || cand >= byLevel.length) continue;
+          const a = byLevel[cand]!;
+          if (usedAgents.has(a.id) || usedChars.has(a.character)) continue;
+          pick = a;
+          break;
+        }
       }
-      const a = byLevel[best]!;
-      used.set(a.id, (used.get(a.id) ?? 0) + 1);
+      if (!pick) break; // stable exhausted — the rest stay anonymous
+      usedAgents.add(pick.id);
+      usedChars.add(pick.character);
       // The guard fights AS its coached main — the map shows who really
       // stands there. A mirror of the player's character is fine: that is
       // someone else's take on your fighter.
-      n.charId = a.character;
+      n.charId = pick.character;
       n.agent = {
-        id: a.id, name: a.name, level: a.level, wins: a.wins, losses: a.losses,
-        ...(a.motto ? { motto: a.motto } : {}),
+        id: pick.id, name: pick.name, level: pick.level, wins: pick.wins, losses: pick.losses,
+        ...(pick.motto ? { motto: pick.motto } : {}),
         // Clamped HERE so a hand-edited DB row cannot smuggle out-of-range
         // knobs into a pinned setup — same stance as trainedAgentPin.
-        ...(a.personality ? { personality: clampPersonality(a.personality) } : {}),
+        ...(pick.personality ? { personality: clampPersonality(pick.personality) } : {}),
       };
-    });
+    }
+    // Pass 2: anonymous fight nodes keep their generated character unless a
+    // cast guard now uses it — then they draw a fresh one from the unused
+    // roster (minus the player, matching the generator's own exclusion).
+    // A roster smaller than the fight count tolerates repeats, exactly as
+    // the generator itself does when its pool runs out.
+    // Step A: the FIRST anonymous holder of each still-free character keeps
+    // its original. Deciding all keepers BEFORE any re-roll is the fix for
+    // the gbush/gbush bug: a re-rolled node once drew a character an
+    // untouched node further down was about to keep.
+    const keeper = new Map<string, BoardNode>();
+    for (const n of fights) {
+      if (n.agent || !n.charId) continue;
+      if (!usedChars.has(n.charId) && !keeper.has(n.charId)) keeper.set(n.charId, n);
+    }
+    for (const c of keeper.keys()) usedChars.add(c);
+    // Step B: every other anonymous node re-rolls from the unused roster
+    // (minus the player, matching the generator's own exclusion). A roster
+    // smaller than the fight count tolerates repeats, exactly as the
+    // generator itself does when its pool runs out.
+    const pool = enabledCharacterIds
+      .filter((c) => !usedChars.has(c) && c !== playerChar)
+      .sort(() => Math.random() - 0.5);
+    for (const n of fights) {
+      if (n.agent || (n.charId && keeper.get(n.charId) === n)) continue;
+      const fresh = pool.pop();
+      if (!fresh) continue;
+      n.charId = fresh;
+      usedChars.add(fresh);
+    }
   };
   // Free-tier abuse valves (agent class): per-sub battles, per-IP signups.
   const agentBattleCap = dayCounter();
@@ -1693,7 +1739,7 @@ export const createMatchServer = (opts: {
               const board = generateBoard({ roster: roster.length > 0 ? roster : [c.character], seed: newBoardSeed() });
               // Cast for the free agent-class lane too — a fleet grinder's
               // autopiloted run still writes real names into the log/history.
-              await castBoard(board, c.identity?.sub ?? '');
+              await castBoard(board, c.identity?.sub ?? '', c.character);
               run = {
                 token: randomUUID(),
                 sub: c.identity?.sub ?? '',
@@ -2201,7 +2247,7 @@ export const createMatchServer = (opts: {
           const roster = enabledCharacterIds.filter((id) => id !== character);
           run.board = generateBoard({ roster: roster.length > 0 ? roster : [character], seed: newBoardSeed() });
           // ADR 0009 step 3: named stable guards on the fight nodes.
-          await castBoard(run.board, identity.sub);
+          await castBoard(run.board, identity.sub, character);
           run.at = run.board.start;
           run.path = [run.board.start];
           const named = run.board.nodes.filter((n) => n.agent).length;

@@ -147,6 +147,27 @@ const firstFight = (board: Board): number => {
   return n!.id;
 };
 
+/**
+ * Open runs until the CAST GUARD's node is a legal first move. With one
+ * coached guard the uniqueness rule (one guard per fighter per board) casts
+ * exactly ONE node, and level banding puts a LV1 guard on the earliest
+ * region-1 fight — usually, but not always, adjacent to the start. Boards
+ * are seeded randomly, so a few re-entries always find one (entries cost
+ * 1 CR from the 10 CR daily grant; the loop is bounded well under it).
+ */
+const openRunAtGuard = async (
+  http: string, dev: string, character: string, guard: string,
+): Promise<{ token: string; board: Board; node: number }> => {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const { token, board } = await openRun(http, dev, character);
+    const node = firstFight(board);
+    if (board.nodes.find((n) => n.id === node)?.agent?.id === guard) {
+      return { token, board, node };
+    }
+  }
+  throw new Error(`no board put ${guard} on a first-move node in 6 tries`);
+};
+
 const defendOf = async (
   p: ReturnType<typeof memoryPersistence>, sub: string,
 ): Promise<{ wins: number; losses: number; elo: number }> => {
@@ -168,11 +189,11 @@ test('a human beating a cast guard records the guard FELL — a bot does not', a
     const wsUrl = `ws://localhost:${server.port}`;
 
     // ---- HUMAN HANDS: the defense records.
-    const run1 = await openRun(http, 'P1', 'analog');
+    const run1 = await openRunAtGuard(http, 'P1', 'analog', 'agent:guard');
     assert.ok(run1.board.nodes.some((n) => n.agent?.id === 'agent:guard'), 'board was cast');
     const c1 = wsClient(wsUrl, 'P1', false);
     await c1.ready;
-    c1.send({ t: 'queue', character: 'analog', mode: 'arcade', runToken: run1.token, arcadeNode: firstFight(run1.board) });
+    c1.send({ t: 'queue', character: 'analog', mode: 'arcade', runToken: run1.token, arcadeNode: run1.node });
     const setup1 = await c1.next<SMatch>('match');
     assert.ok(setup1.names[1].includes('WALLGUARD'), `nameplate bills the guard (got "${setup1.names[1]}")`);
     const line = winningLine(setup1);
@@ -190,10 +211,10 @@ test('a human beating a cast guard records the guard FELL — a bot does not', a
     assert.ok(after1.elo < ELO_BASE, 'falling cost the guard rating');
 
     // ---- DECLARED AGENT: same flow, hello.agent=true → nothing records.
-    const run2 = await openRun(http, 'P2', 'analog');
+    const run2 = await openRunAtGuard(http, 'P2', 'analog', 'agent:guard');
     const c2 = wsClient(wsUrl, 'P2', true);
     await c2.ready;
-    c2.send({ t: 'queue', character: 'analog', mode: 'arcade', runToken: run2.token, arcadeNode: firstFight(run2.board) });
+    c2.send({ t: 'queue', character: 'analog', mode: 'arcade', runToken: run2.token, arcadeNode: run2.node });
     const setup2 = await c2.next<SMatch>('match');
     const line2 = winningLine(setup2);
     line2.forEach((v, k) => c2.send({ t: 'i', k, v }));
