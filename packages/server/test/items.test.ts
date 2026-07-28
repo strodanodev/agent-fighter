@@ -192,12 +192,17 @@ describe('consumables in matches (ADR 0007 final shape)', () => {
     // policy PULSES slot 0's bit (Btn.Item = 1<<10) — a held bit only edges
     // once (and pre-round eats that edge), so pulse to keep making fresh
     // rising edges until one lands on a free ground frame and drinks.
+    // aiPoll's OWN item bits are MASKED OFF (0b111 << 10): since the AI
+    // learned to drink (ADR 0009 supporting fix) it would sip slot 1 on its
+    // own triggers — this test is about what SETTLEMENT does with an
+    // un-drunk row, so the policy must be the only drinker in the building.
     const r = await playOneMatch({
       url: `ws://localhost:${server.port}`,
       name: 'Drinker', character: 'analog', skill: 60,
       charactersDir, aiSeed: 41, paceMs: 1, mode: 'solo',
       policy: (g, ai) =>
-        aiPoll(ai, g) | (g.tick < 3000 && ((g.tick / 10) | 0) % 2 === 0 ? (1 << 10) : 0),
+        (aiPoll(ai, g) & ~(0b111 << 10))
+        | (g.tick < 3000 && ((g.tick / 10) | 0) % 2 === 0 ? (1 << 10) : 0),
     });
     assert.equal(r.result.reason, 'verified');
     assert.equal(r.result.deviator, undefined, 'no side flagged — both simmed the same buffed match');

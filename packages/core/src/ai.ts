@@ -1,4 +1,4 @@
-import { Btn } from './input.js';
+import { Btn, ITEM_BITS } from './input.js';
 import type { InputFrame } from './input.js';
 import { fp, fpToPx, nextRand } from './fp.js';
 import { STAGE, TUNING } from './data.js';
@@ -374,6 +374,43 @@ const emit = (me: FighterState, step: QStep | null, moveDir: number, crouch: boo
 };
 
 // ---------------------------------------------------------------- the brain
+/**
+ * CONSUMABLES (ADR 0007/0009): which carried slot to drink RIGHT NOW, or -1.
+ *
+ * DELIBERATELY RNG-FREE — every trigger is a deterministic read of public
+ * state, so this consumes nothing from the AI's rng stream and an item-less
+ * match plays out bit-identically to how it did before this existed (no
+ * golden churn, and no way to tell a behavior change from a stream shift).
+ * Mirrors the sim's own drink rules: free ground states only (useItem
+ * refuses everything else), one can per slot, timed buffs never stacked.
+ *
+ * The doctrine, kind by kind (integer math only):
+ *  · PATCH (1)     — emergency: below 35% health, drink before the next hit.
+ *  · FIREWALL (3)  — losing and under 60%: shield up while there is still
+ *                    health worth protecting; never while one is running.
+ *  · OVERCLOCK (2) — the opponent is DOWN: buff during the oki window you
+ *                    already own, so the pressure that follows hits harder.
+ *  · VOLT (4)      — early neutral at range with an empty-ish bar: bank the
+ *                    meter while nothing is happening.
+ */
+const drinkSlot = (
+  me: FighterState, op: FighterState, maxHealth: number, tick: number, dist: number,
+): number => {
+  const free = me.action === Action.Idle || me.action === Action.WalkF
+    || me.action === Action.WalkB || me.action === Action.Crouch;
+  if (!free) return -1;
+  const kinds = [me.itemKind0, me.itemKind1, me.itemKind2];
+  const slot = (k: number): number => kinds.indexOf(k);
+  if (slot(1) >= 0 && me.health * 20 < maxHealth * 7) return slot(1);
+  if (slot(3) >= 0 && me.itemDefLeft === 0
+    && me.health < op.health && me.health * 5 < maxHealth * 3) return slot(3);
+  if (slot(2) >= 0 && me.itemDmgLeft === 0
+    && (op.action === Action.Knockdown || op.action === Action.Getup)) return slot(2);
+  if (slot(4) >= 0 && tick > 90 && me.meter * 2 < TUNING.meterMax
+    && dist > 180) return slot(4);
+  return -1;
+};
+
 export const aiPoll = (ai: AiState, g: GameState): InputFrame => {
   const me = g.fighters[ai.side];
   const op = g.fighters[1 - ai.side]!;
@@ -429,6 +466,13 @@ export const aiPoll = (ai: AiState, g: GameState): InputFrame => {
     }
     return frame;
   }
+
+  // ---- drink a carried can when the moment is right (RNG-free — see
+  // drinkSlot). Returning ONLY the item bit makes this tick the rising edge
+  // the sim drinks on; the slot clears on consumption, so the trigger
+  // disappears by itself and play resumes next poll.
+  const sip = drinkSlot(me, op, ch.b.maxHealth, g.tick, dist);
+  if (sip >= 0) return ITEM_BITS[sip]!;
 
   // ---- non-actionable states: reactions that don't need the intent system
   switch (me.action) {
