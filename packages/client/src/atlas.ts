@@ -85,9 +85,15 @@ const alphaBounds = (img: HTMLImageElement): Roster['portraitBox'] => {
   return r < 0 ? null : { x: l, y: t, w: r - l + 1, h: b - t + 1 };
 };
 
-const loadImage = (src: string): Promise<HTMLImageElement | null> =>
+const loadImage = (src: string, cors = false): Promise<HTMLImageElement | null> =>
   new Promise((resolve) => {
     const img = new Image();
+    // Cross-origin art must be requested with CORS or the canvas is TAINTED,
+    // and alphaBox() below reads pixels back — it would throw a SecurityError.
+    // Only set for cross-origin: on a same-origin load this is a no-op, but on
+    // a host that does NOT send the header it would turn a working image into
+    // a failed one.
+    if (cors) img.crossOrigin = 'anonymous';
     img.onload = () => resolve(img);
     img.onerror = () => resolve(null); // missing art is survivable — we fall back to a rect
     img.src = src;
@@ -105,10 +111,20 @@ const fetchJson = async <T>(url: string): Promise<T | null> => {
 export const listCharacters = async (): Promise<string[]> =>
   (await fetchJson<string[]>('/api/characters')) ?? [];
 
-export const loadRoster = async (id: string): Promise<Roster> => {
-  const bundle = await fetchJson<CharacterBundle>(`/characters/${id}/character.json`);
+/**
+ * Load a character bundle + its atlas.
+ *
+ * `base` is the origin serving `characters/` — empty (the default) means
+ * same-origin, which is how the game itself loads. The replay player passes
+ * the game origin so the marketing site can render real sprites without
+ * copying 148 MB of art into a second repo.
+ */
+export const loadRoster = async (id: string, base = ''): Promise<Roster> => {
+  const root = base.replace(/\/$/, '');
+  const cors = root !== '';
+  const bundle = await fetchJson<CharacterBundle>(`${root}/characters/${id}/character.json`);
   if (!bundle) throw new Error(`character "${id}" not found`);
-  const atlas = await fetchJson<AtlasData>(`/characters/${id}/sprites/atlas.json`);
+  const atlas = await fetchJson<AtlasData>(`${root}/characters/${id}/sprites/atlas.json`);
   // Atlases ship as WebP (a fraction of the bytes); `image` names the file.
   // Older atlases predate the field and are always atlas.png.
   const sheetFile = atlas?.image ?? 'atlas.png';
@@ -130,10 +146,10 @@ export const loadRoster = async (id: string): Promise<Roster> => {
   const safePortrait = safeName(meta?.selectPortrait);
   const safeVs = safeName(meta?.vsPortrait);
   const [sheet, refPortrait, selectPortrait, vsPortrait] = await Promise.all([
-    loadImage(`/characters/${id}/sprites/${sheetFile}`),
-    loadImage(`/characters/${id}/sprites/_reference.png`),
-    safePortrait ? loadImage(`/characters/${id}/sprites/${safePortrait}`) : Promise.resolve(null),
-    safeVs ? loadImage(`/characters/${id}/sprites/${safeVs}`) : Promise.resolve(null),
+    loadImage(`${root}/characters/${id}/sprites/${sheetFile}`, cors),
+    loadImage(`${root}/characters/${id}/sprites/_reference.png`, cors),
+    safePortrait ? loadImage(`${root}/characters/${id}/sprites/${safePortrait}`, cors) : Promise.resolve(null),
+    safeVs ? loadImage(`${root}/characters/${id}/sprites/${safeVs}`, cors) : Promise.resolve(null),
   ]);
   const dedicated = !!selectPortrait;
   const portrait = selectPortrait ?? refPortrait;
