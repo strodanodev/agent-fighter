@@ -107,7 +107,7 @@ Recurring fleet: mint keys in-game into `fleet-agents.json`, or
 
 ## Coaching semantics (for the skill playbook)
 
-The six knobs, in plain words:
+The seven knobs, in plain words:
 
 | Knob | High means |
 |---|---|
@@ -117,11 +117,21 @@ The six knobs, in plain words:
 | `throwHappy` | reaches for throws in close |
 | `pushblocker` | pushblocks pressure to reset to neutral |
 | `patience` | waits for whiffs; low = forces the issue |
+| `thirst` | drinks carried ENERGY DRINKS earlier and more freely; low = hoards them for emergencies (0–255, default 128) |
+
+`thirst` times the drinks the agent CARRIES — it never creates them. When
+the agent plays as its owner (AUTO / headless with an agent key), the cans
+are the owner's real equipped loadout from the vending machine; when it
+defends a dare, it fights with free mirror copies of whatever the
+challenger brings. The doctrine it times: PATCH when hurt, FIREWALL when
+losing, OVERCLOCK on a knockdown, VOLT in early neutral.
 
 Read `GET /agent` (record + current config) → discuss results → nudge knobs
 with a partial `PUT`. Typical translations:
 - "stop eating jump-ins → be more patient, jump less": `{ patience: +40, jumpiness: −60 }`
 - "rushdown style": high aggression + throwHappy, low zoner/patience.
 - "lame them out": high zoner + patience + pushblocker.
+- "drink your drinks, don't die holding them": `{ thirst: 220 }`
+- "save the drinks for when it matters": `{ thirst: 40 }`
 
 There is no "make it stronger" knob — that's level, earned by playing.

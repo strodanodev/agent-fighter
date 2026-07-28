@@ -216,6 +216,32 @@ describe('consumables in matches (ADR 0007 final shape)', () => {
     assert.equal(back!.equippedSlot, 1, 'and it is still equipped for the next match');
   });
 
+  it('DARE MIRROR: the dared agent gets FREE COPIES of the challenger loadout', async () => {
+    // Owner decision 2026-07-29 (option 1): a dare is a challenge, not a
+    // raid on the owner's fridge — side 1 fights with mirror copies that
+    // exist only inside the sim (itemRows[1] stays empty, so settlement can
+    // never consume or return them from anyone's inventory).
+    await fetch(`${http}/me`, { headers: hdr('Rival') });
+    const rival = await mem.getAccount({ sub: 'dev:Rival' } as never, 'Rival', false);
+    await mem.setAgentConfig('dev:Rival', {
+      character: 'vector', personality: { thirst: 255 }, motto: 'chug life',
+    });
+    await fund('Darer', 'fund-darer');
+    const a = await buy('Darer', 'mirror-pull-1');
+    const b = await buy('Darer', 'mirror-pull-2');
+    await equip('Darer', [a.rowId, b.rowId]);
+
+    const setup = await rawSolo(server.port, 'Darer', rival.refCode);
+    const items = setup.items as [Array<{ id: string }>, Array<{ id: string }>];
+    assert.equal(items[0].length, 2, 'challenger carries both cans');
+    assert.deepEqual(items[1].map((i) => i.id), items[0].map((i) => i.id),
+      'the dared agent mirrors the challenger, can for can');
+    // The coached thirst rides the personality pin — the mirror copies get
+    // DRUNK on the rival's schedule, in both the client sim and the re-sim.
+    const solo = setup.solo as { personality?: Record<string, number> };
+    assert.equal(solo.personality?.thirst, 255, 'coached thirst is pinned');
+  });
+
   it('the setup echoes the equipped loadout (arrays per side; house side empty)', async () => {
     const a = await buy('Echoer', 'fs-pull-3');
     await equip('Echoer', [a.rowId]);
@@ -326,13 +352,13 @@ const rawWager = (port: number, name: string): Promise<Record<string, unknown>> 
   });
 
 /** Raw solo queue → resolve the SMatch setup (then abandon the socket). */
-const rawSolo = (port: number, name: string): Promise<Record<string, unknown>> =>
+const rawSolo = (port: number, name: string, agentOf?: string): Promise<Record<string, unknown>> =>
   new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://localhost:${port}`);
     const timer = setTimeout(() => { ws.close(); reject(new Error('no setup before timeout')); }, 8_000);
     ws.on('open', () => {
       ws.send(JSON.stringify({ t: 'hello', v: PROTOCOL_VERSION, name, engine: ENGINE_VERSION }));
-      ws.send(JSON.stringify({ t: 'queue', character: 'analog', mode: 'solo' }));
+      ws.send(JSON.stringify({ t: 'queue', character: 'analog', mode: 'solo', ...(agentOf ? { agentOf } : {}) }));
     });
     ws.on('message', (d) => {
       const m = JSON.parse(String(d)) as Record<string, unknown>;

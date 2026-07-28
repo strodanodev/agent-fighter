@@ -93,6 +93,7 @@ const saveState = (s: FleetState): void => writeFileSync(stateFile, JSON.stringi
 const rollPersonality = (): Record<string, number> => ({
   aggression: 90 + rand(131), jumpiness: 40 + rand(151), zoner: 40 + rand(171),
   throwHappy: 30 + rand(121), pushblocker: 60 + rand(161), patience: 60 + rand(141),
+  thirst: rand(256), // hoarders and guzzlers both make good television
 });
 
 const log = (who: string, msg: string): void =>

@@ -141,11 +141,12 @@ Consequences:
 
 ## Supporting fixes (small, independently shippable)
 
-- **Teach `ai.ts` to drink** (it has ZERO item awareness today): PATCH at low
-  HP, OVERCLOCK on knockdown, FIREWALL vs rushdown. Guard the item branch on
-  "carrying nothing" BEFORE any `chance()` call so item-less matches keep an
-  unshifted RNG stream — otherwise goldens can't distinguish behavior change
-  from stream shift. (Any `ai.ts` change re-blesses goldens regardless.)
+- ~~Teach `ai.ts` to drink~~ **DONE 2026-07-29 (commit a2c33c3)**: PATCH
+  <35% HP, FIREWALL when losing under 60%, OVERCLOCK on the opponent's
+  knockdown, VOLT in early neutral. Shipped BETTER than planned: the
+  triggers are fully RNG-FREE (deterministic state reads, no `chance()`
+  at all), so item-less matches replay bit-identically and the goldens
+  passed WITHOUT re-blessing. Pinned by ai-items.test.ts.
 - **Trained agents get the challenger's 3 equip slots** — `startArcadeBattle`
   pins `items: [claimed.pins, []]`; side 1 always fights dry. A dare vs a
   drink-carrying human is currently a rigged fight.

@@ -62,6 +62,13 @@ export interface AiPersonality {
   throwHappy: number;
   pushblocker: number;
   patience: number;
+  /**
+   * COACHABLE DRINKING (owner feature 2026-07-29): how eagerly this agent
+   * drinks its carried cans. 0 = hoard (emergencies only), 128 = the
+   * balanced doctrine that shipped hardcoded, 255 = drink early and often.
+   * Style-only like every knob — it times PAID items, never creates them.
+   */
+  thirst: number;
 }
 
 export interface AiState {
@@ -228,7 +235,15 @@ export const AI_PERSONALITY_RANGES: Record<keyof AiPersonality, [number, number]
   throwHappy: [30, 150],
   pushblocker: [60, 220],
   patience: [60, 200],
+  thirst: [0, 255],
 };
+
+/**
+ * THIRST's fixed default (owner feature 2026-07-29: coachable drinking).
+ * 128 reproduces the exact drink thresholds that shipped hardcoded, so an
+ * uncoached agent behaves bit-identically to before the knob existed.
+ */
+export const THIRST_DEFAULT = 128;
 
 // ---------------------------------------------------------------- create
 export const createAi = (
@@ -239,7 +254,7 @@ export const createAi = (
     side,
     skill: Math.max(0, Math.min(100, skill)),
     rng: (seed | 0) ^ 0x51ed1e5,
-    p: { aggression: 0, jumpiness: 0, zoner: 0, throwHappy: 0, pushblocker: 0, patience: 0 },
+    p: { aggression: 0, jumpiness: 0, zoner: 0, throwHappy: 0, pushblocker: 0, patience: 0, thirst: THIRST_DEFAULT },
     intent: Intent.Observe,
     intentUntil: 0,
     queue: [],
@@ -260,6 +275,12 @@ export const createAi = (
   // Personality: sampled once — this "person" for this match. ALWAYS sampled
   // (even when overridden) so the rng stream downstream of creation is
   // identical with and without a coached personality.
+  // THIRST is the exception and must stay one: it is NOT sampled (fixed
+  // default, set at init above) because a seventh rnd() call here would
+  // shift the stream of every existing AI — in-flight solo matches pinned
+  // before a deploy would re-sim differently after it and false-flag honest
+  // clients as deviators. The override loop below still applies coached
+  // values, since it iterates AI_PERSONALITY_RANGES keys.
   ai.p.aggression = 90 + rnd(ai, 130);
   ai.p.jumpiness = 40 + rnd(ai, 150);
   ai.p.zoner = 40 + rnd(ai, 170);
@@ -384,30 +405,37 @@ const emit = (me: FighterState, step: QStep | null, moveDir: number, crouch: boo
  * Mirrors the sim's own drink rules: free ground states only (useItem
  * refuses everything else), one can per slot, timed buffs never stacked.
  *
- * The doctrine, kind by kind (integer math only):
- *  · PATCH (1)     — emergency: below 35% health, drink before the next hit.
- *  · FIREWALL (3)  — losing and under 60%: shield up while there is still
- *                    health worth protecting; never while one is running.
+ * The doctrine, kind by kind (integer math only), scaled by the COACHED
+ * `thirst` knob (t, 0-255; at THIRST_DEFAULT=128 every threshold equals the
+ * originally-hardcoded value — an uncoached agent is bit-identical to the
+ * pre-knob build):
+ *  · PATCH (1)     — emergency heal below (222+t)‰ health (128 → 35%).
+ *  · FIREWALL (3)  — losing and under (472+t)‰ (128 → 60%): shield up while
+ *                    there is still health worth protecting; never while one
+ *                    is already running.
  *  · OVERCLOCK (2) — the opponent is DOWN: buff during the oki window you
  *                    already own, so the pressure that follows hits harder.
- *  · VOLT (4)      — early neutral at range with an empty-ish bar: bank the
- *                    meter while nothing is happening.
+ *                    (Not thirst-scaled — the window is what it is.)
+ *  · VOLT (4)      — neutral at range > (308−t)px with the bar under
+ *                    (372+t)‰ (128 → 180px, half a bar): bank the meter
+ *                    while nothing is happening.
  */
 const drinkSlot = (
   me: FighterState, op: FighterState, maxHealth: number, tick: number, dist: number,
+  t: number,
 ): number => {
   const free = me.action === Action.Idle || me.action === Action.WalkF
     || me.action === Action.WalkB || me.action === Action.Crouch;
   if (!free) return -1;
   const kinds = [me.itemKind0, me.itemKind1, me.itemKind2];
   const slot = (k: number): number => kinds.indexOf(k);
-  if (slot(1) >= 0 && me.health * 20 < maxHealth * 7) return slot(1);
+  if (slot(1) >= 0 && me.health * 1000 < maxHealth * (222 + t)) return slot(1);
   if (slot(3) >= 0 && me.itemDefLeft === 0
-    && me.health < op.health && me.health * 5 < maxHealth * 3) return slot(3);
+    && me.health < op.health && me.health * 1000 < maxHealth * (472 + t)) return slot(3);
   if (slot(2) >= 0 && me.itemDmgLeft === 0
     && (op.action === Action.Knockdown || op.action === Action.Getup)) return slot(2);
-  if (slot(4) >= 0 && tick > 90 && me.meter * 2 < TUNING.meterMax
-    && dist > 180) return slot(4);
+  if (slot(4) >= 0 && tick > 90 && me.meter * 1000 < TUNING.meterMax * (372 + t)
+    && dist > 308 - t) return slot(4);
   return -1;
 };
 
@@ -471,7 +499,7 @@ export const aiPoll = (ai: AiState, g: GameState): InputFrame => {
   // drinkSlot). Returning ONLY the item bit makes this tick the rising edge
   // the sim drinks on; the slot clears on consumption, so the trigger
   // disappears by itself and play resumes next poll.
-  const sip = drinkSlot(me, op, ch.b.maxHealth, g.tick, dist);
+  const sip = drinkSlot(me, op, ch.b.maxHealth, g.tick, dist, ai.p.thirst);
   if (sip >= 0) return ITEM_BITS[sip]!;
 
   // ---- non-actionable states: reactions that don't need the intent system

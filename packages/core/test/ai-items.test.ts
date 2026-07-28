@@ -82,3 +82,26 @@ describe('ai: drinks carried cans', () => {
     assert.deepEqual(runInputs(), runInputs());
   });
 });
+
+describe('ai: coachable thirst (owner feature 2026-07-29)', () => {
+  it('a hoarder (thirst 0) sits on a can a guzzler (thirst 255) drinks', () => {
+    // Health at 40% of max: inside thirst-255's PATCH window (47.7%), outside
+    // thirst-0's (22.2%) — and THIRST_DEFAULT=128 (35%) also refuses, which
+    // pins "uncoached == the previously hardcoded doctrine".
+    const at40 = (thirst?: number): number => {
+      setMatchItems(null, [{ kind: 'heal', amount: 400, durationTicks: 0 }]);
+      const s = startFight(11);
+      const ai = createAi(1, 60, 999, thirst === undefined ? undefined : { thirst });
+      const f = s.fighters[1];
+      f.health = Math.trunc(MAXHP * 0.4);
+      s.fighters[0].x = fp(200);
+      f.x = fp(1200);
+      advAi(s, ai, 240);
+      setMatchItems(null, null);
+      return f.itemKind0; // 0 = drank, 1 = still holding the heal
+    };
+    assert.equal(at40(255), 0, 'the guzzler drinks at 40%');
+    assert.equal(at40(0), 1, 'the hoarder holds at 40%');
+    assert.equal(at40(undefined), 1, 'uncoached default holds at 40% (35% line)');
+  });
+});

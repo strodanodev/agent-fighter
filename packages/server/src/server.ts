@@ -1355,6 +1355,17 @@ export const createMatchServer = (opts: {
     const claimed = await claimEquipped(c, matchId);
     const items: MatchItems = [claimed.pins, []];
     const itemRows: [number[], number[]] = [claimed.rows, []];
+    // DARE/SPAR LOADOUT MIRROR (owner decision 2026-07-29, option 1): a
+    // trained agent fights with FREE COPIES of whatever its challenger
+    // carries — a dare is a challenge, not a raid on the owner's fridge.
+    // Symmetric by construction (same cans both sides), zero economy impact:
+    // itemRows[1] stays EMPTY, so settlement can never consume or return a
+    // row for the mirror — the copies exist only inside this match's sim.
+    // The AI actually drinks them (a2c33c3), timed by its coached `thirst`.
+    // Ranked-solo house and arcade guards stay dry for now.
+    if (resolved.defenderSub && claimed.pins.length > 0) {
+      items[1] = claimed.pins.map((p) => ({ ...p, effect: { ...p.effect } }));
+    }
     if (c.ws.readyState !== WebSocket.OPEN) {
       // Vanished after escrow → settle as incomplete so the fee refunds.
       startMatch(c, null, 'solo', fee, matchId, resolved, undefined, items, itemRows);
