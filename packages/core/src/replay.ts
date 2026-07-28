@@ -178,6 +178,36 @@ export const base64UrlToBytes = (s: string): Uint8Array => {
   return Uint8Array.from(out);
 };
 
+// ------------------------------------------------------- canonical JSON
+
+/**
+ * Deterministic JSON: object keys sorted, recursively.
+ *
+ * WHY THIS EXISTS (learned the hard way, 2026-07-28). The match digest was
+ * originally computed over `JSON.stringify(pin)` at settlement — which fixes
+ * the field order at the moment of writing and nowhere else. The pin is then
+ * stored as Postgres `jsonb`, and **jsonb does not preserve key order**. So
+ * anyone reading the row back and re-hashing it got a different string, which
+ * defeated the digest's entire purpose: being reproducible by whoever holds
+ * the row.
+ *
+ * Hashing a canonical form instead makes the digest a property of the DATA
+ * rather than of the code path that happened to serialise it, so a verifier —
+ * ours, or a third party auditing an anchored Merkle root years later — lands
+ * on the same bytes without needing our insertion order.
+ *
+ * Deliberately minimal: sorted keys, `undefined` members dropped, no float
+ * canonicalisation (every number in a pin is an integer). Not RFC 8785, and
+ * does not claim to be.
+ */
+export const canonicalJson = (value: unknown): string => {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).filter((k) => obj[k] !== undefined).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(',')}}`;
+};
+
 // ------------------------------------------------------------------ ledger
 
 /** Both sides' input tracks. Index 0 is side 0. */

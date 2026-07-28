@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   REPLAY_CODEC_VERSION, encodeLedger, decodeLedger, ledgerTicks,
   encodeInputTrack, decodeInputTrack, bytesToBase64Url, base64UrlToBytes,
+  canonicalJson,
   Btn, createGameState, setCharacters, step, stateHash, loadCharacter, ANALOG,
   Phase,
 } from '../src/index.js';
@@ -101,6 +102,40 @@ describe('replay codec', () => {
     // but wrong match, which is worse than an error.
     const wrongVersion = bytesToBase64Url(Uint8Array.from([REPLAY_CODEC_VERSION + 9, 2]));
     assert.throws(() => decodeLedger(wrongVersion), /unsupported codec version/);
+  });
+
+  /**
+   * REGRESSION (2026-07-28, caught on real production data).
+   *
+   * The match digest was originally hashed over `JSON.stringify(pin)`, which
+   * bakes in the key order of whichever code path happened to build the
+   * object. The pin is then stored as Postgres `jsonb` — which does NOT
+   * preserve key order — so nobody reading the row back could reproduce the
+   * hash. That defeated the field's only purpose.
+   *
+   * Canonical form must therefore be invariant to key order, which is exactly
+   * what a jsonb round-trip does to it.
+   */
+  it('canonicalJson is invariant to key order (survives a jsonb round-trip)', () => {
+    const asWritten = {
+      seed: 1, stage: 'bgc', chars: ['a', 'b'],
+      result: { winner: 0, hash: 42, rounds: [2, 0] },
+      bounds: { left: 0, right: 1065 },
+    };
+    // The same data with every object's keys in a different order — what a
+    // storage layer is free to hand back.
+    const asStored = {
+      bounds: { right: 1065, left: 0 },
+      result: { rounds: [2, 0], hash: 42, winner: 0 },
+      chars: ['a', 'b'], stage: 'bgc', seed: 1,
+    };
+    assert.equal(canonicalJson(asWritten), canonicalJson(asStored));
+    assert.notEqual(
+      JSON.stringify(asWritten), JSON.stringify(asStored),
+      'the test is meaningless if plain stringify already agreed',
+    );
+    // Array order is DATA, not formatting — it must never be sorted away.
+    assert.notEqual(canonicalJson([1, 2]), canonicalJson([2, 1]));
   });
 
   /**

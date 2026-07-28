@@ -194,6 +194,30 @@ closes permanently.
 **Per-match on-chain minting is explicitly rejected**: it is a cost and
 throughput mistake for a feed that settles thousands of rows.
 
+**The digest must be hashed over CANONICAL json (sorted keys), not
+`JSON.stringify`.** Learned immediately, on the first real production match:
+the pin is stored as Postgres `jsonb`, which does not preserve key order, so
+hashing our insertion order produced a digest that *nobody reading the row back
+could reproduce* — destroying the one property the field exists for. A digest
+must be a function of the DATA, not of the code path that happened to
+serialise it. `canonicalJson` in `@af/core/src/replay.ts`; regression-tested
+against a simulated jsonb round-trip.
+
+### Verifying it — `tools/replay-verify.mts`
+
+The whole layer rests on one claim, so there is a tool that checks it against
+production rather than a fixture: recompute the digest, confirm the character
+bundles are still the ones the match was fought with, decode, replay, and
+compare winner / rounds / endTick / `stateHash` to what was recorded.
+
+It also encodes a distinction that matters commercially: **a forfeit's winner
+is not in the ledger and must not be expected there.** The disconnect ladder
+awards it (ADR 0005); the ledger reproduces only the ticks that were actually
+played. That is the same thing the public API publishes as
+`resolution.verified` — true only when the outcome came out of a full
+re-simulation. Demanding a derived winner from a forfeited ledger would be
+asking the data to lie.
+
 ### What we are NOT doing yet
 
 AIR credentials (ADR 0004's reputation write-back) are the right tool for

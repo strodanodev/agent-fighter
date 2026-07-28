@@ -47,5 +47,6 @@ export type { GenerateOptions } from './arcade-board.js';
 export {
   REPLAY_CODEC_VERSION, encodeLedger, decodeLedger, ledgerTicks,
   encodeInputTrack, decodeInputTrack, bytesToBase64Url, base64UrlToBytes,
+  canonicalJson,
 } from './replay.js';
 export type { LedgerTracks } from './replay.js';

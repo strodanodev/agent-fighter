@@ -18,7 +18,8 @@ import { WebSocketServer, WebSocket } from 'ws';
 import {
   AI_PERSONALITY_RANGES, ENGINE_VERSION, EXIT_BONUS, EXIT_FIGHT_FLOOR, ITEMS,
   ITEM_COST, ITEM_TIER_ODDS, Phase, REGION_NAME, REPLAY_CODEC_VERSION, aiPoll,
-  createAi, createGameState, encodeLedger, exitNodes, generateBoard, isFightNode,
+  canonicalJson, createAi, createGameState, encodeLedger, exitNodes,
+  generateBoard, isFightNode,
   isLegalMove, itemById, loadCharacter, minFights, nodeById, setCharacters,
   setMatchItems, stateHash, step, successors, validateAllTemplates,
 } from '@af/core';
@@ -1001,17 +1002,18 @@ export const createMatchServer = (opts: {
           },
         };
         const ledger = encodeLedger([m.inputs[0], m.inputs[1]]);
-        // Canonical digest: field order is fixed HERE, in one place, so the
-        // hash is reproducible by anyone holding the row. Nothing consumes it
-        // yet — it exists so Merkle-anchoring can be applied retroactively
-        // over history that would otherwise be unhashable.
+        // Canonical digest — hashed over CANONICAL json (sorted keys), not
+        // JSON.stringify. The pin is stored as Postgres jsonb, which does not
+        // preserve key order, so hashing our insertion order would produce a
+        // digest nobody reading the row back could ever reproduce. That is the
+        // one thing this field exists to be: recomputable by whoever holds the
+        // data, so Merkle-anchoring can be applied retroactively.
+        // Verify with: npx tsx tools/replay-verify.mts <matchId>
         const digest = createHash('sha256')
-          .update(
-            JSON.stringify([
-              m.id, ENGINE_VERSION, PROTOCOL_VERSION, REPLAY_CODEC_VERSION,
-              ledger, pin,
-            ]),
-          )
+          .update(canonicalJson([
+            m.id, ENGINE_VERSION, PROTOCOL_VERSION, REPLAY_CODEC_VERSION,
+            ledger, pin,
+          ]))
           .digest('hex');
         void persistence.saveLedger({
           matchId: m.id,
