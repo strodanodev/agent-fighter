@@ -185,6 +185,33 @@ export interface MatchRecord {
   payout?: number;
 }
 
+/**
+ * A settled match's input ledger, as stored (ADR 0010, migration 0023).
+ *
+ * This is what makes a match REPLAYABLE rather than merely reported. Storing
+ * inputs instead of frames is why a ~100-second match costs single-digit
+ * kilobytes: everything else is re-derived by stepping the deterministic sim,
+ * which is exactly what the server already did to decide the result.
+ */
+export interface MatchLedger {
+  matchId: string;
+  /** Both tracks, base64url — @af/core `encodeLedger`. */
+  ledger: string;
+  /**
+   * The pinned setup a replayer must install before stepping: seed, bounds,
+   * characters + bundle hashes, input delay, drink loadouts, solo AI pin.
+   * Deliberately opaque JSON — it is read whole by a replayer, never queried.
+   */
+  pin: Record<string, unknown>;
+  /** The engine build that produced it. A ledger only reproduces on its own. */
+  engine: string;
+  protocol: number;
+  codecVersion: number;
+  ticks: number;
+  /** Canonical sha256 hex — keeps retroactive on-chain anchoring possible. */
+  digest: string;
+}
+
 export interface XpAward {
   side: 0 | 1;
   gained: number; // XP delta — can be NEGATIVE (solo loss)
@@ -265,6 +292,18 @@ export interface Persistence {
   escrowMatch: (matchId: string, subs: [string | null, string | null], fee: number) => Promise<void>;
   /** Settle + award. Idempotent by match id ([] on retry). */
   recordMatch: (r: MatchRecord) => Promise<XpAward[]>;
+  /**
+   * Store a settled match's input ledger for later replay (ADR 0010).
+   *
+   * OPTIONAL on the interface by design: it is pure archival, so a
+   * persistence implementation that does not support it (a test double, an
+   * older deployment) must not be a type error and must not change how a
+   * match settles. Callers use `persistence.saveLedger?.(…)`.
+   *
+   * Idempotent by match id — a retry stores nothing new and never overwrites,
+   * because the first write is the one that matched the settled result.
+   */
+  saveLedger?: (l: MatchLedger) => Promise<void>;
   /**
    * Refund fees whose match NEVER settled — the server died between escrow
    * and record_match, stranding real credits (ADR 0005's known gap). Only
@@ -565,6 +604,8 @@ export const memoryPersistence = (): Persistence => {
   const utcDay = (): string => new Date().toISOString().slice(0, 10);
   /** Newest-first ring of settled matches (GET /agent/matches food). */
   const matchRows: MatchRow[] = [];
+  /** Dev mirror of match_ledgers (ADR 0010). Insertion-ordered, capped. */
+  const ledgerRows = new Map<string, MatchLedger>();
   const agentOf = (sub: string): { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null } => {
     let a = agents.get(sub);
     if (!a) { a = { config: null, keyHash: null, keyCreatedAt: null }; agents.set(sub, a); }
@@ -846,6 +887,17 @@ export const memoryPersistence = (): Persistence => {
     },
     recentMatches: async (sub, limit) =>
       matchRows.filter((m) => m.p0 === sub || m.p1 === sub).slice(0, limit),
+    // Mirrors 0023_match_ledgers.sql. Bounded like matchRows above: the dev
+    // economy is a long-lived process and an unbounded ledger map would be a
+    // slow memory leak in exchange for data nobody reads after the test ends.
+    saveLedger: async (l) => {
+      if (ledgerRows.has(l.matchId)) return; // idempotent, first write wins
+      ledgerRows.set(l.matchId, l);
+      if (ledgerRows.size > 200) {
+        const oldest = ledgerRows.keys().next();
+        if (!oldest.done) ledgerRows.delete(oldest.value);
+      }
+    },
     createAgentAccount: async (sub, name, keyHash, ownerSub) => {
       if (profiles.has(sub)) return false;
       const owner = ownerSub.trim();
@@ -1216,6 +1268,30 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         `/rest/v1/matches?select=${cols}&or=(p0.eq.${s},p1.eq.${s})&order=created_at.desc&limit=${limit | 0}`,
         { method: 'GET' },
       )) as MatchRow[];
+    },
+    // 0023_match_ledgers.sql. A plain insert rather than an RPC: no money
+    // rule is involved, the table is service-role-only, and the primary key
+    // does the whole job of making a retry a no-op.
+    saveLedger: async (l) => {
+      await call('/rest/v1/match_ledgers', {
+        method: 'POST',
+        headers: {
+          // Idempotent by match_id: a retried settlement (server restart,
+          // double callback) must not fail and must not overwrite the row
+          // that was written alongside the settled result.
+          Prefer: 'resolution=ignore-duplicates,return=minimal',
+        },
+        body: JSON.stringify({
+          match_id: l.matchId,
+          ledger: l.ledger,
+          pin: l.pin,
+          engine: l.engine,
+          protocol: l.protocol,
+          codec_version: l.codecVersion,
+          ticks: l.ticks,
+          digest: l.digest,
+        }),
+      });
     },
     buyItem: async (sub, cost, itemId, tier, nonce) => {
       const rows = (await call('/rest/v1/rpc/buy_item', {

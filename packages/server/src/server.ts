@@ -17,10 +17,10 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
   AI_PERSONALITY_RANGES, ENGINE_VERSION, EXIT_BONUS, EXIT_FIGHT_FLOOR, ITEMS,
-  ITEM_COST, ITEM_TIER_ODDS, Phase, REGION_NAME, aiPoll, createAi,
-  createGameState, exitNodes, generateBoard, isFightNode, isLegalMove, itemById,
-  loadCharacter, minFights, nodeById, setCharacters, setMatchItems,
-  stateHash, step, successors, validateAllTemplates,
+  ITEM_COST, ITEM_TIER_ODDS, Phase, REGION_NAME, REPLAY_CODEC_VERSION, aiPoll,
+  createAi, createGameState, encodeLedger, exitNodes, generateBoard, isFightNode,
+  isLegalMove, itemById, loadCharacter, minFights, nodeById, setCharacters,
+  setMatchItems, stateHash, step, successors, validateAllTemplates,
 } from '@af/core';
 import type {
   Board, BoardNode, CharacterBundle, GameState, ItemDef, ItemEffect,
@@ -496,6 +496,29 @@ export const createMatchServer = (opts: {
     const file = join(charactersDir, id, 'character.json');
     return JSON.parse(readFileSync(file, 'utf8')) as CharacterBundle;
   };
+  /**
+   * Content hash of a character's bundle, for the replay pin (ADR 0010).
+   *
+   * Hashes the FILE BYTES rather than the parsed object: no key-order or
+   * float-formatting question can make the same bundle hash two ways. Memoised
+   * because bundles are immutable for the process lifetime.
+   */
+  const charDigestCache = new Map<string, string>();
+  const charDigest = (id: string): string => {
+    const hit = charDigestCache.get(id);
+    if (hit !== undefined) return hit;
+    let digest = '';
+    try {
+      digest = createHash('sha256')
+        .update(readFileSync(join(charactersDir, id, 'character.json')))
+        .digest('hex');
+    } catch {
+      // A missing bundle must not break settlement — an empty digest just
+      // means this replay cannot assert which build it was fought with.
+    }
+    charDigestCache.set(id, digest);
+    return digest;
+  };
   /** A character's canonical style (its bundle meta.style), else a stable hash
    *  fallback for an unstyled character. Drives its arcade AI personality —
    *  the same style that drives its feel (tuning). */
@@ -893,6 +916,70 @@ export const createMatchServer = (opts: {
         }
       }).catch((e) => console.log(`[match ${m.id}] persist failed: ${String(e)}`));
     }
+
+    // ---- REPLAY LEDGER (ADR 0010, Phase 0).
+    //
+    // Keep the artefact we just used to decide the match. Until now the
+    // ledger — the only thing that can reproduce a match frame-for-frame —
+    // was discarded the instant `liveMatches.delete(m.id)` ran above.
+    //
+    // WAGER ONLY, by the owner's call: arcade is 94.6% of all matches and is
+    // a single player against a pinned AI, so storing it would be paying for
+    // the least watchable material in the game. PvP at ~6 KB a match is under
+    // 10 MB a year.
+    //
+    // Wrapped in its OWN try/catch and fire-and-forget: an archival failure
+    // must never touch a settled result. Settlement is money; replays are not.
+    if (persistence?.saveLedger && m.mode === 'wager') {
+      try {
+        const pin = {
+          seed: m.seed,
+          bounds: m.bounds ?? null,
+          stage: m.stage,
+          chars: m.chars,
+          // Frame data is part of the deterministic contract, so a replay
+          // needs to know WHICH build of each character it was fought with —
+          // a retuned bundle stops reproducing exactly like a bumped engine.
+          charDigests: [charDigest(m.chars[0]), charDigest(m.chars[1])],
+          names: m.names,
+          agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
+          delay: m.delay,
+          items: m.items,
+          solo: m.solo,
+          result: {
+            winner: result.winner, reason: result.reason,
+            rounds: result.rounds, endTick: result.endTick,
+            hash: result.hash, deviator: result.deviator ?? null,
+          },
+        };
+        const ledger = encodeLedger([m.inputs[0], m.inputs[1]]);
+        // Canonical digest: field order is fixed HERE, in one place, so the
+        // hash is reproducible by anyone holding the row. Nothing consumes it
+        // yet — it exists so Merkle-anchoring can be applied retroactively
+        // over history that would otherwise be unhashable.
+        const digest = createHash('sha256')
+          .update(
+            JSON.stringify([
+              m.id, ENGINE_VERSION, PROTOCOL_VERSION, REPLAY_CODEC_VERSION,
+              ledger, pin,
+            ]),
+          )
+          .digest('hex');
+        void persistence.saveLedger({
+          matchId: m.id,
+          ledger,
+          pin,
+          engine: ENGINE_VERSION,
+          protocol: PROTOCOL_VERSION,
+          codecVersion: REPLAY_CODEC_VERSION,
+          ticks: Math.max(m.inputs[0].length, m.inputs[1].length),
+          digest,
+        }).catch((e) => console.log(`[match ${m.id}] ledger save failed: ${String(e)}`));
+      } catch (e) {
+        console.log(`[match ${m.id}] ledger encode failed: ${String(e)}`);
+      }
+    }
+
     if (process.env.AF_DEBUG_LEDGER) {
       // Forensics: dump the canonical ledger for offline diffing (sync — the
       // fs import at module top; async here raced process lifetime).

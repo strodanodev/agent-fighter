@@ -43,3 +43,8 @@ export {
   generateBoard, validateBoard, validateAllTemplates, templateIds,
 } from './arcade-board.js';
 export type { GenerateOptions } from './arcade-board.js';
+export {
+  REPLAY_CODEC_VERSION, encodeLedger, decodeLedger, ledgerTicks,
+  encodeInputTrack, decodeInputTrack, bytesToBase64Url, base64UrlToBytes,
+} from './replay.js';
+export type { LedgerTracks } from './replay.js';

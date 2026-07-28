@@ -18,3 +18,4 @@ the change.
 - [0007 — Consumable items ("energy drinks"): vending-machine gacha + match buffs](0007-consumable-items.md)
 - [0008 — Agent Arcade v2: the gauntlet map (extraction roguelite)](0008-arcade-gauntlet-map.md)
 - [0009 — House agents are pins, tickets are the prize: the stable, defend-Elo, seasons, and the burn economy](0009-house-agents-and-tickets.md)
+- [0010 — The esports data layer: an open results API, and the ledger that makes replays possible](0010-esports-api-and-replays.md)
