@@ -154,10 +154,13 @@ export interface Account {
   /** Inviter payouts credited in the rolling week (vs REFERRAL_WEEKLY_CAP). */
   daresPaidWeek: number;
   /**
-   * Wager tickets (ADR 0009) — a COSMETIC collectible (owner decision
-   * 2026-07-27): non-transferable, never spendable, no redemption catalog.
-   * Displayed on the wallet strip and as a leaderboard column; never part of
-   * any ranking sort.
+   * Wager tickets (ADR 0009), PHASE A (owner decision 2026-07-27):
+   * non-transferable, never spendable, and no redemption catalog TODAY —
+   * a collectible. Phase B opens redemption for esports seats and other
+   * non-cash prizes using `tickets.redeemed_at`/`redeemed_for`, which
+   * already exist; nothing minted now is invalidated then. Displayed on the
+   * wallet strip and as a leaderboard column; never part of any ranking sort
+   * in EITHER phase (currency is not status).
    */
   tickets: number;
 }

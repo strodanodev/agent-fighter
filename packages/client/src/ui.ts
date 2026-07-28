@@ -3315,10 +3315,14 @@ export interface RankRow {
   losses: number;
   rank: number;
   /**
-   * Wager tickets — a COSMETIC collectible (owner decision 2026-07-27): no
-   * redemption, no prize, no cash-out. Displayed here and nowhere in the
-   * sort, because `rank` must stay a measure of play. Absent on a pre-0021
-   * server.
+   * Wager tickets. PHASE A (owner decision 2026-07-27, ADR 0009): a COSMETIC
+   * collectible — no redemption, no prize, no cash-out TODAY. Phase B makes
+   * them redeemable for esports seats and other non-cash prizes, against
+   * schema that already exists, so nothing minted now is invalidated later.
+   * UI RULE while in Phase A: say what a ticket IS, never what it may become —
+   * no "redeemable soon", no teased catalog. Displayed here and nowhere in
+   * the sort, because `rank` must stay a measure of play. Absent on a
+   * pre-0021 server.
    */
   tickets?: number;
   /**

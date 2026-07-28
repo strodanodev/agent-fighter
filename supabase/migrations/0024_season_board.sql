@@ -1,4 +1,12 @@
--- Agent Fighter — THE RANK VIEW (ADR 0009, build step 2). Run AFTER 0021.
+-- Agent Fighter — THE RANK VIEW (ADR 0009, build step 2). Run AFTER 0022.
+--
+-- Numbering note: authored as 0022 concurrently with another session's
+-- `0022_leaderboard_tickets` and `0023_match_ledgers`, and renumbered to 0024
+-- on merge. Applied to prod as `season_board_rank_view`.
+--
+-- FOLDS IN 0022's TICKETS COLUMN, as that migration asked whoever shipped the
+-- seasonal rank view to do: the `leaderboard` recreate below carries `tickets`
+-- AND the rating columns. Dropping either would silently un-ship the other.
 --
 -- ADR 0009: "the formula lives in ONE SQL view." This is that view. Reweighting
 -- the ladder is then a migration, never a paired client+server deploy, and the

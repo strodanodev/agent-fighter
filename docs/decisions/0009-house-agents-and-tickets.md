@@ -21,41 +21,73 @@ Builds on: 0003 (agents-first online), 0004 (credits), 0006 (train my agent),
 Supersedes: the winner-takes-pot half of 0004's wager economy (on cutover);
 the fleet-as-24/7-grinders framing of `agent-fleet.ts`
 
-## AMENDMENT 2026-07-27 — tickets are COSMETIC
+## AMENDMENT 2026-07-27 — tickets are COSMETIC **FOR NOW** (two phases)
 
-Owner decision, after the burn+mint shipped: **tickets are a cosmetic
-collectible.** No redemption catalog, no esports seats, no merch, no vouchers,
-no tokens — ever. The reward for winning a wager is a 🎟 count beside your
-name on the leaderboard (migration 0021) and on your wallet strip.
+Consolidated owner decision. An earlier draft of this amendment said tickets
+would be cosmetic *"— ever"*; that overstated it and is superseded here. The
+actual decision is **phased**:
 
-This is a simplification, and it retires most of what the rest of this ADR
-worries about:
+- **PHASE A — NOW (shipped).** Tickets are a **cosmetic collectible**. No
+  redemption, no catalog, no prize, no cash-out. The reward for winning a
+  wager is a 🎟 count beside your name on the leaderboard and wallet strip.
+- **PHASE B — LATER (intended, not scheduled).** Tickets become
+  **redeemable** for **esports qualification seats and other non-cash
+  prizes**. Sponsored-token redemptions stay deferred pending real legal
+  review (a tradeable token is cash-equivalent and reopens everything the
+  burn closed).
 
-- **Farming defences stop being load-bearing.** With nothing to redeem, a
-  colluded ticket buys bragging rights for 20 burned credits. The weekly mint
-  cap in "Open questions" can stay closed; Elo-banded matchmaking is no longer
-  needed *as an anti-farm measure* (it remains a good matchmaking idea).
-- **The legal posture is now trivial.** Not "tournament/redemption model" —
-  just a skill game with a credit sink and a scoreboard. The three-shop
-  problem cannot arise, because there is no shop.
-- **"Ticket form: soulbound AIR credential" is moot** as a transferability
-  guard (a DB row is equally non-transferable). A credential mirror is now
-  optional flavour — provenance for its own sake — not a control.
+**Why this ordering is not a compromise.** Value is added at the REDEMPTION
+COUNTER, not at the mint. The hard, expensive, must-be-correct half — burn
+settlement, one-ticket-per-match idempotency, human-hands gating, the
+soulbound record — is identical in both phases and is already shipped and
+smoke-tested. Phase B opens `tickets.redeemed_at` / `redeemed_for`, which
+already exist in the schema and are unused. So:
 
-Two rules survive the change and are *more* important now, not less:
+> **Nothing minted in Phase A is invalidated by Phase B.** Today's tickets
+> are tomorrow's claimable tickets; the history accrues from day one.
 
-1. **Tickets never feed rank.** They are a display column; `rank` stays
-   ordered by level/xp/wins. Currency-as-status turns the ladder into "who
-   wagered most". Credits = utility, tickets = flair, Elo = status.
-2. **Human hands only.** Still enforced, now purely for scoreboard integrity
-   rather than fraud: a leaderboard column that a headless runner could farm
-   overnight is a worthless column.
+That is the whole argument for shipping cosmetic first: it banks real ticket
+history while the catalog, the legal review and the fulfilment ops — none of
+which exist yet — are built.
 
-The honest cost: a cosmetic prize motivates less than 20 credits did, so
-wager's pull now rests entirely on the column being visible and scarce. If
-wager volume drops after the cutover, that is the reason — and the fix is
-making the count *legible* (season badges, top-holder callouts), not
-reintroducing a payout.
+**What Phase A defers (and Phase B must restore):**
+
+- **Farming defences.** While nothing is redeemable, a colluded ticket buys
+  bragging rights for 20 burned credits, so the weekly mint cap can stay
+  closed and Elo-banded matchmaking is not needed *as an anti-farm measure*
+  (it remains a good matchmaking idea). **These become load-bearing again the
+  moment a catalog opens** — the mint cap and the banding are Phase B
+  prerequisites, not permanently retired.
+- **The legal posture.** Phase A is just a skill game with a credit sink and
+  a scoreboard. Phase B is the tournament/redemption model this ADR was
+  written for, and needs the review before it opens.
+- **Soulbound form.** As a transferability guard the AIR credential is moot
+  in Phase A (a DB row is equally non-transferable), so a credential mirror
+  is optional flavour today. It matters again in Phase B, when a ticket is
+  worth something and provenance stops being decorative.
+
+**Two rules survive both phases and are more important now, not less:**
+
+1. **Tickets never feed rank.** Display column only; `rank` stays ordered by
+   level/xp/wins (and the season ladder by Elo). Currency-as-status turns the
+   ladder into "who wagered most". Credits = utility, tickets = flair→prize,
+   Elo = status.
+2. **Human hands only.** Enforced today for scoreboard integrity — a column a
+   headless runner could farm overnight is worthless — and for outright fraud
+   prevention once Phase B gives tickets value. Never weaken it in Phase A on
+   the grounds that "it's only cosmetic".
+
+**Communication rule for Phase A surfaces: say what a ticket IS, never what
+it might become.** No "redeemable soon", no teased catalog. A prize promised
+before a catalog, a legal review and a fulfilment path exist is a promise you
+may have to break; under-promising now makes Phase B a gift rather than a
+correction.
+
+The honest cost of Phase A: a cosmetic prize motivates less than 20 credits
+did, so wager's pull rests entirely on the column being visible and scarce.
+If wager volume drops after the cutover, that is the reason — and the fix is
+making the count *legible* (season badges, top-holder callouts) or bringing
+Phase B forward, never reintroducing a pot.
 
 ## The feature in one line
 
@@ -94,9 +126,10 @@ Consequences:
 | The fleet's ladder role | **Gatekeepers**: named guardians of rank-bracket promotion; a gate is a BOOLEAN (pass once → promoted; re-fights grant nothing) | Gives defend-Elo a stake, gives top players an on-demand meaningful fight (pinned local-sim, no queue), closes the farm-the-deterministic-AI hole |
 | Wager settlement | **Both entries BURN; winner mints a TICKET.** No-contest/incomplete still refunds both (escrow sweeper unchanged). Hard cutover — never dual-run pot-wager and ticket-wager | Credits never flow player-to-player → removes sharking, removes the bot-counterparty mint, moves wager toward the tournament/redemption model and away from peer wagering |
 | Ticket form | **Soulbound via AIR credential** (issue-on-behalf pipeline already built, 0004/M5 write-back). Non-transferable by construction — no token contract | The rail exists; a credential has no transfer path to close |
+| **What a ticket is WORTH — phased (owner decision 2026-07-27, consolidated)** | **PHASE A (now, shipped): COSMETIC.** No redemption, no prize, no cash-out — a number next to your name on the leaderboard. **PHASE B (later): REDEEMABLE** for esports qualification seats and other non-cash prizes. The mint, the burn and the soulbound record are IDENTICAL in both phases; only the redemption counter opens | Ships the hard part (settlement, idempotency, human-hands gating) while it carries no prize risk, and lets tickets accrue real history before anything is claimable. Phase A also needs no legal review, no catalog and no fulfilment ops — none of which exist yet. Because value is added at the COUNTER, not the mint, Phase B is a pure addition: `tickets.redeemed_at`/`redeemed_for` are already in the schema and unused. **Nothing minted in Phase A is invalidated by Phase B** |
 | Who can mint tickets | **Human hands only**: `agent:true` connections (already forced for agent-key auth) can never mint; agent-class inertness extends to tickets | "Bots fill wallets; only hands fill trophy cases." Residual: raw-JWT headless looks human but is realtime-paced + Elo-banded — accepted |
 | PvE tickets | **NONE** (owner decision). Tickets are human-vs-human wager only | A PvE ticket lane is exactly what a JWT-headless bot would farm |
-| Ticket catalog | ~~Esports seats + non-cash perks (merch/vouchers after ops review). Sponsored-token redemptions DEFERRED pending real legal review~~ → **SUPERSEDED 2026-07-27: there is no catalog. Tickets are a COSMETIC COLLECTIBLE** — see the amendment below | A ticket redeemable for a tradeable token is cash-equivalent and reopens the gambling classification the burn just closed |
+| Ticket catalog | **PHASE A: none — nothing is redeemable.** **PHASE B: esports qualification seats + non-cash perks** (merch/vouchers after ops review). Sponsored-token redemptions stay DEFERRED pending real legal review. (An interim note here read "there is no catalog, ever"; that overstated the decision — see the consolidated amendment above) | A ticket redeemable for a tradeable token is cash-equivalent and reopens the gambling classification the burn just closed. Phase A ships the settlement half while it carries no prize risk; the catalog opens later against schema that already exists |
 | Seasons | **Two tracks.** Lifetime level/XP NEVER resets (drives `skillForLevel`, AIR reputation creds, CPU calibration — 0006's skill-from-level rule stays intact). New **season score** (seasonal Elo) resets per season and drives the prize ladder, ticket season, gate assignments | A raw XP reset would floor every trained agent's skill quarterly and overwrite LV38 credentials with LV1 |
 | Season length | **Placeholder 21 days** (owner: set properly later). Tickets, season score, and gate rotation share ONE boundary | One boundary, one announcement, one reset |
 | Rating design | Elo as the spine; activity gate (~10 decided matches to fully count, idle decay); level as tiebreaker. Formula lives in **ONE SQL view** (the `agent_roster`/`player_stats` pattern) | Reweighting = a migration, not a paired deploy; three display surfaces can never drift. Credits and tickets NEVER feed rank (currency ≠ status) |

@@ -7,11 +7,19 @@
 -- invisible until the rank views ship"), so appending `tickets` here clobbers
 -- nothing — but whoever ships the seasonal rank view must fold BOTH in.
 --
--- Owner decision 2026-07-27: tickets are a **COSMETIC COLLECTIBLE**. There is
--- no redemption catalog, no prize, no cash-out — the reward for winning a
--- wager is a number next to your name. That simplifies everything the ADR
--- worried about: with nothing to redeem, farming buys only bragging rights
--- and the legal posture is a plain skill contest with a credit sink.
+-- Owner decision 2026-07-27, CONSOLIDATED: tickets are a **COSMETIC
+-- COLLECTIBLE IN PHASE A** — no redemption catalog, no prize, no cash-out
+-- today; the reward for winning a wager is a number next to your name. That
+-- simplifies everything the ADR worried about *for now*: with nothing to
+-- redeem, farming buys only bragging rights and the legal posture is a plain
+-- skill contest with a credit sink.
+--
+-- PHASE B (intended, unscheduled) makes tickets REDEEMABLE for esports
+-- qualification seats and other non-cash prizes. This migration is unaffected
+-- either way — it adds a display column — but note that the farming defences
+-- this file calls unnecessary (mint cap, Elo banding) become load-bearing
+-- again the moment a catalog opens. An earlier draft of this note said
+-- cosmetic "ever"; see ADR 0009's consolidated amendment.
 --
 -- TICKETS DO NOT AFFECT RANK. The window function's ORDER BY is untouched
 -- (level, xp, wins) — this is a DISPLAY column only. Currency is not status:
