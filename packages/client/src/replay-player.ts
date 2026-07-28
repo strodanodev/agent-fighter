@@ -71,6 +71,8 @@ export interface ReplayHandle {
   seek(tick: number): void;
   setSpeed(mult: number): void;
   restart(): void;
+  /** Paint one frame now — for hidden tabs, where rAF never fires. */
+  render(): void;
   destroy(): void;
   getState(): ReplayState;
 }
@@ -152,8 +154,18 @@ export const mountReplay = async (opts: MountOptions): Promise<ReplayHandle> => 
     ];
   };
 
+  /**
+   * A replay ends when the LEDGER runs out or the MATCH does — and those are
+   * not the same tick. A decided match reaches MatchOver a couple of frames
+   * before its last recorded input (the ledger keeps whatever arrived while
+   * the KO was resolving), so testing only `tick >= total` silently skips the
+   * verification check on every match that ended in a knockout.
+   */
+  const atEnd = (): boolean =>
+    state.tick >= state.total || game.phase === Phase.MatchOver;
+
   const advance = (): void => {
-    if (state.tick >= state.total || game.phase === Phase.MatchOver) {
+    if (atEnd()) {
       state.playing = false;
       checkVerified();
       return;
@@ -177,6 +189,17 @@ export const mountReplay = async (opts: MountOptions): Promise<ReplayHandle> => 
   };
 
   // ---------------------------------------------------------------- render
+
+  /**
+   * Paint one frame on demand.
+   *
+   * Rendering normally happens inside the rAF loop, which browsers throttle to
+   * zero in a BACKGROUND OR HIDDEN tab — so an automated check, a screenshot
+   * harness, or an embedder that mounts while off-screen would see a blank
+   * canvas and conclude the player is broken. The game exposes afStep/afScreen
+   * for exactly this reason; this is the same escape hatch.
+   */
+  const render = (): void => draw();
 
   const draw = (): void => {
     const w = canvas.width;
@@ -203,9 +226,15 @@ export const mountReplay = async (opts: MountOptions): Promise<ReplayHandle> => 
     // Camera: frame both fighters with margin, clamped to the playfield, and
     // never zoomed past 1:1 — a replay that pushed in on a lone fighter would
     // hide the spacing, which in a fighting game is most of the information.
-    const pad = 200;
-    const spanX = Math.max(Math.abs(x1 - x0) + pad * 2, 520);
-    const scale = Math.min(w / spanX, h / (STAGE.floorYPx + 120), 1.9);
+    const pad = 150;
+    const spanX = Math.max(Math.abs(x1 - x0) + pad * 2, 460);
+    // VERTICAL SPAN IS THE ACTION, NOT THE WORLD. Fitting `floorYPx` (the
+    // floor's distance from the world origin, 460px of mostly empty sky)
+    // dominated the fit and shrank the fighters to thumbnails. What has to be
+    // on screen is roughly a super-jump above the floor, so that is what is
+    // budgeted for — a ~200px-tall fighter then fills about half the frame.
+    const spanY = 420;
+    const scale = Math.min(w / spanX, h / spanY, 2.4);
     const midX = (x0 + x1) / 2;
     const halfW = w / (2 * scale);
     const camX = Math.max(left + halfW, Math.min(right - halfW, midX));
@@ -331,10 +360,12 @@ export const mountReplay = async (opts: MountOptions): Promise<ReplayHandle> => 
     seek: (t: number) => {
       state.verified = null;
       rebuild(Math.max(0, Math.min(state.total, Math.floor(t))));
-      if (state.tick >= state.total) checkVerified();
+      if (atEnd()) checkVerified();
+      render();
     },
     setSpeed: (m: number) => { state.speed = Math.max(0.1, Math.min(4, m)); },
-    restart: () => { state.verified = null; rebuild(0); state.playing = true; },
+    restart: () => { state.verified = null; rebuild(0); state.playing = true; render(); },
+    render,
     destroy: () => { alive = false; cancelAnimationFrame(raf); },
     getState: () => ({ ...state }),
   };
