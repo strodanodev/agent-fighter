@@ -37,7 +37,8 @@ export {
   topoOrder, routeTo, pathTo, minFights, exitNodes, exitRoutes, boardCredits,
 } from './arcade-map.js';
 export type {
-  Board, BoardNode, BoardNodeKind, BoardRegion, BoardLoot, ExitTier, RouteStat,
+  Board, BoardAgent, BoardNode, BoardNodeKind, BoardRegion, BoardLoot, ExitTier,
+  RouteStat,
 } from './arcade-map.js';
 export {
   generateBoard, validateBoard, validateAllTemplates, templateIds,

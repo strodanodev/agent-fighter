@@ -255,6 +255,20 @@ export interface AgentConfig {
   motto?: string;
 }
 
+/** One member of the STABLE (ADR 0009 step 3) — see Persistence.stable(). */
+export interface StableRow {
+  id: string;
+  name: string;
+  isAgent: boolean;
+  level: number;
+  wins: number;
+  losses: number;
+  /** The coached main. Casting skips rows whose main left the roster. */
+  character: string;
+  personality?: Record<string, number>;
+  motto?: string;
+}
+
 export interface AgentInfo {
   config: AgentConfig | null;
   /** ISO timestamp of the current key's mint — null = no key issued. */
@@ -343,6 +357,13 @@ export interface Persistence {
    * depends on.
    */
   seasonBoard: (limit?: number) => Promise<unknown[]>;
+  /**
+   * THE STABLE (ADR 0009 step 3): every profile with a coached agent_config —
+   * fleet personas AND players' trained agents (default-on, owner decision
+   * 2026-07-27). These are the identities cast onto arcade board nodes.
+   * Mirrors the `stable` view (0026).
+   */
+  stable: () => Promise<StableRow[]>;
   /** LIVE agents (real trained agents) as opponent-card identities. */
   agentRoster: () => Promise<AgentRosterRow[]>;
   /** The house agent's live aggregate record (grows as players fight it). */
@@ -895,6 +916,23 @@ export const memoryPersistence = (): Persistence => {
         level: p.level, xp: p.xp, wins: p.wins, losses: p.losses,
       };
     },
+    /** Mirrors the `stable` view (0026): every profile with a coached config. */
+    stable: async () => {
+      const out: StableRow[] = [];
+      for (const [sub, a] of agents) {
+        if (!a.config || !profiles.has(sub)) continue;
+        const p = prof(sub);
+        out.push({
+          id: sub, name: names.get(sub)?.name ?? 'anon',
+          isAgent: names.get(sub)?.agent ?? false,
+          level: p.level, wins: p.wins, losses: p.losses,
+          character: a.config.character,
+          personality: a.config.personality,
+          ...(a.config.motto ? { motto: a.config.motto } : {}),
+        });
+      }
+      return out.sort((x, y) => y.level - x.level || x.name.localeCompare(y.name));
+    },
     setAgentConfig: async (sub, config) => {
       if (!profiles.has(sub)) return false;
       agentOf(sub).config = config;
@@ -1229,6 +1267,20 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
       (await call(`/rest/v1/leaderboard?select=*&limit=${limit | 0}`, { method: 'GET' })) as unknown[],
     seasonBoard: async (limit = 20) =>
       (await call(`/rest/v1/season_board?select=*&limit=${limit | 0}`, { method: 'GET' })) as unknown[],
+    stable: async () => {
+      const rows = (await call('/rest/v1/stable?select=*', { method: 'GET' })) as
+        Array<Record<string, unknown>>;
+      return rows
+        .filter((r) => typeof r.character === 'string' && r.character)
+        .map((r) => ({
+          id: String(r.id), name: String(r.name ?? 'anon'),
+          isAgent: r.is_agent === true,
+          level: Number(r.level ?? 1), wins: Number(r.wins ?? 0), losses: Number(r.losses ?? 0),
+          character: String(r.character),
+          personality: (r.personality ?? undefined) as Record<string, number> | undefined,
+          ...(r.motto ? { motto: String(r.motto) } : {}),
+        }));
+    },
     agentRoster: async () =>
       (await call('/rest/v1/agent_roster?select=*&order=level.desc,wins.desc&limit=50', { method: 'GET' })) as AgentRosterRow[],
     houseStats: async () => {

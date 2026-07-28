@@ -163,9 +163,26 @@ Consequences:
 ## Build order
 
 ```
-1. Elo in record_match          DONE 2026-07-27 (0021_elo.sql, not yet applied)
-2. rank/season SQL views        (leaderboard reads the view; client renders)  ← NEXT
-3. Stable table + identity pinning into arcade nodes   ← biggest felt win
+1. Elo in record_match          DONE 2026-07-27 (0021_elo.sql, APPLIED)
+2. rank/season SQL views        DONE 2026-07-27 (0024_season_board.sql, APPLIED;
+                                client renders with the season UI, later)
+3. Stable + identity pinning    SERVER HALF DONE 2026-07-28 (0026_stable.sql
+                                APPLIED as `stable_view`; castBoard in
+                                server.ts; BoardNode.agent in @af/core —
+                                pure data, goldens untouched). The stable is
+                                a VIEW over profiles.agent_config, not a new
+                                table: pinning only needs identity + config,
+                                which 0007 already stores. The hosted-runner
+                                key store (plaintext afk_ keys) is the OTHER
+                                half of "fleet state → Supabase" and stays
+                                deferred until Railway hosting is scheduled.
+                                Client map does not RENDER node.agent yet
+                                (additive field, old clients ignore it) —
+                                but the nameplate + match record already
+                                carry the guard's name with zero client
+                                change ("IRONCLAD · LV7 · THE CORE").
+                                Nemesis weighting (grudge-return) deferred
+                                to the habit-vector step.
 4. Defend-Elo + AGENTS-tab defend columns
 5. economy_daily view + payout knobs
 6. TICKETS cutover              DONE 2026-07-27 (0020_tickets.sql; farm cap

@@ -70,6 +70,26 @@ export type BoardLoot =
   | { kind: 'credits'; amount: number }
   | { kind: 'drink'; itemId: string; tier: number };
 
+/**
+ * A STABLE identity guarding a fight node (ADR 0009 step 3): a real coached
+ * agent — fleet persona or another player's trained agent — with a name and
+ * a record, instead of an anonymous archetype. Assigned server-side at board
+ * generation ("casting"); PURE DATA the sim never reads. `personality` is the
+ * clamped style pin the server will install for this bout — it reaches the
+ * client at match time anyway (the client sims locally per ADR 0008), so
+ * carrying it on the board leaks nothing new. `id` is the public profile id,
+ * the same one leaderboard/agent_roster already expose.
+ */
+export interface BoardAgent {
+  id: string;
+  name: string;
+  level: number;
+  wins: number;
+  losses: number;
+  motto?: string;
+  personality?: Record<string, number>;
+}
+
 export interface BoardNode {
   id: number;
   /** Lattice position, 0..BOARD_W-1 / 0..BOARD_H-1. Display only. */
@@ -81,6 +101,14 @@ export interface BoardNode {
   charId?: string;
   /** fight | gate | boss: the AI skill for this bout (region band). */
   skill?: number;
+  /**
+   * fight | gate | boss: the stable identity standing here. Absent = the
+   * anonymous archetype (pre-stable behavior, and the empty-stable fallback).
+   * Identity supplies NAME + STYLE; `skill` above keeps supplying difficulty
+   * (ADR 0009: a LV40 agent guarding a region-1 node is still a region-1
+   * fight — the ladder must never eat the difficulty curve).
+   */
+  agent?: BoardAgent;
   /** loot: what you pick up by stepping here. */
   loot?: BoardLoot;
   /** exit: which extraction point this is. */

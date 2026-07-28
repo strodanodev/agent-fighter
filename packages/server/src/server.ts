@@ -37,7 +37,7 @@ import {
   ARCADE_FEE,
   InsufficientCredits, SOLO_FEE, WAGER_FEE, createPersistence, loadDotEnv,
 } from './persist.js';
-import type { Account, ArcadeExtract, MatchMode, Persistence } from './persist.js';
+import type { Account, ArcadeExtract, MatchMode, Persistence, StableRow } from './persist.js';
 import { createAirIssuer, loadIssuerConfig } from './air-issuer.js';
 import type { AirIssuer } from './air-issuer.js';
 import { connectPageHtml } from './connect-page.js';
@@ -673,6 +673,54 @@ export const createMatchServer = (opts: {
     }
     return best.id;
   };
+  /**
+   * CAST THE BOARD (ADR 0009 step 3): put a STABLE identity — a fleet persona
+   * or another player's trained agent — on every fight node, so the arcade is
+   * populated by named rivals with real records instead of anonymous
+   * archetypes. Assignment is level-banded (low-level agents guard region 1,
+   * high-level region 3) because identity supplies NAME + STYLE while the
+   * BOARD keeps supplying skill; a least-used window stops a small stable
+   * pinning one agent onto every node. The player's own agent is excluded
+   * (sparring exists for that), as is any agent whose coached main has left
+   * the roster. Empty stable / persistence failure → the board stays as
+   * generated (anonymous archetypes), never an error: casting is flavor,
+   * entering the arcade is money.
+   */
+  const castBoard = async (board: Board, playerSub: string): Promise<void> => {
+    if (!persistence) return;
+    let stable: StableRow[];
+    try { stable = await persistence.stable(); } catch { return; }
+    const cast = stable.filter((a) =>
+      a.id !== playerSub && enabledCharacterIds.includes(a.character));
+    if (cast.length === 0) return;
+    const byLevel = [...cast].sort((p, q) => p.level - q.level || p.name.localeCompare(q.name));
+    const fights = board.nodes
+      .filter(isFightNode)
+      .sort((p, q) => p.region - q.region || p.id - q.id);
+    const used = new Map<string, number>();
+    fights.forEach((n, i) => {
+      const t = fights.length <= 1 ? 0 : i / (fights.length - 1);
+      const center = Math.round(t * (byLevel.length - 1));
+      let best = center;
+      for (const cand of [center - 1, center + 1]) {
+        if (cand < 0 || cand >= byLevel.length) continue;
+        if ((used.get(byLevel[cand]!.id) ?? 0) < (used.get(byLevel[best]!.id) ?? 0)) best = cand;
+      }
+      const a = byLevel[best]!;
+      used.set(a.id, (used.get(a.id) ?? 0) + 1);
+      // The guard fights AS its coached main — the map shows who really
+      // stands there. A mirror of the player's character is fine: that is
+      // someone else's take on your fighter.
+      n.charId = a.character;
+      n.agent = {
+        id: a.id, name: a.name, level: a.level, wins: a.wins, losses: a.losses,
+        ...(a.motto ? { motto: a.motto } : {}),
+        // Clamped HERE so a hand-edited DB row cannot smuggle out-of-range
+        // knobs into a pinned setup — same stance as trainedAgentPin.
+        ...(a.personality ? { personality: clampPersonality(a.personality) } : {}),
+      };
+    });
+  };
   // Free-tier abuse valves (agent class): per-sub battles, per-IP signups.
   const agentBattleCap = dayCounter();
   const signupCap = dayCounter();
@@ -1029,12 +1077,15 @@ export const createMatchServer = (opts: {
     // The suffix is the ZONE rather than a battle counter — with a branching
     // board there is no "n of N" any more, and where you are matters more
     // than how far you've come.
+    // A cast node bills as its STABLE guard (ADR 0009 step 3: "NULLPTR3A ·
+    // THE CORE"), so the name on the map, the nameplate, and the match
+    // record are the same rival. Uncast nodes keep billing as the character.
     // Trained-agent opponents (dare/spar) bill as their owner's agent.
     const arcadeZone = arcadeRun?.board
       ? REGION_NAME[nodeById(arcadeRun.board, arcadeRun.pending)?.region ?? 1]
       : '';
     const houseName = arcadeRun
-      ? `${(bundleOf(solo!.character) as { name?: string }).name ?? solo!.character} · ${arcadeZone}`.toUpperCase()
+      ? `${solo!.agentName ?? (bundleOf(solo!.character) as { name?: string }).name ?? solo!.character} · ${arcadeZone}`.toUpperCase()
       : solo?.agentName ?? `HOUSE LV${solo?.level ?? 1}`;
     const m: Match = {
       id: id ?? newMatchId(),
@@ -1410,17 +1461,23 @@ export const createMatchServer = (opts: {
     run.pending = node.id;
     run.lastActive = Date.now();
     const oppChar = node.charId || run.charId;
+    // ADR 0009 step 3: a cast node carries a STABLE identity — its name goes
+    // on the nameplate/match record and its coached style becomes the pin.
+    // Skill is NOT theirs: the board's region band keeps setting difficulty.
+    const pinned = node.agent;
     const opts = {
-      level: c.account?.level ?? 1,
+      level: pinned?.level ?? c.account?.level ?? 1,
       // The BOARD sets the difficulty (region band); the test hook can force it.
       skill: arcadeSkillOverride
         ? arcadeSkillOverride(run.fights, ARCADE_TOTAL)
         : node.skill ?? 50,
       character: oppChar,
       aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
-      // Personality from the character's CANONICAL style (its meta.style — the
-      // same style that drives its feel), so a bot plays it like its archetype.
-      personality: ARCADE_PERSONALITY[styleOfChar(oppChar)],
+      // Coached style when a stable agent stands here (clamped at cast time);
+      // else the character's CANONICAL style (its meta.style — the same style
+      // that drives its feel), so a bot plays it like its archetype.
+      personality: pinned?.personality ?? ARCADE_PERSONALITY[styleOfChar(oppChar)],
+      agentName: pinned ? `${pinned.name.toUpperCase()} · LV${pinned.level}` : undefined,
     };
     const claimed = await claimEquipped(c, matchId);
     const items: MatchItems = [claimed.pins, []];
@@ -1592,6 +1649,9 @@ export const createMatchServer = (opts: {
               // falls through to the same check every battle takes)
               const roster = enabledCharacterIds.filter((id) => id !== c.character);
               const board = generateBoard({ roster: roster.length > 0 ? roster : [c.character], seed: newBoardSeed() });
+              // Cast for the free agent-class lane too — a fleet grinder's
+              // autopiloted run still writes real names into the log/history.
+              await castBoard(board, c.identity?.sub ?? '');
               run = {
                 token: randomUUID(),
                 sub: c.identity?.sub ?? '',
@@ -2098,9 +2158,12 @@ export const createMatchServer = (opts: {
           // mirror match rather than an empty board.
           const roster = enabledCharacterIds.filter((id) => id !== character);
           run.board = generateBoard({ roster: roster.length > 0 ? roster : [character], seed: newBoardSeed() });
+          // ADR 0009 step 3: named stable guards on the fight nodes.
+          await castBoard(run.board, identity.sub);
           run.at = run.board.start;
           run.path = [run.board.start];
-          console.log(`[arcade] run ${token.slice(0, 8)} board "${run.board.templateId}" seed ${run.board.seed} as ${character}`);
+          const named = run.board.nodes.filter((n) => n.agent).length;
+          console.log(`[arcade] run ${token.slice(0, 8)} board "${run.board.templateId}" seed ${run.board.seed} as ${character} · ${named} stable guard(s)`);
         } else if (character && character !== run.charId) {
           return json(res, 409, { error: 'your fighter is locked for the whole arcade run' });
         }
