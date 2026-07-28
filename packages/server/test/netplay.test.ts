@@ -83,6 +83,7 @@ describe('persistence hook (Phase B)', () => {
       sweepOrphanedItems: async () => 0,
       releaseReferral: async () => 0,
       leaderboard: async () => [],
+      seasonBoard: async () => [],
       agentRoster: async () => [],
       houseStats: async () => ({ wins: 0, losses: 0, streak: 0, battles: 0 }),
       getAgent: async () => null,

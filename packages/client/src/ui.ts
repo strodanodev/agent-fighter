@@ -3321,6 +3321,19 @@ export interface RankRow {
    * server.
    */
   tickets?: number;
+  /**
+   * Ratings (ADR 0009 step 2). Served by `/leaderboard` but NOT RENDERED yet,
+   * deliberately: this screen is sorted by progression (level/XP), and until a
+   * rated wager has actually happened every value here is the 1200 base — a
+   * column of identical numbers on a ladder that is not sorted by them. The
+   * Elo ladder is its own board (`/leaderboard?board=season`, the
+   * `season_board` view) and lands with the season/prize UI, which is where a
+   * rating is the thing being ranked. Absent on a pre-0022 server.
+   */
+  elo?: number;
+  season_elo?: number;
+  rated?: number;
+  season_rated?: number;
 }
 
 export const RANK_TABS = ['ALL', 'HUMANS', 'AGENTS'] as const;

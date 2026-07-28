@@ -161,3 +161,44 @@ test('grinding PvE never ages a player out of the provisional K', async () => {
   const a = aw.find((x) => x.side === 0)!;
   assert.equal(a.eloDelta, 20, 'still provisional (K=40) after 10 PvE battles');
 });
+
+test('season board: ranks the qualified, still LISTS the provisional', async () => {
+  const p = memoryPersistence();
+  await p.getAccount(id('vet'), 'VET', false);
+  await p.getAccount(id('rook'), 'ROOK', false);
+  // 10 rated wagers puts BOTH past the provisional gate; `vet` wins them all.
+  for (let i = 0; i < 10; i++) {
+    await p.recordMatch(rec({
+      matchId: `s${i}`, identities: [id('vet'), id('rook')], names: ['VET', 'ROOK'],
+    }));
+  }
+  // A third player with a decided PvE record only — listed, never ranked.
+  await p.getAccount(id('pve'), 'PVE', false);
+  await p.recordMatch(rec({
+    matchId: 'pve1', mode: 'arcade', fee: 0,
+    identities: [id('pve'), null], names: ['PVE', 'HOUSE'],
+  }));
+
+  const board = await p.seasonBoard(10) as Array<Record<string, unknown>>;
+  const by = (n: string) => board.find((r) => r.name === n)!;
+
+  assert.equal(by('VET').qualified, true);
+  assert.equal(by('ROOK').qualified, true);
+  assert.equal(by('VET').rank, 1, 'the winner tops the ladder');
+  assert.equal(by('ROOK').rank, 2);
+  assert.ok((by('VET').elo as number) > (by('ROOK').elo as number));
+
+  // Present, but holding no position a prize could key on.
+  assert.equal(by('PVE').qualified, false);
+  assert.equal(by('PVE').rank, null, 'provisional players rank NULL, not last');
+  assert.equal(by('PVE').elo, ELO_BASE);
+  // Ordering: every qualified row precedes every provisional one.
+  assert.ok(board.findIndex((r) => r.name === 'PVE')
+    > board.findIndex((r) => r.name === 'ROOK'));
+});
+
+test('season board excludes profiles with no decided matches at all', async () => {
+  const p = memoryPersistence();
+  await p.getAccount(id('lurker'), 'LURKER', false); // account, never fought
+  assert.equal((await p.seasonBoard(10)).length, 0);
+});

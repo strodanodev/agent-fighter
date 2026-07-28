@@ -332,6 +332,14 @@ export interface Persistence {
    */
   releaseReferral: (inviteeSub: string) => Promise<number>;
   leaderboard: (limit?: number) => Promise<unknown[]>;
+  /**
+   * THE season ladder (ADR 0009 step 2) — the `season_board` view. Ranked on
+   * season Elo, but only for profiles past the provisional gate; everyone else
+   * is listed below with a NULL rank. Kept SEPARATE from `leaderboard`, which
+   * measures progression (level/XP) and whose ordering `player_stats.rank`
+   * depends on.
+   */
+  seasonBoard: (limit?: number) => Promise<unknown[]>;
   /** LIVE agents (real trained agents) as opponent-card identities. */
   agentRoster: () => Promise<AgentRosterRow[]>;
   /** The house agent's live aggregate record (grows as players fight it). */
@@ -843,7 +851,33 @@ export const memoryPersistence = (): Persistence => {
           level: p.level, xp: p.xp, wins: p.wins, losses: p.losses, rank: i + 1,
           // Cosmetic collectible (0022) — displayed, never part of the sort.
           tickets: ticketsOf(id),
+          elo: p.elo, season_elo: p.seasonElo,
+          rated: p.rated, season_rated: p.seasonRated,
         })),
+    /** Mirrors the `season_board` view in 0022_season_board.sql — keep in sync. */
+    seasonBoard: async (limit = 20) => {
+      const season = currentSeason();
+      const rows = [...profiles.entries()]
+        .filter(([, p]) => p.wins + p.losses > 0 && p.season === season)
+        .sort((a, b) =>
+          Number(b[1].seasonRated >= ELO_PROVISIONAL) - Number(a[1].seasonRated >= ELO_PROVISIONAL)
+          || b[1].seasonElo - a[1].seasonElo
+          || b[1].level - a[1].level || b[1].xp - a[1].xp || b[1].wins - a[1].wins)
+        .slice(0, limit);
+      // Rank counts ONLY the qualified block, so a provisional player has no
+      // rank rather than a misleading one off an unconverged rating.
+      let qualifiedSeen = 0;
+      return rows.map(([id, p]) => {
+        const qualified = p.seasonRated >= ELO_PROVISIONAL;
+        if (qualified) qualifiedSeen++;
+        return {
+          id, name: names.get(id)?.name ?? 'anon', is_agent: names.get(id)?.agent ?? false,
+          season: p.season, elo: p.seasonElo, rated: p.seasonRated,
+          lifetime_elo: p.elo, level: p.level, wins: p.wins, losses: p.losses,
+          qualified, rank: qualified ? qualifiedSeen : null,
+        };
+      });
+    },
     // Dev economy has no durable match history; the client falls back to a
     // client-simulated house agent when these come back empty/zero.
     agentRoster: async () => [],
@@ -1190,6 +1224,8 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
     },
     leaderboard: async (limit = 20) =>
       (await call(`/rest/v1/leaderboard?select=*&limit=${limit | 0}`, { method: 'GET' })) as unknown[],
+    seasonBoard: async (limit = 20) =>
+      (await call(`/rest/v1/season_board?select=*&limit=${limit | 0}`, { method: 'GET' })) as unknown[],
     agentRoster: async () =>
       (await call('/rest/v1/agent_roster?select=*&order=level.desc,wins.desc&limit=50', { method: 'GET' })) as AgentRosterRow[],
     houseStats: async () => {

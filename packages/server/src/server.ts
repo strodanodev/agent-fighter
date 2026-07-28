@@ -1953,8 +1953,14 @@ export const createMatchServer = (opts: {
     }
     if (path === '/leaderboard') {
       if (!persistence) return json(res, 503, { error: 'persistence not configured' });
-      const limit = Math.min(100, Math.max(1, Number(new URL(req.url ?? '/', 'http://x').searchParams.get('limit')) || 20));
-      void persistence.leaderboard(limit)
+      const q = new URL(req.url ?? '/', 'http://x').searchParams;
+      const limit = Math.min(100, Math.max(1, Number(q.get('limit')) || 20));
+      // ?board=season → the Elo ladder (ADR 0009). Default stays the
+      // progression board, so every deployed client keeps its current view.
+      const board = q.get('board') === 'season'
+        ? persistence.seasonBoard(limit)
+        : persistence.leaderboard(limit);
+      void board
         .then((rows) => json(res, 200, rows))
         .catch((e) => json(res, 502, { error: String(e) }));
       return;
