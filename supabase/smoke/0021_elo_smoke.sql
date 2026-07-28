@@ -1,11 +1,16 @@
 -- SMOKE TEST for 0021_elo.sql — run in the Supabase SQL editor.
 --
+-- STATUS: RAN AGAINST PROD 2026-07-27 (owner-authorized, via MCP) — ALL FIVE
+-- CHECKS PASSED and the cleanup left zero rows (34 real profiles untouched).
+-- Highlight: the deviator case settled 1220→1198 / 1180→1202 with the
+-- ticket minted by the deviator's OPPONENT — the one case a TS mirror
+-- cannot prove. Kept as a reusable regression script: re-run after ANY
+-- future record_match change.
+--
 -- WHY THIS EXISTS AS A FILE: the house rule from 0002 is "always smoke-test
 -- SQL on real Postgres" — a TypeScript mirror cannot catch a SQL-only bug
 -- (that lesson cost a settlement where `NULL = s` made BOTH sides losers).
--- The pure rating math IS already verified against prod; what is NOT yet
--- verified end-to-end is record_match's rating pre-pass. This script closes
--- that gap. It writes, so it needs a human to run it.
+-- It writes, so it needs an explicitly authorized run.
 --
 -- It is SELF-CLEANING: every row it creates is removed by the final block,
 -- and every id is namespaced `smoke:elo:*` / `smoke-elo-*` so the cleanup

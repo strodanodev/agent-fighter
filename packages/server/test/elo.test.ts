@@ -202,3 +202,40 @@ test('season board excludes profiles with no decided matches at all', async () =
   await p.getAccount(id('lurker'), 'LURKER', false); // account, never fought
   assert.equal((await p.seasonBoard(10)).length, 0);
 });
+
+test('GET /leaderboard serves both boards over real HTTP', async () => {
+  // The endpoint itself had zero coverage (found by the 2026-07-28 audit):
+  // every earlier test exercised persistence directly, so a broken route or
+  // a bad ?board= branch would have shipped silently.
+  const { createMatchServer } = await import('../src/server.js');
+  const p = memoryPersistence();
+  await p.getAccount(id('a'), 'A', false);
+  await p.getAccount(id('b'), 'B', false);
+  for (let i = 0; i < 10; i++) await p.recordMatch(rec({ matchId: `h${i}` }));
+  const server = await createMatchServer({ port: 0, persistence: p, noPaceCheck: true });
+  try {
+    const http = `http://localhost:${server.port}`;
+
+    // Default board: progression order, rating columns present for display.
+    const prog = await (await fetch(`${http}/leaderboard?limit=10`)).json() as
+      Array<{ name: string; rank: number; elo?: number }>;
+    assert.ok(prog.length >= 2);
+    assert.equal(prog[0]!.rank, 1);
+    assert.ok(typeof prog[0]!.elo === 'number', 'rating columns ride along');
+
+    // ?board=season: Elo order, qualification semantics.
+    const season = await (await fetch(`${http}/leaderboard?board=season&limit=10`)).json() as
+      Array<{ name: string; elo: number; qualified: boolean; rank: number | null }>;
+    const winner = season.find((r) => r.name === 'A')!;
+    const loser = season.find((r) => r.name === 'B')!;
+    assert.equal(winner.qualified, true, '10 rated matches qualifies');
+    assert.equal(winner.rank, 1);
+    assert.ok(winner.elo > loser.elo);
+
+    // An unknown ?board= value falls back to the default board, never a 500.
+    const fallback = await fetch(`${http}/leaderboard?board=nonsense&limit=1`);
+    assert.equal(fallback.status, 200);
+  } finally {
+    server.close();
+  }
+});
