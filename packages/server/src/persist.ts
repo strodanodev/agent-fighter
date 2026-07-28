@@ -267,6 +267,10 @@ export interface StableRow {
   character: string;
   personality?: Record<string, number>;
   motto?: string;
+  /** Defend record (ADR 0009 step 4). Absent on a pre-0028 view. */
+  defendElo?: number;
+  defendWins?: number;
+  defendLosses?: number;
 }
 
 export interface AgentInfo {
@@ -364,6 +368,16 @@ export interface Persistence {
    * Mirrors the `stable` view (0026).
    */
   stable: () => Promise<StableRow[]>;
+  /**
+   * DEFEND-ELO (ADR 0009 step 4): a human challenged this agent and the
+   * match decided. Idempotent by MATCH id (a settlement retry cannot
+   * double-count); refuses self-defense; rates the agent against the
+   * challenger's lifetime elo WITHOUT touching the challenger. Returns
+   * true only when this call recorded the defense. The human-hands gate
+   * (no agent-class, no declared-agent connections) lives at the CALLER —
+   * server.ts finishMatch — because only it knows the connection.
+   */
+  recordDefense: (agentSub: string, matchId: string, challengerSub: string, won: boolean) => Promise<boolean>;
   /** LIVE agents (real trained agents) as opponent-card identities. */
   agentRoster: () => Promise<AgentRosterRow[]>;
   /** The house agent's live aggregate record (grows as players fight it). */
@@ -523,6 +537,8 @@ interface ProfileRow {
    *  not wins+losses, and it is what the provisional K-factor keys on. */
   elo: number; rated: number;
   seasonElo: number; seasonRated: number; season: number;
+  /** DEFEND record (ADR 0009 step 4): held/fell when humans fight this agent. */
+  defendElo: number; defendWins: number; defendLosses: number;
 }
 
 /** Apply an XP delta with level-ups (positive) or a clamped burn (negative). */
@@ -620,6 +636,8 @@ export const memoryPersistence = (): Persistence => {
    * minting a second one.
    */
   const tickets = new Map<string, { sub: string; season: number; redeemed: boolean }>();
+  /** Defenses (ADR 0009 step 4), keyed by MATCH id — the 0028 unique(match_id). */
+  const defenses = new Map<string, { agent: string; challenger: string; won: boolean }>();
   const ticketsOf = (sub: string): number => {
     let n = 0;
     for (const t of tickets.values()) if (t.sub === sub && !t.redeemed) n++;
@@ -651,6 +669,7 @@ export const memoryPersistence = (): Persistence => {
         credits: 0, level: 1, xp: 0, wins: 0, losses: 0, lastDaily: '',
         elo: ELO_BASE, rated: 0,
         seasonElo: ELO_BASE, seasonRated: 0, season: currentSeason(),
+        defendElo: ELO_BASE, defendWins: 0, defendLosses: 0,
       };
       profiles.set(sub, p);
     }
@@ -877,6 +896,7 @@ export const memoryPersistence = (): Persistence => {
           tickets: ticketsOf(id),
           elo: p.elo, season_elo: p.seasonElo,
           rated: p.rated, season_rated: p.seasonRated,
+          defend_elo: p.defendElo, defend_wins: p.defendWins, defend_losses: p.defendLosses,
         })),
     /** Mirrors the `season_board` view in 0022_season_board.sql — keep in sync. */
     seasonBoard: async (limit = 20) => {
@@ -929,9 +949,24 @@ export const memoryPersistence = (): Persistence => {
           character: a.config.character,
           personality: a.config.personality,
           ...(a.config.motto ? { motto: a.config.motto } : {}),
+          defendElo: p.defendElo, defendWins: p.defendWins, defendLosses: p.defendLosses,
         });
       }
       return out.sort((x, y) => y.level - x.level || x.name.localeCompare(y.name));
+    },
+    /** Mirrors record_defense in 0028_defend.sql — keep in lockstep. */
+    recordDefense: async (agentSub, matchId, challengerSub, won) => {
+      if (!agentSub || !matchId || agentSub === challengerSub) return false;
+      if (defenses.has(matchId)) return false; // idempotent by match
+      if (!profiles.has(agentSub)) return false;
+      defenses.set(matchId, { agent: agentSub, challenger: challengerSub, won });
+      const a = prof(agentSub);
+      const cElo = profiles.get(challengerSub)?.elo ?? ELO_BASE;
+      // Flat K=24: defenses arrive slowly, so the rating must move while an
+      // agent still has few. The challenger's rating is READ, never written.
+      a.defendElo = Math.max(ELO_FLOOR, a.defendElo + eloShift(a.defendElo, cElo, won ? 1 : 0, 24));
+      if (won) a.defendWins++; else a.defendLosses++;
+      return true;
     },
     setAgentConfig: async (sub, config) => {
       if (!profiles.has(sub)) return false;
@@ -983,6 +1018,7 @@ export const memoryPersistence = (): Persistence => {
         credits: 0, level: 1, xp: 0, wins: 0, losses: 0, lastDaily: '9999-12-31',
         elo: ELO_BASE, rated: 0,
         seasonElo: ELO_BASE, seasonRated: 0, season: currentSeason(),
+        defendElo: ELO_BASE, defendWins: 0, defendLosses: 0,
       });
       names.set(sub, { name, agent: true });
       owners.set(sub, owner);
@@ -1279,8 +1315,19 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
           character: String(r.character),
           personality: (r.personality ?? undefined) as Record<string, number> | undefined,
           ...(r.motto ? { motto: String(r.motto) } : {}),
+          // Absent on a pre-0028 view — undefined, never a fake 1200.
+          ...(r.defend_elo != null ? {
+            defendElo: Number(r.defend_elo),
+            defendWins: Number(r.defend_wins ?? 0),
+            defendLosses: Number(r.defend_losses ?? 0),
+          } : {}),
         }));
     },
+    recordDefense: async (agentSub, matchId, challengerSub, won) =>
+      Boolean(await call('/rest/v1/rpc/record_defense', {
+        method: 'POST',
+        body: JSON.stringify({ _agent: agentSub, _match: matchId, _challenger: challengerSub, _won: won }),
+      })),
     agentRoster: async () =>
       (await call('/rest/v1/agent_roster?select=*&order=level.desc,wins.desc&limit=50', { method: 'GET' })) as AgentRosterRow[],
     houseStats: async () => {

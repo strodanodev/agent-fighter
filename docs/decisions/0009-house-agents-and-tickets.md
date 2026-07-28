@@ -183,7 +183,19 @@ Consequences:
                                 change ("IRONCLAD · LV7 · THE CORE").
                                 Nemesis weighting (grudge-return) deferred
                                 to the habit-vector step.
-4. Defend-Elo + AGENTS-tab defend columns
+4. Defend-Elo                   DONE 2026-07-29 (0028_defend.sql APPLIED as
+                                `defend_elo`): defenses table idempotent by
+                                match + record_defense RPC; every fight vs a
+                                cast guard or dared agent updates THAT
+                                agent's defend record (flat K=24 vs the
+                                challenger's lifetime elo — the challenger's
+                                own rating is NEVER written). Human hands
+                                only, gated in finishMatch: agent-class subs
+                                and declared-agent connections record
+                                nothing (anti-grief), and sparring refuses
+                                self-defense. defend_* columns appended to
+                                agent_roster/stable/leaderboard; AGENTS-tab
+                                RENDERING waits for the season-UI pass.
 5. economy_daily view + payout knobs
 6. TICKETS cutover              DONE 2026-07-27 (0020_tickets.sql; farm cap
                                 deliberately deferred — the 20-CR burn is the

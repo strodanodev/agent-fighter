@@ -189,6 +189,8 @@ interface Match {
   overAt: [number, number]; // -1 until a side reports MatchOver
   finished: boolean;
   forfeitTimer: NodeJS.Timeout | null;
+  /** DEFEND-ELO (ADR 0009 step 4): whose agent side 1 is (see SoloPin). */
+  defender?: string;
 }
 
 export interface MatchServer {
@@ -218,6 +220,13 @@ interface SoloPin {
   level: number;
   personality?: Record<string, number>;
   agentName?: string;
+  /**
+   * DEFEND-ELO (ADR 0009 step 4): the profile whose agent is being fought —
+   * a cast stable guard (node.agent.id) or a dared trained agent (its
+   * owner's sub). A decided match updates THAT profile's defend record;
+   * finishMatch applies the human-hands gate before recording.
+   */
+  defenderSub?: string;
 }
 
 /**
@@ -861,6 +870,29 @@ export const createMatchServer = (opts: {
           console.log(`[items] settle failed for ${m.id}: ${String(e)}`));
       }
     }
+    // DEFEND-ELO (ADR 0009 step 4): a decided fight against a pinned agent —
+    // a cast stable guard or a dared trained agent — is a DEFENSE on that
+    // agent's record. Fire-and-forget like every progression write: the
+    // verdict is never delayed, and record_defense is idempotent by match id.
+    // HUMAN HANDS ONLY, the tickets/ratings gates: an agent-class challenger
+    // or a declared-agent connection records nothing — without the connection
+    // gate a headless runner could grief a rival's defend record overnight.
+    // Draws and no-contests decide nothing; a challenger who deviates or
+    // ragequits FELL to the guard (the settlement ladder already says so).
+    if (persistence && m.defender && m.mode !== 'friendly'
+      && (result.winner === 0 || result.winner === 1)) {
+      const challenger = m.clients[0]?.identity?.sub;
+      const humanHands = !!challenger && !m.clients[0]!.agent && !isAgentClassSub(challenger);
+      if (humanHands && challenger !== m.defender) {
+        const held = result.winner === 1 || result.deviator === 0;
+        const defender = m.defender;
+        void persistence.recordDefense(defender, m.id, challenger, held)
+          .then((recorded) => {
+            if (recorded) console.log(`[defend] ${defender} ${held ? 'HELD' : 'FELL'} vs ${m.clients[0]!.name} (${m.id})`);
+          })
+          .catch((e) => console.log(`[defend] record failed for ${m.id}: ${String(e)}`));
+      }
+    }
     // Persist + award XP AFTER the result is out — progression is async and
     // must never delay or gate the verdict. record_match is idempotent by
     // match id, so a crash-retry can't double-award.
@@ -1113,6 +1145,7 @@ export const createMatchServer = (opts: {
       overAt: [-1, -1],
       finished: false,
       forfeitTimer: null,
+      defender: solo?.defenderSub,
     };
     // Resolve the chosen stage's playfield bounds once (part of the pinned,
     // deterministic setup — shipped to clients and used by the verifier).
@@ -1440,6 +1473,10 @@ export const createMatchServer = (opts: {
         personality: clampPersonality(info.config.personality),
         agentName: `${owner.name.toUpperCase()}'S AGENT · LV${info.level}`,
         aiSeed: ((Date.now() % 100000) + nextMatch) | 0,
+        // A dare IS a defense of the owner's agent. Sparring (your own code)
+        // pins the same sub — recordDefense refuses agent === challenger, so
+        // coaching sessions never rate your own agent.
+        defenderSub: owner.sub,
       };
     } catch (err) {
       // A Supabase blip here would otherwise reject up into the queue IIFE
@@ -1480,6 +1517,9 @@ export const createMatchServer = (opts: {
       // that drives its feel), so a bot plays it like its archetype.
       personality: pinned?.personality ?? ARCADE_PERSONALITY[styleOfChar(oppChar)],
       agentName: pinned ? `${pinned.name.toUpperCase()} · LV${pinned.level}` : undefined,
+      // Beating (or falling to) a cast guard is a DEFENSE for that agent's
+      // record — finishMatch gates on human hands before recording.
+      defenderSub: pinned?.id,
     };
     const claimed = await claimEquipped(c, matchId);
     const items: MatchItems = [claimed.pins, []];

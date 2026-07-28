@@ -3338,6 +3338,15 @@ export interface RankRow {
   season_elo?: number;
   rated?: number;
   season_rated?: number;
+  /**
+   * DEFEND record (ADR 0009 step 4): held/fell when humans fought this
+   * agent's pinned matches. THE meaningful agent stat — rendering it on the
+   * AGENTS tab is the season-UI pass, alongside the rating columns above.
+   * Absent on a pre-0028 server.
+   */
+  defend_elo?: number;
+  defend_wins?: number;
+  defend_losses?: number;
 }
 
 export const RANK_TABS = ['ALL', 'HUMANS', 'AGENTS'] as const;
