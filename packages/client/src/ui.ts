@@ -4445,8 +4445,11 @@ export const drawMap = (ctx: CanvasRenderingContext2D, tick: number, v: MapView)
       marchingOutline(ctx, cx - w / 2 - 5, cy - h / 2 - 5, w + 10, h + 10, tick, GOLD_LT, 9, 0.85);
       // Name the fighter you just chose, right where you chose them — ABOVE
       // the piece, because below it is where the player token stands.
+      // A cast node names its STABLE guard (ADR 0009): the same rival the
+      // nameplate and match record will bill as.
       const who = n.kind === 'exit' ? 'EXTRACTION POINT'
-        : v.nameOf(n.charId ?? '').toUpperCase().slice(0, 16);
+        : n.agent ? `${n.agent.name.toUpperCase()} · LV${n.agent.level}`.slice(0, 24)
+          : v.nameOf(n.charId ?? '').toUpperCase().slice(0, 16);
       label(ctx, who, cx, cy - h / 2 - 12, 11, GOLD_LT, 'center', true);
     }
     // The whole piece is the tap target for reachable routes.
@@ -4584,7 +4587,7 @@ export const drawMap = (ctx: CanvasRenderingContext2D, tick: number, v: MapView)
 
     const labelX = tx + th + 10;
     const who = n.kind === 'exit' ? `EXTRACT · EXIT ${n.exitTier ?? 1}`
-      : v.nameOf(n.charId ?? '').toUpperCase().slice(0, 16);
+      : (n.agent?.name ?? v.nameOf(n.charId ?? '')).toUpperCase().slice(0, 16);
     const kindTag = n.kind === 'boss' ? 'BOSS' : n.kind === 'gate' ? 'GATE' : '';
     label(ctx, `${k + 1}`, labelX, rowY + 19, 12, on ? GOLD_LT : '#ffffff66', 'left', false);
     label(ctx, who, labelX + 14, rowY + 19, 13, on ? '#ffffff' : '#ffffffdd', 'left', true);
@@ -4630,12 +4633,19 @@ export const drawMap = (ctx: CanvasRenderingContext2D, tick: number, v: MapView)
     // Deliberately identity-only (no bio): the full dossier is the select
     // screen's job, and a variable-height block here would fight the button
     // anchored below it.
+    // A cast node headlines its STABLE guard (ADR 0009) — a real coached
+    // agent with a record and a motto — over the character it pilots.
     const mid = cardY2 + cardH2 / 2;
-    label(ctx, 'NEXT UP', tX, mid - 14, 9, '#ffffff77', 'left', false);
-    display(ctx, nextUp.bundle.name.toUpperCase().slice(0, 16), tX, mid + 6, 18, {
+    const guardId = selNode?.agent;
+    label(ctx, guardId ? 'GUARDED BY' : 'NEXT UP', tX, mid - 14, 9, '#ffffff77', 'left', false);
+    display(ctx, (guardId?.name ?? nextUp.bundle.name).toUpperCase().slice(0, 16), tX, mid + 6, 18, {
       align: 'left', glow: st.color + '99', glowBlur: 10,
     });
-    const styleTxt = wrapLines(ctx, `${st.label}  ·  ${st.tag}`, tW, 9.5, 1)[0] ?? st.label;
+    const sub = guardId
+      ? `LV${guardId.level} · ${guardId.wins}-${guardId.losses}`
+        + (guardId.motto ? `  ·  “${guardId.motto}”` : `  ·  ${st.label}`)
+      : `${st.label}  ·  ${st.tag}`;
+    const styleTxt = wrapLines(ctx, sub, tW, 9.5, 1)[0] ?? st.label;
     label(ctx, styleTxt, tX, mid + 19, 9.5, st.color, 'left', false);
   }
 
