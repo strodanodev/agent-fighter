@@ -13,7 +13,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  ELO_BASE, SEASON_DAYS, SEASON_EPOCH_MS, WAGER_FEE,
+  ELO_BASE, SEASON_LABEL, WAGER_FEE,
   currentSeason, eloK, memoryPersistence,
 } from '../src/persist.js';
 import type { MatchRecord } from '../src/persist.js';
@@ -141,12 +141,14 @@ test('K-factor: provisional while finding your level, calm at the top', () => {
   assert.equal(eloK(2400, 50), 10, 'top of the ladder moves slowly');
 });
 
-test('seasons are arithmetic over a fixed epoch — no cron, no season table', () => {
-  const day = 86_400_000;
-  assert.equal(currentSeason(SEASON_EPOCH_MS), 1);
-  assert.equal(currentSeason(SEASON_EPOCH_MS + (SEASON_DAYS - 1) * day), 1);
-  assert.equal(currentSeason(SEASON_EPOCH_MS + SEASON_DAYS * day), 2);
-  assert.equal(currentSeason(SEASON_EPOCH_MS + 2 * SEASON_DAYS * day), 3);
+test('SEASON 0 · OPEN BETA: the clock is frozen until the owner starts season 1', () => {
+  // Owner decision 2026-07-29 (0029): current_season() returns 0
+  // unconditionally. The earlier 21-day placeholder would have auto-rolled on
+  // Aug 17 and wiped every beta rating on a boundary nobody decided — a
+  // season starts when the OWNER says so, via a migration + this mirror.
+  assert.equal(currentSeason(), 0);
+  assert.match(SEASON_LABEL, /SEASON 0/);
+  assert.match(SEASON_LABEL, /OPEN BETA/);
 });
 
 test('grinding PvE never ages a player out of the provisional K', async () => {

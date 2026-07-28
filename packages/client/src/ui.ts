@@ -3349,7 +3349,32 @@ export interface RankRow {
   defend_losses?: number;
 }
 
-export const RANK_TABS = ['ALL', 'HUMANS', 'AGENTS'] as const;
+export const RANK_TABS = ['ALL', 'HUMANS', 'AGENTS', 'SEASON'] as const;
+
+/** Messaging for the current season, mirrored from @af/server persist.ts —
+ *  the clock is FROZEN at season 0 until the owner starts season 1. */
+export const SEASON_LABEL = 'SEASON 0 · OPEN BETA';
+
+/**
+ * One row of `/leaderboard?board=season` (the `season_board` view): the Elo
+ * ladder, ranked ONLY for profiles past the provisional gate; everyone else
+ * is listed below with a null rank ("placements"). Absent on a pre-0024
+ * server, which ignores ?board= and returns RankRow-shaped rows — the
+ * renderer tolerates that by falling back through the shared field names.
+ */
+export interface SeasonRow {
+  name: string;
+  is_agent: boolean;
+  /** Season Elo (the view aliases season_elo to `elo`). */
+  elo?: number;
+  /** Rated matches this season — the provisional gate counts to 10. */
+  rated?: number;
+  level: number;
+  wins: number;
+  losses: number;
+  qualified?: boolean;
+  rank: number | null;
+}
 
 /**
  * Public standings screen (M5): humans and agents ranked together, with tab
@@ -3363,12 +3388,14 @@ export const drawRanks = (
   error: string,
   tick: number,
   you?: string,
+  seasonRows?: SeasonRow[] | null, // the SEASON tab's board (null = loading)
 ): void => {
   drawMenuBackdrop(ctx);
   ctx.fillStyle = '#0a0616cc';
   ctx.fillRect(0, 0, VW, VH);
 
-  display(ctx, 'LEADERBOARD', VW / 2, 64, 40, { glow: 'rgba(255,209,102,0.5)' });
+  display(ctx, 'LEADERBOARD', VW / 2, 58, 40, { glow: 'rgba(255,209,102,0.5)' });
+  label(ctx, SEASON_LABEL, VW / 2, 80, 12, '#8ad6ffcc');
 
   // Escape hatch back to the title — phones have no ESC key.
   // (Previously an invisible bottom-left zone; the footer said "TAP HERE"
@@ -3383,11 +3410,12 @@ export const drawRanks = (
   ctx.lineWidth = 1;
   label(ctx, '‹ TITLE', VW - 16 - backW / 2, 12 + backH / 2 + 4, 12, '#ffffffcc');
 
-  // Tabs — ◄ ► cycles, arcade style.
+  // Tabs — ◄ ► cycles, arcade style. Spacing derives from the count so a
+  // new tab never overlaps its neighbours.
   const tabY = 104;
   RANK_TABS.forEach((t, i) => {
-    const x = VW / 2 + (i - 1) * 170;
-    tapZone(x - 80, tabY - 16, 160, 32, `ranktab:${i}`);
+    const x = VW / 2 + (i - (RANK_TABS.length - 1) / 2) * 150;
+    tapZone(x - 70, tabY - 16, 140, 32, `ranktab:${i}`);
     if (i === tab) {
       const pulse = 1 + 0.04 * Math.sin(tick / 10);
       display(ctx, t, x, tabY, 18, { scale: pulse, glow: 'rgba(255,209,102,0.55)' });
@@ -3403,24 +3431,65 @@ export const drawRanks = (
   // Re-spaced when TICKETS joined (0021) — everything shifts left to make a
   // column of room on the right without widening the panel.
   const cols = { rank: 36, name: 78, kind: 330, lv: 440, xp: 500, wl: 585, tix: 692 };
+  const seasonTab = tab === 3;
+  const agentsTab = tab === 2;
   label(ctx, '#', boxX + cols.rank, boxY + 28, 12, GOLD_LT);
   label(ctx, 'FIGHTER', boxX + cols.name + 60, boxY + 28, 12, GOLD_LT);
   label(ctx, 'TYPE', boxX + cols.kind + 24, boxY + 28, 12, GOLD_LT);
-  label(ctx, 'LV', boxX + cols.lv, boxY + 28, 12, GOLD_LT);
-  label(ctx, 'XP', boxX + cols.xp + 16, boxY + 28, 12, GOLD_LT);
-  label(ctx, 'W — L', boxX + cols.wl, boxY + 28, 12, GOLD_LT);
-  label(ctx, 'TICKETS', boxX + cols.tix, boxY + 28, 12, GOLD_LT);
+  if (seasonTab) {
+    // The Elo ladder: rating is THE ranked number here; the right side says
+    // whether a fighter holds a rank at all (10 rated matches to qualify).
+    label(ctx, 'ELO', boxX + cols.lv + 10, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'W — L', boxX + cols.wl - 30, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'STATUS', boxX + cols.tix - 10, boxY + 28, 12, GOLD_LT);
+  } else if (agentsTab) {
+    // The DEFEND record (ADR 0009 step 4) is what agent rank MEANS — how it
+    // holds up when humans come for it — so it replaces the grind columns.
+    label(ctx, 'LV', boxX + cols.lv, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'DEF ELO', boxX + cols.xp + 16, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'DEFENSE', boxX + cols.wl + 4, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'TICKETS', boxX + cols.tix, boxY + 28, 12, GOLD_LT);
+  } else {
+    label(ctx, 'LV', boxX + cols.lv, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'XP', boxX + cols.xp + 16, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'W — L', boxX + cols.wl, boxY + 28, 12, GOLD_LT);
+    label(ctx, 'TICKETS', boxX + cols.tix, boxY + 28, 12, GOLD_LT);
+  }
   ctx.fillStyle = '#ffffff22';
   ctx.fillRect(boxX + 16, boxY + 38, boxW - 32, 1);
 
+  const activeRows = seasonTab ? seasonRows : rows;
   if (error) {
     label(ctx, `⚠ ${error}`, VW / 2, boxY + boxH / 2, 15, '#ff9d9d');
     label(ctx, 'is the match server running?  npm run server', VW / 2, boxY + boxH / 2 + 26, 12, '#ffffff77');
-  } else if (!rows) {
+  } else if (!activeRows) {
     const dots = '.'.repeat(1 + (Math.trunc(tick / 20) % 3));
     label(ctx, `FETCHING STANDINGS${dots}`, VW / 2, boxY + boxH / 2, 15, '#f7e0a3');
+  } else if (seasonTab) {
+    const srows = seasonRows ?? [];
+    if (srows.length === 0) {
+      label(ctx, 'NO SEASON MATCHES YET — WIN A WAGER TO START PLACEMENTS', VW / 2, boxY + boxH / 2, 14, '#ffffff88');
+    }
+    srows.slice(0, 10).forEach((r, i) => {
+      const y = boxY + 62 + i * 30;
+      const isYou = !!you && r.name === you;
+      if (isYou) {
+        ctx.fillStyle = '#ffd16622';
+        ctx.fillRect(boxX + 12, y - 18, boxW - 24, 26);
+      }
+      const qualified = r.qualified === true && r.rank != null;
+      const medal = r.rank === 1 ? '#ffd166' : r.rank === 2 ? '#cfd8e3' : r.rank === 3 ? '#d9915b' : '#ffffffbb';
+      label(ctx, qualified ? String(r.rank) : '—', boxX + cols.rank, y, 15, qualified ? medal : '#ffffff44');
+      label(ctx, r.name.slice(0, 22).toUpperCase() + (isYou ? '  (YOU)' : ''), boxX + cols.name, y, 15,
+        isYou ? GOLD_LT : qualified ? '#ffffffdd' : '#ffffff88', 'left');
+      label(ctx, r.is_agent ? '🤖 AGENT' : 'HUMAN', boxX + cols.kind, y, 12, r.is_agent ? '#8fd0ff' : '#8fe8a0', 'left');
+      label(ctx, String(r.elo ?? 1200), boxX + cols.lv + 10, y, 15, qualified ? '#ffe28c' : '#ffffff77');
+      label(ctx, `${r.wins} — ${r.losses}`, boxX + cols.wl - 30, y, 13, '#ffffff99');
+      label(ctx, qualified ? 'QUALIFIED' : `PLACEMENTS ${Math.min(r.rated ?? 0, 10)}/10`,
+        boxX + cols.tix - 10, y, qualified ? 12 : 11, qualified ? '#8fe8a0' : '#ffffff66');
+    });
   } else {
-    const filtered = rows.filter((r) =>
+    const filtered = rows!.filter((r) =>
       tab === 0 || (tab === 1 ? !r.is_agent : r.is_agent));
     if (filtered.length === 0) {
       label(ctx, 'NO RANKED FIGHTERS YET — WIN A MATCH TO CLAIM #1', VW / 2, boxY + boxH / 2, 14, '#ffffff88');
@@ -3437,8 +3506,19 @@ export const drawRanks = (
       label(ctx, r.name.slice(0, 22).toUpperCase() + (isYou ? '  (YOU)' : ''), boxX + cols.name, y, 15, isYou ? GOLD_LT : '#ffffffdd', 'left');
       label(ctx, r.is_agent ? '🤖 AGENT' : 'HUMAN', boxX + cols.kind, y, 12, r.is_agent ? '#8fd0ff' : '#8fe8a0', 'left');
       label(ctx, String(r.level), boxX + cols.lv, y, 15, '#ffffffdd');
-      label(ctx, String(r.xp), boxX + cols.xp + 16, y, 13, '#ffffff99');
-      label(ctx, `${r.wins} — ${r.losses}`, boxX + cols.wl, y, 14, '#ffffffdd');
+      if (agentsTab) {
+        // Defend columns (pre-0028 server: dim dashes, not fake zeros).
+        const held = r.defend_wins ?? 0;
+        const fell = r.defend_losses ?? 0;
+        const fresh = r.defend_elo == null || (held === 0 && fell === 0);
+        label(ctx, r.defend_elo == null ? '—' : String(r.defend_elo),
+          boxX + cols.xp + 16, y, 13, fresh ? '#ffffff44' : '#ffe28c');
+        label(ctx, fresh ? 'UNTESTED' : `${held} — ${fell}`,
+          boxX + cols.wl + 4, y, fresh ? 11 : 14, fresh ? '#ffffff44' : '#ffffffdd');
+      } else {
+        label(ctx, String(r.xp), boxX + cols.xp + 16, y, 13, '#ffffff99');
+        label(ctx, `${r.wins} — ${r.losses}`, boxX + cols.wl, y, 14, '#ffffffdd');
+      }
       // A column of zeros reads as a broken feature, so an empty case is a
       // dim dash. Agent-class fighters can never mint, so theirs stays dashed
       // by construction — that is honest, not a gap.

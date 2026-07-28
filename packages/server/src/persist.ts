@@ -107,14 +107,17 @@ export const ELO_FLOOR = 100;
 /** Rated matches before the provisional (fast-converging) K-factor retires. */
 export const ELO_PROVISIONAL = 10;
 /**
- * Season 1 opens at this instant; 21 days is the ADR 0009 PLACEHOLDER length
- * (owner sets the real cadence before season 1 closes). Seasons are pure
- * arithmetic over a fixed epoch — no cron, no season table, no ops.
+ * SEASON 0 · OPEN BETA (owner decision 2026-07-29, mirrors 0029): the season
+ * clock is FROZEN at 0 until the owner picks season 1's start date (after
+ * 2026-08-17). Freezing is not just messaging — the earlier 21-day
+ * placeholder arithmetic would have auto-rolled on Aug 17 and the lazy
+ * rollover would have wiped every beta rating on a boundary nobody decided.
+ * Season 1 = a future migration restoring epoch arithmetic (returning >= 1)
+ * anchored at the chosen date, plus this mirror; the lazy rollover in
+ * recordMatch then re-bases everyone on their first season-1 match.
  */
-export const SEASON_EPOCH_MS = Date.UTC(2026, 6, 27); // 2026-07-27T00:00:00Z
-export const SEASON_DAYS = 21;
-export const currentSeason = (now: number = Date.now()): number =>
-  1 + Math.floor((now - SEASON_EPOCH_MS) / (SEASON_DAYS * 86_400_000));
+export const SEASON_LABEL = 'SEASON 0 · OPEN BETA';
+export const currentSeason = (): number => 0;
 
 /** Standard Elo expectation. Float math is fine — determinism binds @af/core only. */
 export const eloShift = (mine: number, theirs: number, score: number, k: number): number =>
@@ -830,7 +833,7 @@ export const memoryPersistence = (): Persistence => {
         let minted = false;
         if (r.mode === 'wager' && s.won && !sub.startsWith('agent:') && !r.agents[side]
           && !tickets.has(r.matchId)) {
-          tickets.set(r.matchId, { sub, season: 1, redeemed: false });
+          tickets.set(r.matchId, { sub, season: currentSeason(), redeemed: false });
           minted = true;
         }
         out.push({

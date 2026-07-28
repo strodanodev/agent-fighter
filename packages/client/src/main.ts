@@ -25,7 +25,7 @@ import {
   drawVsCard, drawWallet, resetTaps, SHOP_SPIN_TICKS, setBgVideo, setGameLogo, setLogo,
   setStageAsset, setUiKit, setVendingArt, tapHit, tapZone, worldTransform,
 } from './ui.js';
-import type { AgentOpponent, Cam, ExtractView, HudFx, HudId, Mode, RankRow, ShopInventoryEntry, ShopReveal, XpInfo } from './ui.js';
+import type { AgentOpponent, Cam, ExtractView, HudFx, HudId, Mode, RankRow, SeasonRow, ShopInventoryEntry, ShopReveal, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit, loadVendingArt } from './chrome.js';
 import type { BgVideo, StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
@@ -384,6 +384,8 @@ const matchHttpUrl = (): string => matchWsUrl().replace(/^ws/, 'http');
 
 // Public standings (drawRanks) — fetched from the match server on entry.
 let ranksRows: RankRow[] | null = null;
+/** The SEASON tab's Elo board (?board=season) — fetched alongside. */
+let seasonRows: SeasonRow[] | null = null;
 let ranksTab = 0;
 let ranksErr = '';
 let ranksBusy = false;
@@ -392,6 +394,7 @@ const fetchRanks = (): void => {
   if (ranksBusy) return;
   ranksBusy = true;
   ranksRows = null;
+  seasonRows = null;
   ranksErr = '';
   void fetchT(`${matchHttpUrl()}/leaderboard?limit=100`)
     .then(async (res) => {
@@ -400,6 +403,14 @@ const fetchRanks = (): void => {
     })
     .catch((e) => { ranksErr = (e as Error).message || 'unreachable'; })
     .finally(() => { ranksBusy = false; });
+  // Best-effort: a pre-0024 server ignores ?board= and returns progression
+  // rows, which the SEASON renderer tolerates (shared field names).
+  void fetchT(`${matchHttpUrl()}/leaderboard?board=season&limit=100`)
+    .then(async (res) => {
+      if (res.ok) seasonRows = (await res.json()) as SeasonRow[];
+      else seasonRows = [];
+    })
+    .catch(() => { seasonRows = []; });
 };
 
 // ---- AGENT OPPONENT identity (select-screen badge) ------------------------
@@ -2561,7 +2572,7 @@ const frame = (steps = 1): void => {
     }
   } else if (screen === 'ranks') {
     drawRanks(ctx, ranksRows, ranksTab, ranksErr, uiTick,
-      authName() ?? (DEV_GUEST ?? undefined));
+      authName() ?? (DEV_GUEST ?? undefined), seasonRows);
     if (pressedThisFrame.has('ArrowLeft') || pressedThisFrame.has('KeyA')) {
       ranksTab = (ranksTab + RANK_TABS.length - 1) % RANK_TABS.length;
     }
