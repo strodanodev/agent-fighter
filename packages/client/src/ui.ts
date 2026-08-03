@@ -1469,7 +1469,7 @@ export const drawTitle = (
 
   const menuY0 = barY + 30;
   // AGENT ARCADE is FREE-TO-PLAY: the menu is always live. Signing in is only
-  // needed for RANKED wager + the account tools — a guest sees the same layout,
+  // needed for RANKED PVP + the account tools — a guest sees the same layout,
   // just with sign-in copy and those actions routed through the AIR dialog.
   const guest = !menu.signedIn;
   {
@@ -1486,13 +1486,13 @@ export const drawTitle = (
     }
     // 2-player local is disabled (single-controller / mobile focus) — omitted.
     // Mode rows are big button plates (≥44px tall — a real finger target on a
-    // phone), each with a one-line subtitle explaining the stakes.
+    // phone), each with a one-line subtitle naming the entry and the reward.
     const rows: [Mode, string, string][] = [
       ['cpu', 'AGENT ARCADE', guest
         ? 'FREE TO PLAY · BEAT EVERY AGENT · NO SIGN-IN'
         : 'RANKED · 1 CREDIT PER RUN · BEAT EVERY AGENT'],
-      ['online', 'ONLINE WAGER', guest
-        ? 'SIGN IN TO WAGER · WIN A 🎟 TICKET'
+      ['online', 'RANKED PVP', guest
+        ? 'SIGN IN TO PLAY RANKED · WIN A 🎟 TICKET'
         : '10 CR ENTRY · WINNER TAKES A 🎟 TICKET'],
     ];
     const btnW = Math.min(560, VW - 48), btnH = 46, btnGap = 10;
@@ -1888,7 +1888,7 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
         : { from: '#ffffff', mid: '#cfd8e3', to: '#6b7686', outline: '#101318', align: 'left' });
     label(ctx, v.reveal.desc, rx + 118, ry + 104, 14, '#ffffffdd', 'left');
     label(ctx, `“${v.reveal.flavor}”`, rx + 118, ry + 126, 11, '#ffffff88', 'left');
-    label(ctx, 'CARRY IT INTO ARENA OR WAGER · DRINK IT MID-FIGHT (TAP / R)', rx + 118, ry + 158, 10, '#8fd0ff', 'left');
+    label(ctx, 'CARRY IT INTO ARCADE OR RANKED PVP · DRINK IT MID-FIGHT (TAP / R)', rx + 118, ry + 158, 10, '#8fd0ff', 'left');
     ctx.restore();
     // Sparkle ring on a fresh LV3.
     if (tier === 3 && v.revealAge < 40) {
@@ -1981,7 +1981,7 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
     }
     // Narrow segments get their tags to the right of the bar.
     label(ctx, 'LV 2 · 25%   LV 3 · 5%', obX + obW * 0.7 + 6, obY + 31, 9, '#ffffff88', 'left');
-    label(ctx, '4 · CARRY ONE INTO ARENA OR WAGER, THEN TAP THE CAN', lx, ry + 178, 12, '#8fd0ff', 'left');
+    label(ctx, '4 · CARRY ONE INTO ARCADE OR RANKED PVP, THEN TAP THE CAN', lx, ry + 178, 12, '#8fd0ff', 'left');
     label(ctx, '(OR PRESS R) TO DRINK IT MID-FIGHT. USED = GONE.', lx + 14, ry + 196, 12, '#8fd0ff', 'left');
   }
 
@@ -2051,7 +2051,7 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
     bevel(ctx, px, py, pw, ph, PANEL, GOLD_LT, GOLD_DK, 3);
     ctx.restore();
     display(ctx, `INSERT ${v.cost} CR?`, cx, py + 46, 28, { glow: 'rgba(255,209,102,0.55)' });
-    label(ctx, 'ONE RANDOM ENERGY DRINK — NO REFUNDS, NO RE-ROLLS', cx, py + 74, 11, '#ffffffcc');
+    label(ctx, 'ONE RANDOM ENERGY DRINK — NO REFUNDS, NO EXCHANGES', cx, py + 74, 11, '#ffffffcc');
     if (v.credits !== null) {
       label(ctx, `BALANCE AFTER: ${v.credits - v.cost} CR`, cx, py + 94, 12, GOLD_LT);
     }
@@ -3596,7 +3596,7 @@ export const drawRanks = (
   } else if (seasonTab) {
     const srows = seasonRows ?? [];
     if (srows.length === 0) {
-      label(ctx, 'NO SEASON MATCHES YET — WIN A WAGER TO START PLACEMENTS', VW / 2, boxY + boxH / 2, 14, '#ffffff88');
+      label(ctx, 'NO SEASON MATCHES YET — WIN A RANKED PVP MATCH TO START PLACEMENTS', VW / 2, boxY + boxH / 2, 14, '#ffffff88');
     }
     srows.slice(0, 10).forEach((r, i) => {
       const y = boxY + 62 + i * 30;
@@ -4229,9 +4229,9 @@ export const drawNetError = (
   // What happens to the money — the first thing a player wants to know.
   label(ctx, 'THE SERVER SETTLES THIS MATCH FROM ITS OWN RECORD.', VW / 2, boxY + 108, 13, '#ffffffcc');
   label(ctx, mode === 'friendly'
-    ? 'FRIENDLY MATCH — NOTHING WAS STAKED, NOTHING IS LOST'
+    ? 'FRIENDLY MATCH — NO ENTRY FEE, NOTHING IS LOST'
     : mode === 'wager'
-      ? 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE THE POT IS REFUNDED'
+      ? 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE BOTH ENTRIES ARE REFUNDED'
       : 'IF IT WAS ALREADY DECIDED THE RESULT STANDS · OTHERWISE YOUR CREDIT IS REFUNDED',
   VW / 2, boxY + 128, 11, '#ffd166');
 
@@ -4286,7 +4286,7 @@ export const drawOpponentGone = (
     from: '#ffe9a3', mid: '#ffd166', to: '#a5711a', outline: '#2a1c04',
   });
   label(ctx, friendly
-    ? "IF THEY DON'T RETURN, THE ROUND IS YOURS — NOTHING WAS STAKED"
+    ? "IF THEY DON'T RETURN, THE ROUND IS YOURS — NO ENTRY WAS CHARGED"
     : "IF THEY DON'T RETURN, YOU WIN BY FORFEIT",
   VW / 2, boxY + 146, 11, '#ffd166');
 };

@@ -1350,11 +1350,11 @@ const installOnlineMatch = (): void => {
         // Dare-vs-agent (ADR 0006): the pinned personality is the tell.
         s.solo?.personality ? 'VS A COACHED AGENT · RANKED · SERVER-VERIFIED' : 'RANKED · SERVER-VERIFIED']
       : s.mode === 'friendly'
-        ? ['FRIENDLY CHALLENGE      NO FEE · NO POT · NO RECORDS', 'BRAGGING RIGHTS ONLY · SERVER-VERIFIED']
-        // TICKETS (ADR 0009): both entries burn — say so plainly. Hiding the
-        // burn behind "winner takes all" would be lying about money.
+        ? ['FRIENDLY CHALLENGE      NO FEE · NO REWARDS · NO RECORDS', 'BRAGGING RIGHTS ONLY · SERVER-VERIFIED']
+        // TICKETS (ADR 0009): both entries burn — say so plainly. Nobody wins
+        // the other player's credits; the prize is the ticket and the rating.
         : [`ENTRY −${s.fee ?? 10} CR      BOTH ENTRIES BURN      WINNER TAKES A 🎟 TICKET`,
-          'WAGER · SERVER-VERIFIED · TICKETS SHOW ON THE LEADERBOARD'];
+          'RANKED PVP · SERVER-VERIFIED · TICKETS SHOW ON THE LEADERBOARD'];
   // CONSUMABLES: the pinned loadout is part of the stakes — show what's
   // carried (server echo = the truth, not what the player asked for).
   const myDrinks = s.items?.[s.side] ?? [];
@@ -2147,7 +2147,7 @@ const tickSelect = (): void => {
         if (!token) { screen = 'title'; showToast('ENTER AGENT ARCADE FROM THE TITLE'); return; }
         startArcadeRanked(token);
       } else if (!isSignedIn()) {
-        // WAGER needs the account for escrow — a guest who reached select via
+        // RANKED PVP needs the account for escrow — a guest who reached select via
         // "change fighter" is bounced to sign-in rather than queued unpaid.
         locked = [false, false];
         void authLogin();
@@ -2283,12 +2283,12 @@ const frame = (steps = 1): void => {
     };
     /**
      * Both modes now route through the select screen first — you pick your
-     * fighter before entering the match (ONLINE WAGER stakes credits, so a
+     * fighter before entering the match (RANKED PVP charges credits, so a
      * blind quick-queue was a footgun; AGENT ARCADE locks the pick for the
      * whole run). Select's lock handler does the actual queue.
      */
     const launchMode = (): void => {
-      // RANKED WAGER stakes real credits → needs the AIR account for escrow.
+      // RANKED PVP charges real credits → needs the AIR account for escrow.
       // A guest here opens sign-in instead of queuing. (On touch the dialog is
       // fired in-gesture from the pointerdown handler; this covers desktop
       // Enter and any keyboard fall-through — authLogin() no-ops if already busy.)
@@ -2739,10 +2739,10 @@ const frame = (steps = 1): void => {
     ctx.fillText(arcadeQ
       ? 'RANKED GAUNTLET · 1 CREDIT PER RUN · BEAT EVERY AGENT'
       : friendlyQ
-        ? `FRIENDLY · FREE · NO POT · ROOM ${friendlyRoom}`
+        ? `FRIENDLY · FREE · UNRANKED · ROOM ${friendlyRoom}`
         : solo
           ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
-          : 'WAGER · 10 CR EACH · BOTH BURN · WINNER TAKES A 🎟 TICKET', VW / 2, VH / 2 - 4);
+          : 'RANKED PVP · 10 CR ENTRY EACH · BOTH BURN · WINNER TAKES A 🎟 TICKET', VW / 2, VH / 2 - 4);
     ctx.font = '13px "Courier New", monospace';
     ctx.fillStyle = '#ffffff88';
     ctx.fillText(failed
@@ -3180,11 +3180,11 @@ const frame = (steps = 1): void => {
       ctx.textAlign = 'center';
       if (net.result) {
         const ok = net.result.reason === 'verified';
-        const pot = net.setup?.mode === 'wager' && (net.setup.fee ?? 0) > 0
-          ? ` · POT ${(net.setup.fee ?? 0) * 2} CR` : '';
+        const entry = net.setup?.mode === 'wager' && (net.setup.fee ?? 0) > 0
+          ? ` · ${net.setup.fee ?? 0} CR ENTRY EACH` : '';
         ctx.fillStyle = ok ? '#7ee85a' : '#ffd166';
         ctx.fillText(
-          ok ? `✓ SERVER-VERIFIED RESULT · ${net.result.rounds[0]}-${net.result.rounds[1]}${pot}`
+          ok ? `✓ SERVER-VERIFIED RESULT · ${net.result.rounds[0]}-${net.result.rounds[1]}${entry}`
             : `RESULT: ${net.result.reason.toUpperCase()}`,
           VW / 2, VH - 44);
       } else if (net.status === 'error') {

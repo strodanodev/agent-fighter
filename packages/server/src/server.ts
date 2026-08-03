@@ -1339,7 +1339,7 @@ export const createMatchServer = (opts: {
         // queue by one client, so the while loop still terminates.
         if (c0.identity?.sub && c0.identity.sub === c1.identity?.sub) {
           c1.state = 'lobby';
-          send(c1, { t: 'error', msg: 'this account is already queued for a wager match' });
+          send(c1, { t: 'error', msg: 'this account is already queued for a ranked pvp match' });
           queue.unshift(c0);
           continue;
         }
@@ -1355,7 +1355,7 @@ export const createMatchServer = (opts: {
             const poor = e instanceof InsufficientCredits ? e.side : 0;
             const [broke, ok] = poor === 0 ? [c0, c1] : [c1, c0];
             broke.state = 'lobby';
-            send(broke, { t: 'error', code: 'credits', msg: `wager needs ${fee} credits` });
+            send(broke, { t: 'error', code: 'credits', msg: `ranked pvp needs ${fee} credits` });
             queue.unshift(ok);
             continue;
           }
@@ -1935,7 +1935,7 @@ export const createMatchServer = (opts: {
           // Fast pre-check for a friendly error; escrow re-checks atomically.
           const fee = mode === 'solo' ? SOLO_FEE : WAGER_FEE;
           if (persistence && (c.account?.credits ?? 0) < fee) {
-            return send(c, { t: 'error', code: 'credits', msg: `${mode === 'solo' ? 'ranked' : 'wager'} match needs ${fee} credit${fee > 1 ? 's' : ''}` });
+            return send(c, { t: 'error', code: 'credits', msg: `${mode === 'solo' ? 'ranked' : 'ranked pvp'} match needs ${fee} credit${fee > 1 ? 's' : ''}` });
           }
           // DARE-VS-AGENT / SPARRING (ADR 0006): solo, but the opponent is a
           // TRAINED agent resolved from a dare code. Resolve BEFORE queueing
