@@ -59,6 +59,55 @@ Rule 2 exists because **browsers block `ws://` from an https origin** as mixed
 content. The production default must be `wss://` or online play is dead before
 a packet moves. Railway terminates TLS, so the server itself stays plain `ws`.
 
+## Shipping assets (characters + pets): `npm run ship`
+
+For **asset** changes — a character authored in Studio, a pet and its frames —
+do not run the deploy steps by hand. `tools/ship-assets.mjs` does the whole
+thing and refuses to proceed when something is wrong.
+
+**WHICH FOLDER YOU ARE IN DECIDES WHICH COMMAND WORKS.** The repo is
+`AGENT FIGHTER\agent-fighter\`; the parent `AGENT FIGHTER\` wrapper has no
+`package.json`, so npm there walks up to a stray home-dir one and fails with a
+bare `Missing script: "ship"`. Both spellings do the identical thing:
+
+```bash
+# from the WRAPPER folder (AGENT FIGHTER\) — use the .cmd launcher:
+.\ship --dry-run
+.\ship
+.\ship -m "add nullpup"
+
+# from the REPO folder (AGENT FIGHTER\agent-fighter\) — npm resolves:
+npm run ship -- --dry-run          # print the plan, change nothing
+npm run ship                       # verify → build → commit → push → deploy both
+npm run ship -- -m "add nullpup"   # explicit commit message
+npm run ship -- --no-deploy        # commit + push only
+```
+
+`.\ship` just `cd`s into the repo and forwards every argument, so anything
+below that works with one works with the other.
+
+It exists because every one of these has bitten us at least once:
+
+| Guard | The failure it prevents |
+|---|---|
+| repo check | the parent `AGENT FIGHTER/` wrapper is a different, stray git repo |
+| `rehash --check` | `versionHash` drift → online play dies with "bundle hash mismatch" |
+| WIP guard | `railway up` / `vercel deploy` upload the WORKING TREE, so an unfinished Studio character ships **selectable and broken** |
+| **pet manifest** | a `pet.json` naming a frame that is missing, or that exists but is not committed → **404 art in prod** |
+| paired deploy | both tiers read these directories off disk; one-sided leaves the server rolling a pet the client cannot draw |
+| engine skew | server `engine` ≠ client `ENGINE_VERSION` → every online match hello-rejects |
+
+The pet manifest guard runs twice on purpose: once up front (is every
+referenced frame on disk?) and again after staging, immediately before the
+commit (is every referenced frame actually going into it?). The second one is
+the check that a manifest+art pair cannot drift apart — frames dismissed as
+rejects in one session became a real animation in the next, and the manifest
+started pointing at them.
+
+Post-deploy it polls both tiers until each confirms the new assets: the client
+must serve `/pets/<id>/pet.json` **and its first frame**, and the server's
+health must list the pet ids (`pets` in the health JSON) plus the full roster.
+
 ## Deploying the match server
 
 ```bash

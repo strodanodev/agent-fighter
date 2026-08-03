@@ -1,0 +1,13 @@
+{
+  "id": "bird",
+  "name": "BIRD",
+  "desc": "",
+  "flavor": "",
+  "tint": "#ff52d1",
+  "sizePx": 44,
+  "fps": 1,
+  "motion": "float",
+  "sprites": [
+    "frame0.png"
+  ]
+}

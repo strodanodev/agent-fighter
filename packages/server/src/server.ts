@@ -2867,7 +2867,10 @@ export const createMatchServer = (opts: {
     for (const c of clients) if (c.agent) agentsOnline++;
     return json(res, 200, {
       game: 'agent-fighter', engine: ENGINE_VERSION, protocol: PROTOCOL_VERSION,
-      characters: characterIds, stages: stageIds,
+      // `pets` rides alongside characters/stages so a deploy script can prove
+      // THIS tier actually picked up an asset change — the server reads pets/
+      // off disk at boot, so "the client has it" says nothing about the server.
+      characters: characterIds, stages: stageIds, pets: petCatalog.map((p) => p.id),
       online: clients.size, agents: agentsOnline, queued: queue.length,
       persistence: !!persistence,
     });

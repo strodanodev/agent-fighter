@@ -2,7 +2,7 @@
   "name": "agent-fighter",
   "private": true,
   "version": "0.0.1",
-  "description": "Agent Fighter — browser 2D fighting game. Milestone 0: deterministic sim skeleton.",
+  "description": "Agent Fighter \u2014 browser 2D fighting game. Milestone 0: deterministic sim skeleton.",
   "workspaces": [
     "packages/*"
   ],
@@ -26,7 +26,7 @@
     "deploy": "node tools/deploy.mjs",
     "deploy:server": "node tools/deploy.mjs server",
     "deploy:client": "node tools/deploy.mjs client",
-    "ship": "node tools/ship-characters.mjs"
+    "ship": "node tools/ship-assets.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.24.0",

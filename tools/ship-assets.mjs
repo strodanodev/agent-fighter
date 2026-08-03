@@ -1,10 +1,19 @@
 #!/usr/bin/env node
 /**
- * `npm run ship` — one command to take newly-authored characters from the
- * working tree to LIVE prod, doing every check + step we otherwise do by hand.
+ * `npm run ship` — one command to take newly-authored ASSETS (characters AND
+ * pets) from the working tree to LIVE prod, doing every check + step we
+ * otherwise do by hand.
  *
- * Encodes the lessons from two manual roster deploys (see
- * memory/agent-fighter-deployment.md):
+ * Both asset kinds are read off DISK by BOTH tiers, which is why they ship
+ * together and always as a pair:
+ *   · the Railway match server reads characters/ to re-simulate ledgers and
+ *     pets/ to build its adoption catalog;
+ *   · the Vercel client serves both directories as static art + manifests.
+ * Updating one tier only means the server rolls a pet the client cannot draw,
+ * or verifies a bundle the client does not have.
+ *
+ * Encodes the lessons from two manual roster deploys and the ADR 0011 pets
+ * rollout (see memory/agent-fighter-deployment.md):
  *
  *   1. WRONG-DIRECTORY TRAP. The real repo is the `agent-fighter/` folder; the
  *      parent `AGENT FIGHTER/` wrapper contains a STRAY home-dir git repo. This
@@ -22,10 +31,16 @@
  *      --include-wip (finish it, mark it meta.disabled, or opt in explicitly).
  *   5. ENGINE SKEW. After deploy, the Railway `engine` must equal the client's
  *      ENGINE_VERSION; a mismatch hello-rejects every online match. We verify.
+ *   6. REFERENCED-BUT-MISSING PET ART (2026-08-03, caught one commit before it
+ *      shipped). `pet.json.sprites` is a CONTRACT: an unreferenced file that
+ *      ships is merely waste, but a REFERENCED file that does not ship is a
+ *      404 for that pet's art in prod. Frames left untracked because they
+ *      looked like rejects became a real animation a session later. So every
+ *      referenced frame must exist on disk AND be tracked/staged, or we abort.
  *
  * Usage:
  *   npm run ship -- [-m "commit message"] [flags]
- *   node tools/ship-characters.mjs [-m "commit message"] [flags]
+ *   node tools/ship-assets.mjs [-m "commit message"] [flags]
  *
  * Flags:
  *   -m <msg>       Commit message. Default: auto-derived from the changed roster.
@@ -44,6 +59,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CHARACTERS = join(ROOT, 'characters');
+const PETS = join(ROOT, 'pets');
 const HEALTH = 'https://match-server-production.up.railway.app/';
 const VERCEL_ALIAS = 'https://agent-fighter.vercel.app';
 
@@ -143,14 +159,76 @@ const incompleteDisabled = newChars.filter((id) => !hasAtlas(id) && isDisabled(i
 const otherTracked = porcelain
   .filter((l) => !l.startsWith('??'))
   .map((l) => l.slice(3))
-  .filter((p) => !p.startsWith('characters/') && !p.startsWith('packages/client/demo/'));
+  .filter((p) => !p.startsWith('characters/') && !p.startsWith('pets/') && !p.startsWith('packages/client/demo/'));
 
-if (touchedChars.size === 0) fail('no character changes in the working tree — nothing to ship. (Author or edit a character in Studio first.)');
+// ── 2b. pets (ADR 0011) ─────────────────────────────────────────────────────
+// A pet is pets/<id>/pet.json + the frames it references. Unlike a character
+// there is no atlas to signal completeness: a pet with NO sprites is perfectly
+// valid (the client draws a procedural companion from its tint). What is NOT
+// valid is a pet.json that names a frame which will not ship.
+const petTracked = (id) => spawnSync('git', ['ls-files', '--error-unmatch', `pets/${id}/pet.json`],
+  { cwd: ROOT, stdio: 'ignore' }).status === 0;
+const petDef = (id) => { try { return JSON.parse(readFileSync(join(PETS, id, 'pet.json'), 'utf8')); } catch { return null; } };
+/** Will this path be in the deploy? Tracked already, or staged right now. */
+const willShip = (rel) =>
+  spawnSync('git', ['ls-files', '--error-unmatch', rel], { cwd: ROOT, stdio: 'ignore' }).status === 0;
+
+const petDirs = existsSync(PETS)
+  ? readdirSync(PETS, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && existsSync(join(PETS, d.name, 'pet.json'))).map((d) => d.name)
+  : [];
+
+const touchedPets = new Set();
+for (const line of porcelain) {
+  const m = line.slice(3).match(/^pets\/([^/]+)\//);
+  if (m) touchedPets.add(m[1]);
+}
+const newPets = [...touchedPets].filter((id) => !petTracked(id));
+const changedPets = [...touchedPets].filter((id) => petTracked(id));
+
+// Validate EVERY pet, not just the touched ones: a manifest broken in an
+// earlier session is exactly the kind of thing that ships silently.
+const petProblems = [];
+const petsMissingArt = new Map(); // id → frames referenced but not shipping
+for (const id of petDirs) {
+  const def = petDef(id);
+  if (!def) { petProblems.push(`${id}: pet.json is unreadable/invalid JSON`); continue; }
+  const sprites = Array.isArray(def.sprites) ? def.sprites : [];
+  const missing = sprites.filter((f) => !existsSync(join(PETS, id, f)));
+  const unshipped = sprites.filter((f) => existsSync(join(PETS, id, f)) && !willShip(`pets/${id}/${f}`));
+  if (missing.length) petProblems.push(`${id}: pet.json references ${missing.join(', ')} — not on disk`);
+  if (unshipped.length) petsMissingArt.set(id, unshipped);
+}
+if (petProblems.length) {
+  fail(`pet manifest problems:\n    ${petProblems.join('\n    ')}\n` +
+    '  Fix the pet.json sprite list in Studio (Pets tab), or restore the files.');
+}
+
+if (touchedChars.size === 0 && touchedPets.size === 0) {
+  fail('no character or pet changes in the working tree — nothing to ship. (Author or edit one in Studio first.)');
+}
 
 // ── 3. the plan ─────────────────────────────────────────────────────────────
 step('Plan');
 if (newChars.length) log(`  ${c.grn}new characters:${c.x} ${newChars.join(', ')}`);
 if (changedChars.length) log(`  ${c.cyn}updated characters:${c.x} ${changedChars.join(', ')}`);
+if (newPets.length) log(`  ${c.grn}new pets:${c.x} ${newPets.join(', ')}`);
+if (changedPets.length) log(`  ${c.cyn}updated pets:${c.x} ${changedPets.join(', ')}`);
+for (const id of petDirs) {
+  const def = petDef(id);
+  const n = Array.isArray(def?.sprites) ? def.sprites.length : 0;
+  if (touchedPets.has(id)) {
+    log(`      ${c.dim}${id}: ${n ? `${n} frame(s)` : 'procedural (no art)'}` +
+      `${def?.motion === 'ground' ? ' · ground' : ' · float'}${c.x}`);
+  }
+}
+// New art that git does not know about yet. NOT an error — `git add pets/`
+// picks it up below — but worth showing, because this is the exact list that
+// once got left behind and would have 404'd in prod.
+if (petsMissingArt.size) {
+  const total = [...petsMissingArt.values()].reduce((a, b) => a + b.length, 0);
+  log(`  ${c.ylw}new pet art to commit:${c.x} ${total} frame(s) across ${petsMissingArt.size} pet(s)`);
+}
 if (otherTracked.length) {
   log(`  ${c.ylw}other modified files:${c.x} ${otherTracked.length}`);
   otherTracked.slice(0, 12).forEach((p) => log(`      ${p}`));
@@ -176,7 +254,11 @@ if (!message) {
   const parts = [];
   if (commitNew.length) parts.push(`add ${commitNew.join(', ')}`);
   if (changedChars.length) parts.push(`update ${changedChars.join(', ')}`);
-  message = `feat(roster): ${parts.join('; ') || 'ship character changes'}`;
+  if (newPets.length) parts.push(`add pet ${newPets.join(', ')}`);
+  if (changedPets.length) parts.push(`update pet ${changedPets.join(', ')}`);
+  const scope = touchedChars.size && touchedPets.size ? 'assets'
+    : touchedPets.size ? 'pets' : 'roster';
+  message = `feat(${scope}): ${parts.join('; ') || 'ship asset changes'}`;
 }
 log(`\n  ${c.b}commit:${c.x} ${message}`);
 log(`  ${c.b}deploy:${c.x} ${flags.noDeploy ? 'NO (--no-deploy) — commit + push only' : 'Railway (server) + Vercel (client), paired'}`);
@@ -200,7 +282,27 @@ ok(`roster manifest: ${expectedRoster.length} characters`);
 
 // ── 6. commit ───────────────────────────────────────────────────────────────
 step('Commit');
-exec('git add', 'git', ['add', 'characters/', 'packages/client/demo/']);
+exec('git add', 'git', ['add', 'characters/', 'pets/', 'packages/client/demo/']);
+
+// THE PET ART CONTRACT, asserted after staging and before the commit: every
+// frame a shipping pet.json names must now be in the index. Staging pets/
+// wholesale should guarantee it — but this is the failure that already reached
+// a commit once, so it gets checked rather than assumed.
+{
+  const staged = new Set(gitLines('diff --cached --name-only'));
+  const orphans = [];
+  for (const id of petDirs) {
+    for (const f of petDef(id)?.sprites ?? []) {
+      const rel = `pets/${id}/${f}`;
+      if (!staged.has(rel) && !willShip(rel)) orphans.push(rel);
+    }
+  }
+  if (orphans.length) {
+    fail(`these pet frames are referenced by a pet.json but are neither committed nor staged:\n    ${orphans.join('\n    ')}\n` +
+      '  They would 404 in prod. `git add` them, or remove them from the pet\'s sprite list.');
+  }
+  ok('pet art contract: every referenced frame is committed or staged');
+}
 if (flags.all || otherTracked.length) {
   // stage the already-modified tracked files so the tree is clean for deploy
   exec('git add (tracked)', 'git', ['add', '-u']);
@@ -237,24 +339,52 @@ const superset = (arr) => arr && want.size <= new Set(arr).size && [...want].eve
 const fetchJson = async (url) => { try { const r = await fetch(url, { cache: 'no-store' }); return await r.json(); } catch { return null; } };
 
 // Vercel alias updates fast; Railway builds async (~2–4 min). Poll both.
+// Pets must land on both tiers too: the client SERVES the art, the server
+// CATALOGS it. Checking one proves nothing about the other.
+const wantPets = new Set(petDirs.filter((id) => !petDef(id)?.disabled));
+const petsLive = async () => {
+  for (const id of touchedPets) {
+    const def = petDef(id);
+    if (!def) return false;
+    const r = await fetch(`${VERCEL_ALIAS}/pets/${id}/pet.json`, { cache: 'no-store' }).catch(() => null);
+    if (!r?.ok) return false;
+    // …and the first referenced frame, which is what actually 404s.
+    const first = def.sprites?.[0];
+    if (first) {
+      const f = await fetch(`${VERCEL_ALIAS}/pets/${id}/${first}`, { cache: 'no-store' }).catch(() => null);
+      if (!f?.ok) return false;
+    }
+  }
+  return true;
+};
+
 let serverOk = false, clientOk = false, health = null, clientRoster = null;
 for (let i = 1; i <= 16 && !(serverOk && clientOk); i++) {
   if (!serverOk) {
     health = await fetchJson(HEALTH);
-    serverOk = health && superset(health.characters) && (!expectedEngine || health.engine === expectedEngine);
+    // `pets` is absent on a server older than the ADR 0011 build — treat that
+    // as "not updated yet" only when we are actually shipping pets.
+    const serverPetsOk = touchedPets.size === 0
+      || (Array.isArray(health?.pets) && [...wantPets].every((id) => health.pets.includes(id)));
+    serverOk = health && superset(health.characters) && serverPetsOk
+      && (!expectedEngine || health.engine === expectedEngine);
   }
   if (!clientOk) {
     clientRoster = await fetchJson(`${VERCEL_ALIAS}/api/characters`);
-    clientOk = superset(clientRoster);
+    clientOk = superset(clientRoster) && await petsLive();
   }
-  log(`  ${c.dim}poll ${i}: server=${serverOk ? 'ok' : `${health?.characters?.length ?? '?'} chars / ${health?.engine ?? '?'}`}  client=${clientOk ? 'ok' : `${clientRoster?.length ?? '?'} chars`}${c.x}`);
+  log(`  ${c.dim}poll ${i}: server=${serverOk ? 'ok' : `${health?.characters?.length ?? '?'} chars / ${health?.pets?.length ?? '?'} pets / ${health?.engine ?? '?'}`}  client=${clientOk ? 'ok' : `${clientRoster?.length ?? '?'} chars`}${c.x}`);
   if (serverOk && clientOk) break;
   if (i < 16) await sleep(20_000);
 }
 
 log('');
-if (clientOk) ok(`Vercel client: ${VERCEL_ALIAS} serves all ${want.size} characters`); else warn(`Vercel client did not show the full roster yet — check ${VERCEL_ALIAS}/api/characters`);
-if (serverOk) ok(`Railway server: full roster, engine ${health.engine}`); else warn(`Railway server not updated yet (async build) — expected engine ${expectedEngine}; poll ${HEALTH}`);
+const petNote = touchedPets.size ? ` + ${touchedPets.size} pet(s) with their art` : '';
+if (clientOk) ok(`Vercel client: ${VERCEL_ALIAS} serves all ${want.size} characters${petNote}`); else warn(`Vercel client did not show everything yet — check ${VERCEL_ALIAS}/api/characters and /pets/<id>/pet.json`);
+if (serverOk) ok(`Railway server: full roster${touchedPets.size ? `, ${health.pets?.length ?? 0} pets in the catalog` : ''}, engine ${health.engine}`); else warn(`Railway server not updated yet (async build) — expected engine ${expectedEngine}; poll ${HEALTH}`);
+if (touchedPets.size && health && !Array.isArray(health.pets)) {
+  warn('this server build predates the pets health field — it cannot confirm its catalog. Redeploy the server, or check its logs for "[pets] N in the catalog".');
+}
 if (health && expectedEngine && health.engine !== expectedEngine) warn(`ENGINE SKEW: server ${health.engine} ≠ client ${expectedEngine} — online play will hello-reject until both match. Redeploy the lagging tier.`);
 
 if (serverOk && clientOk) {
