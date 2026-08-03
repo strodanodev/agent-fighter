@@ -274,8 +274,15 @@ const ROUND_SECONDS = 99;
  *            moved (no golden replay lands a projectile on a grabbing fighter),
  *            but the SIM behavior changed in that scenario, so client and server
  *            must pin the same engine — hence the version bump + paired deploy.
+ * af-core-8: PETS (ADR 0011). Eight new FighterState fields (the five aura
+ *            lines, two regen accumulators, the crit flash) shift the
+ *            serialize layout, so the goldens are re-blessed — but the
+ *            BEHAVIOUR of a pet-less match is unchanged: every aura path is
+ *            gated on a non-zero line, and `rngSeed` (live for the first time,
+ *            as the crit roll) only advances when a fighter with a crit aura
+ *            lands a clean hit. The 61 behavioural tests must not move.
  */
-const ENGINE_VERSION = 'af-core-7';
+const ENGINE_VERSION = 'af-core-8';
 const TUNING_INIT = {
     roundsToWin: 2, // best of 3
     preRoundTicks: 60,
@@ -404,6 +411,116 @@ const ITEMS = [
         desc: '+1½ SUPER BARS', flavor: 'Do not drink near capacitors.' },
 ];
 const itemById = (id) => ITEMS.find((i) => i.id === id);
+
+// ---- core/src/pets.js ----
+/**
+ * PETS — companions with rolled AURAS (ADR 0011). Pure DATA, exactly like
+ * characters (ADR 0002) and drinks (ADR 0007): a small effect vocabulary the
+ * engine interprets, never per-pet code.
+ *
+ * What lives here: the aura vocabulary, its legal ranges, the rarity table
+ * and the pure helpers that read an aura. What does NOT live here:
+ *
+ *   · the pet CATALOG — pets are asset folders on disk (`pets/<id>/pet.json`,
+ *     authored by the Studio, read by the match server), not a registry in
+ *     this file. Adding a pet must never require a core change;
+ *   · the ROLL — the server rolls which pet and which aura values at PURCHASE
+ *     time, so by the time a match starts an aura is a fixed, known set of
+ *     integers. This file must stay free of randomness (guards.test.ts bans
+ *     Math.random in core) and free of sim imports.
+ *
+ * Everything is per-mille integers. No floats go anywhere near the sim.
+ */
+// --------------------------------------------------------------------------
+// Aura ranges and rarity
+// --------------------------------------------------------------------------
+/** Aura line order — protocol for anything that serializes an aura compactly. */
+const AURA_LINES = [
+    'atk', 'def', 'hpRegen', 'crit', 'energyRegen',
+];
+/** Human labels + a one-liner, for the profile page and the VS card. */
+const AURA_LABELS = {
+    atk: 'ATK DAMAGE',
+    def: 'DEFENSE',
+    hpRegen: 'HP REGEN',
+    crit: 'CRITICAL',
+    energyRegen: 'ENERGY REGEN',
+};
+/**
+ * The ADR 0011 "subtle" band: one line rolls in [10, 80] per-mille — 1% to
+ * 8%. The floor exists so a rolled line is never a disappointment; the cap is
+ * what keeps a pet a nudge instead of a build.
+ */
+const AURA_MIN = 10;
+const AURA_MAX = 80;
+/**
+ * Rarity decides HOW MANY lines a pet rolls, not how big they are — a common
+ * pet can out-roll a legendary on its single line. Odds mirror the drink
+ * gacha (ADR 0007).
+ */
+const PET_RARITY_ODDS = [
+    { rarity: 1, pct: 70 },
+    { rarity: 2, pct: 25 },
+    { rarity: 3, pct: 5 },
+];
+/** Lines rolled per rarity (index by rarity; 0 unused). */
+const AURA_LINES_BY_RARITY = [0, 1, 2, 3];
+/** UI accent per rarity (index by rarity; 0 unused). Matches ITEM_TIER_COLORS. */
+const PET_RARITY_COLORS = ['', '#cfd8e3', '#6fd3ff', '#ffd166'];
+const PET_RARITY_LABELS = ['', 'COMMON', 'RARE', 'LEGENDARY'];
+/** Price of one adoption, in credits (mirrored in the pets migration docs). */
+const PET_COST = 25;
+// --------------------------------------------------------------------------
+// Sim-facing constants
+// --------------------------------------------------------------------------
+/**
+ * Regen period, in ticks. Both regen lines pay out `amount` per-mille of the
+ * relevant maximum ONCE per period, spread evenly across it (the sim keeps an
+ * integer accumulator rather than dividing, so nothing rounds away).
+ *
+ * 3600 ticks = 60 seconds. At the 8% cap that is 8% of a health bar per
+ * minute — about 13% across a full 99-second round.
+ */
+const PET_REGEN_PERIOD_TICKS = 3600;
+/**
+ * Extra damage on a critical hit, per-mille (+50%). Fixed, not rolled: the
+ * aura rolls how OFTEN you crit, never how hard.
+ */
+const PET_CRIT_BONUS = 500;
+/** Ticks the renderer is told to flash a crit for (cosmetic; state-driven). */
+const PET_CRIT_FLASH_TICKS = 24;
+// --------------------------------------------------------------------------
+// Helpers
+// --------------------------------------------------------------------------
+const NO_AURA = Object.freeze({
+    atk: 0, def: 0, hpRegen: 0, crit: 0, energyRegen: 0,
+});
+const clampLine = (v) => {
+    const n = Math.trunc(Number(v) || 0);
+    return n <= 0 ? 0 : n > AURA_MAX ? AURA_MAX : n;
+};
+/**
+ * Bound an aura at the boundary (the 2026-07-18 audit lesson). Anything that
+ * arrives from the network, the database or a JSON file goes through this
+ * before it can reach a fighter: a hostile pin cannot mint a 10× aura, and a
+ * missing line reads as 0 rather than NaN.
+ */
+const clampAura = (a) => ({
+    atk: clampLine(a?.atk),
+    def: clampLine(a?.def),
+    hpRegen: clampLine(a?.hpRegen),
+    crit: clampLine(a?.crit),
+    energyRegen: clampLine(a?.energyRegen),
+});
+/** True when an aura would do nothing at all (all five lines zero). */
+const auraIsEmpty = (a) => a.atk === 0 && a.def === 0 && a.hpRegen === 0
+    && a.crit === 0 && a.energyRegen === 0;
+/** The non-zero lines, in AURA_LINES order — what the UI actually lists. */
+const auraLines = (a) => AURA_LINES
+    .map((kind) => ({ kind, amount: a[kind] }))
+    .filter((l) => l.amount > 0);
+/** "+4.5% ATK DAMAGE" — one line as display copy. */
+const auraLineText = (kind, amount) => `+${(amount / 10).toFixed(1).replace(/\.0$/, '')}% ${AURA_LABELS[kind]}`;
 
 // ---- core/src/characters/analog.js ----
 /**
@@ -829,6 +946,21 @@ const setMatchItems = (i0, i1) => {
     matchItems[0] = clampSide(i0);
     matchItems[1] = clampSide(i1);
 };
+/**
+ * PETS (ADR 0011): the per-side AURA carried into the next match. Same
+ * contract as setCharacters/setMatchItems — install between matches, never
+ * mid-sim, identical on every simulating peer (client, server verifier,
+ * rollback re-sim). The pinned aura comes from SMatch.pets and is applied to
+ * each fighter at spawn; `null` (the default) is the pre-pet behavior.
+ *
+ * Values are CLAMPED here, on top of the clamp the server already applied —
+ * bound data at every boundary, so a hostile pin cannot mint a 10× aura.
+ */
+const matchAuras = [{ ...NO_AURA }, { ...NO_AURA }];
+const setMatchPets = (a0, a1) => {
+    matchAuras[0] = clampAura(a0);
+    matchAuras[1] = clampAura(a1);
+};
 /** Effect kind → the small integer stored in FighterState.itemKindN (serialized). */
 const ITEM_KIND_CODE = {
     heal: 1, damageMult: 2, defenseMult: 3, meterGain: 4,
@@ -894,6 +1026,17 @@ const spawnFighter = (x, facing, ch, _side) => ({
     itemDmgLeft: 0,
     itemDef: 0,
     itemDefLeft: 0,
+    // The pet aura is installed by the callers from the pinned loadout (match
+    // start AND every round reset — unlike a drink it is never spent), so
+    // spawnFighter stays side-effect-free.
+    auraAtk: 0,
+    auraDef: 0,
+    auraCrit: 0,
+    auraHpRegen: 0,
+    auraEnergyRegen: 0,
+    auraHpAcc: 0,
+    auraMeterAcc: 0,
+    critFlash: 0,
     dirHist: new Array(HIST_LEN).fill(5),
 });
 const emptyProjectile = () => ({
@@ -944,7 +1087,24 @@ const createGameState = (seed, bounds = DEFAULT_BOUNDS) => {
 const spawnItemFighter = (i, cx, off) => {
     const f = spawnFighter(cx + (i === 0 ? -off : off), i === 0 ? 1 : -1, characters[i], i);
     loadCarriedSlots(f, i);
+    installAura(f, i);
     return f;
+};
+/**
+ * Apply side `i`'s pinned pet aura (ADR 0011). Called at match start AND at
+ * every round reset: an aura is a property of the equipped pet, not a
+ * consumable, so it is on for every round of the match.
+ */
+const installAura = (f, i) => {
+    const a = matchAuras[i];
+    f.auraAtk = a.atk;
+    f.auraDef = a.def;
+    f.auraCrit = a.crit;
+    f.auraHpRegen = a.hpRegen;
+    f.auraEnergyRegen = a.energyRegen;
+    f.auraHpAcc = 0;
+    f.auraMeterAcc = 0;
+    f.critFlash = 0;
 };
 /** Fill a fresh fighter's carried slots from the pinned loadout. */
 const loadCarriedSlots = (f, i) => {
@@ -981,6 +1141,15 @@ const resetRound = (s) => {
         fresh.itemKind2 = prev.itemKind2;
         fresh.itemAmount2 = prev.itemAmount2;
         fresh.itemDur2 = prev.itemDur2;
+        // The pet aura persists for the whole match. Carried from the PREVIOUS
+        // fighter rather than re-read from the module slot, so a match already in
+        // flight can never be re-pinned out from under itself (ADR 0011).
+        fresh.auraAtk = prev.auraAtk;
+        fresh.auraDef = prev.auraDef;
+        fresh.auraCrit = prev.auraCrit;
+        fresh.auraHpRegen = prev.auraHpRegen;
+        fresh.auraEnergyRegen = prev.auraEnergyRegen;
+        // Accumulators and the crit flash do NOT carry — fresh round, fresh bar.
         s.fighters[i] = fresh;
     }
     for (let i = 0; i < PROJECTILE_SLOTS; i++)
@@ -1027,6 +1196,8 @@ const FIGHTER_FIELDS = [
     'itemKind1', 'itemAmount1', 'itemDur1',
     'itemKind2', 'itemAmount2', 'itemDur2',
     'itemDmg', 'itemDmgLeft', 'itemDef', 'itemDefLeft',
+    'auraAtk', 'auraDef', 'auraCrit', 'auraHpRegen', 'auraEnergyRegen',
+    'auraHpAcc', 'auraMeterAcc', 'critFlash',
 ];
 const PROJECTILE_FIELDS = [
     'active', 'owner', 'moveIdx', 'x', 'y', 'velX', 'life', 'hasHit',
@@ -1632,16 +1803,82 @@ const useItem = (f, ch, s) => {
     }
     clearSlot(f, s); // each can drinks exactly once
 };
-/** Item-buff damage pipeline: attacker's OVERCLOCK, then victim's FIREWALL. */
-const itemScaled = (dmg, src, vic, floor) => {
+/**
+ * PETS (ADR 0011) — the HP REGEN and ENERGY REGEN auras, one live tick.
+ *
+ * Integer-exact by accumulator: each tick adds `max × rate` and pays out
+ * whole points once the accumulator reaches `1000 × period`, so the full
+ * per-mille amount lands over the period with nothing lost to division. (A
+ * naive `max × rate / 1000 / period` per tick truncates to zero.)
+ *
+ * Deliberately excluded: a KO'd fighter (health 0) never ticks back up, and
+ * neither regen can exceed its ceiling — no overheal, no meter above the cap.
+ */
+const AURA_ACC_FULL = 1000 * PET_REGEN_PERIOD_TICKS;
+const auraRegen = (f, ch) => {
+    if (f.auraHpRegen > 0 && f.health > 0 && f.health < ch.b.maxHealth) {
+        f.auraHpAcc += ch.b.maxHealth * f.auraHpRegen;
+        if (f.auraHpAcc >= AURA_ACC_FULL) {
+            const gain = Math.trunc(f.auraHpAcc / AURA_ACC_FULL);
+            f.auraHpAcc -= gain * AURA_ACC_FULL;
+            f.health = Math.min(ch.b.maxHealth, f.health + gain);
+        }
+    }
+    if (f.auraEnergyRegen > 0 && f.health > 0 && f.meter < TUNING.meterMax) {
+        f.auraMeterAcc += TUNING.meterMax * f.auraEnergyRegen;
+        if (f.auraMeterAcc >= AURA_ACC_FULL) {
+            const gain = Math.trunc(f.auraMeterAcc / AURA_ACC_FULL);
+            f.auraMeterAcc -= gain * AURA_ACC_FULL;
+            f.meter = Math.min(TUNING.meterMax, f.meter + gain);
+        }
+    }
+};
+/**
+ * Buff damage pipeline, in a fixed order so it is reproducible: the
+ * attacker's pet ATK aura, the attacker's OVERCLOCK, then the victim's
+ * DEFENSE aura and FIREWALL. Each step truncates on its own — per-mille
+ * integers only, never a compounded float (ADR 0001).
+ *
+ * A fighter with no pet and no drink passes through untouched, which is why
+ * a pet-less match stays bit-identical to pre-pet builds.
+ */
+const buffScaled = (dmg, src, vic, floor) => {
     let d = dmg;
+    if (src.buff.auraAtk > 0) {
+        d = Math.trunc((d * (1000 + src.buff.auraAtk)) / 1000);
+    }
     if (src.buff.itemDmgLeft > 0 && src.buff.itemDmg > 0) {
         d = Math.trunc((d * (1000 + src.buff.itemDmg)) / 1000);
+    }
+    if (vic.auraDef > 0) {
+        d = Math.trunc((d * (1000 - vic.auraDef)) / 1000);
     }
     if (vic.itemDefLeft > 0 && vic.itemDef > 0) {
         d = Math.trunc((d * (1000 - vic.itemDef)) / 1000);
     }
     return Math.max(floor, d);
+};
+/**
+ * PETS (ADR 0011) — the CRITICAL aura, and the only randomness in combat.
+ *
+ * Deterministic despite the name: the roll comes from `GameState.rngSeed`,
+ * which the server pins in SMatch.seed, which round-trips through
+ * snapshot()/restore(), and which the verifying re-sim replays. A rollback
+ * re-simulating the same tick history re-rolls the SAME crits.
+ *
+ * The seed advances ONLY when a fighter with a crit aura lands a clean hit —
+ * so a pet-less match never touches it and the pre-pet golden behaviour is
+ * preserved exactly.
+ */
+const critScaled = (dmg, s, src) => {
+    const chance = src.buff.auraCrit;
+    if (chance <= 0)
+        return dmg;
+    s.rngSeed = nextRand(s.rngSeed);
+    if (s.rngSeed % 1000 >= chance)
+        return dmg;
+    src.buff.critFlash = PET_CRIT_FLASH_TICKS;
+    return Math.max(1, Math.trunc((dmg * (1000 + PET_CRIT_BONUS)) / 1000));
 };
 /** Apply one hit/block. Returns 0 none, 1 hit, 2 block. */
 const strike = (s, src, vic, hb) => {
@@ -1661,7 +1898,8 @@ const strike = (s, src, vic, hb) => {
         return 0;
     const dir = src.facing;
     if (canBlock(vic, src.x, hb.guard)) {
-        vic.health = Math.max(0, vic.health - (hb.chip > 0 ? itemScaled(hb.chip, src, vic, 0) : 0));
+        // Chip is never critical — a crit is a clean-hit reward, not a chip one.
+        vic.health = Math.max(0, vic.health - (hb.chip > 0 ? buffScaled(hb.chip, src, vic, 0) : 0));
         vic.blockstunLeft = hb.blockstun;
         vic.velX = dir * fp(hb.pushbackBlock);
         vic.pushblocked = 0;
@@ -1684,7 +1922,7 @@ const strike = (s, src, vic, hb) => {
         vic.juggleBudget = TUNING.juggleBudget;
     }
     vic.comboHits++;
-    const dmg = itemScaled(Math.max(Math.trunc((hb.damage * Math.max(vic.comboScaling, TUNING.scalingFloor)) / 1000), 1), src, vic, 1);
+    const dmg = critScaled(buffScaled(Math.max(Math.trunc((hb.damage * Math.max(vic.comboScaling, TUNING.scalingFloor)) / 1000), 1), src, vic, 1), s, src);
     vic.comboScaling = Math.max(Math.trunc((vic.comboScaling * TUNING.scalingMult) / 1000), TUNING.scalingFloor);
     if (vicAir)
         vic.juggleBudget -= hb.juggleCost;
@@ -1933,6 +2171,13 @@ const step = (s, inputs) => {
         f1.itemDmgLeft--;
     if (f1.itemDefLeft > 0)
         f1.itemDefLeft--;
+    // Pet auras (ADR 0011) tick on exactly the same live-fighting ticks.
+    auraRegen(f0, c0);
+    auraRegen(f1, c1);
+    if (f0.critFlash > 0)
+        f0.critFlash--;
+    if (f1.critFlash > 0)
+        f1.critFlash--;
     updateFighter(s, f0, f1, c0, io0);
     updateFighter(s, f1, f0, c1, io1);
     resolveThrows(s);
@@ -2343,14 +2588,21 @@ const AI_PERSONALITY_RANGES = {
     throwHappy: [30, 150],
     pushblocker: [60, 220],
     patience: [60, 200],
+    thirst: [0, 255],
 };
+/**
+ * THIRST's fixed default (owner feature 2026-07-29: coachable drinking).
+ * 128 reproduces the exact drink thresholds that shipped hardcoded, so an
+ * uncoached agent behaves bit-identically to before the knob existed.
+ */
+const THIRST_DEFAULT = 128;
 // ---------------------------------------------------------------- create
 const createAi = (side, skill, seed, personality) => {
     const ai = {
         side,
         skill: Math.max(0, Math.min(100, skill)),
         rng: (seed | 0) ^ 0x51ed1e5,
-        p: { aggression: 0, jumpiness: 0, zoner: 0, throwHappy: 0, pushblocker: 0, patience: 0 },
+        p: { aggression: 0, jumpiness: 0, zoner: 0, throwHappy: 0, pushblocker: 0, patience: 0, thirst: THIRST_DEFAULT },
         intent: 0 /* Intent.Observe */,
         intentUntil: 0,
         queue: [],
@@ -2371,6 +2623,12 @@ const createAi = (side, skill, seed, personality) => {
     // Personality: sampled once — this "person" for this match. ALWAYS sampled
     // (even when overridden) so the rng stream downstream of creation is
     // identical with and without a coached personality.
+    // THIRST is the exception and must stay one: it is NOT sampled (fixed
+    // default, set at init above) because a seventh rnd() call here would
+    // shift the stream of every existing AI — in-flight solo matches pinned
+    // before a deploy would re-sim differently after it and false-flag honest
+    // clients as deviators. The override loop below still applies coached
+    // values, since it iterates AI_PERSONALITY_RANGES keys.
     ai.p.aggression = 90 + rnd(ai, 130);
     ai.p.jumpiness = 40 + rnd(ai, 150);
     ai.p.zoner = 40 + rnd(ai, 170);
@@ -2485,6 +2743,51 @@ const emit = (me, step, moveDir, crouch) => {
     return f;
 };
 // ---------------------------------------------------------------- the brain
+/**
+ * CONSUMABLES (ADR 0007/0009): which carried slot to drink RIGHT NOW, or -1.
+ *
+ * DELIBERATELY RNG-FREE — every trigger is a deterministic read of public
+ * state, so this consumes nothing from the AI's rng stream and an item-less
+ * match plays out bit-identically to how it did before this existed (no
+ * golden churn, and no way to tell a behavior change from a stream shift).
+ * Mirrors the sim's own drink rules: free ground states only (useItem
+ * refuses everything else), one can per slot, timed buffs never stacked.
+ *
+ * The doctrine, kind by kind (integer math only), scaled by the COACHED
+ * `thirst` knob (t, 0-255; at THIRST_DEFAULT=128 every threshold equals the
+ * originally-hardcoded value — an uncoached agent is bit-identical to the
+ * pre-knob build):
+ *  · PATCH (1)     — emergency heal below (222+t)‰ health (128 → 35%).
+ *  · FIREWALL (3)  — losing and under (472+t)‰ (128 → 60%): shield up while
+ *                    there is still health worth protecting; never while one
+ *                    is already running.
+ *  · OVERCLOCK (2) — the opponent is DOWN: buff during the oki window you
+ *                    already own, so the pressure that follows hits harder.
+ *                    (Not thirst-scaled — the window is what it is.)
+ *  · VOLT (4)      — neutral at range > (308−t)px with the bar under
+ *                    (372+t)‰ (128 → 180px, half a bar): bank the meter
+ *                    while nothing is happening.
+ */
+const drinkSlot = (me, op, maxHealth, tick, dist, t) => {
+    const free = me.action === 0 /* Action.Idle */ || me.action === 1 /* Action.WalkF */
+        || me.action === 2 /* Action.WalkB */ || me.action === 3 /* Action.Crouch */;
+    if (!free)
+        return -1;
+    const kinds = [me.itemKind0, me.itemKind1, me.itemKind2];
+    const slot = (k) => kinds.indexOf(k);
+    if (slot(1) >= 0 && me.health * 1000 < maxHealth * (222 + t))
+        return slot(1);
+    if (slot(3) >= 0 && me.itemDefLeft === 0
+        && me.health < op.health && me.health * 1000 < maxHealth * (472 + t))
+        return slot(3);
+    if (slot(2) >= 0 && me.itemDmgLeft === 0
+        && (op.action === 15 /* Action.Knockdown */ || op.action === 16 /* Action.Getup */))
+        return slot(2);
+    if (slot(4) >= 0 && tick > 90 && me.meter * 1000 < TUNING.meterMax * (372 + t)
+        && dist > 308 - t)
+        return slot(4);
+    return -1;
+};
 const aiPoll = (ai, g) => {
     const me = g.fighters[ai.side];
     const op = g.fighters[1 - ai.side];
@@ -2540,6 +2843,13 @@ const aiPoll = (ai, g) => {
         }
         return frame;
     }
+    // ---- drink a carried can when the moment is right (RNG-free — see
+    // drinkSlot). Returning ONLY the item bit makes this tick the rising edge
+    // the sim drinks on; the slot clears on consumption, so the trigger
+    // disappears by itself and play resumes next poll.
+    const sip = drinkSlot(me, op, ch.b.maxHealth, g.tick, dist, ai.p.thirst);
+    if (sip >= 0)
+        return ITEM_BITS[sip];
     // ---- non-actionable states: reactions that don't need the intent system
     switch (me.action) {
         case 18 /* Action.Thrown */: {
@@ -4343,18 +4653,26 @@ Object.assign(globalThis, {
  * (the classic GGPO throttle) rather than drift.
  */
 // Protocol constants — must match packages/server/src/protocol.ts.
-// Must match the server's PROTOCOL_VERSION. v8 = TICKETS (ADR 0009): a decided
-// wager burns both entries instead of paying a pot, so a v7 client would
-// advertise stakes that no longer exist.
-const NET_PROTOCOL = 8;
+// Must match the server's PROTOCOL_VERSION. v9 = PETS (ADR 0011): SMatch.pets
+// is part of the deterministic setup, so a client that did not install it
+// would silently simulate a different match than the verifier.
+// (v8 = TICKETS, ADR 0009: a decided wager burns both entries instead of
+// paying a pot, so a v7 client advertised stakes that no longer exist.)
+const NET_PROTOCOL = 9;
 const MAX_AHEAD = 15;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
 /** Client-initiated RTT probe cadence (connection-quality overlay). */
 const PING_MS = 2_000;
-/** Install a setup's pinned drink loadouts into core — part of match construction. */
+/**
+ * Install a setup's pinned drinks AND pet auras into core — part of match
+ * construction, not a cosmetic step: skipping either would simulate a
+ * different match than the server's verifier and convict this client as the
+ * deviator for its own opponent's pet.
+ */
 const installSetupItems = (s) => {
     setMatchItems(s.items?.[0]?.map((p) => p.effect) ?? null, s.items?.[1]?.map((p) => p.effect) ?? null);
+    setMatchPets(s.pets?.[0]?.aura ?? null, s.pets?.[1]?.aura ?? null);
 };
 /** Resume retry policy: a handful of quick attempts inside the server's
  * FORFEIT_GRACE window (20s) — 6 × ~1.6s covers a router blip with room. */
@@ -11456,6 +11774,177 @@ const initTouchControls = () => {
     });
 };
 
+// ---- client/src/pets.js ----
+/**
+ * PETS — the companion that floats behind a fighter (ADR 0011).
+ *
+ * PURELY COSMETIC. The sim knows a pet only as five per-mille numbers on the
+ * fighter (its aura); everything in this file is render-time. The pet's
+ * position is a pure function of the fighter's state plus the tick, so it
+ * rolls back with everything else and needs no state of its own.
+ *
+ * Art is optional. A pet.json with no `sprites` draws as a procedural
+ * companion in its tint — which means a pet published ahead of its Studio art
+ * is still playable, and a failed image load degrades instead of vanishing.
+ */
+const DEFAULT_TINT = '#6fd3ff';
+const petCache = new Map();
+const loadPetImage = (src) => new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null); // missing art is never fatal
+    img.src = src;
+});
+/**
+ * Load `pets/<id>/pet.json` + its frames. Memoised per id (pets are immutable
+ * for the page's lifetime, like character bundles) and never throws: an
+ * unreachable pet resolves to null and the caller simply draws nothing.
+ */
+const loadPet = (id, base = '') => {
+    const hit = petCache.get(id);
+    if (hit)
+        return hit;
+    const p = (async () => {
+        try {
+            const res = await fetch(`${base}pets/${id}/pet.json`);
+            if (!res.ok)
+                return null;
+            const def = await res.json();
+            const names = Array.isArray(def.sprites) ? def.sprites.slice(0, 16) : [];
+            const frames = (await Promise.all(names.map((n) => loadPetImage(`${base}pets/${id}/${n}`)))).filter((i) => i !== null);
+            return { id, def, frames, tint: def.tint ?? DEFAULT_TINT };
+        }
+        catch {
+            return null;
+        }
+    })();
+    petCache.set(id, p);
+    return p;
+};
+/** Preload the pets a match pinned. Returns one entry per side (null = none). */
+const loadMatchPets = async (pins, base = '') => {
+    if (!pins)
+        return [null, null];
+    const [a, b] = await Promise.all([
+        pins[0] ? loadPet(pins[0].id, base) : Promise.resolve(null),
+        pins[1] ? loadPet(pins[1].id, base) : Promise.resolve(null),
+    ]);
+    return [a, b];
+};
+/**
+ * Where the pet sits this frame: BEHIND the fighter (opposite the way they
+ * face), shoulder height, bobbing.
+ *
+ * Deliberately derived from the fighter's CURRENT state only — no smoothing
+ * buffer, no velocity integration of its own. A pet that kept private state
+ * would drift after a rollback re-sim and the two peers' screens would stop
+ * agreeing about where it is. The lag is faked by leaning the offset against
+ * the fighter's velocity instead, which is a pure function of the frame.
+ */
+const petPos = (f, tick, x, y, size) => {
+    const behind = -f.facing; // the side away from the opponent
+    const drift = Math.max(-14, Math.min(14, -(f.velX / 256) * 1.6)); // trails the dash
+    const bob = Math.sin((tick + x) * 0.06) * (size * 0.09);
+    return {
+        x: x + behind * (34 + size * 0.25) + drift,
+        y: y - 78 - size * 0.35 + bob,
+    };
+};
+/**
+ * Draw one fighter's pet. Call BEFORE the fighter itself — "floating behind"
+ * is both a position and a z-order.
+ *
+ * `critFlash` on the fighter (set by the sim when its crit aura fires) makes
+ * the pet flare: the companion is where the aura visibly lives, so the player
+ * can tell the pet did something rather than guessing at the damage numbers.
+ */
+const drawPet = (ctx, pet, f, tick, fx, fy) => {
+    const size = pet.def.sizePx ?? 44;
+    const { x, y } = petPos(f, tick, fx, fy, size);
+    const flare = f.critFlash > 0 ? f.critFlash / 24 : 0;
+    ctx.save();
+    // Aura glow — brighter the instant a crit lands.
+    const glow = ctx.createRadialGradient(x, y, 1, x, y, size * (0.85 + flare * 0.7));
+    glow.addColorStop(0, `${pet.tint}${flare > 0 ? 'cc' : '66'}`);
+    glow.addColorStop(1, `${pet.tint}00`);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(x, y, size * (0.85 + flare * 0.7), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+    if (pet.frames.length > 0) {
+        const fps = Math.max(1, Math.min(30, pet.def.fps ?? 8));
+        const img = pet.frames[Math.floor((tick * fps) / 60) % pet.frames.length];
+        const h = size;
+        const w = img.width > 0 ? (img.width / img.height) * h : h;
+        ctx.imageSmoothingEnabled = false;
+        // Mirror with the fighter so the pet always looks the way they do.
+        ctx.translate(x, y);
+        ctx.scale(f.facing, 1);
+        ctx.drawImage(img, -w / 2, -h / 2, w, h);
+    }
+    else {
+        drawProceduralPet(ctx, x, y, size, pet.tint, tick, flare);
+    }
+    ctx.restore();
+};
+/**
+ * The art-less companion: a hovering core with an orbiting spark and two
+ * fins. Small, readable at gameplay scale, and clearly not a fighter — it
+ * must never be mistaken for a hittable object, because it isn't one.
+ */
+const drawProceduralPet = (ctx, x, y, size, tint, tick, flare) => {
+    const r = size * 0.26;
+    const flap = Math.sin(tick * 0.16); // wing beat, not a drift
+    ctx.translate(x, y);
+    // Wings, beating. Big and translucent so the silhouette reads as ALIVE at
+    // gameplay scale — a plain disc with a slot on it reads as a HUD icon, which
+    // is the one thing a companion must never look like.
+    for (const dir of [-1, 1]) {
+        ctx.fillStyle = `${tint}44`;
+        ctx.beginPath();
+        ctx.moveTo(dir * r * 0.5, -r * 0.15);
+        ctx.quadraticCurveTo(dir * r * 2.4, -r * (1.5 + flap * 0.5), dir * r * 2.2, r * (0.1 + flap * 0.3));
+        ctx.quadraticCurveTo(dir * r * 1.3, r * 0.5, dir * r * 0.5, r * 0.2);
+        ctx.closePath();
+        ctx.fill();
+    }
+    // Tail wisp, trailing the beat.
+    ctx.strokeStyle = `${tint}66`;
+    ctx.lineWidth = Math.max(1, r * 0.16);
+    ctx.beginPath();
+    ctx.moveTo(0, r * 0.7);
+    ctx.quadraticCurveTo(r * 0.5 * flap, r * 1.5, -r * 0.4 * flap, r * 2.1);
+    ctx.stroke();
+    // Body.
+    const body = ctx.createRadialGradient(-r * 0.3, -r * 0.4, r * 0.1, 0, 0, r);
+    body.addColorStop(0, '#ffffff');
+    body.addColorStop(0.5, tint);
+    body.addColorStop(1, '#0b0e13');
+    ctx.fillStyle = body;
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fill();
+    // Two eyes — the cheapest possible "this is a creature" signal. They widen
+    // on a crit, which is the only tell the player needs.
+    const eyeR = Math.max(1, r * (0.17 + flare * 0.1));
+    ctx.fillStyle = `rgba(8,11,17,${0.85 - flare * 0.5})`;
+    for (const dir of [-1, 1]) {
+        ctx.beginPath();
+        ctx.arc(dir * r * 0.34, -r * 0.12, eyeR, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    // Orbiting spark.
+    const a = tick * 0.08;
+    ctx.fillStyle = '#ffffff';
+    ctx.globalAlpha = 0.55 + flare * 0.45;
+    ctx.beginPath();
+    ctx.arc(Math.cos(a) * r * 1.7, Math.sin(a) * r * 0.8, Math.max(1.2, r * 0.14), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+};
+
 // ---- client/src/main.js ----
 /**
  * Agent Fighter — game client.
@@ -11465,6 +11954,7 @@ const initTouchControls = () => {
  * the client interprets no frame data, it only asks the engine which sprite
  * to draw (`spriteForFighter`) and blits it.
  */
+
 
 
 
@@ -12411,6 +12901,13 @@ let stageIds = [];
 let stageAssets = [];
 let stageCursor = 0;
 let fighters = null;
+/**
+ * PETS (ADR 0011): the companion floating behind each fighter this match, or
+ * null for a side with none equipped. Cosmetic — the aura itself is installed
+ * into the sim by net.ts from the same pin. Loaded asynchronously: a pet that
+ * has not arrived yet simply is not drawn, which never blocks the fight.
+ */
+let matchPets = [null, null];
 let game = null;
 let showBoxes = false;
 let seed = 1;
@@ -12680,6 +13177,9 @@ const installOnlineMatch = () => {
     }
     fighters = [r0, r1];
     setCharacters(r0.ch, r1.ch);
+    // The pinned pets are art only — fire and forget, never awaited.
+    matchPets = [null, null];
+    void loadMatchPets(s.pets).then((p) => { matchPets = p; });
     const si = stageIds.indexOf(s.stage);
     if (si >= 0)
         setStageAsset(stageAssets[si] ?? null);
@@ -12744,12 +13244,30 @@ const installOnlineMatch = () => {
     if (myDrinks.length > 0) {
         vsStakes.push(`🥤 ${myDrinks.map((d) => d.name).join(' · ')} — TAP A CAN OR PRESS R TO DRINK`);
     }
+    // PETS (ADR 0011): open carry is only fair if it is DISCLOSED — both sides'
+    // auras go on the card, mine first, in the same server-echoed truth.
+    const petLine = [s.side, 1 - s.side]
+        .map((side) => {
+        const pin = s.pets?.[side];
+        if (!pin)
+            return '';
+        const lines = auraLines(clampAura(pin.aura))
+            .map((l) => auraLineText(l.kind, l.amount)).join(' · ');
+        return `${side === s.side ? 'YOUR' : 'THEIR'} ${pin.name}: ${lines}`;
+    })
+        .filter(Boolean)
+        .join('      ');
+    if (petLine)
+        vsStakes.push(`🐾 ${petLine}`);
     const newChallenger = s.mode === 'arcade' && (s.arcade?.fights ?? 0) > 0;
     void audio.playStinger(newChallenger ? 'here_comes_a_new_challenger' : 'vs', { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
 const startFight = () => {
     fighters = [allRosters[picks[0]], allRosters[picks[1]]];
     setCharacters(fighters[0].ch, fighters[1].ch);
+    // Offline play carries no aura (the server is what pins one), so clear any
+    // companion left over from the last online match.
+    matchPets = [null, null];
     // Local play: walls follow the selected stage's view-lock region (matches
     // the online feel, where the server pins the same bounds).
     game = createGameState(seed++, currentStageBounds());
@@ -13007,6 +13525,7 @@ const startPracticeFight = (node) => {
     picks[1] = opp >= 0 ? opp : picks[0];
     fighters = [allRosters[picks[0]], allRosters[picks[1]]];
     setCharacters(fighters[0].ch, fighters[1].ch);
+    matchPets = [null, null]; // practice gauntlet: free, and aura-free
     // Rotate the stage art each battle so a run tours the whole game.
     if (stageAssets.length > 0) {
         stageCursor = (seed + run.fights) % stageAssets.length;
@@ -13299,6 +13818,13 @@ const renderFight = (g) => {
             const throb = fxPulse(g.tick, 0.35, 0.6, 1); // fast, wide swing
             auraGlow(ctx, px(f.x), px(f.y) - 52, 88, f.itemDmgLeft > 0 ? '#ff9d6b' : '#6fd3ff', 0.75 * throb);
         }
+    }
+    // Pets first: "floating behind the fighter" is a z-order as much as a
+    // position, so every companion lands under every fighter (ADR 0011).
+    for (const i of [0, 1]) {
+        const pet = matchPets[i];
+        if (pet)
+            drawPet(ctx, pet, g.fighters[i], g.tick, px(g.fighters[i].x), px(g.fighters[i].y));
     }
     // Fighters (draw the one in hitstun last so it reads on top).
     const order = g.fighters[0].action === 10 /* Action.Hitstun */ ? [1, 0] : [0, 1];

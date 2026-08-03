@@ -107,6 +107,15 @@ describe('persistence hook (Phase B)', () => {
       settleItems: async () => {},
       setEquipped: async () => {},
       equippedItems: async () => [],
+      // PETS (ADR 0011): nobody owns one here, so no aura is ever pinned.
+      buyPet: async () => ({
+        rowId: 0, petId: 'none', rarity: 1, equipped: false, createdAt: '',
+        aura: { atk: 0, def: 0, hpRegen: 0, crit: 0, energyRegen: 0 },
+        credits: 100, duplicate: false,
+      }),
+      listPets: async () => [],
+      setEquippedPet: async () => {},
+      equippedPet: async () => null,
       debitCredits: async () => ({ credits: 100, duplicate: false }),
       arcadeExtract: async () => ({
         credits: 100, granted: 0, multiplierPct: 100, drinkBudget: 3, duplicate: false,

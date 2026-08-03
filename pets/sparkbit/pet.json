@@ -1,0 +1,12 @@
+{
+  "id": "sparkbit",
+  "name": "SPARKBIT",
+  "desc": "ONE BIT. PERMANENTLY SET.",
+  "flavor": "Hums at 60Hz. Refuses to flip.",
+  "tint": "#ff7a7a",
+  "sizePx": 38,
+  "fps": 10,
+  "sprites": [
+    "frame0.png"
+  ]
+}

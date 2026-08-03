@@ -22,16 +22,19 @@ import {
   generateBoard, isFightNode,
   isLegalMove, itemById, loadCharacter, minFights, nodeById, setCharacters,
   setMatchItems, stateHash, step, successors, validateAllTemplates,
+  AURA_LINES, AURA_LINES_BY_RARITY, AURA_MAX, AURA_MIN, PET_COST,
+  PET_RARITY_ODDS, auraIsEmpty, clampAura, setMatchPets,
 } from '@af/core';
 import type {
   Board, BoardNode, CharacterBundle, GameState, ItemDef, ItemEffect,
+  PetAura, PetDef, PetRarity,
 } from '@af/core';
 import {
   ARCADE_NEXT_GRACE_MS, DEFAULT_PORT, FORFEIT_GRACE_MS, IDLE_FORFEIT_MS, INPUT_DELAY,
   INPUT_DELAY_MAX, INPUT_DELAY_MIN, PING_INTERVAL_MS, PROTOCOL_VERSION,
   SOLO_PACE_MAX, SOLO_PACE_MIN, SOLO_PACE_SLACK_MS, TICK_MS,
 } from './protocol.js';
-import type { ClientMsg, ItemPin, SMatch, SResult, ServerMsg } from './protocol.js';
+import type { ClientMsg, ItemPin, PetPin, SMatch, SResult, ServerMsg } from './protocol.js';
 import { verifyAirToken } from './airjwt.js';
 import type { AirIdentity } from './airjwt.js';
 import {
@@ -72,6 +75,37 @@ const rollItem = (): ItemDef => {
   }
   const pool = ITEMS.filter((i) => i.tier === tier);
   return pool[Math.floor(Math.random() * pool.length)]!;
+};
+
+/**
+ * PET ADOPTION ROLL (ADR 0011). Like the drink gacha the randomness lives
+ * HERE, server-side, at purchase time — never in the sim: by the time an aura
+ * can matter in a match it is a fixed, known set of integers.
+ *
+ * Two rolls, in this order: RARITY decides how many aura lines the pet gets
+ * (odds from @af/core), then each line is drawn without replacement from the
+ * five and rolled in [AURA_MIN, AURA_MAX]. Rarity buys BREADTH, never
+ * magnitude — a common pet can out-roll a legendary on its one line, which is
+ * what stops the top rarity from being the only pet worth owning.
+ */
+const rollRarity = (): PetRarity => {
+  let r = Math.random() * 100;
+  for (const t of PET_RARITY_ODDS) {
+    if (r < t.pct) return t.rarity;
+    r -= t.pct;
+  }
+  return 1;
+};
+
+const rollAura = (rarity: PetRarity): PetAura => {
+  const aura: PetAura = { atk: 0, def: 0, hpRegen: 0, crit: 0, energyRegen: 0 };
+  const pool = [...AURA_LINES];
+  const lines = Math.min(AURA_LINES_BY_RARITY[rarity] ?? 1, pool.length);
+  for (let i = 0; i < lines; i++) {
+    const kind = pool.splice(Math.floor(Math.random() * pool.length), 1)[0]!;
+    aura[kind] = AURA_MIN + Math.floor(Math.random() * (AURA_MAX - AURA_MIN + 1));
+  }
+  return clampAura(aura);
 };
 
 /** Abuse valves for the free agent class — plain in-memory day counters.
@@ -173,6 +207,10 @@ interface Match {
   /** The items-table rowIds behind each pin, same order — server-side only
    *  (never shipped to clients; settlement maps spent slots → rows). */
   itemRows: [number[], number[]];
+  /** PETS (ADR 0011): the equipped companion per side, read at pair time.
+   *  Nothing is reserved or settled — an aura is never consumed, so unlike
+   *  `items` there is no release path and no rowIds to track. */
+  pets: MatchPets;
   startedAt: number; // wall clock — solo pace sanity (SOLO_PACE_*)
   /** Per-side bearer secrets for CResume — only their owners ever see them. */
   resumeTokens: [string, string];
@@ -318,6 +356,20 @@ const styleFallback = (charId: string): StyleName => {
 type MatchItems = [ItemPin[], ItemPin[]];
 const NO_ITEMS: MatchItems = [[], []];
 
+/** The pinned per-side pet (ADR 0011). null = that side has none equipped. */
+type MatchPets = [PetPin | null, PetPin | null];
+const NO_PETS: MatchPets = [null, null];
+
+/**
+ * Install a match's pinned pet auras into the core module slot (the
+ * setCharacters pattern). EVERY re-sim path must run this — including the
+ * pet-less default, which CLEARS the slot so one verification can never leak
+ * an aura into the next match.
+ */
+const installPets = (pets: MatchPets): void => {
+  setMatchPets(pets[0]?.aura ?? null, pets[1]?.aura ?? null);
+};
+
 /**
  * Install a match's pinned drink loadouts into the core module slot (the
  * setCharacters pattern). EVERY re-sim path must run this — including the
@@ -388,9 +440,11 @@ const verifyAndScan = (
   items: MatchItems = NO_ITEMS,
   bounds?: { left: number; right: number },
   matchId = '',
+  pets: MatchPets = NO_PETS,
 ): { outcome: VerifyOutcome; deviator: 0 | 1 | undefined } => {
   setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
   installItems(items);
+  installPets(pets);
   const g = createGameState(seed, bounds);
   const ai = solo ? createAi(1, solo.skill, solo.aiSeed, solo.personality) : null;
   const n = solo ? inputs[0].length : Math.min(inputs[0].length, inputs[1].length);
@@ -559,6 +613,33 @@ export const createMatchServer = (opts: {
       : [];
   const characterIds = listIds(charactersDir, 'character.json');
   const stageIds = listIds(stagesDir, 'stage.json');
+  /**
+   * PETS (ADR 0011): the catalog is asset FOLDERS, not a registry — the
+   * Studio writes `pets/<id>/pet.json` beside characters/ and stages/, and a
+   * new pet ships by adding a folder. Read once at boot (immutable for the
+   * process lifetime, like the character bundles).
+   */
+  const petsDir = join(root, 'pets');
+  const petCatalog: PetDef[] = listIds(petsDir, 'pet.json')
+    .map((id) => {
+      try {
+        const def = JSON.parse(
+          readFileSync(join(petsDir, id, 'pet.json'), 'utf8'),
+        ) as PetDef;
+        return { ...def, id }; // the FOLDER name is the id, always
+      } catch {
+        console.log(`[pets] skipping "${id}": unreadable pet.json`);
+        return null;
+      }
+    })
+    .filter((p): p is PetDef => p !== null);
+  /** Adoptable pets (a Studio-disabled pet stays owned, but stops dropping). */
+  const adoptablePets = petCatalog.filter((p) => !p.disabled);
+  const petById = (id: string): PetDef | undefined =>
+    petCatalog.find((p) => p.id === id);
+  if (petCatalog.length > 0) {
+    console.log(`[pets] ${petCatalog.length} in the catalog, ${adoptablePets.length} adoptable`);
+  }
   /** The playable roster (meta.disabled mirrors the client's select screen). */
   const enabledCharacterIds = characterIds.filter((id) => {
     const meta = (bundleOf(id) as { meta?: { disabled?: boolean } }).meta;
@@ -814,7 +895,8 @@ export const createMatchServer = (opts: {
     // was two full passes). Solo has one human side; the opponent is the
     // server's own re-derived AI.
     const { outcome: v, deviator } = verifyAndScan(
-      bundles, m.seed, m.inputs, m.hashes, m.solo ?? null, m.items, m.bounds, m.id);
+      bundles, m.seed, m.inputs, m.hashes, m.solo ?? null, m.items, m.bounds, m.id,
+      m.pets);
 
     // THE SETTLEMENT LADDER (ADR 0003/0005). The input ledger is the truth;
     // a dropped socket never overrules it:
@@ -1072,6 +1154,9 @@ export const createMatchServer = (opts: {
           agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
           delay: m.delay,
           items: m.items,
+          // A replay only reproduces if it installs the SAME auras (ADR 0011)
+          // — the pin is the whole deterministic setup, or it is nothing.
+          pets: m.pets,
           solo: m.solo,
           result: {
             winner: result.winner, reason: result.reason,
@@ -1152,6 +1237,7 @@ export const createMatchServer = (opts: {
     arcadeRun?: ArcadeRun,
     items: MatchItems = [[], []],
     itemRows: [number[], number[]] = [[], []],
+    pets: MatchPets = [null, null],
   ): void => {
     // Arcade battles bill as the character, not "HOUSE": the run IS the mode.
     // The suffix is the ZONE rather than a battle counter — with a branching
@@ -1179,6 +1265,7 @@ export const createMatchServer = (opts: {
       arcadeRun: arcadeRun ?? null,
       items,
       itemRows,
+      pets,
       // Local-sim solo has NO input scheduling at all — zero added latency.
       // PvP sizes the delay from both sides' measured RTT (fallback: fixed).
       delay: solo ? 0 : c1 ? adaptiveDelay(c0, c1) : INPUT_DELAY,
@@ -1221,6 +1308,7 @@ export const createMatchServer = (opts: {
           }
           : undefined,
         items: m.items[0].length > 0 || m.items[1].length > 0 ? m.items : undefined,
+        pets: m.pets[0] || m.pets[1] ? m.pets : undefined,
         resume: m.resumeTokens[c.side],
       };
       send(c, setup);
@@ -1284,8 +1372,11 @@ export const createMatchServer = (opts: {
         // side dry); only the cans actually drunk stay consumed at settle.
         const e0 = await claimEquipped(c0, matchId);
         const e1 = await claimEquipped(c1, matchId);
+        // PETS (ADR 0011): open carry here too — both sides' auras ride in,
+        // disclosed on the VS card. Nothing is reserved, so nothing can fail.
+        const pets: MatchPets = [await equippedPin(c0), await equippedPin(c1)];
         startMatch(c0, c1, 'wager', fee, matchId, undefined, undefined,
-          [e0.pins, e1.pins], [e0.rows, e1.rows]);
+          [e0.pins, e1.pins], [e0.rows, e1.rows], pets);
       }
     } finally {
       pairing = false;
@@ -1338,6 +1429,37 @@ export const createMatchServer = (opts: {
     }
   };
 
+  /**
+   * PETS (ADR 0011): read this client's EQUIPPED pet and pin its rolled aura
+   * for the match. Nothing is reserved and nothing is settled — an aura is a
+   * property of an owned pet, not a consumable, so the same pet can ride
+   * every concurrent match its owner is in.
+   *
+   * Agent-class accounts get no aura: they cannot hold credits, so they can
+   * never have adopted one, and the check keeps that honest. A read failure
+   * NEVER kills the match — it simply runs pet-less, and the client learns
+   * the truth from the SMatch.pets echo.
+   */
+  const equippedPin = async (c: Client): Promise<PetPin | null> => {
+    if (!persistence || !c.identity?.sub || isAgentClassSub(c.identity.sub)) return null;
+    try {
+      const owned = await persistence.equippedPet(c.identity.sub);
+      if (!owned) return null;
+      const def = petById(owned.petId);
+      const aura = clampAura(owned.aura);
+      if (auraIsEmpty(aura)) return null; // a cosmetic-only pet pins nothing
+      return {
+        id: owned.petId,
+        name: def?.name ?? owned.petId.toUpperCase(),
+        rarity: owned.rarity,
+        aura,
+      };
+    } catch (e) {
+      console.log(`[pets] aura read failed for ${c.name}: ${String(e)}`);
+      return null;
+    }
+  };
+
   const startSolo = async (c: Client, pin?: SoloPin): Promise<void> => {
     const fee = persistence ? SOLO_FEE : 0;
     const matchId = newMatchId();
@@ -1366,12 +1488,16 @@ export const createMatchServer = (opts: {
     if (resolved.defenderSub && claimed.pins.length > 0) {
       items[1] = claimed.pins.map((p) => ({ ...p, effect: { ...p.effect } }));
     }
+    // PETS (ADR 0011): the challenger's aura rides in. Deliberately NOT
+    // mirrored to a dared agent the way the drinks are — a pet is a rolled,
+    // account-bound possession, not a can you can hand someone a copy of.
+    const pets: MatchPets = [await equippedPin(c), null];
     if (c.ws.readyState !== WebSocket.OPEN) {
       // Vanished after escrow → settle as incomplete so the fee refunds.
-      startMatch(c, null, 'solo', fee, matchId, resolved, undefined, items, itemRows);
+      startMatch(c, null, 'solo', fee, matchId, resolved, undefined, items, itemRows, pets);
       return finishMatch(c.match!, null);
     }
-    startMatch(c, null, 'solo', fee, matchId, resolved, undefined, items, itemRows);
+    startMatch(c, null, 'solo', fee, matchId, resolved, undefined, items, itemRows, pets);
   };
 
   /**
@@ -1581,13 +1707,14 @@ export const createMatchServer = (opts: {
     const claimed = await claimEquipped(c, matchId);
     const items: MatchItems = [claimed.pins, []];
     const itemRows: [number[], number[]] = [claimed.rows, []];
+    const pets: MatchPets = [await equippedPin(c), null];
     if (c.ws.readyState !== WebSocket.OPEN) {
       // Vanished before the setup landed → settle as incomplete; the run
       // keeps its position and its bag and stays retryable until it expires.
-      startMatch(c, null, 'arcade', 0, matchId, opts, run, items, itemRows);
+      startMatch(c, null, 'arcade', 0, matchId, opts, run, items, itemRows, pets);
       return finishMatch(c.match!, null);
     }
-    startMatch(c, null, 'arcade', 0, matchId, opts, run, items, itemRows);
+    startMatch(c, null, 'arcade', 0, matchId, opts, run, items, itemRows, pets);
   };
 
   const onMessage = (c: Client, raw: string): void => {
@@ -1889,6 +2016,7 @@ export const createMatchServer = (opts: {
           mode: m.mode, fee: m.fee,
           solo: m.solo ?? undefined,
           items: m.items[0].length > 0 || m.items[1].length > 0 ? m.items : undefined,
+          pets: m.pets[0] || m.pets[1] ? m.pets : undefined,
           resume: m.resumeTokens[side],
           inputs: [toNullable(m.inputs[0]), toNullable(m.inputs[1])],
         });
@@ -2456,6 +2584,104 @@ export const createMatchServer = (opts: {
           items: items.map((it) => ({
             ...it, def: ITEMS.find((d) => d.id === it.itemId) ?? null,
           })),
+        });
+      })().catch((e) => json(res, 502, { error: String(e) }));
+      return;
+    }
+    // ---- PETS (ADR 0011). Same auth posture as the vending machine: OWNER
+    // auth only (AIR JWT / dev header). Agent keys are deliberately refused
+    // so a leaked coach key can neither spend credits nor reshape a loadout,
+    // and agent-class accounts are refused outright (0 credits by
+    // construction — they can never own a pet).
+    //
+    // These are the routes the LANDING SITE's profile page talks to; pets are
+    // equipped there, not in the game client.
+    //   GET  /pets        → { cost, catalog, credits, pets: [owned w/ aura] }
+    //   POST /pets/adopt  → body { nonce } → server-side roll + atomic debit;
+    //                       idempotent by nonce (a retry replays the grant and
+    //                       can NEVER re-roll a better aura).
+    //   POST /pets/equip  → body { rowId: number | null } — one pet or none.
+    if (path === '/pets' || path === '/pets/adopt' || path === '/pets/equip') {
+      if (!persistence) return json(res, 503, { error: 'persistence not configured' });
+      const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '')?.[1];
+      const devName = persistence.dev ? String(req.headers['x-dev-name'] ?? '') : '';
+      void (async () => {
+        const identity = bearer ? await verifyAirToken(bearer)
+          : devName ? { sub: `dev:${devName.slice(0, 24)}` }
+          : null;
+        if (!identity) return json(res, 401, { error: 'sign in required' });
+        if (isAgentClassSub(identity.sub)) {
+          return json(res, 403, { error: 'agent-class accounts cannot own pets' });
+        }
+
+        if (path === '/pets/equip') {
+          if (req.method !== 'POST') return json(res, 405, { error: 'POST {rowId} to equip' });
+          const body = await readCappedBody(req, res);
+          if (body === null) return;
+          let rowId: number | null = null;
+          try {
+            const raw = (JSON.parse(body || '{}') as Record<string, unknown>).rowId;
+            if (raw !== null && raw !== undefined) {
+              if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) {
+                return json(res, 400, { error: 'rowId: a positive integer, or null to unequip' });
+              }
+              rowId = raw;
+            }
+          } catch { return json(res, 400, { error: 'bad json' }); }
+          await persistence.setEquippedPet(identity.sub, rowId);
+          const equipped = await persistence.equippedPet(identity.sub);
+          return json(res, 200, {
+            equipped: equipped ? { ...equipped, def: petById(equipped.petId) ?? null } : null,
+          });
+        }
+
+        if (path === '/pets/adopt') {
+          if (req.method !== 'POST') return json(res, 405, { error: 'POST {nonce} to adopt' });
+          if (adoptablePets.length === 0) {
+            return json(res, 503, { error: 'no pets have been published yet' });
+          }
+          const body = await readCappedBody(req, res);
+          if (body === null) return;
+          let nonce = '';
+          try { nonce = String((JSON.parse(body || '{}') as Record<string, unknown>).nonce ?? ''); }
+          catch { return json(res, 400, { error: 'bad json' }); }
+          nonce = nonce.trim();
+          if (nonce.length < 8 || nonce.length > 64) {
+            return json(res, 400, { error: 'nonce: 8-64 characters (client adoption id)' });
+          }
+          const def = adoptablePets[Math.floor(Math.random() * adoptablePets.length)]!;
+          const rarity = rollRarity();
+          const aura = rollAura(rarity);
+          try {
+            const r = await persistence.buyPet(
+              identity.sub, PET_COST, def.id, rarity, aura, nonce);
+            // On a duplicate replay the ROLL above is discarded — the stored
+            // grant wins, so a retried adoption can never re-roll.
+            if (!r.duplicate) {
+              console.log(`[pets] ${identity.sub} adopted ${r.petId} (R${r.rarity}) for ${PET_COST}`);
+            }
+            return json(res, 200, {
+              pet: { ...r, def: petById(r.petId) ?? null },
+              credits: r.credits,
+              duplicate: r.duplicate,
+              cost: r.duplicate ? 0 : PET_COST,
+            });
+          } catch (e) {
+            if (e instanceof InsufficientCredits) {
+              return json(res, 402, {
+                error: `insufficient credits — adopting costs ${PET_COST}`, code: 'credits',
+              });
+            }
+            throw e;
+          }
+        }
+
+        const owned = await persistence.listPets(identity.sub, 50);
+        return json(res, 200, {
+          cost: PET_COST,
+          catalog: adoptablePets,
+          credits: await persistence.getCredits(identity.sub),
+          pets: owned.map((p) => ({ ...p, def: petById(p.petId) ?? null })),
         });
       })().catch((e) => json(res, 502, { error: String(e) }));
       return;

@@ -30,6 +30,9 @@ const ORDER = [
   'core/src/input.js',
   'core/src/data.js',
   'core/src/items.js',
+  // PETS (ADR 0011): pure data + clamps, imported by BOTH state.js and sim.js,
+  // so it has to precede them.
+  'core/src/pets.js',
   'core/src/characters/analog.js',
   'core/src/motion.js',
   'core/src/state.js',
@@ -52,6 +55,9 @@ const ORDER = [
   'client/src/autospecial.js',
   'client/src/pwa.js',
   'client/src/touch.js',
+  // The companion renderer — cosmetic, reads FighterState only, so anywhere
+  // before main.js works.
+  'client/src/pets.js',
   'client/src/main.js',
 ];
 

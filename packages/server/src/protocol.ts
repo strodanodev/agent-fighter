@@ -7,12 +7,14 @@
  * server relays it and re-simulates the ledger to derive the result.
  */
 
-// v8: TICKETS (ADR 0009). A DELIBERATE hard cutover, not an additive change:
-// a decided wager now burns both fees instead of paying a pot, so a v7 client
-// would show "WINNER TAKES 20" over a match that pays nothing. Lying to a
-// player about money is worse than forcing an update — old clients get a clean
-// "protocol 8 required" and must reload.
-export const PROTOCOL_VERSION = 8;
+// v9: PETS (ADR 0011). SMatch.pets is structurally additive, but it is part
+// of the DETERMINISTIC contract: a client that ignored it would install no
+// aura, simulate a different match than the verifier, and be convicted as the
+// deviator for its own opponent's pet. A silent desync is worse than a forced
+// update — old clients get a clean "protocol 9 required" and must reload.
+// (v8: TICKETS, ADR 0009 — a decided wager burns both fees instead of paying
+// a pot, so a v7 client would have lied to the player about the money.)
+export const PROTOCOL_VERSION = 9;
 export const DEFAULT_PORT = 8477;
 
 /**
@@ -308,6 +310,21 @@ export interface SMatch {
    * verified re-sim shows were drunk.
    */
   items?: [ItemPin[], ItemPin[]];
+  /**
+   * PETS (ADR 0011): the pinned per-side companion, or null for a side with
+   * none equipped. Same deterministic contract as `items` — BOTH simulating
+   * ends install it via core `setMatchPets` BEFORE createGameState, and core
+   * re-clamps every line. Absent = pet-less match.
+   *
+   * The server reads each profile's equipped pet itself at queue time; the
+   * client never nominates one. Unlike a drink an aura is never consumed, so
+   * there is no settlement counterpart — it is pure setup.
+   *
+   * The `id` is what the RENDERER needs (which sprite floats behind that
+   * fighter); the aura is what the SIM needs. Both sides see both, which is
+   * what makes open carry disclosed rather than hidden.
+   */
+  pets?: [PetPin | null, PetPin | null];
   /** This side's resume token (bearer secret — never shown to the opponent). */
   resume?: string;
 }
@@ -318,6 +335,18 @@ export interface ItemPin {
   name: string;
   tier: number;
   effect: { kind: string; amount: number; durationTicks: number };
+}
+/**
+ * One pinned pet as it rides SMatch (ADR 0011): display fields + the rolled
+ * aura the sim installs. Per-mille integers, re-clamped by core.
+ */
+export interface PetPin {
+  id: string;
+  name: string;
+  rarity: number;
+  aura: {
+    atk: number; def: number; hpRegen: number; crit: number; energyRegen: number;
+  };
 }
 export interface SInput { t: 'i'; k: number; v: number }
 /**

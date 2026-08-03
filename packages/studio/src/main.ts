@@ -58,7 +58,8 @@ interface StudioMeta {
   disabled?: boolean; // greyed out + unselectable on the character-select screen
 }
 
-type TabName = 'character' | 'frames' | 'moves' | 'cancels' | 'test' | 'generate' | 'stage';
+type TabName = 'character' | 'frames' | 'moves' | 'cancels' | 'test' | 'generate' | 'stage'
+  | 'pets';
 
 // ------------------------------------------------------------------ state
 let stCharId = 'analog';
@@ -504,6 +505,23 @@ const numInput = (value: number, onCommit: (v: number) => void, width = 54): HTM
     },
   });
 
+/**
+ * Like numInput but does NOT mark the character bundle dirty — for fields
+ * belonging to a DIFFERENT asset (a pet, a stage). Sharing numInput made
+ * editing a pet light up the character's "save *", inviting a save of a
+ * bundle nothing had touched.
+ */
+const numInputClean = (
+  value: number, onCommit: (v: number) => void, width = 54,
+): HTMLInputElement =>
+  mkEl('input', {
+    type: 'number', value, style: `width:${width}px`, step: 'any',
+    onchange: (e: Event) => {
+      const v = Number((e.target as HTMLInputElement).value);
+      if (!Number.isNaN(v)) { onCommit(v); renderAll(); }
+    },
+  });
+
 const selInput = (value: string, options: string[], onCommit: (v: string) => void): HTMLSelectElement => {
   const s = mkEl('select', {
     onchange: (e: Event) => { onCommit((e.target as HTMLSelectElement).value); stDirty = true; renderAll(); },
@@ -660,7 +678,8 @@ const renderNewCharDialog = (): HTMLElement | null => {
 
 // ------------------------------------------------------------------ header
 const renderHeader = (): HTMLElement => {
-  const tabs: TabName[] = ['character', 'frames', 'moves', 'cancels', 'test', 'generate', 'stage'];
+  const tabs: TabName[] = ['character', 'frames', 'moves', 'cancels', 'test', 'generate',
+    'stage', 'pets'];
   return mkEl('div', { class: 'header' },
     mkEl('span', { class: 'logo' }, 'AF STUDIO'),
     selInput(stCharId, stCharList, (id) => { void loadChar(id).then(renderAll); }),
@@ -3764,6 +3783,331 @@ const renderStageTab = (): HTMLElement => {
   );
 };
 
+// ============================================================ PETS (ADR 0011)
+/**
+ * The Pets tab. A pet is the simplest asset in the repo — `pets/<id>/pet.json`
+ * (a PetDef) plus its frames — so this tab is deliberately small: generate or
+ * upload an image, key out its background, trim it, save.
+ *
+ * WHAT THIS TAB DOES NOT DO: auras. Every line is rolled per-adoption by the
+ * match server (ADR 0011), so two players owning the same pet own different
+ * auras. There is nothing here to balance and nothing here to cheat.
+ */
+interface PetEd {
+  id: string;
+  name: string;
+  desc: string;
+  flavor: string;
+  tint: string;
+  sizePx: number;
+  fps: number;
+  sprites: string[];
+  disabled?: boolean;
+}
+
+let stPetList: { id: string; def: PetEd }[] = [];
+let stPetEd: PetEd | null = null;
+/** Decoded frames for the preview, index-aligned with the saved sprite list. */
+let stPetFrames: (HTMLCanvasElement | null)[] = [];
+let stPetPrompt = 'a tiny cute robotic companion creature, floating drone pet, '
+  + 'glowing accents, chunky readable silhouette, side view, full body';
+let stNewPet: { id: string } | null = null;
+
+const petDefaults = (id: string): PetEd => ({
+  id,
+  name: id.toUpperCase(),
+  desc: '',
+  flavor: '',
+  tint: '#6fd3ff',
+  sizePx: 44,
+  fps: 8,
+  sprites: [],
+});
+
+const loadPetEd = async (id: string): Promise<void> => {
+  const hit = stPetList.find((p) => p.id === id);
+  stPetEd = { ...petDefaults(id), ...(hit?.def ?? {}), id };
+  stPetFrames = [];
+  for (const name of stPetEd.sprites) {
+    // Cache-bust: the Studio rewrites these constantly and a stale frame
+    // would quietly misrepresent what is on disk.
+    const img = await new Promise<HTMLImageElement | null>((resolve) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = () => resolve(null);
+      i.src = `/pets/${id}/${name}?v=${Date.now()}`;
+    });
+    if (!img) { stPetFrames.push(null); continue; }
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth;
+    c.height = img.naturalHeight;
+    c.getContext('2d')!.drawImage(img, 0, 0);
+    stPetFrames.push(c);
+  }
+  renderAll();
+};
+
+/** Write pet.json + every frame. Writing the FOLDER is the whole publish. */
+const savePet = async (): Promise<void> => {
+  const p = stPetEd;
+  if (!p) return;
+  try {
+    for (let i = 0; i < stPetFrames.length; i++) {
+      const c = stPetFrames[i];
+      if (!c) continue;
+      await apiJson(`/api/pets/${p.id}/frame${i}.png`, {
+        method: 'PUT', body: canvasToPngDataUrl(c),
+      });
+    }
+    const def = {
+      id: p.id,
+      name: p.name,
+      desc: p.desc,
+      flavor: p.flavor,
+      tint: p.tint,
+      sizePx: p.sizePx,
+      fps: p.fps,
+      sprites: stPetFrames
+        .map((c, i) => (c ? `frame${i}.png` : null))
+        .filter((n): n is string => n !== null),
+      ...(p.disabled ? { disabled: true } : {}),
+    };
+    await apiJson(`/api/pets/${p.id}/pet.json`, {
+      method: 'PUT', body: JSON.stringify(def, null, 2),
+    });
+    stPetList = await apiJson<{ id: string; def: PetEd }[]>('/api/pets');
+    stStatus = `saved pet "${p.id}" (${def.sprites.length} frame(s)) — restart the `
+      + 'match server to put it in the adoption pool';
+  } catch (e) {
+    stStatus = `PET SAVE FAILED: ${(e as Error).message}`;
+  }
+  renderAll();
+};
+
+/** Key out the background, trim to the creature, add it as a frame. */
+const addPetFrame = (img: HTMLImageElement | HTMLCanvasElement): void => {
+  const { canvas } = removeBackground(img, keySettings());
+  stPetFrames.push(cropToAlpha(canvas, 0.04) ?? canvas);
+  stStatus = `frame ${stPetFrames.length} added — save the pet to publish it`;
+  renderAll();
+};
+
+const renderPetsTab = (): HTMLElement => {
+  void (async () => {
+    if (stPetList.length === 0) {
+      try {
+        stPetList = await apiJson<{ id: string; def: PetEd }[]>('/api/pets');
+      } catch { /* none published yet */ }
+      if (!stPetEd && stPetList[0]) await loadPetEd(stPetList[0].id);
+      else renderAll();
+    }
+  })();
+
+  const pane = mkEl('div', { class: 'pane' });
+  pane.append(mkEl('div', { class: 'row' },
+    mkEl('b', {}, 'PET'),
+    sessionSelect(stPetEd?.id ?? '', stPetList.map((p) => p.id), (id) => { void loadPetEd(id); }),
+    mkEl('button', { onclick: () => { stNewPet = { id: '' }; renderAll(); } }, '+ new pet')));
+
+  const p = stPetEd;
+  if (!p) {
+    pane.append(mkEl('p', { class: 'hint' },
+      'No pets yet. "+ new pet" writes pets/<id>/ — the match server reads that '
+      + 'directory to build its adoption pool, so a new folder IS a new pet.'));
+    return pane;
+  }
+
+  // ---- animated preview, on a dark plate (a pet is seen mid-fight)
+  const cv = mkEl('canvas', { width: 320, height: 220, class: 'frcanvas' });
+  const paint = (): void => {
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    const g = ctx.createLinearGradient(0, 0, 0, 220);
+    g.addColorStop(0, '#141a24');
+    g.addColorStop(1, '#080b11');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 320, 220);
+    const t = Math.floor(performance.now() / 16.67);
+    const cx = 160;
+    const cy = 105 + Math.sin(t * 0.06) * 5;
+    // The same aura glow the game draws behind the companion.
+    const glow = ctx.createRadialGradient(cx, cy, 1, cx, cy, p.sizePx);
+    glow.addColorStop(0, `${p.tint}66`);
+    glow.addColorStop(1, `${p.tint}00`);
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(cx, cy, p.sizePx, 0, Math.PI * 2);
+    ctx.fill();
+    const live = stPetFrames.filter((c): c is HTMLCanvasElement => c !== null);
+    if (live.length > 0) {
+      const fps = Math.max(1, Math.min(30, p.fps));
+      const img = live[Math.floor((t * fps) / 60) % live.length]!;
+      const h = p.sizePx * 2; // 2× so pixel work is actually judgeable here
+      const w = (img.width / img.height) * h;
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(img, cx - w / 2, cy - h / 2, w, h);
+    } else {
+      ctx.fillStyle = '#8a91a8';
+      ctx.font = '13px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('no art yet — the game draws a', cx, cy - 6);
+      ctx.fillText('procedural companion in this tint', cx, cy + 12);
+    }
+    ctx.fillStyle = '#8a91a8';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`${p.sizePx}px in world · ${p.fps} fps · ${live.length} frame(s)`, 8, 210);
+  };
+  paint();
+  // rAF is throttled to 0 in a hidden pane — setInterval keeps this alive.
+  const timer = window.setInterval(() => {
+    if (!cv.isConnected) { window.clearInterval(timer); return; }
+    paint();
+  }, 50);
+
+  const txt = (
+    label: string, value: string, onCommit: (v: string) => void, width = 240,
+  ): HTMLElement =>
+    mkEl('label', { class: 'row' }, `${label} `,
+      mkEl('input', {
+        value,
+        style: `width:${width}px`,
+        onchange: (e: Event) => { onCommit((e.target as HTMLInputElement).value); renderAll(); },
+      }));
+
+  const meta = mkEl('div', {},
+    txt('name', p.name, (v) => { p.name = v.toUpperCase().slice(0, 32); }),
+    txt('desc', p.desc, (v) => { p.desc = v.toUpperCase().slice(0, 60); }, 340),
+    txt('flavor', p.flavor, (v) => { p.flavor = v.slice(0, 90); }, 340),
+    mkEl('div', { class: 'row' },
+      'tint ',
+      mkEl('input', {
+        type: 'color', value: p.tint,
+        onchange: (e: Event) => { p.tint = (e.target as HTMLInputElement).value; renderAll(); },
+      }),
+      ' size ', numInputClean(p.sizePx, (v) => { p.sizePx = Math.max(16, Math.min(120, Math.round(v))); }),
+      ' fps ', numInputClean(p.fps, (v) => { p.fps = Math.max(1, Math.min(30, Math.round(v))); })),
+    mkEl('label', { class: 'row' },
+      mkEl('input', {
+        type: 'checkbox', checked: !!p.disabled,
+        onchange: (e: Event) => {
+          p.disabled = (e.target as HTMLInputElement).checked;
+          renderAll();
+        },
+      }),
+      ' disabled — stays owned by whoever adopted it, stops dropping'),
+  );
+
+  pane.append(mkEl('div', { class: 'row', style: 'align-items:flex-start;gap:18px' }, cv, meta));
+
+  // ---- frame strip
+  if (stPetFrames.some((c) => c !== null)) {
+    const strip = mkEl('div', { class: 'row', style: 'flex-wrap:wrap;gap:8px' });
+    stPetFrames.forEach((c, i) => {
+      if (!c) return;
+      const thumb = mkEl('canvas', { width: 72, height: 72, class: 'frcanvas' });
+      const tctx = thumb.getContext('2d')!;
+      tctx.fillStyle = '#0d1117';
+      tctx.fillRect(0, 0, 72, 72);
+      const s = Math.min(64 / c.width, 64 / c.height);
+      tctx.imageSmoothingEnabled = false;
+      tctx.drawImage(c, 36 - (c.width * s) / 2, 36 - (c.height * s) / 2, c.width * s, c.height * s);
+      strip.append(mkEl('div', {}, thumb,
+        mkEl('div', { class: 'row' },
+          mkEl('button', { onclick: () => { stPetFrames.splice(i, 1); renderAll(); } }, '✕'),
+          mkEl('button', { onclick: () => { stPetFrames[i] = flipCanvasH(c); renderAll(); } }, '↔'))));
+    });
+    pane.append(mkEl('h4', {}, `frames (played in order at ${p.fps} fps)`), strip);
+  }
+
+  // ---- generate / upload
+  const promptBox = mkEl('textarea', {
+    style: 'width:100%;height:56px',
+    onchange: (e: Event) => { stPetPrompt = (e.target as HTMLTextAreaElement).value; },
+  }, stPetPrompt);
+
+  const genBtn = mkEl('button', {
+    onclick: () => {
+      void (async () => {
+        stStatus = 'generating pet…';
+        renderAll();
+        try {
+          const img = await generateImage(
+            `${stPetPrompt}, on a ${bgPhrase()} background, no shadows, no floor`,
+            (Math.random() * 1e9) | 0, 1024, 1024, false, stSpriteProvider);
+          addPetFrame(img);
+        } catch (e) {
+          stStatus = `generate failed: ${(e as Error).message}`;
+          renderAll();
+        }
+      })();
+    },
+  }, '✨ generate a frame');
+
+  const upload = mkEl('input', {
+    type: 'file', accept: 'image/png,image/jpeg,image/webp',
+    onchange: (e: Event) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => addPetFrame(img);
+        img.src = String(reader.result);
+      };
+      reader.readAsDataURL(file);
+    },
+  });
+
+  pane.append(
+    mkEl('h4', {}, 'art'),
+    mkEl('p', { class: 'hint' },
+      'Every frame is background-keyed (Generate tab key settings) and trimmed to '
+      + 'the creature before it lands in the strip. A pet with NO frames is still '
+      + 'publishable — the game draws a procedural companion in its tint.'),
+    promptBox,
+    mkEl('div', { class: 'row' }, genBtn, mkEl('span', {}, ' or upload '), upload),
+    mkEl('div', { class: 'row' },
+      mkEl('button', { class: 'primary', onclick: () => { void savePet(); } }, '💾 save pet')),
+    mkEl('p', { class: 'hint' },
+      'AURAS ARE NOT SET HERE. The match server rolls every aura line at adoption '
+      + 'time (ADR 0011) — rarity decides how MANY lines a pet rolls, never how '
+      + 'strong they are.'),
+  );
+
+  return pane;
+};
+
+/** "+ new pet" — same modal pattern as new character / new stage. */
+const renderNewPetDialog = (): HTMLElement | null => {
+  if (!stNewPet) return null;
+  const idIn = mkEl('input', {
+    value: stNewPet.id,
+    placeholder: 'lowercase-id',
+    oninput: (e: Event) => { stNewPet!.id = (e.target as HTMLInputElement).value; },
+  });
+  return mkEl('div', { class: 'modal' },
+    mkEl('div', { class: 'modalbox' },
+      mkEl('h3', {}, 'new pet'),
+      mkEl('div', { class: 'row' }, 'id ', idIn),
+      mkEl('p', { class: 'hint' }, 'The folder name IS the id — pets/<id>/pet.json.'),
+      mkEl('div', { class: 'row' },
+        mkEl('button', {
+          class: 'primary',
+          onclick: () => {
+            const id = stNewPet!.id.trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
+            if (!id) return;
+            stNewPet = null;
+            stPetEd = petDefaults(id);
+            stPetFrames = [];
+            stStatus = `new pet "${id}" — generate or upload art, then save`;
+            renderAll();
+          },
+        }, 'create'),
+        mkEl('button', { onclick: () => { stNewPet = null; renderAll(); } }, 'cancel'))));
+};
+
+
 const renderAll = (): void => {
   const app = document.getElementById('app')!;
   cancelAnimationFrame(stRaf);
@@ -3781,8 +4125,10 @@ const renderAll = (): void => {
     case 'test': app.append(renderTestTab()); break;
     case 'generate': app.append(renderGenerateTab()); break;
     case 'stage': app.append(renderStageTab()); break;
+    case 'pets': app.append(renderPetsTab()); break;
   }
-  for (const dlg of [renderNewCharDialog(), renderNewStageDialog(), renderConfirmDialog()]) {
+  for (const dlg of [renderNewCharDialog(), renderNewStageDialog(), renderNewPetDialog(),
+    renderConfirmDialog()]) {
     if (dlg) app.append(dlg);
   }
 };

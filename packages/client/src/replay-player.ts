@@ -23,9 +23,9 @@
  */
 import {
   Phase, STAGE, createGameState, decodeLedger, fpToPx, setCharacters,
-  setMatchItems, stateHash, step,
+  setMatchItems, setMatchPets, stateHash, step,
 } from '@af/core';
-import type { GameState, ItemEffect } from '@af/core';
+import type { GameState, ItemEffect, PetAura } from '@af/core';
 import { drawFighter, loadRoster, resetFighterTrails } from './atlas.js';
 import type { Roster } from './atlas.js';
 
@@ -38,6 +38,8 @@ export interface ReplayPin {
   names: [string, string];
   delay?: number;
   items?: [Array<{ effect: ItemEffect }>, Array<{ effect: ItemEffect }>] | null;
+  /** PETS (ADR 0011): the pinned auras. A replay only reproduces with them. */
+  pets?: [{ aura: PetAura } | null, { aura: PetAura } | null] | null;
   result?: {
     hash: number; winner: number; rounds: [number, number];
     endTick: number; reason: string;
@@ -123,7 +125,8 @@ export const mountReplay = async (opts: MountOptions): Promise<ReplayHandle> => 
   /**
    * Install the pinned setup and re-step to `target`.
    *
-   * Characters and items are re-installed on EVERY rebuild, not once at mount.
+   * Characters, items and pet auras are re-installed on EVERY rebuild, not
+   * once at mount.
    * They live in module-level slots inside the core (the `setCharacters`
    * pattern), so another replay — or the game itself — mounting in the same
    * page would otherwise leave the wrong cast installed and silently produce a
@@ -135,6 +138,7 @@ export const mountReplay = async (opts: MountOptions): Promise<ReplayHandle> => 
       (pin.items?.[0] ?? []).map((p) => p.effect),
       (pin.items?.[1] ?? []).map((p) => p.effect),
     );
+    setMatchPets(pin.pets?.[0]?.aura ?? null, pin.pets?.[1]?.aura ?? null);
     game = createGameState(pin.seed, pin.bounds ?? undefined);
     resetFighterTrails();
     let t = 0;

@@ -43,7 +43,39 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { clampAura } from '@af/core';
+import type { PetAura } from '@af/core';
 import type { AirIdentity } from './airjwt.js';
+
+/** The pets columns both Supabase reads select (0030_pets.sql). */
+const PET_COLS = 'id,pet_id,rarity,aura_atk,aura_def,aura_hp_regen,'
+  + 'aura_crit,aura_energy_regen,equipped,created_at';
+
+/** One PostgREST pets row → OwnedPet. */
+const petRow = (r: Record<string, unknown>): OwnedPet => ({
+  rowId: Number(r.id ?? 0),
+  petId: String(r.pet_id ?? ''),
+  rarity: Number(r.rarity ?? 1),
+  aura: clampAura({
+    atk: Number(r.aura_atk ?? 0),
+    def: Number(r.aura_def ?? 0),
+    hpRegen: Number(r.aura_hp_regen ?? 0),
+    crit: Number(r.aura_crit ?? 0),
+    energyRegen: Number(r.aura_energy_regen ?? 0),
+  }),
+  equipped: Boolean(r.equipped),
+  createdAt: String(r.created_at ?? ''),
+});
+
+/** Strip the bookkeeping fields off a stored pet row (memory impl). */
+const petView = (row: OwnedPet): OwnedPet => ({
+  rowId: row.rowId,
+  petId: row.petId,
+  rarity: row.rarity,
+  aura: { ...row.aura },
+  equipped: row.equipped,
+  createdAt: row.createdAt,
+});
 
 export const DAILY_CREDITS = 10;
 /** Both sides of an accepted dare get this (mirrored in 0005_referrals.sql). */
@@ -485,6 +517,48 @@ export interface Persistence {
   arcadeExtract: (
     sub: string, runToken: string, loot: number, bonus: number,
   ) => Promise<ArcadeExtract>;
+  /**
+   * PETS (ADR 0011): adopt a pet — debit `cost` credits and grant the
+   * SERVER-rolled pet + aura atomically (the roll happens in server.ts;
+   * persistence just records it). Idempotent by `nonce`: a replayed
+   * adoption returns the already-granted pet with `duplicate: true`, charges
+   * nothing and — crucially — RE-ROLLS NOTHING. Throws InsufficientCredits(0)
+   * when the balance can't cover it.
+   *
+   * There is deliberately no counterpart that changes a pet's owner. Account
+   * binding is enforced by the absence of a transfer path (0030_pets.sql).
+   */
+  buyPet: (
+    sub: string, cost: number, petId: string, rarity: number, aura: PetAura,
+    nonce: string,
+  ) => Promise<PetPurchase>;
+  /** Everything `sub` owns, newest first. */
+  listPets: (sub: string, limit?: number) => Promise<OwnedPet[]>;
+  /**
+   * Equip exactly one pet, or none. `rowId` null unequips. A row that isn't
+   * `sub`'s is ignored (never throws — an unknown id is a no-op, not an
+   * error the profile page has to handle).
+   */
+  setEquippedPet: (sub: string, rowId: number | null) => Promise<void>;
+  /** The equipped pet, or null. Read at queue time to pin the aura. */
+  equippedPet: (sub: string) => Promise<OwnedPet | null>;
+}
+
+/** One owned pet: the catalog id plus the aura this individual rolled. */
+export interface OwnedPet {
+  rowId: number;
+  petId: string;
+  rarity: number;
+  aura: PetAura;
+  equipped: boolean;
+  createdAt: string;
+}
+
+export interface PetPurchase extends OwnedPet {
+  /** Balance after the adoption (unchanged on a duplicate replay). */
+  credits: number;
+  /** True = this nonce already adopted something; nothing was charged. */
+  duplicate: boolean;
 }
 
 /** What banking a run bag actually paid (ADR 0008). */
@@ -630,6 +704,9 @@ export const memoryPersistence = (): Persistence => {
     slot?: number | null;
   })[] = [];
   let nextItemRow = 1;
+  /** Adopted pets, newest first (ADR 0011). Nonce = idempotency key. */
+  const ownedPets: (OwnedPet & { sub: string; nonce: string })[] = [];
+  let nextPetRow = 1;
   /** Idempotency keys of non-refundable debits (`sub|reason|key`) — ADR 0007. */
   const debits = new Set<string>();
   /**
@@ -1104,6 +1181,42 @@ export const memoryPersistence = (): Persistence => {
         if (row) row.slot = slot;
       });
     },
+    // Mirrors 0030_pets.sql buy_pet — keep in sync (money logic lives twice).
+    buyPet: async (sub, cost, petId, rarity, aura, nonce) => {
+      const replay = ownedPets.find((p) => p.sub === sub && p.nonce === nonce);
+      if (replay) {
+        // A replayed adoption returns the SAME pet with the SAME aura. The
+        // roll can never be retried into a better one.
+        return { ...petView(replay), credits: prof(sub).credits, duplicate: true };
+      }
+      const p = prof(sub);
+      if (p.credits < cost) throw new InsufficientCredits(0);
+      p.credits -= cost;
+      const row = {
+        sub,
+        nonce,
+        rowId: nextPetRow++,
+        petId,
+        rarity,
+        aura: clampAura(aura),
+        equipped: false,
+        createdAt: new Date().toISOString(),
+      };
+      ownedPets.unshift(row);
+      return { ...petView(row), credits: p.credits, duplicate: false };
+    },
+    listPets: async (sub, limit = 50) =>
+      ownedPets.filter((p) => p.sub === sub).slice(0, limit).map(petView),
+    setEquippedPet: async (sub, rowId) => {
+      for (const row of ownedPets) if (row.sub === sub) row.equipped = false;
+      if (rowId === null) return;
+      const pick = ownedPets.find((p) => p.sub === sub && p.rowId === rowId);
+      if (pick) pick.equipped = true; // unknown id = no-op, mirroring the SQL
+    },
+    equippedPet: async (sub) => {
+      const row = ownedPets.find((p) => p.sub === sub && p.equipped);
+      return row ? petView(row) : null;
+    },
     equippedItems: async (sub) =>
       ownedItems
         .filter((i) => i.sub === sub && !i.consumedMatchId && i.slot !== null && i.slot !== undefined)
@@ -1568,6 +1681,67 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
           { method: 'PATCH', body: JSON.stringify({ equipped_slot: slot }) },
         );
       }
+    },
+    // PETS (ADR 0011) — mirrors 0030_pets.sql buy_pet.
+    buyPet: async (sub, cost, petId, rarity, aura, nonce) => {
+      const a = clampAura(aura);
+      const rows = (await call('/rest/v1/rpc/buy_pet', {
+        method: 'POST',
+        body: JSON.stringify({
+          _profile: sub, _cost: cost | 0, _pet: petId, _rarity: rarity | 0,
+          _atk: a.atk, _def: a.def, _hp: a.hpRegen, _crit: a.crit,
+          _energy: a.energyRegen, _nonce: nonce,
+        }),
+      })) as Array<Record<string, unknown>>;
+      const row = rows?.[0] ?? {};
+      return {
+        rowId: Number(row.row_id ?? 0),
+        petId: String(row.granted_pet ?? petId),
+        rarity: Number(row.granted_rarity ?? rarity),
+        // Read the aura BACK from the row: on a duplicate replay these are
+        // the originally rolled values, not the ones we just proposed.
+        aura: clampAura({
+          atk: Number(row.atk ?? 0),
+          def: Number(row.def ?? 0),
+          hpRegen: Number(row.hp_regen ?? 0),
+          crit: Number(row.crit ?? 0),
+          energyRegen: Number(row.energy_regen ?? 0),
+        }),
+        equipped: false,
+        createdAt: new Date().toISOString(),
+        credits: Number(row.credits ?? 0),
+        duplicate: Boolean(row.duplicate),
+      };
+    },
+    listPets: async (sub, limit = 50) => {
+      // pets is RLS default-deny — only this service-role path reads it.
+      const rows = (await call(
+        `/rest/v1/pets?select=${PET_COLS}&profile_id=eq.${encodeURIComponent(sub)}`
+        + `&order=created_at.desc&limit=${limit | 0}`,
+        { method: 'GET' },
+      )) as Array<Record<string, unknown>>;
+      return rows.map(petRow);
+    },
+    setEquippedPet: async (sub, rowId) => {
+      // Clear then set: the pets_equipped_idx unique index would reject an
+      // overlapping pair, and the service role is the single writer.
+      await call(
+        `/rest/v1/pets?profile_id=eq.${encodeURIComponent(sub)}&equipped=is.true`,
+        { method: 'PATCH', body: JSON.stringify({ equipped: false }) },
+      );
+      if (rowId === null) return;
+      await call(
+        `/rest/v1/pets?id=eq.${rowId | 0}&profile_id=eq.${encodeURIComponent(sub)}`,
+        { method: 'PATCH', body: JSON.stringify({ equipped: true }) },
+      );
+    },
+    equippedPet: async (sub) => {
+      const rows = (await call(
+        `/rest/v1/pets?select=${PET_COLS}&profile_id=eq.${encodeURIComponent(sub)}`
+        + `&equipped=is.true&limit=1`,
+        { method: 'GET' },
+      )) as Array<Record<string, unknown>>;
+      return rows?.[0] ? petRow(rows[0]) : null;
     },
     equippedItems: async (sub) => {
       const rows = (await call(

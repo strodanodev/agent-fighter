@@ -6,6 +6,7 @@
  *   /                  -> demo/agent-fighter.html   (as index.html)
  *   /characters/*      -> repo characters/  (minus frames-raw)
  *   /stages/*          -> repo stages/
+ *   /pets/*            -> repo pets/       (ADR 0011)
  *   /assets/*          -> packages/client/assets/  (audio, bg video, logos)
  *   /api/characters    -> static JSON list (fetch().json() ignores mime type)
  *   /api/stages        -> static JSON list
@@ -23,6 +24,7 @@ const ROOT = join(here, '..');
 const OUT = join(ROOT, 'public');
 const CHARACTERS = join(ROOT, 'characters');
 const STAGES = join(ROOT, 'stages');
+const PETS = join(ROOT, 'pets');
 const ASSETS = join(ROOT, 'packages', 'client', 'assets');
 const DEMO = join(ROOT, 'packages', 'client', 'demo');
 
@@ -52,6 +54,7 @@ if (existsSync(CHARACTERS)) {
   });
 }
 if (existsSync(STAGES)) cpSync(STAGES, join(OUT, 'stages'), { recursive: true });
+if (existsSync(PETS)) cpSync(PETS, join(OUT, 'pets'), { recursive: true });
 if (existsSync(ASSETS)) cpSync(ASSETS, join(OUT, 'assets'), { recursive: true });
 
 // The two dynamic endpoints, frozen to static files at build time.
@@ -67,4 +70,5 @@ const stages = listDirs(STAGES, 'stage.json');
 writeFileSync(join(OUT, 'api', 'characters'), JSON.stringify(chars));
 writeFileSync(join(OUT, 'api', 'stages'), JSON.stringify(stages));
 
-console.log(`vercel-build: public/ ready — ${chars.length} characters, ${stages.length} stages`);
+const pets = existsSync(PETS) ? listDirs(PETS, 'pet.json') : [];
+console.log(`vercel-build: public/ ready — ${chars.length} characters, ${stages.length} stages, ${pets.length} pets`);

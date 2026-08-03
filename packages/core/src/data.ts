@@ -338,8 +338,15 @@ export const ROUND_SECONDS = 99;
  *            moved (no golden replay lands a projectile on a grabbing fighter),
  *            but the SIM behavior changed in that scenario, so client and server
  *            must pin the same engine — hence the version bump + paired deploy.
+ * af-core-8: PETS (ADR 0011). Eight new FighterState fields (the five aura
+ *            lines, two regen accumulators, the crit flash) shift the
+ *            serialize layout, so the goldens are re-blessed — but the
+ *            BEHAVIOUR of a pet-less match is unchanged: every aura path is
+ *            gated on a non-zero line, and `rngSeed` (live for the first time,
+ *            as the crit roll) only advances when a fighter with a crit aura
+ *            lands a clean hit. The 61 behavioural tests must not move.
  */
-export const ENGINE_VERSION = 'af-core-7';
+export const ENGINE_VERSION = 'af-core-8';
 
 const TUNING_INIT = {
   roundsToWin: 2, // best of 3

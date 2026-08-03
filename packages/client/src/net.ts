@@ -1,5 +1,5 @@
 import {
-  ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, restore, setMatchItems, snapshot, stateHash, step,
+  ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, restore, setMatchItems, setMatchPets, snapshot, stateHash, step,
 } from '@af/core';
 import type { AiState, GameState, InputFrame, ItemEffect } from '@af/core';
 
@@ -19,10 +19,12 @@ import type { AiState, GameState, InputFrame, ItemEffect } from '@af/core';
  */
 
 // Protocol constants — must match packages/server/src/protocol.ts.
-// Must match the server's PROTOCOL_VERSION. v8 = TICKETS (ADR 0009): a decided
-// wager burns both entries instead of paying a pot, so a v7 client would
-// advertise stakes that no longer exist.
-const NET_PROTOCOL = 8;
+// Must match the server's PROTOCOL_VERSION. v9 = PETS (ADR 0011): SMatch.pets
+// is part of the deterministic setup, so a client that did not install it
+// would silently simulate a different match than the verifier.
+// (v8 = TICKETS, ADR 0009: a decided wager burns both entries instead of
+// paying a pot, so a v7 client advertised stakes that no longer exist.)
+const NET_PROTOCOL = 9;
 const MAX_AHEAD = 15;
 const HASH_EVERY = 60;
 const SNAP_RING = 128;
@@ -62,6 +64,13 @@ export interface NetSetup {
    * createGameState (begin + resume rebuild); absent clears the slot.
    */
   items?: [NetItemPin[], NetItemPin[]];
+  /**
+   * PETS (ADR 0011): the pinned companion per side (null = none equipped).
+   * Same deterministic contract as `items` — installed before EVERY
+   * createGameState; absent clears the slot. `id` tells the RENDERER which
+   * sprite floats behind that fighter; `aura` is what the sim installs.
+   */
+  pets?: [NetPetPin | null, NetPetPin | null];
   /** This side's resume token — lets a dropped socket rejoin (ADR 0005). */
   resume?: string;
 }
@@ -74,12 +83,28 @@ export interface NetItemPin {
   effect: { kind: string; amount: number; durationTicks: number };
 }
 
-/** Install a setup's pinned drink loadouts into core — part of match construction. */
+/** One pinned pet as it rides the setup (display fields + the rolled aura). */
+export interface NetPetPin {
+  id: string;
+  name: string;
+  rarity: number;
+  aura: {
+    atk: number; def: number; hpRegen: number; crit: number; energyRegen: number;
+  };
+}
+
+/**
+ * Install a setup's pinned drinks AND pet auras into core — part of match
+ * construction, not a cosmetic step: skipping either would simulate a
+ * different match than the server's verifier and convict this client as the
+ * deviator for its own opponent's pet.
+ */
 const installSetupItems = (s: NetSetup): void => {
   setMatchItems(
     s.items?.[0]?.map((p) => p.effect as ItemEffect) ?? null,
     s.items?.[1]?.map((p) => p.effect as ItemEffect) ?? null,
   );
+  setMatchPets(s.pets?.[0]?.aura ?? null, s.pets?.[1]?.aura ?? null);
 };
 
 export interface NetResult {

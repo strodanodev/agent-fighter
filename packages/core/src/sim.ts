@@ -2,7 +2,10 @@ import {
   Btn, ITEM_BITS, KICK_MASK, PUNCH_MASK, countBits, held, pressedAttacks,
 } from './input.js';
 import type { InputFrame } from './input.js';
-import { clamp, fp, fpToPx } from './fp.js';
+import { clamp, fp, fpToPx, nextRand } from './fp.js';
+import {
+  PET_CRIT_BONUS, PET_CRIT_FLASH_TICKS, PET_REGEN_PERIOD_TICKS,
+} from './pets.js';
 import { BUTTON_BITS, BUTTON_PRIORITY, STAGE, TUNING } from './data.js';
 import type { HitboxDef, LoadedCharacter, MoveDef, Rect } from './data.js';
 import { detectMotion, downTappedRecently, numpadDir } from './motion.js';
@@ -602,16 +605,83 @@ const useItem = (f: FighterState, ch: LoadedCharacter, s: number): void => {
   clearSlot(f, s); // each can drinks exactly once
 };
 
-/** Item-buff damage pipeline: attacker's OVERCLOCK, then victim's FIREWALL. */
-const itemScaled = (dmg: number, src: StrikeSource, vic: FighterState, floor: number): number => {
+/**
+ * PETS (ADR 0011) — the HP REGEN and ENERGY REGEN auras, one live tick.
+ *
+ * Integer-exact by accumulator: each tick adds `max × rate` and pays out
+ * whole points once the accumulator reaches `1000 × period`, so the full
+ * per-mille amount lands over the period with nothing lost to division. (A
+ * naive `max × rate / 1000 / period` per tick truncates to zero.)
+ *
+ * Deliberately excluded: a KO'd fighter (health 0) never ticks back up, and
+ * neither regen can exceed its ceiling — no overheal, no meter above the cap.
+ */
+const AURA_ACC_FULL = 1000 * PET_REGEN_PERIOD_TICKS;
+
+const auraRegen = (f: FighterState, ch: LoadedCharacter): void => {
+  if (f.auraHpRegen > 0 && f.health > 0 && f.health < ch.b.maxHealth) {
+    f.auraHpAcc += ch.b.maxHealth * f.auraHpRegen;
+    if (f.auraHpAcc >= AURA_ACC_FULL) {
+      const gain = Math.trunc(f.auraHpAcc / AURA_ACC_FULL);
+      f.auraHpAcc -= gain * AURA_ACC_FULL;
+      f.health = Math.min(ch.b.maxHealth, f.health + gain);
+    }
+  }
+  if (f.auraEnergyRegen > 0 && f.health > 0 && f.meter < TUNING.meterMax) {
+    f.auraMeterAcc += TUNING.meterMax * f.auraEnergyRegen;
+    if (f.auraMeterAcc >= AURA_ACC_FULL) {
+      const gain = Math.trunc(f.auraMeterAcc / AURA_ACC_FULL);
+      f.auraMeterAcc -= gain * AURA_ACC_FULL;
+      f.meter = Math.min(TUNING.meterMax, f.meter + gain);
+    }
+  }
+};
+
+/**
+ * Buff damage pipeline, in a fixed order so it is reproducible: the
+ * attacker's pet ATK aura, the attacker's OVERCLOCK, then the victim's
+ * DEFENSE aura and FIREWALL. Each step truncates on its own — per-mille
+ * integers only, never a compounded float (ADR 0001).
+ *
+ * A fighter with no pet and no drink passes through untouched, which is why
+ * a pet-less match stays bit-identical to pre-pet builds.
+ */
+const buffScaled = (dmg: number, src: StrikeSource, vic: FighterState, floor: number): number => {
   let d = dmg;
+  if (src.buff.auraAtk > 0) {
+    d = Math.trunc((d * (1000 + src.buff.auraAtk)) / 1000);
+  }
   if (src.buff.itemDmgLeft > 0 && src.buff.itemDmg > 0) {
     d = Math.trunc((d * (1000 + src.buff.itemDmg)) / 1000);
+  }
+  if (vic.auraDef > 0) {
+    d = Math.trunc((d * (1000 - vic.auraDef)) / 1000);
   }
   if (vic.itemDefLeft > 0 && vic.itemDef > 0) {
     d = Math.trunc((d * (1000 - vic.itemDef)) / 1000);
   }
   return Math.max(floor, d);
+};
+
+/**
+ * PETS (ADR 0011) — the CRITICAL aura, and the only randomness in combat.
+ *
+ * Deterministic despite the name: the roll comes from `GameState.rngSeed`,
+ * which the server pins in SMatch.seed, which round-trips through
+ * snapshot()/restore(), and which the verifying re-sim replays. A rollback
+ * re-simulating the same tick history re-rolls the SAME crits.
+ *
+ * The seed advances ONLY when a fighter with a crit aura lands a clean hit —
+ * so a pet-less match never touches it and the pre-pet golden behaviour is
+ * preserved exactly.
+ */
+const critScaled = (dmg: number, s: GameState, src: StrikeSource): number => {
+  const chance = src.buff.auraCrit;
+  if (chance <= 0) return dmg;
+  s.rngSeed = nextRand(s.rngSeed);
+  if (s.rngSeed % 1000 >= chance) return dmg;
+  src.buff.critFlash = PET_CRIT_FLASH_TICKS;
+  return Math.max(1, Math.trunc((dmg * (1000 + PET_CRIT_BONUS)) / 1000));
 };
 
 /** Apply one hit/block. Returns 0 none, 1 hit, 2 block. */
@@ -634,7 +704,8 @@ const strike = (s: GameState, src: StrikeSource, vic: FighterState, hb: HitboxDe
   const dir = src.facing;
 
   if (canBlock(vic, src.x, hb.guard)) {
-    vic.health = Math.max(0, vic.health - (hb.chip > 0 ? itemScaled(hb.chip, src, vic, 0) : 0));
+    // Chip is never critical — a crit is a clean-hit reward, not a chip one.
+    vic.health = Math.max(0, vic.health - (hb.chip > 0 ? buffScaled(hb.chip, src, vic, 0) : 0));
     vic.blockstunLeft = hb.blockstun;
     vic.velX = dir * fp(hb.pushbackBlock);
     vic.pushblocked = 0;
@@ -657,8 +728,9 @@ const strike = (s: GameState, src: StrikeSource, vic: FighterState, hb: HitboxDe
     vic.juggleBudget = TUNING.juggleBudget;
   }
   vic.comboHits++;
-  const dmg = itemScaled(Math.max(
-    Math.trunc((hb.damage * Math.max(vic.comboScaling, TUNING.scalingFloor)) / 1000), 1), src, vic, 1);
+  const dmg = critScaled(buffScaled(Math.max(
+    Math.trunc((hb.damage * Math.max(vic.comboScaling, TUNING.scalingFloor)) / 1000), 1),
+  src, vic, 1), s, src);
   vic.comboScaling = Math.max(
     Math.trunc((vic.comboScaling * TUNING.scalingMult) / 1000), TUNING.scalingFloor);
   if (vicAir) vic.juggleBudget -= hb.juggleCost;
@@ -908,6 +980,12 @@ export const step = (s: GameState, inputs: [InputFrame, InputFrame]): void => {
   if (f0.itemDefLeft > 0) f0.itemDefLeft--;
   if (f1.itemDmgLeft > 0) f1.itemDmgLeft--;
   if (f1.itemDefLeft > 0) f1.itemDefLeft--;
+
+  // Pet auras (ADR 0011) tick on exactly the same live-fighting ticks.
+  auraRegen(f0, c0);
+  auraRegen(f1, c1);
+  if (f0.critFlash > 0) f0.critFlash--;
+  if (f1.critFlash > 0) f1.critFlash--;
 
   updateFighter(s, f0, f1, c0, io0);
   updateFighter(s, f1, f0, c1, io1);

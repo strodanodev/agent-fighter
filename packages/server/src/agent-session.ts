@@ -15,7 +15,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, loadCharacter,
-  setCharacters, setMatchItems, stateHash, step,
+  setCharacters, setMatchItems, setMatchPets, stateHash, step,
 } from '@af/core';
 import type { AiState, CharacterBundle, GameState, InputFrame, ItemEffect } from '@af/core';
 import { HASH_EVERY, PROTOCOL_VERSION } from './protocol.js';
@@ -119,6 +119,8 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
     // characters — re-pin both before every burst or concurrent sessions
     // corrupt each other. undefined when the setup carried no items.
     let myItems: SMatch['items'] = undefined;
+    /** Pinned pet auras (ADR 0011) — engine-global for the same reason. */
+    let myPets: SMatch['pets'] = undefined;
     const pinChars = (): void => {
       if (!myChars) return;
       setCharacters(myChars[0], myChars[1]);
@@ -126,6 +128,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
         myItems?.[0]?.map((p) => p.effect as ItemEffect) ?? null,
         myItems?.[1]?.map((p) => p.effect as ItemEffect) ?? null,
       );
+      setMatchPets(myPets?.[0]?.aura ?? null, myPets?.[1]?.aura ?? null);
     };
 
     const myInputs: number[] = [];
@@ -194,6 +197,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
             loadCharacter(bundleOf(msg.chars[1].id)),
           ];
           myItems = msg.items;
+          myPets = msg.pets;
           pinChars();
           game = createGameState(msg.seed, msg.bounds);
           ai = createAi(side, opts.skill, opts.aiSeed ?? msg.seed ^ (side + 1) * 0x9e37, opts.personality);

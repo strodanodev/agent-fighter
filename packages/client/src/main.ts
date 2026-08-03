@@ -9,6 +9,7 @@
 import {
   Action, Btn, EXIT_BONUS, EXIT_FIGHT_FLOOR, Phase, REGION_NAME, STAGE,
   TICKS_PER_SEC, TUNING, aiPoll, createAi, createGameState, debugBoxes,
+  auraLineText, auraLines, clampAura,
   generateBoard, isLegalMove, itemById, nodeById, setCharacters, step, successors,
 } from '@af/core';
 import type { AiState, Board, BoardNode, GameState, InputFrame } from '@af/core';
@@ -17,6 +18,8 @@ import {
 } from './progress.js';
 import type { Profile } from './progress.js';
 import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './atlas.js';
+import { drawPet, loadMatchPets } from './pets.js';
+import type { LoadedPet } from './pets.js';
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
@@ -1000,6 +1003,13 @@ let stageIds: string[] = [];
 let stageAssets: (StageAsset | null)[] = [];
 let stageCursor = 0;
 let fighters: [Roster, Roster] | null = null;
+/**
+ * PETS (ADR 0011): the companion floating behind each fighter this match, or
+ * null for a side with none equipped. Cosmetic — the aura itself is installed
+ * into the sim by net.ts from the same pin. Loaded asynchronously: a pet that
+ * has not arrived yet simply is not drawn, which never blocks the fight.
+ */
+let matchPets: [LoadedPet | null, LoadedPet | null] = [null, null];
 let game: GameState | null = null;
 let showBoxes = false;
 let seed = 1;
@@ -1286,6 +1296,9 @@ const installOnlineMatch = (): void => {
   }
   fighters = [r0, r1];
   setCharacters(r0.ch, r1.ch);
+  // The pinned pets are art only — fire and forget, never awaited.
+  matchPets = [null, null];
+  void loadMatchPets(s.pets).then((p) => { matchPets = p; });
   const si = stageIds.indexOf(s.stage);
   if (si >= 0) setStageAsset(stageAssets[si] ?? null);
   net!.begin();
@@ -1348,6 +1361,19 @@ const installOnlineMatch = (): void => {
   if (myDrinks.length > 0) {
     vsStakes.push(`🥤 ${myDrinks.map((d) => d.name).join(' · ')} — TAP A CAN OR PRESS R TO DRINK`);
   }
+  // PETS (ADR 0011): open carry is only fair if it is DISCLOSED — both sides'
+  // auras go on the card, mine first, in the same server-echoed truth.
+  const petLine = ([s.side, 1 - s.side] as const)
+    .map((side) => {
+      const pin = s.pets?.[side];
+      if (!pin) return '';
+      const lines = auraLines(clampAura(pin.aura))
+        .map((l) => auraLineText(l.kind, l.amount)).join(' · ');
+      return `${side === s.side ? 'YOUR' : 'THEIR'} ${pin.name}: ${lines}`;
+    })
+    .filter(Boolean)
+    .join('      ');
+  if (petLine) vsStakes.push(`🐾 ${petLine}`);
   const newChallenger = s.mode === 'arcade' && (s.arcade?.fights ?? 0) > 0;
   void audio.playStinger(newChallenger ? 'here_comes_a_new_challenger' : 'vs',
     { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
@@ -1356,6 +1382,9 @@ const installOnlineMatch = (): void => {
 const startFight = (): void => {
   fighters = [allRosters[picks[0]]!, allRosters[picks[1]]!];
   setCharacters(fighters[0].ch, fighters[1].ch);
+  // Offline play carries no aura (the server is what pins one), so clear any
+  // companion left over from the last online match.
+  matchPets = [null, null];
   // Local play: walls follow the selected stage's view-lock region (matches
   // the online feel, where the server pins the same bounds).
   game = createGameState(seed++, currentStageBounds());
@@ -1609,6 +1638,8 @@ const startPracticeFight = (node: BoardNode): void => {
   picks[1] = opp >= 0 ? opp : picks[0];
   fighters = [allRosters[picks[0]]!, allRosters[picks[1]]!];
   setCharacters(fighters[0].ch, fighters[1].ch);
+  matchPets = [null, null]; // practice gauntlet: free, and aura-free
+
   // Rotate the stage art each battle so a run tours the whole game.
   if (stageAssets.length > 0) {
     stageCursor = (seed + run.fights) % stageAssets.length;
@@ -1904,6 +1935,13 @@ const renderFight = (g: GameState): void => {
       auraGlow(ctx, px(f.x), px(f.y) - 52, 88,
         f.itemDmgLeft > 0 ? '#ff9d6b' : '#6fd3ff', 0.75 * throb);
     }
+  }
+
+  // Pets first: "floating behind the fighter" is a z-order as much as a
+  // position, so every companion lands under every fighter (ADR 0011).
+  for (const i of [0, 1] as const) {
+    const pet = matchPets[i];
+    if (pet) drawPet(ctx, pet, g.fighters[i], g.tick, px(g.fighters[i].x), px(g.fighters[i].y));
   }
 
   // Fighters (draw the one in hitstun last so it reads on top).

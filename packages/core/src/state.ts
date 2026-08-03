@@ -2,6 +2,8 @@ import { fp, fpToPx } from './fp.js';
 import { ROUND_SECONDS, STAGE, TICKS_PER_SEC, TUNING, loadCharacter } from './data.js';
 import type { LoadedCharacter } from './data.js';
 import type { ItemEffect } from './items.js';
+import { NO_AURA, clampAura } from './pets.js';
+import type { PetAura } from './pets.js';
 import { HIST_LEN } from './motion.js';
 import { ANALOG } from './characters/analog.js';
 
@@ -95,6 +97,24 @@ export interface FighterState {
   itemDmgLeft: number;
   itemDef: number; // ACTIVE: per-mille damage-taken reduction while itemDefLeft > 0
   itemDefLeft: number;
+  // PETS (ADR 0011) — the equipped companion's rolled AURA, pinned by the
+  // server into match setup and installed at spawn. Unlike a drink an aura is
+  // never spent and never expires: it is on for the whole match, every round.
+  // All per-mille; all zero when no pet is equipped, so a pet-less match is
+  // bit-identical to pre-pet builds.
+  auraAtk: number; // bonus damage dealt
+  auraDef: number; // damage-taken reduction
+  auraCrit: number; // chance a clean hit crits (rolled off GameState.rngSeed)
+  auraHpRegen: number; // of maxHealth per PET_REGEN_PERIOD_TICKS
+  auraEnergyRegen: number; // of TUNING.meterMax per PET_REGEN_PERIOD_TICKS
+  // Regen accumulators. Integer-exact: each live tick adds max×rate and pays
+  // out whole points at 1000×period, so nothing is lost to division. Reset
+  // every round (health and positions are fresh anyway).
+  auraHpAcc: number;
+  auraMeterAcc: number;
+  /** Cosmetic: ticks left of the crit flash. State-driven so the renderer
+   *  stays a pure function of GameState (and rollback un-flashes correctly). */
+  critFlash: number;
   dirHist: number[]; // ring buffer of numpad dirs, length HIST_LEN
 }
 
@@ -180,6 +200,25 @@ export const setMatchItems = (i0: ItemEffect[] | null, i1: ItemEffect[] | null):
   matchItems[1] = clampSide(i1);
 };
 
+/**
+ * PETS (ADR 0011): the per-side AURA carried into the next match. Same
+ * contract as setCharacters/setMatchItems — install between matches, never
+ * mid-sim, identical on every simulating peer (client, server verifier,
+ * rollback re-sim). The pinned aura comes from SMatch.pets and is applied to
+ * each fighter at spawn; `null` (the default) is the pre-pet behavior.
+ *
+ * Values are CLAMPED here, on top of the clamp the server already applied —
+ * bound data at every boundary, so a hostile pin cannot mint a 10× aura.
+ */
+const matchAuras: [PetAura, PetAura] = [{ ...NO_AURA }, { ...NO_AURA }];
+
+export const setMatchPets = (
+  a0: Partial<PetAura> | null, a1: Partial<PetAura> | null,
+): void => {
+  matchAuras[0] = clampAura(a0);
+  matchAuras[1] = clampAura(a1);
+};
+
 /** Effect kind → the small integer stored in FighterState.itemKindN (serialized). */
 const ITEM_KIND_CODE: Record<ItemEffect['kind'], number> = {
   heal: 1, damageMult: 2, defenseMult: 3, meterGain: 4,
@@ -250,6 +289,17 @@ const spawnFighter = (
   itemDmgLeft: 0,
   itemDef: 0,
   itemDefLeft: 0,
+  // The pet aura is installed by the callers from the pinned loadout (match
+  // start AND every round reset — unlike a drink it is never spent), so
+  // spawnFighter stays side-effect-free.
+  auraAtk: 0,
+  auraDef: 0,
+  auraCrit: 0,
+  auraHpRegen: 0,
+  auraEnergyRegen: 0,
+  auraHpAcc: 0,
+  auraMeterAcc: 0,
+  critFlash: 0,
   dirHist: new Array(HIST_LEN).fill(5),
 });
 
@@ -319,7 +369,25 @@ const spawnItemFighter = (i: 0 | 1, cx: number, off: number): FighterState => {
     i,
   );
   loadCarriedSlots(f, i);
+  installAura(f, i);
   return f;
+};
+
+/**
+ * Apply side `i`'s pinned pet aura (ADR 0011). Called at match start AND at
+ * every round reset: an aura is a property of the equipped pet, not a
+ * consumable, so it is on for every round of the match.
+ */
+const installAura = (f: FighterState, i: 0 | 1): void => {
+  const a = matchAuras[i];
+  f.auraAtk = a.atk;
+  f.auraDef = a.def;
+  f.auraCrit = a.crit;
+  f.auraHpRegen = a.hpRegen;
+  f.auraEnergyRegen = a.energyRegen;
+  f.auraHpAcc = 0;
+  f.auraMeterAcc = 0;
+  f.critFlash = 0;
 };
 
 /** Fill a fresh fighter's carried slots from the pinned loadout. */
@@ -351,6 +419,15 @@ export const resetRound = (s: GameState): void => {
     fresh.itemKind0 = prev.itemKind0; fresh.itemAmount0 = prev.itemAmount0; fresh.itemDur0 = prev.itemDur0;
     fresh.itemKind1 = prev.itemKind1; fresh.itemAmount1 = prev.itemAmount1; fresh.itemDur1 = prev.itemDur1;
     fresh.itemKind2 = prev.itemKind2; fresh.itemAmount2 = prev.itemAmount2; fresh.itemDur2 = prev.itemDur2;
+    // The pet aura persists for the whole match. Carried from the PREVIOUS
+    // fighter rather than re-read from the module slot, so a match already in
+    // flight can never be re-pinned out from under itself (ADR 0011).
+    fresh.auraAtk = prev.auraAtk;
+    fresh.auraDef = prev.auraDef;
+    fresh.auraCrit = prev.auraCrit;
+    fresh.auraHpRegen = prev.auraHpRegen;
+    fresh.auraEnergyRegen = prev.auraEnergyRegen;
+    // Accumulators and the crit flash do NOT carry — fresh round, fresh bar.
     s.fighters[i] = fresh as GameState['fighters'][0];
   }
   for (let i = 0; i < PROJECTILE_SLOTS; i++) s.projectiles[i] = emptyProjectile();
@@ -398,6 +475,8 @@ const FIGHTER_FIELDS = [
   'itemKind1', 'itemAmount1', 'itemDur1',
   'itemKind2', 'itemAmount2', 'itemDur2',
   'itemDmg', 'itemDmgLeft', 'itemDef', 'itemDefLeft',
+  'auraAtk', 'auraDef', 'auraCrit', 'auraHpRegen', 'auraEnergyRegen',
+  'auraHpAcc', 'auraMeterAcc', 'critFlash',
 ] as const;
 
 const PROJECTILE_FIELDS = [

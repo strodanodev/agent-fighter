@@ -23,6 +23,10 @@ const ORDER = [
   'core/src/fp.js',
   'core/src/input.js',
   'core/src/data.js',
+  // PETS (ADR 0011): state.js reads NO_AURA/clampAura at MODULE level, so
+  // leaving this out does not fail to compile — it produces a bundle that
+  // throws on load and renders a blank Studio.
+  'core/src/pets.js',
   'core/src/characters/analog.js',
   'core/src/motion.js',
   'core/src/state.js',
@@ -34,8 +38,35 @@ const ORDER = [
 
 const seen = new Map();
 const chunks = [];
+// Every INTERNAL value import across the bundled set, collected before imports
+// are stripped and checked against `seen` once concatenation is done. This is
+// the same completeness guard the client bundler carries, ported here after a
+// module left out of ORDER (core/src/pets.js) shipped a Studio that threw
+// `ReferenceError: NO_AURA is not defined` on load and rendered a blank page
+// — with a clean build and a clean typecheck (2026-08-03).
+const valueImports = [];
+
+// tsc has already elided type-only imports, so every surviving `import … from`
+// is a real runtime binding. Relative paths and `@af/*` are INTERNAL and must
+// resolve inside the bundle; bare packages are external and skipped.
+const collectImports = (src, rel) => {
+  for (const m of src.matchAll(/^import\s+([\s\S]*?)\s+from\s+['"]([^'"]+)['"]\s*;/gm)) {
+    const spec = m[2];
+    if (!(spec.startsWith('.') || spec.startsWith('@af/'))) continue;
+    const named = m[1].trim().match(/^\{([\s\S]*)\}$/);
+    if (!named) continue; // default / namespace imports: none in the bundled set
+    for (const part of named[1].split(',')) {
+      // Validate the ORIGINAL exported name (`x` in `x as y`) — that is the
+      // binding a concatenation bundle must actually define.
+      const name = part.trim().split(/\s+as\s+/)[0].trim();
+      if (name) valueImports.push({ rel, name, spec });
+    }
+  }
+};
+
 for (const rel of ORDER) {
   let src = readFileSync(join(tmp, rel), 'utf8');
+  collectImports(src, rel);
   src = src
     .replace(/^import\s[^;]*;\s*$/gm, '')
     .replace(/^export\s*\{[^}]*\}\s*(from\s*[^;]*)?;\s*$/gm, '')
@@ -48,6 +79,21 @@ for (const rel of ORDER) {
   chunks.push(`// ---- ${rel} ----\n${src.trim()}`);
 }
 rmSync(tmp, { recursive: true, force: true });
+
+// Completeness guard: an internal import with no matching definition means its
+// defining module is missing from ORDER above. Fail the BUILD with the exact
+// symbols rather than shipping a bundle that only throws in the browser.
+const unresolved = valueImports.filter(({ name }) => !seen.has(name));
+if (unresolved.length > 0) {
+  const lines = unresolved.map(
+    ({ rel, name, spec }) => `    - '${name}' (from '${spec}') imported by ${rel}`,
+  );
+  throw new Error(
+    `Bundler: ${unresolved.length} imported symbol(s) have no definition in the bundle. `
+      + 'Their defining module is missing from ORDER in '
+      + `packages/studio/tools/bundle.mjs — add it:\n${lines.join('\n')}`,
+  );
+}
 
 const js = chunks.join('\n\n');
 const html = `<!DOCTYPE html>

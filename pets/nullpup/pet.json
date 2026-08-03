@@ -1,0 +1,10 @@
+{
+  "id": "nullpup",
+  "name": "NULL PUP",
+  "desc": "A POINTER THAT NEVER LEARNED TO DEREFERENCE",
+  "flavor": "Loyal to an address that was freed years ago.",
+  "tint": "#ffd166",
+  "sizePx": 52,
+  "sprites": [],
+  "fps": 8
+}

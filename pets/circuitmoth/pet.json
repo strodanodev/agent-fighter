@@ -1,0 +1,12 @@
+{
+  "id": "circuitmoth",
+  "name": "CIRCUIT MOTH",
+  "desc": "DRAWN TO THE GLOW OF A LOSING HEALTH BAR",
+  "flavor": "It eats static. Nobody knows why it stays.",
+  "tint": "#6fd3ff",
+  "sizePx": 46,
+  "fps": 6,
+  "sprites": [
+    "frame6.png"
+  ]
+}

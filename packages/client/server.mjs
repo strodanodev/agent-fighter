@@ -14,6 +14,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, '..', '..');
 const CHARACTERS = join(ROOT, 'characters');
 const STAGES = join(ROOT, 'stages');
+const PETS = join(ROOT, 'pets');
 const ASSETS = join(here, 'assets');
 const PORT = Number(process.env.PORT || 8475);
 
@@ -83,6 +84,9 @@ createServer((req, res) => {
     file = under(CHARACTERS, '/characters/');
   } else if (path.startsWith('/stages/')) {
     file = under(STAGES, '/stages/');
+  } else if (path.startsWith('/pets/')) {
+    // PETS (ADR 0011): pet.json + frames, same shape as characters/stages.
+    file = under(PETS, '/pets/');
   } else if (path.startsWith('/assets/')) {
     file = under(ASSETS, '/assets/');
   } else if (path.startsWith('/vendor/')) {

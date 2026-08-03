@@ -4,6 +4,8 @@
  *  - Serves the built Studio SPA (studio.html) + character bundles.
  *  - /api/generate proxies the image model (NVIDIA build API) so the API key
  *    stays server-side in .env — never shipped to the browser, never committed.
+ *  - /api/pets CRUD: pets/<id>/pet.json + frames (ADR 0011). The match server
+ *    reads the same directory to build its adoption catalog.
  *  - /api/characters CRUD: bundles live in characters/<id>/character.json with
  *    sprites alongside. Every save recomputes the bundle content hash
  *    (spec §3: the hash is part of match setup once money is on the line).
@@ -18,6 +20,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, '..', '..');
 const CHARACTERS = join(ROOT, 'characters');
 const STAGES = join(ROOT, 'stages');
+const PETS = join(ROOT, 'pets');
 const PORT = Number(process.env.PORT || 8474);
 
 // ---- .env (zero-dep parse) -------------------------------------------------
@@ -401,6 +404,42 @@ const server = createServer(async (req, res) => {
       mkdirSync(dir, { recursive: true });
       const raw = await readBody(req);
       if (name.endsWith('.json') || name.endsWith('.svg')) {
+        writeFileSync(join(dir, name), raw);
+      } else {
+        const b64 = raw.toString('utf8').replace(/^data:image\/\w+;base64,/, '');
+        writeFileSync(join(dir, name), Buffer.from(b64, 'base64'));
+      }
+      return json(res, 200, { ok: true });
+    }
+
+    // ------------------------------------------------ pets (ADR 0011)
+    // A pet is the simplest asset in the repo: pets/<id>/pet.json (a PetDef)
+    // plus its frames. The match server reads this directory to build the
+    // adoption catalog, so publishing a pet IS writing the folder.
+    //
+    // AURAS ARE NOT AUTHORED HERE. Every line is rolled per-adoption by the
+    // match server; the Studio only makes the creature.
+    if (path === '/api/pets' && req.method === 'GET') {
+      const list = existsSync(PETS)
+        ? readdirSync(PETS, { withFileTypes: true })
+          .filter((d) => d.isDirectory() && existsSync(join(PETS, d.name, 'pet.json')))
+          .map((d) => ({
+            id: d.name,
+            def: JSON.parse(readFileSync(join(PETS, d.name, 'pet.json'), 'utf8')),
+          }))
+        : [];
+      return json(res, 200, list);
+    }
+    const petApi = path.match(/^\/api\/pets\/([^/]+)\/([^/]+)$/);
+    if (petApi && req.method === 'PUT') {
+      const [, id, name] = petApi;
+      if (!safeId(id) || !/^(pet\.json|frame[0-9]{1,2}\.png)$/.test(name)) {
+        return json(res, 400, { error: 'bad pet path' });
+      }
+      const dir = join(PETS, id);
+      mkdirSync(dir, { recursive: true });
+      const raw = await readBody(req);
+      if (name.endsWith('.json')) {
         writeFileSync(join(dir, name), raw);
       } else {
         const b64 = raw.toString('utf8').replace(/^data:image\/\w+;base64,/, '');
