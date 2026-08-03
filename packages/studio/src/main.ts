@@ -3801,6 +3801,7 @@ interface PetEd {
   tint: string;
   sizePx: number;
   fps: number;
+  motion: 'float' | 'ground';
   sprites: string[];
   disabled?: boolean;
 }
@@ -3812,6 +3813,13 @@ let stPetFrames: (HTMLCanvasElement | null)[] = [];
 let stPetPrompt = 'a tiny cute robotic companion creature, floating drone pet, '
   + 'glowing accents, chunky readable silhouette, side view, full body';
 let stNewPet: { id: string } | null = null;
+/**
+ * Background keying policy for incoming frames.
+ * 'auto'   — key only art that arrives with an opaque background (the default);
+ * 'always' — force the pass (a flat-colour render the detector misreads);
+ * 'never'  — trust the file exactly as uploaded.
+ */
+let stPetKey: 'auto' | 'always' | 'never' = 'auto';
 
 const petDefaults = (id: string): PetEd => ({
   id,
@@ -3821,6 +3829,7 @@ const petDefaults = (id: string): PetEd => ({
   tint: '#6fd3ff',
   sizePx: 44,
   fps: 8,
+  motion: 'float',
   sprites: [],
 });
 
@@ -3867,6 +3876,7 @@ const savePet = async (): Promise<void> => {
       tint: p.tint,
       sizePx: p.sizePx,
       fps: p.fps,
+      motion: p.motion,
       sprites: stPetFrames
         .map((c, i) => (c ? `frame${i}.png` : null))
         .filter((n): n is string => n !== null),
@@ -3885,10 +3895,64 @@ const savePet = async (): Promise<void> => {
 };
 
 /** Key out the background, trim to the creature, add it as a frame. */
+/**
+ * Does this image ALREADY have a cut-out background?
+ *
+ * Samples the border ring rather than the whole bitmap: a keyed sprite is
+ * transparent at its edges, an un-keyed one (a flat-colour render, a photo)
+ * is opaque there. Cheap, and it cannot be fooled by interior transparency
+ * (a donut shape) the way a whole-image alpha count can.
+ */
+const alreadyCutOut = (img: HTMLImageElement | HTMLCanvasElement): boolean => {
+  const w = img instanceof HTMLCanvasElement ? img.width : img.naturalWidth;
+  const h = img instanceof HTMLCanvasElement ? img.height : img.naturalHeight;
+  if (w < 2 || h < 2) return false;
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  c.getContext('2d')!.drawImage(img, 0, 0);
+  const d = c.getContext('2d', { willReadFrequently: true })!
+    .getImageData(0, 0, w, h).data;
+  let clear = 0;
+  let seen = 0;
+  const at = (x: number, y: number): void => {
+    seen++;
+    if (d[(y * w + x) * 4 + 3]! < 16) clear++;
+  };
+  for (let x = 0; x < w; x++) { at(x, 0); at(x, h - 1); }
+  for (let y = 0; y < h; y++) { at(0, y); at(w - 1, y); }
+  return seen > 0 && clear / seen > 0.6;
+};
+
+/**
+ * Add one frame to the strip.
+ *
+ * KEYING IS NOT UNCONDITIONAL. Running background removal over art that is
+ * already cut out is worse than useless: the border sample lands on
+ * transparent pixels, so the key colour is meaningless and the pass eats
+ * holes straight through the sprite's dark pixels (it did exactly that to a
+ * pixel-art upload). An image that arrives with its background already gone
+ * is passed through untouched; `stPetKey` forces the old behaviour when a
+ * flat-background render genuinely needs it.
+ */
+const toCanvas = (img: HTMLImageElement | HTMLCanvasElement): HTMLCanvasElement => {
+  if (img instanceof HTMLCanvasElement) return img;
+  const c = document.createElement('canvas');
+  c.width = img.naturalWidth;
+  c.height = img.naturalHeight;
+  c.getContext('2d')!.drawImage(img, 0, 0);
+  return c;
+};
+
 const addPetFrame = (img: HTMLImageElement | HTMLCanvasElement): void => {
-  const { canvas } = removeBackground(img, keySettings());
-  stPetFrames.push(cropToAlpha(canvas, 0.04) ?? canvas);
-  stStatus = `frame ${stPetFrames.length} added — save the pet to publish it`;
+  const key = stPetKey === 'auto' ? !alreadyCutOut(img) : stPetKey === 'always';
+  const base = key ? removeBackground(img, keySettings()).canvas : toCanvas(img);
+  // A fully transparent result means the pass destroyed the art — keep the
+  // ORIGINAL rather than pushing an empty frame.
+  stPetFrames.push(cropToAlpha(base, 0.04) ?? toCanvas(img));
+  stStatus = `frame ${stPetFrames.length} added — `
+    + (key ? 'background keyed out' : 'kept its own transparency (not keyed)')
+    + ' — save the pet to publish it';
   renderAll();
 };
 
@@ -3987,6 +4051,16 @@ const renderPetsTab = (): HTMLElement => {
       }),
       ' size ', numInputClean(p.sizePx, (v) => { p.sizePx = Math.max(16, Math.min(120, Math.round(v))); }),
       ' fps ', numInputClean(p.fps, (v) => { p.fps = Math.max(1, Math.min(30, Math.round(v))); })),
+    mkEl('div', { class: 'row' },
+      'moves ',
+      sessionSelect(p.motion, ['float', 'ground'], (v) => {
+        p.motion = v === 'ground' ? 'ground' : 'float';
+      }),
+      mkEl('span', { class: 'hint' },
+        p.motion === 'ground'
+          ? 'walks the stage floor — stays down when the fighter jumps'
+          : 'hovers at shoulder height — rises with the fighter'),
+    ),
     mkEl('label', { class: 'row' },
       mkEl('input', {
         type: 'checkbox', checked: !!p.disabled,
@@ -4062,9 +4136,23 @@ const renderPetsTab = (): HTMLElement => {
   pane.append(
     mkEl('h4', {}, 'art'),
     mkEl('p', { class: 'hint' },
-      'Every frame is background-keyed (Generate tab key settings) and trimmed to '
-      + 'the creature before it lands in the strip. A pet with NO frames is still '
-      + 'publishable — the game draws a procedural companion in its tint.'),
+      'Art that ALREADY has a transparent background is kept exactly as uploaded '
+      + '— keying it again eats holes through the sprite. Anything with an opaque '
+      + 'background is keyed (Generate tab key settings) and trimmed. A pet with '
+      + 'NO frames is still publishable — the game draws a procedural companion '
+      + 'in its tint.'),
+    mkEl('div', { class: 'row' },
+      'background ',
+      sessionSelect(stPetKey, ['auto', 'always', 'never'], (v) => {
+        stPetKey = v === 'always' ? 'always' : v === 'never' ? 'never' : 'auto';
+      }),
+      mkEl('span', { class: 'hint' },
+        stPetKey === 'auto'
+          ? 'key only art that arrives with an opaque background (recommended)'
+          : stPetKey === 'always'
+            ? 'force the key — for a flat-colour render auto misreads'
+            : 'never key — trust the file exactly as uploaded'),
+    ),
     promptBox,
     mkEl('div', { class: 'row' }, genBtn, mkEl('span', {}, ' or upload '), upload),
     mkEl('div', { class: 'row' },

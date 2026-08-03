@@ -460,6 +460,13 @@ const server = createServer(async (req, res) => {
       const rel = normalize(path.slice('/stages/'.length)).replace(/^([.][.][/\\])+/, '');
       filePath = join(STAGES, rel);
       if (!filePath.startsWith(STAGES)) filePath = null;
+    } else if (path.startsWith('/pets/')) {
+      // PETS (ADR 0011). Without this the Pets tab can WRITE frames but never
+      // read them back: pet.json lists them, every load 404s, and the editor
+      // reports "0 frame(s)" for a pet that has art on disk.
+      const rel = normalize(path.slice('/pets/'.length)).replace(/^([.][.][/\\])+/, '');
+      filePath = join(PETS, rel);
+      if (!filePath.startsWith(PETS)) filePath = null;
     }
     if (filePath && existsSync(filePath)) {
       const ext = filePath.slice(filePath.lastIndexOf('.'));

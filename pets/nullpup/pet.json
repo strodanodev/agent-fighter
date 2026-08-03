@@ -5,6 +5,9 @@
   "flavor": "Loyal to an address that was freed years ago.",
   "tint": "#ffd166",
   "sizePx": 52,
-  "sprites": [],
-  "fps": 8
+  "fps": 8,
+  "sprites": [
+    "frame0.png"
+  ],
+  "motion": "ground"
 }

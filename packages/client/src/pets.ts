@@ -11,7 +11,8 @@
  * is still playable, and a failed image load degrades instead of vanishing.
  */
 
-import type { FighterState, PetDef } from '@af/core';
+import { STAGE } from '@af/core';
+import type { FighterState, PetDef, PetMotion } from '@af/core';
 import type { NetPetPin } from './net.js';
 
 /** A loaded pet: its definition plus whatever art actually decoded. */
@@ -83,13 +84,29 @@ export const loadMatchPets = async (
  */
 const petPos = (
   f: FighterState, tick: number, x: number, y: number, size: number,
-): { x: number; y: number } => {
+  motion: PetMotion,
+): { x: number; y: number; onGround: boolean } => {
   const behind = -f.facing; // the side away from the opponent
   const drift = Math.max(-14, Math.min(14, -(f.velX / 256) * 1.6)); // trails the dash
+  const speed = Math.abs(f.velX) / 256;
+
+  if (motion === 'ground') {
+    // Walks the floor and STAYS there when the fighter jumps — that is the
+    // whole difference between having feet and not. A trot bounce scales
+    // with the fighter's speed, so it is still when they are still.
+    const trot = speed > 0.5 ? Math.abs(Math.sin(tick * 0.28)) * Math.min(6, speed * 1.2) : 0;
+    return {
+      x: x + behind * (30 + size * 0.3) + drift,
+      y: STAGE.floorYPx - trot,
+      onGround: true,
+    };
+  }
+
   const bob = Math.sin((tick + x) * 0.06) * (size * 0.09);
   return {
     x: x + behind * (34 + size * 0.25) + drift,
     y: y - 78 - size * 0.35 + bob,
+    onGround: false,
   };
 };
 
@@ -110,19 +127,31 @@ export const drawPet = (
   fy: number,
 ): void => {
   const size = pet.def.sizePx ?? 44;
-  const { x, y } = petPos(f, tick, fx, fy, size);
+  const motion: PetMotion = pet.def.motion === 'ground' ? 'ground' : 'float';
+  const { x, y, onGround } = petPos(f, tick, fx, fy, size, motion);
   const flare = f.critFlash > 0 ? f.critFlash / 24 : 0;
+  // A ground pet is drawn standing ON its position; a floater is centred on
+  // it. `gy` is where the glow and the procedural body belong either way.
+  const gy = onGround ? y - size * 0.45 : y;
 
   ctx.save();
 
+  if (onGround) {
+    // Its own contact shadow — without one a walking pet reads as sliding.
+    ctx.fillStyle = 'rgba(0,0,0,0.38)';
+    ctx.beginPath();
+    ctx.ellipse(x, STAGE.floorYPx + 2, size * 0.3, size * 0.09, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
   // Aura glow — brighter the instant a crit lands.
-  const glow = ctx.createRadialGradient(x, y, 1, x, y, size * (0.85 + flare * 0.7));
+  const glow = ctx.createRadialGradient(x, gy, 1, x, gy, size * (0.85 + flare * 0.7));
   glow.addColorStop(0, `${pet.tint}${flare > 0 ? 'cc' : '66'}`);
   glow.addColorStop(1, `${pet.tint}00`);
   ctx.globalCompositeOperation = 'lighter';
   ctx.fillStyle = glow;
   ctx.beginPath();
-  ctx.arc(x, y, size * (0.85 + flare * 0.7), 0, Math.PI * 2);
+  ctx.arc(x, gy, size * (0.85 + flare * 0.7), 0, Math.PI * 2);
   ctx.fill();
   ctx.globalCompositeOperation = 'source-over';
 
@@ -135,9 +164,10 @@ export const drawPet = (
     // Mirror with the fighter so the pet always looks the way they do.
     ctx.translate(x, y);
     ctx.scale(f.facing, 1);
-    ctx.drawImage(img, -w / 2, -h / 2, w, h);
+    // A ground pet stands ON y (feet on the floor); a floater is centred.
+    ctx.drawImage(img, -w / 2, onGround ? -h : -h / 2, w, h);
   } else {
-    drawProceduralPet(ctx, x, y, size, pet.tint, tick, flare);
+    drawProceduralPet(ctx, x, gy, size, pet.tint, tick, flare);
   }
 
   ctx.restore();

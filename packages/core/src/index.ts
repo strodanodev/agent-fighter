@@ -34,9 +34,9 @@ export {
   AURA_LINES, AURA_LABELS, AURA_MIN, AURA_MAX, AURA_LINES_BY_RARITY,
   PET_RARITY_ODDS, PET_RARITY_COLORS, PET_RARITY_LABELS, PET_COST,
   PET_REGEN_PERIOD_TICKS, PET_CRIT_BONUS, PET_CRIT_FLASH_TICKS,
-  NO_AURA, clampAura, auraIsEmpty, auraLines, auraLineText,
+  NO_AURA, clampAura, auraIsEmpty, auraLines, auraLineText, PET_MOTIONS,
 } from './pets.js';
-export type { PetAura, PetAuraKind, PetDef, PetRarity } from './pets.js';
+export type { PetAura, PetAuraKind, PetDef, PetRarity, PetMotion } from './pets.js';
 export { setMatchPets } from './state.js';
 export {
   BOARD_W, BOARD_H, REGION_NAME, REGION_SKILL, REGION_CREDITS,

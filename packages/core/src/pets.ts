@@ -39,6 +39,11 @@ export interface PetAura {
 
 export type PetRarity = 1 | 2 | 3;
 
+/** How a pet moves with its fighter. Render-time only; see PetDef.motion. */
+export type PetMotion = 'float' | 'ground';
+
+export const PET_MOTIONS: readonly PetMotion[] = ['float', 'ground'];
+
 /** A pet as the Studio authors it into `pets/<id>/pet.json`. */
 export interface PetDef {
   id: string;
@@ -58,6 +63,20 @@ export interface PetDef {
    * still playable. Cosmetic only.
    */
   tint?: string;
+  /**
+   * How the companion carries itself. Cosmetic — it changes where the
+   * renderer puts the pet, never anything the sim reads.
+   *
+   * 'float'  — hovers at shoulder height behind the fighter, bobbing, and
+   *            rises with them on a jump (a drone, a moth, a wisp).
+   * 'ground' — walks the stage floor behind the fighter and STAYS there when
+   *            they jump, with a trot bounce while they move (a pup, a crab,
+   *            anything with feet).
+   *
+   * Default 'float' — the pre-existing behaviour, so an unauthored pet is
+   * unchanged.
+   */
+  motion?: PetMotion;
   /**
    * Sprite file names inside `pets/<id>/`, played as a loop at `fps`.
    * Written by the Studio. Empty/absent = procedural.
