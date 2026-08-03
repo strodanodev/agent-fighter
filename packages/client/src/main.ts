@@ -2046,7 +2046,13 @@ const renderFight = (g: GameState): void => {
     // CONSUMABLES: which side is the human's, so drawHud makes only YOUR can
     // tappable ('item:use') and prompts it. -1 for local 2P (both are human,
     // no online item flow — practice mode carries nothing).
-    net ? localSide() : (mode === 'cpu' ? 0 : -1));
+    net ? localSide() : (mode === 'cpu' ? 0 : -1),
+    // PETS (ADR 0011): name + tint only. The aura VALUES the strip prints come
+    // from the fighters themselves, so the HUD can never disagree with the sim.
+    [
+      matchPets[0] ? { name: matchPets[0].def.name, tint: matchPets[0].tint } : null,
+      matchPets[1] ? { name: matchPets[1].def.name, tint: matchPets[1].tint } : null,
+    ]);
 
   // Screen-space FX (announcement shockwaves) — over the HUD so a KO ring
   // sweeps across the whole frame.

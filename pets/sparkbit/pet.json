@@ -3,10 +3,16 @@
   "name": "SPARKBIT",
   "desc": "ONE BIT. PERMANENTLY SET.",
   "flavor": "Hums at 60Hz. Refuses to flip.",
-  "tint": "#ff7a7a",
-  "sizePx": 38,
-  "fps": 10,
+  "tint": "#ff5cfa",
+  "sizePx": 45,
+  "fps": 6,
+  "motion": "float",
   "sprites": [
-    "frame1.png"
+    "frame0.png",
+    "frame1.png",
+    "frame2.png",
+    "frame3.png",
+    "frame4.png",
+    "frame5.png"
   ]
 }

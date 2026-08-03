@@ -925,6 +925,132 @@ const drawItemSlot = (
   // the XL countdown — so no tiny chips here anymore.)
 };
 
+/**
+ * PET AURA (ADR 0011) — the permanent buff strip.
+ *
+ * Values are read from the FIGHTER, not from the match pin: the aura lives in
+ * GameState, so this renders correctly in a replay too, and it can never
+ * disagree with what the sim is actually applying.
+ *
+ * Order and colours mirror @af/core AURA_LINES.
+ */
+const AURA_CHIPS = [
+  { read: (f: GameState['fighters'][0]) => f.auraAtk, tag: 'ATK', color: '#ff9d6b' },
+  { read: (f: GameState['fighters'][0]) => f.auraDef, tag: 'DEF', color: '#6fd3ff' },
+  { read: (f: GameState['fighters'][0]) => f.auraHpRegen, tag: 'HP', color: '#7cffa0' },
+  { read: (f: GameState['fighters'][0]) => f.auraCrit, tag: 'CRIT', color: '#ffd166' },
+  { read: (f: GameState['fighters'][0]) => f.auraEnergyRegen, tag: 'NRG', color: '#c084fc' },
+] as const;
+
+/** Per-mille → "4.3%" (trailing ".0" trimmed), matching the profile page. */
+const auraPct = (v: number): string => `${(v / 10).toFixed(1).replace(/\.0$/, '')}%`;
+
+/** What the HUD knows about a side's pet — name/tint only; values come from the sim. */
+export interface PetHud { name: string; tint: string }
+
+/**
+ * A row of chips under the meter: which aura lines this fighter is carrying
+ * and how much. Always on (unlike a drink, an aura is never spent), so it sits
+ * quietly at low contrast — except the CRIT chip, which flares on the tick the
+ * sim actually rolls one, turning an invisible mechanic into visible feedback.
+ */
+const drawPetAura = (
+  ctx: CanvasRenderingContext2D, i: 0 | 1, f: GameState['fighters'][0],
+  tick: number, pet?: PetHud | null,
+): void => {
+  const lines = AURA_CHIPS
+    .map((c) => ({ ...c, amount: c.read(f) }))
+    .filter((c) => c.amount > 0);
+  if (lines.length === 0) return;
+
+  const tint = pet?.tint ?? '#cfd8e3';
+  // BELOW the wallet/stats band, which starts at exactly this offset and runs
+  // two rows deep — sharing that line hid the first chip behind "459 CR · LV1"
+  // on the left and behind the partner badge on the right. The offset is
+  // UNCONDITIONAL even when there is no id strip: a HUD row that moves
+  // depending on whether you are signed in is worse than one that always sits
+  // a little low.
+  const y = HUD.meterY + HUD.meterSegH + 9 + 30;
+  const h = 15;
+  const pad = 6;
+  const gap = 5;
+  const flare = f.critFlash > 0;
+
+  ctx.save();
+  ctx.font = 'bold 10px ui-monospace, Consolas, monospace';
+
+  // Measure first so the whole strip can be right-aligned for player 2.
+  const pawW = 13;
+  const all = lines.map((c) => ({
+    ...c,
+    w: ctx.measureText(`${c.tag} +${auraPct(c.amount)}`).width + pad * 2,
+  }));
+
+  // Never run under the centre logo/timer. A real roll tops out at THREE
+  // lines (rarity decides how many), so this only bites if that ever changes
+  // — but a HUD that silently slides under the brand mark is not something to
+  // leave to a data constant somewhere else.
+  const budget = VW / 2 - 150 - HUD.edge;
+  const shown: typeof all = [];
+  let used = pawW;
+  for (const c of all) {
+    if (used + c.w + gap > budget) break;
+    used += c.w + gap;
+    shown.push(c);
+  }
+  const hidden = all.length - shown.length;
+  if (shown.length === 0) { ctx.restore(); return; }
+
+  const widths = shown.map((c) => c.w);
+  // The overflow marker is part of the strip's width, or P2 — which is laid
+  // out from the RIGHT edge inward — would draw it off the screen.
+  const overflowW = hidden > 0 ? ctx.measureText(`+${hidden}`).width + 4 : 0;
+  const total = used + overflowW;
+  let x = i === 0 ? HUD.edge : VW - HUD.edge - total;
+
+  // Backing plate: the strip sits over stage art that can be any brightness.
+  ctx.fillStyle = 'rgba(8,10,16,0.55)';
+  ctx.fillRect(x - 4, y - 2, total + 8, h + 4);
+
+  // Paw mark: whose buff this is, in the pet's own colour.
+  ctx.fillStyle = tint;
+  ctx.globalAlpha = 0.9;
+  ctx.beginPath();
+  ctx.arc(x + 5, y + h / 2 + 1, 3.1, 0, Math.PI * 2);
+  ctx.fill();
+  for (let t = 0; t < 3; t++) {
+    ctx.beginPath();
+    ctx.arc(x + 1.6 + t * 3.4, y + h / 2 - 4.2, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  x += pawW;
+
+  shown.forEach((c, k) => {
+    const w = widths[k]!;
+    const hot = c.tag === 'CRIT' && flare;
+    ctx.globalAlpha = hot ? 1 : 0.95;
+    ctx.fillStyle = hot ? c.color : `${c.color}26`;
+    ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = hot ? c.color : `${c.color}66`;
+    ctx.fillRect(x, y, 2, h); // inner accent bar
+    ctx.fillStyle = hot ? '#12070a' : c.color;
+    ctx.textAlign = 'left';
+    ctx.fillText(`${c.tag} +${auraPct(c.amount)}`, x + pad, y + h - 4);
+    ctx.globalAlpha = 1;
+    x += w + gap;
+  });
+
+  // Say so when a line did not fit, rather than quietly dropping it.
+  if (hidden > 0) {
+    ctx.fillStyle = `${tint}bb`;
+    ctx.textAlign = 'left';
+    ctx.fillText(`+${hidden}`, x, y + h - 4);
+  }
+
+  ctx.restore();
+};
+
 /** Buff accents: [0] = OVERCLOCK (damage), [1] = FIREWALL (defense). */
 const BUFF_UI = [
   { color: '#ff9d6b' },
@@ -1007,6 +1133,7 @@ export const drawHud = (
   autoSpecialCharged = false, // local player has ≥1 bar → logo badge glows red
   ids?: [HudId | null, HudId | null], // wallet + stats strip under each HUD block
   localSide: number = -1, // which side is the human's (their can is tappable); -1 none
+  pets?: [PetHud | null, PetHud | null], // pet name/tint for the aura strip (ADR 0011)
 ): void => {
   for (const i of [0, 1] as const) {
     const f = g.fighters[i];
@@ -1024,6 +1151,7 @@ export const drawHud = (
     if (ids?.[i]) drawPlayerId(ctx, i, ids[i]!);
     drawItemSlot(ctx, i, f, g.tick, i === localSide);
     drawBuffState(ctx, i, f, g.tick);
+    drawPetAura(ctx, i, f, g.tick, pets?.[i]);
   }
   drawTimer(ctx, Math.ceil(g.timerTicks / TICKS_PER_SEC), g.tick);
 
