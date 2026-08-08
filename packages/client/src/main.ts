@@ -932,8 +932,8 @@ const enterSelectForArcade = (): void => {
   locked = [false, false];
   selectingFriendly = false;
   selectingAgentOf = '';
-  let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
-  if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+  let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled && !r.boss);
+  if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled && !r.boss));
   picks = [fe, fe];
   if (auth.status === 'in' || DEV_GUEST) void fetchShop();
   void audio.playBgm('player_select', { fadeInSec: 0.5 });
@@ -1406,9 +1406,15 @@ let bossJustFell = false;
 /** Loot swept on the last advance; enterMap surfaces it as a map toast. */
 let lootSweep = '';
 
-/** The roster ids a board may be populated from (never the player's own). */
+/** The roster ids a board may be populated from (never the player's own,
+ *  never a boss monster — bosses only ever stand on the boss node). */
 const arcadeRoster = (): string[] => allRosters
-  .filter((r, i) => !r.disabled && i !== picks[0])
+  .filter((r, i) => !r.disabled && !r.boss && i !== picks[0])
+  .map((r) => r.id);
+
+/** Enabled BOSS MONSTERS (Studio: meta.boss) — the boss-node candidate pool. */
+const bossRoster = (): string[] => allRosters
+  .filter((r) => !r.disabled && r.boss)
   .map((r) => r.id);
 
 const rosterName = (charId: string): string =>
@@ -1424,9 +1430,13 @@ const startArcadePractice = (): void => {
   lastFighter = roster.id;
   safeSetItem(LAST_FIGHTER_KEY, lastFighter);
   const pool = arcadeRoster();
+  const bosses = bossRoster();
+  const bseed = (Math.random() * 0x7fffffff) | 0;
   const board = generateBoard({
     roster: pool.length > 0 ? pool : [roster.id],
-    seed: (Math.random() * 0x7fffffff) | 0,
+    seed: bseed,
+    // Same rule as the server: an authored boss monster guards the boss node.
+    ...(bosses.length > 0 ? { boss: bosses[bseed % bosses.length]! } : {}),
   });
   arcade = {
     practice: true, board, at: board.start, pending: -1, charId: roster.id,
@@ -1661,9 +1671,20 @@ const startPracticeFight = (node: BoardNode): void => {
   picks[1] = opp >= 0 ? opp : picks[0];
   fighters = [allRosters[picks[0]]!, allRosters[picks[1]]!];
   setCharacters(fighters[0].ch, fighters[1].ch);
-  // Rotate the stage art each battle so a run tours the whole game.
+  // Rotate the stage art each battle so a run tours the whole game — except
+  // the warden, who gets the BOSS STAGE when one is authored (Studio stage
+  // toggle). Boss arenas sit out the normal rotation either way, so the
+  // room only ever appears for the fight it was built for.
   if (stageAssets.length > 0) {
-    stageCursor = (seed + run.fights) % stageAssets.length;
+    const bossStages = stageAssets.map((s, i) => (s?.meta.boss ? i : -1)).filter((i) => i >= 0);
+    const rotation = stageAssets.map((s, i) => (s?.meta.boss ? -1 : i)).filter((i) => i >= 0);
+    if (node.kind === 'boss' && bossStages.length > 0) {
+      stageCursor = bossStages[(seed + run.fights) % bossStages.length]!;
+    } else if (rotation.length > 0) {
+      stageCursor = rotation[(seed + run.fights) % rotation.length]!;
+    } else {
+      stageCursor = (seed + run.fights) % stageAssets.length;
+    }
     setStageAsset(stageAssets[stageCursor] ?? null);
   }
   game = createGameState(seed++, currentStageBounds());
@@ -2104,7 +2125,9 @@ const renderFight = (g: GameState): void => {
 // ---------------------------------------------------------------- screens
 const tickSelect = (): void => {
   const n = allRosters.length;
-  const enabled = (i: number): boolean => !allRosters[i]?.disabled;
+  // Boss monsters are not on this screen at all (the grid hides them), so
+  // the cursor must never land on one — same skip as a disabled fighter.
+  const enabled = (i: number): boolean => !allRosters[i]?.disabled && !allRosters[i]?.boss;
   const anyEnabled = allRosters.some((_r, i) => enabled(i));
   // ESC / the ‹ TITLE button: unlock a locked pick first; otherwise leave.
   if (pressedThisFrame.has('Escape') || taps.has('back')) {
@@ -2294,8 +2317,8 @@ const frame = (steps = 1): void => {
       referralToast: referralToastAge >= 0,
       refCode: accountFetch === 'done' ? account?.refCode : undefined,
       challenge: !!pendingRoom,
-      fighter: (allRosters.find((r) => r.id === lastFighter && !r.disabled)
-        ?? allRosters.find((r) => !r.disabled))?.bundle.name,
+      fighter: (allRosters.find((r) => r.id === lastFighter && !r.disabled && !r.boss)
+        ?? allRosters.find((r) => !r.disabled && !r.boss))?.bundle.name,
       audio: {
         masterMuted: audio.isMasterMuted(),
         musicMuted: audio.isChannelMuted('music'),
@@ -2316,8 +2339,8 @@ const frame = (steps = 1): void => {
       selectingFriendly = false; // a title select is always wager (online) or arcade (cpu)
       selectingAgentOf = ''; // …never a dare-vs-agent leftover
       // Cursor starts on the REMEMBERED fighter so select is one confirm away.
-      let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
-      if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+      let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled && !r.boss);
+      if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled && !r.boss));
       picks = [fe, fe];
       // CONSUMABLES: refresh the stash so the equipped indicator is honest.
       if (signedIn) void fetchShop();

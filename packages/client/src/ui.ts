@@ -2963,11 +2963,18 @@ export const drawSelect = (
   // the heading and that band. Cells shrink to fit as the roster grows so the
   // grid never pushes the cards off-screen (that cropped the layout once the
   // roster passed two rows).
-  const cols = Math.min(rosters.length, 6);
+  // BOSS MONSTERS are hidden from the grid entirely (not greyed — absent):
+  // they are opponents, never picks. The grid lays out only the visible
+  // fighters, but every tap id / cursor check keeps the ABSOLUTE roster
+  // index, so main.ts's picks/cursors arithmetic is untouched.
+  const visible = rosters
+    .map((r, k) => ({ r, k }))
+    .filter(({ r }) => !r.boss);
+  const cols = Math.min(Math.max(visible.length, 1), 6);
   const gap = 12;
   const nameH = 20; // per-cell headroom for the name label under each portrait
   const maxGridW = 720;
-  const rows = Math.ceil(rosters.length / cols);
+  const rows = Math.ceil(Math.max(visible.length, 1) / cols);
   const cardW = 448, cardH = 206;
   const cardY = VH - cardH - 26; // fixed: the card band never moves
   const gy = 74;
@@ -2977,9 +2984,9 @@ export const drawSelect = (
   const cell = Math.max(28, Math.min(96, cellByW, cellByH));
   const gridW = cols * cell + (cols - 1) * gap;
   const gx = (VW - gridW) / 2;
-  rosters.forEach((r, k) => {
-    const x = gx + (k % cols) * (cell + gap);
-    const y = gy + Math.floor(k / cols) * (cell + gap + 20);
+  visible.forEach(({ r, k }, slot) => {
+    const x = gx + (slot % cols) * (cell + gap);
+    const y = gy + Math.floor(slot / cols) * (cell + gap + 20);
     // Tap the portrait to move the cursor here; tap the selected one again to
     // confirm (main.ts). Disabled fighters register nothing — untappable.
     if (!r.disabled) tapZone(x - 2, y - 2, cell + 4, cell + 24, `pick:${k}`);

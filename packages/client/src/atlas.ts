@@ -60,6 +60,13 @@ export interface Roster {
   vsFraming: { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean } | null;
   /** Disabled in Studio (meta.disabled): greyed out and unselectable on the select screen. */
   disabled: boolean;
+  /**
+   * BOSS MONSTER (Studio: meta.boss). Hidden from the select grid entirely
+   * and excluded from the normal opponent pool — it exists only to guard the
+   * arcade board's boss node. The bundle still loads like any other so the
+   * boss fight can render it.
+   */
+  boss: boolean;
 }
 
 /** Tight alpha bounds of an image (computed once at load). */
@@ -139,6 +146,7 @@ export const loadRoster = async (id: string, base = ''): Promise<Roster> => {
       vsPortrait?: string;
       vsFraming?: Framing;
       disabled?: boolean;
+      boss?: boolean;
     };
   }).meta;
   const safeName = (f: string | undefined): string | null =>
@@ -163,6 +171,7 @@ export const loadRoster = async (id: string, base = ''): Promise<Roster> => {
     vsPortrait,
     vsFraming: vsPortrait ? (meta?.vsFraming ?? null) : null,
     disabled: !!meta?.disabled,
+    boss: !!meta?.boss,
   };
 };
 
