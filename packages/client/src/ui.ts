@@ -46,7 +46,7 @@ export const setVendingArt = (img: HTMLImageElement | null): void => { vendingIm
  * title and character-select screens. Screen-space (not world-transformed);
  * the video is an ambient backdrop, not a stage element.
  */
-const drawMenuBackdrop = (ctx: CanvasRenderingContext2D): void => {
+export const drawMenuBackdrop = (ctx: CanvasRenderingContext2D): void => {
   if (bgVideo && drawBgVideoCover(ctx, bgVideo, 0, 0, VW, VH)) return;
   ctx.save();
   const cam = menuCam();
@@ -1360,9 +1360,12 @@ export const drawTitle = (
     // Mode rows are big button plates (≥44px tall — a real finger target on a
     // phone), each with a one-line subtitle explaining the stakes.
     const rows: [Mode, string, string][] = [
+      // v2 copy: the gauntlet is an extraction board, not a beat-em-all ladder
+      // — "beat every agent" outlived its ruleset (the map screen teaches the
+      // real rules; this row must not contradict them).
       ['cpu', 'AGENT ARCADE', guest
-        ? 'FREE TO PLAY · BEAT EVERY AGENT · NO SIGN-IN'
-        : 'RANKED · 1 CREDIT PER RUN · BEAT EVERY AGENT'],
+        ? 'FREE TO PLAY · RAID THE GAUNTLET BOARD · NO SIGN-IN'
+        : 'RANKED · 1 CREDIT PER RUN · EXTRACT THE BAG ALIVE'],
       ['online', 'ONLINE WAGER', guest
         ? 'SIGN IN TO WAGER · WIN A 🎟 TICKET'
         : '10 CR ENTRY · WINNER TAKES A 🎟 TICKET'],
@@ -3279,7 +3282,16 @@ export const drawGameOver = (
   ctx: CanvasRenderingContext2D,
   tick: number,
   age: number, // ticks since the screen appeared — drives pop-in + countdown
-  info: { by: string; stage: number; total: number },
+  info: {
+    by: string;
+    /** Fights WON before this one — the death happened on fight `fights + 1`. */
+    fights: number;
+    /** What died with the run. 0/0 for a clean first-fight loss. */
+    bagCredits: number;
+    bagDrinks: number;
+    /** The warden got them — the one death worth its own line. */
+    boss?: boolean;
+  },
 ): void => {
   ctx.fillStyle = '#12040acc';
   ctx.fillRect(0, 0, VW, VH);
@@ -3293,9 +3305,22 @@ export const drawGameOver = (
   ctx.restore();
 
   if (age > 14) {
-    label(ctx, `DEFEATED BY ${info.by.toUpperCase()}  ·  BATTLE ${info.stage} OF ${info.total}`,
+    label(ctx, `DEFEATED BY ${info.by.toUpperCase()}  ·  FIGHT ${info.fights + 1} OF THE RUN`,
       VW / 2, VH / 2 + 24, 16, '#ffd7d7');
-    label(ctx, 'THE GAUNTLET RESETS — ENTER AGAIN FROM THE TITLE', VW / 2, VH / 2 + 50, 12, '#ffffff88');
+    // The map warned "LOSE A FIGHT AND THIS IS GONE" — honesty demands the
+    // death screen close that loop and say what the bag actually cost.
+    const lost = info.bagCredits + info.bagDrinks;
+    if (lost > 0) {
+      label(ctx,
+        `THE BAG IS GONE — ${info.bagCredits} CR`
+        + (info.bagDrinks > 0 ? ` + ${info.bagDrinks} DRINK${info.bagDrinks === 1 ? '' : 'S'}` : '')
+        + ' NEVER BANKED',
+        VW / 2, VH / 2 + 48, 14, '#ff9d9d');
+    }
+    label(ctx,
+      info.boss ? '☠ THE WARDEN KEEPS THE CORE — COME BACK STRONGER'
+        : 'THE GAUNTLET RESETS — A NEW BOARD EVERY RUN',
+      VW / 2, VH / 2 + (lost > 0 ? 72 : 50), 12, '#ffffff88');
   }
   const secs = Math.max(0, 10 - Math.trunc(age / 60));
   if (tick % 60 < 42) {
@@ -4419,8 +4444,15 @@ export const drawMap = (ctx: CanvasRenderingContext2D, tick: number, v: MapView)
     puzzlePiece(ctx, cx, cy, w, h, t);
     ctx.save();
     ctx.strokeStyle = skin.stroke;
-    ctx.lineWidth = reachable || isHere ? 2.2 : 1.3;
-    if (reachable) { ctx.shadowColor = skin.stroke; ctx.shadowBlur = 6 + 4 * fxPulse(tick, 0.1); }
+    ctx.lineWidth = reachable || isHere || n.kind === 'boss' ? 2.2 : 1.3;
+    // The boss piece smolders from anywhere on the board — the climax should
+    // read as the destination the whole map is pointing at, not one more tile.
+    if (reachable || n.kind === 'boss') {
+      ctx.shadowColor = skin.stroke;
+      ctx.shadowBlur = n.kind === 'boss'
+        ? 9 + 7 * fxPulse(tick, 0.06)
+        : 6 + 4 * fxPulse(tick, 0.1);
+    }
     ctx.stroke();
     ctx.restore();
 
@@ -4731,6 +4763,22 @@ export const drawMap = (ctx: CanvasRenderingContext2D, tick: number, v: MapView)
   if (v.toast) label(ctx, v.toast.slice(0, 46), P.x + P.w / 2, VH - 30, 12, '#ffd166');
   label(ctx, '1-4 / TAP  CHOOSE A ROUTE      ENTER  GO      ESC  ABANDON THE RUN',
     24, VH - 8, 11, '#ffffff66', 'left');
+  // Touch abandon: ESC has no key on a phone, and before this button existed a
+  // mobile player's only exits from a live run were winning, dying, or killing
+  // the app. Emits the same 'back' tap the keyboard path handles, so the
+  // two-press "say what the bag costs" confirm applies to touch too.
+  if (!v.busy) {
+    const ax = 24, ay = VH - 46, aw = 108, ah = 26;
+    ctx.save();
+    ctx.fillStyle = 'rgba(40,12,18,0.85)';
+    ctx.fillRect(ax, ay, aw, ah);
+    ctx.strokeStyle = 'rgba(255,141,157,0.6)';
+    ctx.lineWidth = 1.2;
+    ctx.strokeRect(ax + 0.5, ay + 0.5, aw - 1, ah - 1);
+    label(ctx, '✕ ABANDON', ax + aw / 2, ay + 17, 11, '#ff9d9d');
+    ctx.restore();
+    tapZone(ax, ay, aw, ah, 'back');
+  }
 };
 
 /**
@@ -4751,17 +4799,42 @@ export interface ExtractView {
   practice: boolean;
 }
 
-export const drawExtract = (ctx: CanvasRenderingContext2D, tick: number, v: ExtractView): void => {
+export const drawExtract = (
+  ctx: CanvasRenderingContext2D,
+  tick: number,
+  v: ExtractView,
+  age = 999, // ticks since the screen appeared — drives the deep-clear burst
+): void => {
   drawMenuBackdrop(ctx);
   ctx.fillStyle = 'rgba(4,10,6,0.84)';
   ctx.fillRect(0, 0, VW, VH);
   const cx = VW / 2;
 
-  display(ctx, 'EXTRACTED', cx, 150, 64, {
-    from: '#e8ffe6', mid: '#7ee85a', to: '#2e7a39', glow: 'rgba(126,232,90,0.45)',
-  });
-  label(ctx, `EXIT ${v.exitTier} · ${v.fights} FIGHT${v.fights === 1 ? '' : 'S'} SURVIVED`,
-    cx, 178, 14, '#ffffffcc');
+  // THE CORE cleared: the mode's summit — beat the warden AND walked out.
+  // It celebrates like the shop's tier-3 pull (expanding gold rings), because
+  // right now the vending machine parties harder than the deep exit does.
+  const deep = v.exitTier >= 3;
+  if (deep) {
+    for (let k = 0; k < 3; k++) {
+      const t = clamp01((age - k * 12) / 55);
+      if (t <= 0 || t >= 1) continue;
+      ctx.save();
+      ctx.globalAlpha = (1 - t) * 0.55;
+      ctx.strokeStyle = '#ffd166';
+      ctx.lineWidth = 3 - 2 * t;
+      ctx.beginPath();
+      ctx.arc(cx, 140, 40 + t * 340, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+  display(ctx, deep ? 'CORE CLEARED' : 'EXTRACTED', cx, 150, deep ? 58 : 64, deep
+    ? { from: '#fff6da', mid: '#ffd166', to: '#8a6a1c', glow: 'rgba(255,209,102,0.5)' }
+    : { from: '#e8ffe6', mid: '#7ee85a', to: '#2e7a39', glow: 'rgba(126,232,90,0.45)' });
+  label(ctx, deep
+    ? `☠ WARDEN DOWN · EXIT 3 · ${v.fights} FIGHT${v.fights === 1 ? '' : 'S'} SURVIVED`
+    : `EXIT ${v.exitTier} · ${v.fights} FIGHT${v.fights === 1 ? '' : 'S'} SURVIVED`,
+    cx, 178, 14, deep ? '#ffe9a3' : '#ffffffcc');
 
   // The receipt gets its own plate. This is the one screen where a player
   // checks arithmetic against what the board promised — the backdrop art
@@ -4804,7 +4877,29 @@ export const drawExtract = (ctx: CanvasRenderingContext2D, tick: number, v: Extr
   label(ctx, v.practice ? '0 CR' : `+${v.granted} CR`, cx + 190, y, 26,
     v.practice ? '#ffffff55' : '#7ee85a', 'right');
 
-  label(ctx, 'TAP / ENTER: TITLE', cx, VH - 40, 13,
+  label(ctx, 'TAP / ENTER: TITLE      R: RUN IT AGAIN', cx, VH - 40, 13,
     `rgba(255,255,255,${0.55 + Math.sin(tick / 10) * 0.25})`);
   tapZone(0, 0, VW, VH, 'start');
+
+  // RUN IT AGAIN — the mode's whole loop is "one more run", so the moment a
+  // player is happiest is the worst moment to dump them at the title. The
+  // price is ON the button (ranked re-entry re-opens the 1-CR consent modal;
+  // this never charges by itself). Registered AFTER the full-screen 'start'
+  // zone so the tap wins.
+  const bw2 = 300, bh2 = 46, bx2 = cx - bw2 / 2, by2 = VH - 108;
+  ctx.save();
+  ctx.fillStyle = 'rgba(20,44,20,0.94)';
+  ctx.fillRect(bx2, by2, bw2, bh2);
+  ctx.strokeStyle = tick % 44 < 34 ? '#9dffb0' : '#7ddf8a';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(bx2 + 0.5, by2 + 0.5, bw2 - 1, bh2 - 1);
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 17px system-ui, sans-serif';
+  ctx.fillStyle = '#c8ffd0';
+  ctx.fillText(v.practice ? '⟳ RUN IT AGAIN — FREE' : '⟳ RUN IT AGAIN · 1 CR', cx, by2 + 20);
+  ctx.font = '11px system-ui, sans-serif';
+  ctx.fillStyle = '#ffffffaa';
+  ctx.fillText('fresh board · same stakes', cx, by2 + 36);
+  ctx.restore();
+  tapZone(bx2, by2, bw2, bh2, 'again');
 };
