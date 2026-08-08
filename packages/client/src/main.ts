@@ -903,6 +903,12 @@ let gachaErrAge = -1;
 let gachaFree: PetGachaReveal | null = null;
 /** Where BACK returns to ('extract' entries came off the end of a run). */
 let gachaFrom: 'title' | 'extract' = 'title';
+/**
+ * What to do when a free-roll visit is dismissed. 'again' means the player
+ * pressed RUN IT AGAIN with an unclaimed pet: they see the reveal first, and
+ * the new run starts the moment they leave.
+ */
+let gachaAfterClaim: 'title' | 'again' = 'title';
 
 /** A /pets pet payload → the reveal card's shape. */
 const mapGachaPet = (pet: {
@@ -1896,7 +1902,10 @@ const arcadeGo = (nodeId: number): void => {
 const enterExtractScreen = (tier: number): void => {
   extractAge = 0;
   screen = 'extract';
-  void audio.playStinger(tier >= 3 ? 'credits' : 'win');
+  // skipIfPlaying: beating the warden ALREADY fired `credits`, and walking to
+  // EXIT 3 lands here seconds later. Re-triggering restarted the same jingle
+  // on top of itself (owner report 2026-08-09) — let the fanfare run through.
+  void audio.playStinger(tier >= 3 ? 'credits' : 'win', { skipIfPlaying: true });
 };
 
 /** Bank the bag and end the run — the only way credits leave the board. */
@@ -1938,8 +1947,20 @@ const arcadeExtract = (node: BoardNode): void => {
       // FREE PET ROLL (deepest exit): the grant already happened server-side,
       // atomically with the extraction — this only parks the reveal for the
       // slot-machine screen the continue button routes to.
-      if (body.petRoll?.pet) gachaFree = mapGachaPet(body.petRoll.pet);
+      if (body.petRoll?.pet) {
+        gachaFree = mapGachaPet(body.petRoll.pet);
+        // The CLAIM PET button shows the real creature, and this player may
+        // never have opened the gacha — load its art now, not on first visit.
+        loadGachaArt([gachaFree.petId]);
+      }
       extractView = {
+        petRoll: body.petRoll?.pet
+          ? {
+            petId: String(body.petRoll.pet.petId ?? ''),
+            tint: body.petRoll.pet.def?.tint ?? '#6fd3ff',
+            art: gachaArt,
+          }
+          : null,
         exitTier: body.exitTier ?? tier,
         bonus: body.bonus ?? EXIT_BONUS[tier],
         bag: body.bag ?? run.bag.credits,
@@ -2950,12 +2971,23 @@ const frame = (steps = 1): void => {
     // RUN IT AGAIN before the dismiss check — its zone overlaps 'start'.
     if (extractAge > 20 && (taps.has('again') || pressedThisFrame.has('KeyR'))) {
       extractView = null;
-      arcadeRunAgain();
+      // An UNCLAIMED free roll is claimed FIRST, then the new run starts when
+      // the machine is dismissed. Before this, RUN IT AGAIN skipped the reveal
+      // entirely and left gachaFree armed, so the slot machine would ambush
+      // the player after some LATER, unrelated extraction (owner question,
+      // 2026-08-09). The pet was never lost — it is granted server-side — but
+      // the moment was, and the stale reveal was worse than missing it.
+      if (gachaFree) { gachaAfterClaim = 'again'; enterPetGacha('extract'); } else arcadeRunAgain();
+    } else if (extractAge > 20 && taps.has('claimpet')) {
+      extractView = null;
+      endArcade();
+      gachaAfterClaim = 'title';
+      enterPetGacha('extract');
     } else if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('start')) {
       extractView = null;
       endArcade();
       // Deepest exit earned a FREE pet roll → the slot machine, not the title.
-      if (gachaFree) enterPetGacha('extract');
+      if (gachaFree) { gachaAfterClaim = 'title'; enterPetGacha('extract'); }
     }
   } else if (screen === 'map' || screen === 'extract') {
     // A ranked run's board is being minted / re-read (screen was switched
@@ -3037,8 +3069,13 @@ const frame = (steps = 1): void => {
       }
       // Each reel freezing gets its own clunk (the stagger IS the drama).
       const prevT = (gachaSpinAge - 1) / PET_SPIN_TICKS;
-      for (const stop of [0.5, 0.72, 0.94]) {
-        if (prevT < stop && spinT >= stop) audio.blip({ freq: 1180, volume: 0.4 });
+      for (const stop of [0.42, 0.64, 0.99]) {
+        if (prevT < stop && spinT >= stop) {
+          // Rising pitch across the three stops: the last bite is the loudest
+          // and highest, because that is the one that decides the pet.
+          const nth = [0.42, 0.64, 0.99].indexOf(stop);
+          audio.blip({ freq: 940 + nth * 260, volume: 0.34 + nth * 0.12 });
+        }
       }
       if (gachaSpinAge >= PET_SPIN_TICKS && gachaPending) landGachaSpin();
     }
@@ -3050,6 +3087,7 @@ const frame = (steps = 1): void => {
       costTickets: gachaCostTickets,
       rollBusy: gachaRollBusy,
       reveal: gachaReveal,
+      pending: gachaPending,
       revealAge: gachaRevealAge,
       err: gachaErr,
       errAge: gachaErrAge,
@@ -3115,6 +3153,10 @@ const frame = (steps = 1): void => {
       // An un-pulled FREE roll survives leaving: the pet is already in the
       // inventory server-side, and gachaFree persists until it is pulled.
       screen = 'title';
+      if (gachaAfterClaim === 'again') {
+        gachaAfterClaim = 'title';
+        arcadeRunAgain(); // they asked for another run before the reveal
+      }
     }
   } else if (screen === 'ranks') {
     drawRanks(ctx, ranksRows, ranksTab, ranksErr, uiTick,

@@ -191,6 +191,15 @@ const saveMutePrefs = (p: AudioMutePrefs): void => {
 
 class AudioManager {
   private ctx: AudioContext | null = null;
+  /**
+   * The stinger currently sounding. Stingers are EXCLUSIVE (2026-08-09): each
+   * call used to make its own BufferSource and never stop the last, so two
+   * long jingles could sound on top of each other. That is exactly what
+   * happened on CORE CLEARED — the warden falling fires `credits`, then
+   * extracting through EXIT 3 fires `credits` AGAIN a few seconds later,
+   * while the first is still playing.
+   */
+  private stinger: { id: MusicId; src: AudioBufferSourceNode; cancelled: boolean } | null = null;
   private bgmGain: GainNode | null = null;
   private sfxGain: GainNode | null = null;
   private hitsGain: GainNode | null = null;
@@ -430,10 +439,31 @@ class AudioManager {
    * Routed through the SFX bus (not Hits) so the Music/SFX/Hits toggles stay
    * meaningful.
    */
-  async playStinger(id: MusicId, opts: { duck?: boolean; onEnded?: () => void } = {}): Promise<void> {
+  /**
+   * One-shot musical sting. EXCLUSIVE: starting one stops whatever stinger is
+   * already sounding, so jingles can never stack.
+   *
+   * `skipIfPlaying` is for the case where the SAME sting is already the right
+   * music — re-triggering it would restart the jingle from zero, which reads
+   * as a stutter. The boss/extract pair uses this: the warden's fanfare plays
+   * straight through into the CORE CLEARED receipt instead of restarting.
+   */
+  async playStinger(
+    id: MusicId,
+    opts: { duck?: boolean; onEnded?: () => void; skipIfPlaying?: boolean } = {},
+  ): Promise<void> {
+    if (opts.skipIfPlaying && this.stinger?.id === id) return;
     try {
       const ctx = this.ctxOf();
       const buffer = await this.load(id);
+      // Stop the outgoing sting AFTER the await — two calls in the same tick
+      // must not both think they are first.
+      const prev = this.stinger;
+      if (prev) {
+        prev.cancelled = true; // its onEnded must not fire: ours owns the tail
+        try { prev.src.stop(); } catch { /* already finished */ }
+        this.stinger = null;
+      }
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.connect(this.sfxGain!);
@@ -442,7 +472,13 @@ class AudioManager {
         this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
         this.bgmGain.gain.setTargetAtTime(this.duckLevel(), ctx.currentTime, 0.05);
       }
+      const mine = { id, src, cancelled: false };
+      this.stinger = mine;
       src.onended = () => {
+        if (this.stinger === mine) this.stinger = null;
+        // A sting we deliberately cut short must not run its tail work — its
+        // replacement owns the un-duck and any BGM hand-off now.
+        if (mine.cancelled) return;
         if (duck && this.bgmGain) {
           this.bgmGain.gain.setTargetAtTime(this.musicLevel(), ctx.currentTime, 0.4);
         }

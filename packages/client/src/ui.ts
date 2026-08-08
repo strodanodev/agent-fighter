@@ -2213,6 +2213,13 @@ export interface PetGachaView {
   costTickets: number;  // tickets per roll
   rollBusy: boolean;
   reveal: PetGachaReveal | null;
+  /**
+   * The result the server has ALREADY decided but the reels have not finished
+   * revealing. A reel that has bitten shows THIS; without it the stagger was
+   * cosmetic — stopped reels kept scrolling the strip until the whole spin
+   * ended, so all three appeared to resolve at once.
+   */
+  pending: PetGachaReveal | null;
   revealAge: number;    // -1 = none
   err: string;
   errAge: number;       // -1 = hidden
@@ -2234,8 +2241,15 @@ export interface PetGachaView {
 
 /** Spin length — a beat longer than the shop so three stops fit the arc. */
 export const PET_SPIN_TICKS = 210;
-/** Where each reel freezes, as a fraction of the spin (left → right). */
-const REEL_STOPS = [0.5, 0.72, 0.94] as const;
+/**
+ * Where each reel freezes, as a fraction of the spin (left → right).
+ *
+ * The gap widens on purpose: reels 1 and 2 land close together, then the
+ * THIRD hangs on for nearly a third of the spin on its own. Because every
+ * reel lands on the same pet, two-of-a-kind with one still turning is the
+ * whole tension of the machine — give that beat room.
+ */
+const REEL_STOPS = [0.42, 0.64, 0.99] as const;
 
 /** The procedural companion glyph, miniature (mirrors client pets.ts). */
 const petOrb = (
@@ -2260,6 +2274,47 @@ const petOrb = (
       ctx.fill();
     }
   }
+};
+
+/** Does this canvas support `filter`? Probed once — Safari <17 lacks it. */
+let canvasFilterOk: boolean | null = null;
+const filterSupported = (ctx: CanvasRenderingContext2D): boolean => {
+  if (canvasFilterOk === null) {
+    const before = ctx.filter;
+    ctx.filter = 'brightness(0)';
+    canvasFilterOk = ctx.filter === 'brightness(0)';
+    ctx.filter = before;
+  }
+  return canvasFilterOk;
+};
+
+/**
+ * A pet as an UNREADABLE shape — the machine at rest.
+ *
+ * Real creature silhouettes (so it is obviously a pet machine) with the
+ * identity crushed out, so nothing on the payline can be mistaken for a
+ * result before the lever is pulled. Falls back to the mystery orb wherever
+ * canvas filters are unavailable.
+ */
+const drawPetShadow = (
+  ctx: CanvasRenderingContext2D, x: number, y: number, size: number,
+  petId: string, art: PetGachaArt, tick: number,
+): void => {
+  const a = art[petId];
+  if (!a || a.frames.length === 0 || !filterSupported(ctx)) {
+    petOrb(ctx, x, y, size * 0.42, '#3a3f52', true);
+    return;
+  }
+  const frame = a.frames[0]!;
+  const iw = (frame as HTMLImageElement).width || size;
+  const ih = (frame as HTMLImageElement).height || size;
+  const h = size;
+  const w = Math.min(size * 1.4, (iw / ih) * h);
+  ctx.save();
+  ctx.filter = 'brightness(0.16) saturate(0.2)';
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(frame, x - w / 2, y - h / 2, w, h);
+  ctx.restore();
 };
 
 /**
@@ -2353,6 +2408,9 @@ export const drawPetGacha = (ctx: CanvasRenderingContext2D, tick: number, v: Pet
   ctx.restore();
   display(ctx, 'COMPANION SLOTS', cabCx, cabY + 26, 16, { glow: 'rgba(255,209,102,0.4)' });
 
+  // A pending confirm means a NEW pull is being decided: shut the machine so
+  // the last result cannot be mistaken for this one's.
+  const closing = v.confirm !== null;
   const spinning = v.spinAge >= 0;
   const spinT = spinning ? clamp01(v.spinAge / PET_SPIN_TICKS) : 0;
   const reelW = 148, reelH = 156, reelGap = 18;
@@ -2373,14 +2431,28 @@ export const drawPetGacha = (ctx: CanvasRenderingContext2D, tick: number, v: Pet
     const cyMid = reelY + reelH / 2;
     const stripH = 72;
 
-    if (v.reveal && (!spinning || spinT >= stop)) {
+    // The tick a reel BITES: a white flash over its window, fading fast. The
+    // stop already had a sound; without a visual it read as the reel simply
+    // being finished rather than stopping.
+    if (spinning && spinT >= stop) {
+      const sinceStop = (spinT - stop) * PET_SPIN_TICKS;
+      if (sinceStop < 9) {
+        ctx.fillStyle = `rgba(255,255,255,${0.5 * (1 - sinceStop / 9)})`;
+        ctx.fillRect(rx + 6, reelY + 6, reelW - 12, reelH - 12);
+      }
+    }
+    // A reel shows the RESULT the moment IT stops — not when the whole spin
+    // does. Mid-spin that comes from `pending` (the server already decided);
+    // after the spin, from `reveal`. Without this the stagger was cosmetic.
+    const landed = closing ? null : (v.reveal ?? (spinning && spinT >= stop ? v.pending : null));
+    if (landed && (!spinning || spinT >= stop)) {
       // Landed on the RESULT: the won pet's REAL sprite, with a settle pop.
       const age = v.revealAge >= 0 ? v.revealAge : 0;
       const pop = spinning ? 1 : 0.8 + 0.2 * easeOutBack(clamp01((age - rIdx * 3) / 10));
       drawPetSprite(ctx, rx + reelW / 2, cyMid - 10, 76 * pop,
-        v.reveal.petId, v.reveal.tint, v.art, tick, true);
-      label(ctx, v.reveal.name.slice(0, 14), rx + reelW / 2, cyMid + 56, 11,
-        PET_RARITY_COLORS[Math.max(1, Math.min(3, v.reveal.rarity))]!);
+        landed.petId, landed.tint, v.art, tick, true);
+      label(ctx, landed.name.slice(0, 14), rx + reelW / 2, cyMid + 56, 11,
+        PET_RARITY_COLORS[Math.max(1, Math.min(3, landed.rarity))]!);
     } else if (spinning) {
       // Rolling: a decelerating strip of REAL catalog sprites. Each reel gets
       // its own phase offset so the three never move in lockstep.
@@ -2403,17 +2475,22 @@ export const drawPetGacha = (ctx: CanvasRenderingContext2D, tick: number, v: Pet
         ctx.globalAlpha = 1;
       }
     } else {
-      // Idle: the real catalog drifting by slowly, unlabelled — a shop window.
+      // Idle: SHADOWS only. Real creature shapes drift past so the machine
+      // still reads as a pet machine, but no pet is identifiable — the reveal
+      // has to be earned by pulling, not read off the payline beforehand.
       const pos = tick / 90 + rIdx * 1.4;
       const frac = pos % 1;
       for (let k = -1; k <= 1; k++) {
         const idx = ((Math.floor(pos) + k + rIdx * 3) % n + n) % n;
         const entry = v.catalog[idx]!;
         const y = cyMid + (k - frac) * stripH;
-        ctx.globalAlpha = Math.abs(y - cyMid) < stripH / 2 ? 0.9 : 0.25;
-        drawPetSprite(ctx, rx + reelW / 2, y, 58, entry.id, entry.tint, v.art, tick);
+        ctx.globalAlpha = Math.abs(y - cyMid) < stripH / 2 ? 0.85 : 0.3;
+        drawPetShadow(ctx, rx + reelW / 2, y, 58, entry.id, v.art, tick);
         ctx.globalAlpha = 1;
       }
+      // A '?' sits on the payline so the closed state is stated, not implied.
+      const q = 0.5 + 0.5 * Math.sin((tick + rIdx * 20) / 26);
+      label(ctx, '?', rx + reelW / 2, cyMid + 12, 34, `rgba(255,209,102,${0.25 + 0.3 * q})`);
     }
     ctx.restore();
   }
@@ -2433,7 +2510,7 @@ export const drawPetGacha = (ctx: CanvasRenderingContext2D, tick: number, v: Pet
 
   if (spinning) {
     label(ctx, 'ROLLING…', cabCx, bandY + 8, 12, tick % 30 < 22 ? '#ffd166' : '#ffe9a3');
-  } else if (v.reveal) {
+  } else if (v.reveal && !closing) {
     // Reveal card, then compact ROLL AGAIN row placed FROM the card's bottom.
     const r = v.reveal;
     const rar = Math.max(1, Math.min(3, r.rarity));
@@ -2478,14 +2555,28 @@ export const drawPetGacha = (ctx: CanvasRenderingContext2D, tick: number, v: Pet
       drawRollButtons(ctx, tick, v, cabCx, by, true);
     }
   } else if (v.free) {
-    const bw = 340, bh = 52, bx = cabCx - bw / 2;
+    const bw = 340, bh = 48, bx = cabCx - bw / 2;
     tapZone(bx, bandY, bw, bh, 'gacha:pull');
     ctx.save();
     ctx.shadowColor = 'rgba(124,255,160,0.5)';
     ctx.shadowBlur = 14 + 8 * Math.sin(tick / 8);
     bevel(ctx, bx, bandY, bw, bh, '#173a26', '#7cffa0', '#0b1f14', 3);
     ctx.restore();
-    display(ctx, v.rollBusy ? '…' : 'PULL — FREE ROLL', cabCx, bandY + 35, 22);
+    display(ctx, v.rollBusy ? '…' : 'PULL — FREE ROLL', cabCx, bandY + 33, 21);
+
+    // WHAT IS THIS? — for most players the deep clear is their FIRST contact
+    // with pets, and the paid screen's odds line is not on this one. Three
+    // lines: what a pet does, what the roll can give, and that it costs
+    // nothing. Kept inside the band so it can never reach the canvas edge.
+    const iy = bandY + bh + 14;
+    label(ctx, 'A PET FOLLOWS YOUR FIGHTER AND PASSES IT A PERMANENT AURA',
+      cabCx, iy, 11, '#8fd0ff');
+    label(ctx, 'ODDS · COMMON 70% (1 AURA LINE) · RARE 25% (2) · LEGENDARY 5% (3)',
+      cabCx, iy + 17, 11, '#ffd166');
+    label(ctx, 'EACH LINE ROLLS +1–8% ATK · DEFENSE · HP REGEN · CRIT · ENERGY',
+      cabCx, iy + 33, 10, '#cfd8e3');
+    label(ctx, 'ACCOUNT BOUND · EQUIP ONE AT A TIME · THIS ONE COSTS NOTHING',
+      cabCx, iy + 49, 10, '#8a91a8');
   } else {
     drawRollButtons(ctx, tick, v, cabCx, bandY + 6, false);
   }
@@ -5574,6 +5665,12 @@ export interface ExtractView {
   drinksLeftBehind: number;
   fights: number;
   practice: boolean;
+  /**
+   * An UNCLAIMED free pet roll from clearing the core (ADR 0011). The pet is
+   * already granted server-side; this only drives the CLAIM PET button and
+   * its sprite. null = nothing to claim.
+   */
+  petRoll?: { petId: string; tint: string; art: PetGachaArt } | null;
 }
 
 export const drawExtract = (
@@ -5654,9 +5751,41 @@ export const drawExtract = (
   label(ctx, v.practice ? '0 CR' : `+${v.granted} CR`, cx + 190, y, 26,
     v.practice ? '#ffffff55' : '#7ee85a', 'right');
 
-  label(ctx, 'TAP / ENTER: TITLE      R: RUN IT AGAIN', cx, VH - 40, 13,
+  const claim = v.petRoll ?? null;
+  label(ctx,
+    claim
+      ? 'TAP / ENTER: CLAIM      R: RUN IT AGAIN (CLAIMS FIRST)'
+      : 'TAP / ENTER: TITLE      R: RUN IT AGAIN',
+    cx, VH - 40, 13,
     `rgba(255,255,255,${0.55 + Math.sin(tick / 10) * 0.25})`);
   tapZone(0, 0, VW, VH, 'start');
+
+  // CLAIM PET — the deep-clear reward, with the actual creature on the
+  // button. Drawn BEFORE the run-again zone so run-again still wins its own
+  // rect, and registered after the full-screen 'start' zone so both win over
+  // the dismiss.
+  if (claim) {
+    const cw = 330, ch = 54, cxx = cx - cw / 2, cyy = VH - 176;
+    const pulse = 0.5 + 0.5 * Math.sin(tick / 9);
+    ctx.save();
+    ctx.shadowColor = `rgba(124,255,160,${0.4 + 0.35 * pulse})`;
+    ctx.shadowBlur = 18;
+    bevel(ctx, cxx, cyy, cw, ch, '#12351f', '#7cffa0', '#0b1f14', 3);
+    ctx.restore();
+    // SILHOUETTE, never the real sprite: this button sits BEFORE the slot
+    // machine, and drawing the won pet here handed the player the result up
+    // front — the exact spoiler the closed reels exist to prevent.
+    drawPetShadow(ctx, cxx + 36, cyy + ch / 2, 42, claim.petId, claim.art, tick);
+    ctx.textAlign = 'left';
+    ctx.font = 'bold 18px system-ui, sans-serif';
+    ctx.fillStyle = '#c9ffdd';
+    ctx.fillText('CLAIM YOUR PET', cxx + 68, cyy + 24);
+    ctx.font = '11px system-ui, sans-serif';
+    ctx.fillStyle = '#ffffffaa';
+    ctx.fillText('free roll · the core pays a companion', cxx + 68, cyy + 40);
+    ctx.textAlign = 'center';
+    tapZone(cxx, cyy, cw, ch, 'claimpet');
+  }
 
   // RUN IT AGAIN — the mode's whole loop is "one more run", so the moment a
   // player is happiest is the worst moment to dump them at the title. The
