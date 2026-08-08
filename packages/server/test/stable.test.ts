@@ -66,6 +66,14 @@ test('board casting: fight nodes carry stable identities, clamped and valid', as
 
     const seen = new Set<string>();
     for (const n of fights) {
+      // BOSS MONSTER (v1.0.3.bossfight): a boss-guarded node keeps its
+      // authored identity — the stable must NOT recast the warden. With no
+      // boss character in the repo the branch never fires; with one (e.g.
+      // characters/boss1) the boss node is the one legitimate uncast fight.
+      if (n.kind === 'boss' && !n.agent) {
+        assert.ok(typeof n.skill === 'number', 'boss node skill survives');
+        continue;
+      }
       assert.ok(n.agent, `fight node ${n.id} was left uncast`);
       seen.add(n.agent!.name);
       assert.ok(['IRONCLAD', 'NULLPTR'].includes(n.agent!.name),

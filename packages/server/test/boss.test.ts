@@ -179,6 +179,29 @@ test('SERVER: a boss monster cannot be queued as a fighter, in any mode', async 
     const err = await c.next<Extract<ServerMsg, { t: 'error' }>>('error');
     assert.match(err.msg, /boss monster/, `${mode}: refused with the boss reason`);
   }
+
+  // The COACH path is gated the same way: a boss monster cannot be an
+  // agent's main, so it can never come back as a solo / dare opponent.
+  const http = `http://localhost:${server.port}`;
+  const H = { 'X-Dev-Name': 'Imposter', 'Content-Type': 'application/json' };
+  await fetch(`${http}/me`, { headers: H }); // mint the profile
+  const put = await fetch(`${http}/agent`, {
+    method: 'PUT', headers: H, body: JSON.stringify({ character: 'warden' }),
+  });
+  assert.equal(put.status, 400, 'coaching an agent onto the warden is refused');
+  const err = await put.json() as { error: string };
+  assert.ok(!err.error.includes('warden'), 'the legal-roster list does not offer the boss');
+  // With a legal main already set, a warden PUT silently keeps the old main.
+  const first = realEnabledIds()[0]!;
+  await fetch(`${http}/agent`, {
+    method: 'PUT', headers: H, body: JSON.stringify({ character: first }),
+  });
+  const again = await fetch(`${http}/agent`, {
+    method: 'PUT', headers: H, body: JSON.stringify({ character: 'warden' }),
+  });
+  const cfg = await again.json() as { config?: { character?: string } };
+  assert.equal(again.status, 200);
+  assert.equal(cfg.config?.character, first, 'the coached main never becomes the boss');
 });
 
 test('SERVER: the minted board casts the warden on the boss node; the boss fight pins the boss stage', async (t) => {

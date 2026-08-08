@@ -1,0 +1,36 @@
+{
+  "name": "hell1",
+  "imageW": 2752,
+  "imageH": 1536,
+  "floorY": 1191,
+  "skyColor": "#2b1b4d",
+  "deckColor": "#3a3644",
+  "bounds": {
+    "left": 225,
+    "right": 1381
+  },
+  "boss": true,
+  "layers": [
+    {
+      "file": "layer-bg.png",
+      "depth": 0.15,
+      "stretch": true
+    },
+    {
+      "file": "layer-mid.png",
+      "depth": 0.45,
+      "stretch": false,
+      "scale": 0.6349206349206349,
+      "offsetX": -8,
+      "offsetY": -257
+    },
+    {
+      "file": "layer-fg.png",
+      "depth": 0.75,
+      "stretch": false,
+      "scale": 0.48124161234662577,
+      "offsetX": 94,
+      "offsetY": -625
+    }
+  ]
+}
