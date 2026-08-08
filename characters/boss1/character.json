@@ -519,7 +519,7 @@
               "h": 80
             }
           ],
-          "sprite": "2LP_s0.png"
+          "sprite": "2LP_s1.png"
         },
         {
           "frames": 3,
@@ -557,7 +557,7 @@
               "juggleCost": 1
             }
           ],
-          "sprite": "2LP_s1.png"
+          "sprite": "2LP_s0.png"
         },
         {
           "frames": 6,
@@ -3291,7 +3291,8 @@
       "panY": 0.08943118101350639,
       "rotate": 0,
       "flipH": false
-    }
+    },
+    "boss": true
   },
   "tuning": {
     "jumpSquatTicks": 3,

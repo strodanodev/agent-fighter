@@ -240,8 +240,16 @@ const rollDrink = (region: BoardRegion, rand: () => number): { itemId: string; t
 // ------------------------------------------------------------- generation
 
 export interface GenerateOptions {
-  /** Enabled roster ids MINUS the player's fighter. */
+  /** Enabled roster ids MINUS the player's fighter (and minus boss monsters). */
   roster: string[];
+  /**
+   * A BOSS MONSTER character id (Studio: meta.boss) to stand on the boss
+   * node instead of a shuffled roster fighter. Optional — with no boss
+   * monster authored, the boss node keeps drawing from the roster pool
+   * (pre-feature behavior). Callers pass a single id (their pick from the
+   * available boss pool); this module stays choice-free.
+   */
+  boss?: string;
   /**
    * REQUIRED. Everything downstream is derived from it, so a board is exactly
    * reproducible from (templateId, seed) — a support question or a test can
@@ -360,10 +368,14 @@ export const generateBoard = (opts: GenerateOptions): Board => {
   }
 
   // ---- populate the fighters. Shuffled roster, no repeats until it runs out.
+  // The boss node is cast FIRST when a boss monster exists: it never draws
+  // from the roster pool, so the roster spread over the other nodes is
+  // unchanged whether or not a boss is authored.
   const pool = opts.roster.length > 0 ? shuffled(opts.roster, rand) : [];
   let pick = 0;
   for (const n of nodes) {
     if (!isFightNode(n)) continue;
+    if (n.kind === 'boss' && opts.boss) { n.charId = opts.boss; continue; }
     n.charId = pool.length > 0 ? pool[pick++ % pool.length]! : '';
   }
 

@@ -35,12 +35,16 @@ const charactersDir = join(here, '..', '..', '..', 'characters');
 const bundleOf = (id: string): CharacterBundle =>
   JSON.parse(readFileSync(join(charactersDir, id, 'character.json'), 'utf8')) as CharacterBundle;
 
-/** The playable roster, exactly as the server computes it (meta.disabled). */
+/** The playable roster, exactly as the server computes it (meta.disabled,
+ *  and meta.boss — boss monsters are opponents, never roster). */
 const enabledIds = (): string[] =>
   readdirSync(charactersDir, { withFileTypes: true })
     .filter((d) => d.isDirectory() && existsSync(join(charactersDir, d.name, 'character.json')))
     .map((d) => d.name)
-    .filter((id) => !(bundleOf(id) as { meta?: { disabled?: boolean } }).meta?.disabled);
+    .filter((id) => {
+      const meta = (bundleOf(id) as { meta?: { disabled?: boolean; boss?: boolean } }).meta;
+      return !meta?.disabled && !meta?.boss;
+    });
 
 /** Protocol client with a CONSUMING message queue — multi-battle safe. */
 const arcadeClient = (url: string, name: string) => {

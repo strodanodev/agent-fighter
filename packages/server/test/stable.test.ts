@@ -75,6 +75,12 @@ test('board casting: unique fighters, one guard per character, clamped', async (
     assert.equal(new Set(chars).size, chars.length,
       `duplicate fighter in the gauntlet: ${chars.sort().join(', ')}`);
 
+    // BOSS MONSTER (v1.0.3.bossfight, kept on merge): castBoard skips boss
+    // nodes so the warden keeps its authored identity, which shows up here as
+    // an UNCAST fight node. Filtering on `n.agent` already tolerates that.
+    // Master's rewrite of this block hardcoded ['IRONCLAD','NULLPTR'] for its
+    // older 2-agent setup; spliced onto THIS test's 3-agent COPYCAT case it
+    // fails deterministically, so ours is the version that survives.
     const cast = fights.filter((n) => n.agent);
     const seenAgents = cast.map((n) => n.agent!.name);
     // vector + analog mains → exactly TWO nodes cast (one VECTOR main only);

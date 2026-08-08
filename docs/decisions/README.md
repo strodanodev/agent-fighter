@@ -20,3 +20,4 @@ the change.
 - [0009 — House agents are pins, tickets are the prize: the stable, defend-Elo, seasons, and the burn economy](0009-house-agents-and-tickets.md)
 - [0010 — The esports data layer: an open results API, and the ledger that makes replays possible](0010-esports-api-and-replays.md)
 - [0011 — PETS: account-bound companions with rolled auras](0011-pets-and-auras.md)
+- [0012 — PETS: the warden's cache (deep-clear gacha) + the repeat-play ladder](0012-boss-pets-and-repeat-play.md) — **PROPOSED, not locked; renumbered from 0011 on merge**

@@ -56,6 +56,13 @@ interface StudioMeta {
   vsPortrait?: string;
   vsFraming?: { zoom: number; panX: number; panY: number; rotate?: number; flipH?: boolean };
   disabled?: boolean; // greyed out + unselectable on the character-select screen
+  /**
+   * BOSS MONSTER: guards the arcade gauntlet's boss node instead of a random
+   * roster fighter. Hidden from the character-select grid entirely and
+   * excluded from the normal opponent pool (server + client enforce both).
+   * Combine with a BOSS STAGE (Stage tab) for a full boss-arena fight.
+   */
+  boss?: boolean;
 }
 
 type TabName = 'character' | 'frames' | 'moves' | 'cancels' | 'test' | 'generate' | 'stage'
@@ -1074,6 +1081,30 @@ const renderCharacterTab = (): HTMLElement => {
       : 'active — selectable on the character-select screen.'),
   );
 
+  // BOSS MONSTER — the arcade gauntlet's final guard. Kept separate from
+  // `disabled` on purpose: a boss is fully ACTIVE (it fights), it just isn't
+  // playable. A disabled boss is off everywhere, like any disabled character.
+  const isBoss = !!meta().boss;
+  const bossRow = mkEl('div', {
+    style: 'margin-bottom:12px;padding:8px 12px;border-radius:6px;max-width:1100px;display:flex;'
+      + `align-items:center;gap:12px;background:${isBoss ? '#2c1410' : '#141724'};`
+      + `border:1px solid ${isBoss ? '#ff5d3b' : '#232840'}`,
+  },
+    mkEl('button', {
+      title: 'toggle whether this character is a BOSS MONSTER: it guards the arcade board\'s '
+        + 'boss node instead of a random roster fighter, and is hidden from character select',
+      onclick: () => {
+        const m = meta();
+        if (m.boss) delete m.boss; else m.boss = true;
+        stDirty = true; renderAll();
+      },
+    }, isBoss ? '✓ make playable again' : '☠ make boss monster'),
+    mkEl('span', { class: 'hint' }, isBoss
+      ? 'BOSS MONSTER — guards the gauntlet\'s boss node; hidden from character select and the '
+      + 'normal opponent pool (Save to apply). Pair with a BOSS STAGE in the Stage tab.'
+      : 'normal fighter — playable, and part of the random opponent pool.'),
+  );
+
   // FIGHTER INFO — the select screen's dossier panel (bio + quote), plus the
   // canonical archetype it reads for the FIGHTING STYLE chip. All of it lives
   // in `meta`, which bundle-hash.mjs strips before the sim pin, so editing it
@@ -1118,7 +1149,7 @@ const renderCharacterTab = (): HTMLElement => {
       + 'which writes the AI personality and the matching feel knobs together.'),
   );
 
-  return mkEl('div', { class: 'pane' }, disableRow, portraitSection, loreRow, grid);
+  return mkEl('div', { class: 'pane' }, disableRow, bossRow, portraitSection, loreRow, grid);
 };
 
 // ------------------------------------------------------------------ frames tab
@@ -3140,6 +3171,12 @@ interface StageMetaEd {
    *  draggable handles / number inputs in the Stage tab preview. */
   bounds?: { left: number; right: number };
   layers?: StageLayerMetaEd[];
+  /**
+   * BOSS STAGE: reserved for the arcade gauntlet's boss fight. Excluded from
+   * the normal per-battle stage rotation (server + client both); the boss
+   * fight picks it when one exists. Absent → a normal rotation stage.
+   */
+  boss?: boolean;
 }
 
 /**
@@ -3688,6 +3725,26 @@ const renderStageTab = (): HTMLElement => {
       }, 'full width') : null,
       mkEl('span', { class: 'hint' },
         `view lock: the region the camera pans within and fighters are walled to (world px, 0..${STAGE.widthPx}). Absent = full width.`),
+    ),
+    // BOSS STAGE — mirrors the character tab's boss-monster toggle: an arena
+    // reserved for the gauntlet's final fight, excluded from normal rotation.
+    mkEl('div', {
+      class: 'row',
+      style: `padding:8px 12px;border-radius:6px;background:${m.boss ? '#2c1410' : '#141724'};`
+        + `border:1px solid ${m.boss ? '#ff5d3b' : '#232840'}`,
+    },
+      mkEl('button', {
+        title: 'toggle whether this stage is the BOSS ARENA: the gauntlet\'s boss fight happens here, '
+          + 'and it sits out the normal per-battle stage rotation',
+        onclick: () => {
+          if (m.boss) delete m.boss; else m.boss = true;
+          stStageDirty = true; renderAll();
+        },
+      }, m.boss ? '✓ make rotation stage again' : '☠ make boss stage'),
+      mkEl('span', { class: 'hint' }, m.boss
+        ? 'BOSS STAGE — the gauntlet\'s boss fight happens here; excluded from the normal stage '
+        + 'rotation (Save to apply). Pair with a BOSS MONSTER in the character tab.'
+        : 'rotation stage — appears in the normal per-battle stage rotation.'),
     ),
     mkEl('div', { class: 'genblock' },
       mkEl('b', {}, 'parallax planes — depth-scrolling background, midground, foreground'),

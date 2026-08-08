@@ -640,11 +640,37 @@ export const createMatchServer = (opts: {
   if (petCatalog.length > 0) {
     console.log(`[pets] ${petCatalog.length} in the catalog, ${adoptablePets.length} adoptable`);
   }
-  /** The playable roster (meta.disabled mirrors the client's select screen). */
-  const enabledCharacterIds = characterIds.filter((id) => {
-    const meta = (bundleOf(id) as { meta?: { disabled?: boolean } }).meta;
-    return !meta?.disabled;
+  const charMetaOf = (id: string): { disabled?: boolean; boss?: boolean } | undefined =>
+    (bundleOf(id) as { meta?: { disabled?: boolean; boss?: boolean } }).meta;
+  /**
+   * BOSS MONSTERS (Studio: meta.boss): never playable, never in the normal
+   * opponent pool — they exist only to guard the arcade board's boss node.
+   * A disabled boss is fully off, same as any disabled character.
+   */
+  const bossCharacterIds = characterIds.filter((id) => {
+    const meta = charMetaOf(id);
+    return !!meta?.boss && !meta.disabled;
   });
+  /** The playable roster (meta.disabled mirrors the client's select screen;
+   *  boss monsters are excluded — they are opponents, never picks). */
+  const enabledCharacterIds = characterIds.filter((id) => {
+    const meta = charMetaOf(id);
+    return !meta?.disabled && !meta?.boss;
+  });
+  /**
+   * BOSS STAGES (Studio: stage.json `boss: true`): reserved for boss-node
+   * fights. Excluded from the normal per-match rotation so the arena stays
+   * special; with none authored, boss fights use the normal rotation.
+   */
+  const stageMetaOf = (id: string): { boss?: boolean } => {
+    try {
+      return JSON.parse(readFileSync(join(stagesDir, id, 'stage.json'), 'utf8')) as { boss?: boolean };
+    } catch {
+      return {};
+    }
+  };
+  const bossStageIds = stageIds.filter((id) => !!stageMetaOf(id).boss);
+  const rotationStageIds = stageIds.filter((id) => !stageMetaOf(id).boss);
   const arcadeSkillOverride = opts.arcadeSkill ?? null;
 
   // A template that has drifted out of contract must stop the server, not
@@ -787,6 +813,10 @@ export const createMatchServer = (opts: {
     const byLevel = [...cast].sort((p, q) => p.level - q.level || p.name.localeCompare(q.name));
     const fights = board.nodes
       .filter(isFightNode)
+      // A BOSS MONSTER keeps its node: the warden is authored identity, not a
+      // slot for the stable to fill. (No boss authored → the boss node holds a
+      // roster character and stays castable, pre-feature behavior.)
+      .filter((n) => !bossCharacterIds.includes(n.charId ?? ''))
       .sort((p, q) => p.region - q.region || p.id - q.id);
     // ONE GUARD PER FIGHTER PER BOARD (owner rule 2026-07-29): the generator
     // promises "shuffled roster, no repeats until it runs out", and the first
@@ -1253,12 +1283,18 @@ export const createMatchServer = (opts: {
     const houseName = arcadeRun
       ? `${solo!.agentName ?? (bundleOf(solo!.character) as { name?: string }).name ?? solo!.character} · ${arcadeZone}`.toUpperCase()
       : solo?.agentName ?? `HOUSE LV${solo?.level ?? 1}`;
+    // BOSS STAGE: a boss-node fight happens in the boss arena when one is
+    // authored (Studio stage toggle). Everything else rotates over the
+    // non-boss stages, so the arena only ever appears for the warden.
+    const isBossFight = !!arcadeRun?.board
+      && nodeById(arcadeRun.board, arcadeRun.pending)?.kind === 'boss';
+    const stagePool = isBossFight && bossStageIds.length > 0 ? bossStageIds : rotationStageIds;
     const m: Match = {
       id: id ?? newMatchId(),
       mode, fee,
       clients: [c0, c1],
       seed: (matchSeed = (matchSeed * 1103515245 + 12345) & 0x7fffffff),
-      stage: stageIds.length > 0 ? stageIds[matchSeed % stageIds.length]! : '',
+      stage: stagePool.length > 0 ? stagePool[matchSeed % stagePool.length]! : '',
       chars: [c0.character, c1 ? c1.character : solo!.character],
       names: [c0.name, c1?.name ?? houseName],
       solo: solo ? { skill: solo.skill, aiSeed: solo.aiSeed, personality: solo.personality } : null,
@@ -1609,7 +1645,11 @@ export const createMatchServer = (opts: {
         || p.name.localeCompare(q.name),
       )[0]!;
       const info = await persistence.getAgent(pick.id);
-      const char = info?.config?.character && characterIds.includes(info.config.character)
+      // Boss monsters are never a solo opponent: a DB row claiming one (or a
+      // character later re-minted as a boss) falls back like a retired main.
+      const char = info?.config?.character
+        && characterIds.includes(info.config.character)
+        && !bossCharacterIds.includes(info.config.character)
         ? info.config.character
         : fallback.character;
       return {
@@ -1642,8 +1682,10 @@ export const createMatchServer = (opts: {
       if (!owner) return 'no fighter behind that code';
       const info = await persistence.getAgent(owner.sub);
       if (!info?.config) return `${owner.name} has not trained an agent yet`;
-      // Validated at PUT time, but the roster can shrink between then and now.
-      if (!characterIds.includes(info.config.character)) {
+      // Validated at PUT time, but the roster can shrink between then and now
+      // — and a character can be re-minted as a BOSS, which un-mains it too.
+      if (!characterIds.includes(info.config.character)
+        || bossCharacterIds.includes(info.config.character)) {
         return `${owner.name}'s agent mains a retired fighter — they need to re-coach`;
       }
       return {
@@ -1807,6 +1849,12 @@ export const createMatchServer = (opts: {
         if (!characterIds.includes(msg.character)) {
           return send(c, { t: 'error', msg: `unknown character "${msg.character}"` });
         }
+        // BOSS MONSTERS are opponents, never picks: the select screen hides
+        // them, but the server is the authority — a hand-rolled client
+        // queueing as the warden is refused in every mode.
+        if (bossCharacterIds.includes(msg.character)) {
+          return send(c, { t: 'error', msg: `"${msg.character}" is a boss monster — not playable` });
+        }
         // Bundle pinning: the client must be playing the same data we verify with.
         const serverHash = bundleOf(msg.character).versionHash;
         if (msg.bundleHash && serverHash && msg.bundleHash !== serverHash) {
@@ -1874,7 +1922,14 @@ export const createMatchServer = (opts: {
               // (the per-day battle cap is bumped once, below — this path
               // falls through to the same check every battle takes)
               const roster = enabledCharacterIds.filter((id) => id !== c.character);
-              const board = generateBoard({ roster: roster.length > 0 ? roster : [c.character], seed: newBoardSeed() });
+              const seed = newBoardSeed();
+              const board = generateBoard({
+                roster: roster.length > 0 ? roster : [c.character],
+                seed,
+                ...(bossCharacterIds.length > 0
+                  ? { boss: bossCharacterIds[seed % bossCharacterIds.length]! }
+                  : {}),
+              });
               // Cast for the free agent-class lane too — a fleet grinder's
               // autopiloted run still writes real names into the log/history.
               await castBoard(board, c.identity?.sub ?? '', c.character);
@@ -2393,7 +2448,17 @@ export const createMatchServer = (opts: {
           // Roster minus the player. A one-character roster falls back to a
           // mirror match rather than an empty board.
           const roster = enabledCharacterIds.filter((id) => id !== character);
-          run.board = generateBoard({ roster: roster.length > 0 ? roster : [character], seed: newBoardSeed() });
+          // BOSS MONSTER: when the Studio has authored one (meta.boss), the
+          // boss node is guarded by it instead of a shuffled roster fighter.
+          // Seed-picked so the run stays reproducible from (template, seed).
+          const bseed = newBoardSeed();
+          run.board = generateBoard({
+            roster: roster.length > 0 ? roster : [character],
+            seed: bseed,
+            ...(bossCharacterIds.length > 0
+              ? { boss: bossCharacterIds[bseed % bossCharacterIds.length]! }
+              : {}),
+          });
           // ADR 0009 step 3: named stable guards on the fight nodes.
           await castBoard(run.board, identity.sub, character);
           run.at = run.board.start;
@@ -2879,10 +2944,17 @@ export const createMatchServer = (opts: {
           try { parsed = JSON.parse(body || '{}') as Record<string, unknown>; }
           catch { return json(res, 400, { error: 'bad json' }); }
           const prev = (await persistence.getAgent(sub))?.config;
-          const character = typeof parsed.character === 'string' && characterIds.includes(parsed.character)
+          // Coached mains come from the PLAYABLE roster only — a boss monster
+          // is an opponent, never a main (same rule as the queue refusal).
+          const character = typeof parsed.character === 'string'
+            && characterIds.includes(parsed.character)
+            && !bossCharacterIds.includes(parsed.character)
             ? parsed.character
             : prev?.character;
-          if (!character) return json(res, 400, { error: `character required (one of: ${characterIds.join(', ')})` });
+          if (!character) {
+            const legal = characterIds.filter((id) => !bossCharacterIds.includes(id));
+            return json(res, 400, { error: `character required (one of: ${legal.join(', ')})` });
+          }
           const config = {
             character,
             // Merge over the previous coaching so a Mind can nudge one knob.

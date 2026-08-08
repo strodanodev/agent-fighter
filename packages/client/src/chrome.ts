@@ -313,6 +313,12 @@ export interface StageMeta {
   bounds?: { left: number; right: number };
   /** Multi-plane parallax art. Absent/empty → legacy single `background.png`. */
   layers?: StageLayerMeta[];
+  /**
+   * BOSS STAGE (Studio stage toggle): reserved for the arcade board's boss
+   * fight. Excluded from the normal per-battle stage rotation so the arena
+   * stays special; the boss fight picks it when one exists.
+   */
+  boss?: boolean;
 }
 
 export interface StageLayer {

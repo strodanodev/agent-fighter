@@ -23,7 +23,7 @@ import type { LoadedPet } from './pets.js';
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
-  currentStageBounds, currentStageCamLimits, drawAgent, drawExtract, drawGameOver, drawHud, drawInvite, drawLoading, drawMap, drawNetError, drawOpponentGone,
+  currentStageBounds, currentStageCamLimits, drawAgent, drawExtract, drawGameOver, drawHud, drawInvite, drawLoading, drawMap, drawMenuBackdrop, drawNetError, drawOpponentGone,
   drawRanks, drawReconnecting, drawResults, drawSelect, drawShop, drawStage, drawStageSelect, drawTitle,
   drawPetGacha, drawVsCard, drawWallet, resetTaps, PET_SPIN_TICKS, SHOP_SPIN_TICKS, setBgVideo, setGameLogo, setHover, setLogo, setTitlePetArt,
   setStageAsset, setUiKit, setVendingArt, tapHit, tapZone, worldTransform,
@@ -1190,8 +1190,8 @@ const enterSelectForArcade = (): void => {
   locked = [false, false];
   selectingFriendly = false;
   selectingAgentOf = '';
-  let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
-  if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+  let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled && !r.boss);
+  if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled && !r.boss));
   picks = [fe, fe];
   if (auth.status === 'in' || DEV_GUEST) void fetchShop();
   void audio.playBgm('player_select', { fadeInSec: 0.5 });
@@ -1587,15 +1587,25 @@ const installOnlineMatch = (): void => {
   }
   // Stakes card (P0): what this match costs and pays, up front.
   vsCardAge = 0;
+  // The boss is the run's climax — the VS card is where that has to land.
+  // (`s.arcade.node` is the node being moved onto; the board knows its kind.)
+  const arcNode = arcade && s.arcade ? nodeById(arcade.board, s.arcade.node) : undefined;
   vsStakes = s.mode === 'arcade'
-    ? [
-      `${arcade ? REGION_NAME[nodeById(arcade.board, s.arcade?.node ?? -1)?.region ?? 1] : 'GAUNTLET'}`
-      + `      ${s.arcade?.fights ?? 0} FIGHT${(s.arcade?.fights ?? 0) === 1 ? '' : 'S'} DEEP`
-      + (arcade && arcade.bag.credits > 0 ? `      CARRYING ${arcade.bag.credits} CR` : ''),
-      arcade && arcade.bag.credits + arcade.bag.drinks.length > 0
-        ? 'LOSE AND THE BAG IS GONE · SERVER-VERIFIED'
-        : "RANKED GAUNTLET · SERVER-VERIFIED · LOSE ONCE AND IT'S GAME OVER",
-    ]
+    ? arcNode?.kind === 'boss'
+      ? [
+        `☠ THE CORE WARDEN — FINAL FIGHT`
+        + (arcade && arcade.bag.credits > 0 ? `      CARRYING ${arcade.bag.credits} CR` : ''),
+        `BEAT THE WARDEN AND EXIT 3 OPENS · +${EXIT_BONUS[3]} CR BONUS · LOSE AND THE BAG IS GONE`,
+      ]
+      : [
+        `${arcNode?.kind === 'gate' ? '⛨ GATE · ' : ''}`
+        + `${arcade ? REGION_NAME[arcNode?.region ?? 1] : 'GAUNTLET'}`
+        + `      ${s.arcade?.fights ?? 0} FIGHT${(s.arcade?.fights ?? 0) === 1 ? '' : 'S'} DEEP`
+        + (arcade && arcade.bag.credits > 0 ? `      CARRYING ${arcade.bag.credits} CR` : ''),
+        arcade && arcade.bag.credits + arcade.bag.drinks.length > 0
+          ? 'LOSE AND THE BAG IS GONE · SERVER-VERIFIED'
+          : "RANKED GAUNTLET · SERVER-VERIFIED · LOSE ONCE AND IT'S GAME OVER",
+      ]
     : s.mode === 'solo'
       ? ['ENTRY −1 CR      WIN +2 CR · +60 XP      LOSE −15 XP',
         // Dare-vs-agent (ADR 0006): the pinned personality is the tell.
@@ -1664,6 +1674,7 @@ const startFight = (): void => {
 // (guest / server-offline) use the identical generator locally, reward-free.
 let mapBusy = false; // an /arcade/* request is in flight
 let mapToast = '';
+let mapToastAge = 0; // frames the current toast has been up (auto-dismiss)
 /** Escape was pressed once with a loaded bag — the next one really quits. */
 let mapAbandonArmed = false;
 /**
@@ -1673,10 +1684,28 @@ let mapAbandonArmed = false;
  */
 let mapSel = -1;
 let extractView: ExtractView | null = null;
+let extractAge = 0; // ticks on the extract screen — drives the deep-clear burst
+/**
+ * Kind of the node the current/last arcade fight was moved onto. Purely
+ * cosmetic: 'boss' drives the climax presentation (VS card, HUD tag, the
+ * warden-down results headline, the boss game-over line). The server never
+ * reads it and it decides nothing about the run.
+ */
+let arcadeFightKind: BoardNode['kind'] | null = null;
+/** The warden fell this fight — the results interstitial gets its headline. */
+let bossJustFell = false;
+/** Loot swept on the last advance; enterMap surfaces it as a map toast. */
+let lootSweep = '';
 
-/** The roster ids a board may be populated from (never the player's own). */
+/** The roster ids a board may be populated from (never the player's own,
+ *  never a boss monster — bosses only ever stand on the boss node). */
 const arcadeRoster = (): string[] => allRosters
-  .filter((r, i) => !r.disabled && i !== picks[0])
+  .filter((r, i) => !r.disabled && !r.boss && i !== picks[0])
+  .map((r) => r.id);
+
+/** Enabled BOSS MONSTERS (Studio: meta.boss) — the boss-node candidate pool. */
+const bossRoster = (): string[] => allRosters
+  .filter((r) => !r.disabled && r.boss)
   .map((r) => r.id);
 
 const rosterName = (charId: string): string =>
@@ -1692,9 +1721,13 @@ const startArcadePractice = (): void => {
   lastFighter = roster.id;
   safeSetItem(LAST_FIGHTER_KEY, lastFighter);
   const pool = arcadeRoster();
+  const bosses = bossRoster();
+  const bseed = (Math.random() * 0x7fffffff) | 0;
   const board = generateBoard({
     roster: pool.length > 0 ? pool : [roster.id],
-    seed: (Math.random() * 0x7fffffff) | 0,
+    seed: bseed,
+    // Same rule as the server: an authored boss monster guards the boss node.
+    ...(bosses.length > 0 ? { boss: bosses[bseed % bosses.length]! } : {}),
   });
   arcade = {
     practice: true, board, at: board.start, pending: -1, charId: roster.id,
@@ -1705,7 +1738,13 @@ const startArcadePractice = (): void => {
 
 /** Show the board. Every route decision in the mode is made on this screen. */
 const enterMap = (): void => {
-  mapToast = '';
+  // A pending loot sweep (practice auto-collect) survives the toast reset —
+  // this screen is exactly where the pickup should be announced.
+  mapToast = lootSweep;
+  if (lootSweep) audio.blip({ freq: 940, volume: 0.3 });
+  lootSweep = '';
+  bossJustFell = false;
+  arcadeFightKind = null;
   mapBusy = false;
   mapAbandonArmed = false;
   mapSel = -1; // re-armed against the CURRENT node's routes on the next frame
@@ -1724,14 +1763,23 @@ const enterMap = (): void => {
  */
 const practiceAdvance = (run: ArcadeRun, to: number): void => {
   run.at = to;
+  let sweptCr = 0;
+  let sweptDrinks = 0;
   for (;;) {
     const outs = successors(run.board, run.at);
     if (outs.length !== 1) break;
     const next = nodeById(run.board, outs[0]!);
     if (!next || next.kind !== 'loot' || !next.loot) break;
-    if (next.loot.kind === 'credits') run.bag.credits += next.loot.amount;
-    else run.bag.drinks.push({ itemId: next.loot.itemId, tier: next.loot.tier });
+    if (next.loot.kind === 'credits') { run.bag.credits += next.loot.amount; sweptCr += next.loot.amount; }
+    else { run.bag.drinks.push({ itemId: next.loot.itemId, tier: next.loot.tier }); sweptDrinks++; }
     run.at = next.id;
+  }
+  // Auto-collect is silent by construction (no decision left to make), so the
+  // pickup must announce itself or the bag just mutely ticks up a number.
+  if (sweptCr + sweptDrinks > 0) {
+    lootSweep = `SWEPT INTO THE BAG: ${sweptCr > 0 ? `+${sweptCr} CR` : ''}`
+      + (sweptCr > 0 && sweptDrinks > 0 ? ' · ' : '')
+      + (sweptDrinks > 0 ? `+${sweptDrinks} DRINK${sweptDrinks === 1 ? '' : 'S'}` : '');
   }
 };
 
@@ -1751,6 +1799,18 @@ const fetchArcadeRun = async (token: string, character?: string): Promise<boolea
   if (!res.ok || !body.board) {
     mapToast = (body.error ?? 'RUN NOT FOUND').toUpperCase().slice(0, 46);
     return false;
+  }
+  // Ranked pickups happen server-side (advanceRun auto-collect); the delta
+  // between what we carried and what came back IS the sweep — surface it.
+  if (arcade && !arcade.practice && arcade.runToken === token && body.bag) {
+    const dCr = body.bag.credits - arcade.bag.credits;
+    const dDr = body.bag.drinks.length - arcade.bag.drinks.length;
+    if (dCr > 0 || dDr > 0) {
+      mapToast = `SWEPT INTO THE BAG: ${dCr > 0 ? `+${dCr} CR` : ''}`
+        + (dCr > 0 && dDr > 0 ? ' · ' : '')
+        + (dDr > 0 ? `+${dDr} DRINK${dDr === 1 ? '' : 'S'}` : '');
+      audio.blip({ freq: 940, volume: 0.3 });
+    }
   }
   arcade = {
     practice: false,
@@ -1822,8 +1882,21 @@ const arcadeGo = (nodeId: number): void => {
   if (!node) return;
   if (node.kind === 'exit') { arcadeExtract(node); return; }
   run.pending = nodeId;
+  arcadeFightKind = node.kind; // cosmetic: boss/gate presentation downstream
   if (run.practice) { startPracticeFight(node); return; }
   startOnline('arcade', run.runToken, undefined, nodeId);
+};
+
+/**
+ * Land on the extraction receipt. The deep exit gets the `credits` victory
+ * jingle — the pre-v2 full-clear track that lost its only call site when the
+ * ladder became a board. Clearing THE CORE is the closest thing v2 has to a
+ * full clear, so the fanfare belongs to it.
+ */
+const enterExtractScreen = (tier: number): void => {
+  extractAge = 0;
+  screen = 'extract';
+  void audio.playStinger(tier >= 3 ? 'credits' : 'win');
 };
 
 /** Bank the bag and end the run — the only way credits leave the board. */
@@ -1837,7 +1910,7 @@ const arcadeExtract = (node: BoardNode): void => {
       granted: 0, multiplierPct: 0, drinks: run.bag.drinks.length,
       drinksLeftBehind: 0, fights: run.fights, practice: true,
     };
-    screen = 'extract';
+    enterExtractScreen(tier);
     return;
   }
   mapBusy = true;
@@ -1878,7 +1951,7 @@ const arcadeExtract = (node: BoardNode): void => {
         practice: false,
       };
       storeArcadeRun(null); // banked — nothing left to resume
-      screen = 'extract';
+      enterExtractScreen(extractView.exitTier);
     } catch {
       mapToast = 'SERVER UNREACHABLE — THE RUN IS STILL YOURS';
     } finally {
@@ -1896,9 +1969,20 @@ const startPracticeFight = (node: BoardNode): void => {
   setCharacters(fighters[0].ch, fighters[1].ch);
   matchPets = [null, null]; // practice gauntlet: free, and aura-free
 
-  // Rotate the stage art each battle so a run tours the whole game.
+  // Rotate the stage art each battle so a run tours the whole game — except
+  // the warden, who gets the BOSS STAGE when one is authored (Studio stage
+  // toggle). Boss arenas sit out the normal rotation either way, so the
+  // room only ever appears for the fight it was built for.
   if (stageAssets.length > 0) {
-    stageCursor = (seed + run.fights) % stageAssets.length;
+    const bossStages = stageAssets.map((s, i) => (s?.meta.boss ? i : -1)).filter((i) => i >= 0);
+    const rotation = stageAssets.map((s, i) => (s?.meta.boss ? -1 : i)).filter((i) => i >= 0);
+    if (node.kind === 'boss' && bossStages.length > 0) {
+      stageCursor = bossStages[(seed + run.fights) % bossStages.length]!;
+    } else if (rotation.length > 0) {
+      stageCursor = rotation[(seed + run.fights) % rotation.length]!;
+    } else {
+      stageCursor = (seed + run.fights) % stageAssets.length;
+    }
     setStageAsset(stageAssets[stageCursor] ?? null);
   }
   game = createGameState(seed++, currentStageBounds());
@@ -1913,11 +1997,18 @@ const startPracticeFight = (node: BoardNode): void => {
   quitConfirm = false; // fresh match — clear any stale quit prompt
   screen = 'fight';
   vsCardAge = 0;
-  vsStakes = [
-    `${REGION_NAME[node.region]} · ${run.fights} FIGHT${run.fights === 1 ? '' : 'S'} DEEP`
-    + (run.bag.credits > 0 ? `      CARRYING ${run.bag.credits} CR` : ''),
-    'PRACTICE GAUNTLET · NO FEE · NO XP · NO RECORDS',
-  ];
+  vsStakes = node.kind === 'boss'
+    ? [
+      `☠ THE CORE WARDEN — FINAL FIGHT`
+      + (run.bag.credits > 0 ? `      CARRYING ${run.bag.credits} CR` : ''),
+      'PRACTICE GAUNTLET · BEAT THE WARDEN AND EXIT 3 OPENS · NO FEE · NO RECORDS',
+    ]
+    : [
+      `${node.kind === 'gate' ? '⛨ GATE · ' : ''}`
+      + `${REGION_NAME[node.region]} · ${run.fights} FIGHT${run.fights === 1 ? '' : 'S'} DEEP`
+      + (run.bag.credits > 0 ? `      CARRYING ${run.bag.credits} CR` : ''),
+      'PRACTICE GAUNTLET · NO FEE · NO XP · NO RECORDS',
+    ];
   void audio.playStinger(run.fights === 0 ? 'vs' : 'here_comes_a_new_challenger',
     { onEnded: () => void audio.playBgm(audio.nextRotationTrack(), { fadeInSec: 1 }) });
 };
@@ -1928,9 +2019,34 @@ const endArcade = (): void => {
   net = null;
   arcade = null;
   cpuAi = null;
+  arcadeFightKind = null;
+  bossJustFell = false;
+  lootSweep = '';
   storeArcadeRun(null); // the run is over — nothing to resume
   screen = 'title';
   void audio.playBgm(audio.nextHomeTrack(), { fadeInSec: 1 });
+};
+
+/**
+ * "RUN IT AGAIN" — the repeat-play shortcut from the extract receipt and the
+ * game-over card. Ends the finished run, then jumps straight to the next one:
+ * ranked re-opens the 1-CREDIT consent modal on the title (the button never
+ * charges by itself — payArcadeEntry stays the only spender), practice goes
+ * straight back to fighter select. Kills the old worst path in the mode:
+ * title → mode row → modal → select after every single run.
+ */
+const arcadeRunAgain = (): void => {
+  endArcade();
+  mode = 'cpu';
+  // Guests: the run is free — straight back to fighter select.
+  if (!isSignedIn()) { enterSelectForArcade(); return; }
+  if (pendingArcadeToken) { enterSelectForArcade(); return; } // already paid
+  if (accountFetch === 'done' && account) {
+    arcadeEntryConfirm = true; // endArcade left us on the title — modal owns it
+    return;
+  }
+  // Signed-in with the economy unreachable: stay on the title (the mode row
+  // owns the offline fallback; select would bounce an unpaid ranked entry).
 };
 
 /**
@@ -2288,13 +2404,15 @@ const renderFight = (g: GameState): void => {
         `${net.setup.names[0]}${net.setup.agents[0] ? ' · AGENT' : ''}${net.side === 0 ? ' (YOU)' : ''}`,
         // Arcade: the HUD prefixes the character name itself, so the server
         // name ("ELON · 1/8") would double it — show just the run position.
+        // ("n/7" implied a fixed ladder that v2 replaced with the board; the
+        // warden gets named because the final fight should feel final.)
         `${arcade && !arcade.practice
-          ? `${arcade.fights + 1}/${arcade.total} DEEP`
+          ? (arcadeFightKind === 'boss' ? '☠ THE WARDEN' : `FIGHT ${arcade.fights + 1} · ${arcade.bag.credits} CR BAG`)
           : net.setup.names[1]}${net.setup.agents[1] ? ' · AGENT' : ''}${net.side === 1 ? ' (YOU)' : ''}`,
       ]
       : cpuAi
         ? ['', arcade
-          ? `${arcade.fights + 1}/${arcade.total} DEEP`
+          ? (arcadeFightKind === 'boss' ? '☠ THE WARDEN' : `FIGHT ${arcade.fights + 1} · ${arcade.bag.credits} CR BAG`)
           : `AGENT LV ${cpuLevelFor(profile, lever)}`]
         : undefined,
     autoSpecialCharged(g.fighters[localSide()]),
@@ -2318,7 +2436,9 @@ const renderFight = (g: GameState): void => {
 // ---------------------------------------------------------------- screens
 const tickSelect = (): void => {
   const n = allRosters.length;
-  const enabled = (i: number): boolean => !allRosters[i]?.disabled;
+  // Boss monsters are not on this screen at all (the grid hides them), so
+  // the cursor must never land on one — same skip as a disabled fighter.
+  const enabled = (i: number): boolean => !allRosters[i]?.disabled && !allRosters[i]?.boss;
   const anyEnabled = allRosters.some((_r, i) => enabled(i));
   // ESC / the ‹ TITLE button: unlock a locked pick first; otherwise leave.
   if (pressedThisFrame.has('Escape') || taps.has('back')) {
@@ -2510,8 +2630,8 @@ const frame = (steps = 1): void => {
       referralToast: referralToastAge >= 0,
       refCode: accountFetch === 'done' ? account?.refCode : undefined,
       challenge: !!pendingRoom,
-      fighter: (allRosters.find((r) => r.id === lastFighter && !r.disabled)
-        ?? allRosters.find((r) => !r.disabled))?.bundle.name,
+      fighter: (allRosters.find((r) => r.id === lastFighter && !r.disabled && !r.boss)
+        ?? allRosters.find((r) => !r.disabled && !r.boss))?.bundle.name,
       audio: {
         masterMuted: audio.isMasterMuted(),
         musicMuted: audio.isChannelMuted('music'),
@@ -2532,8 +2652,8 @@ const frame = (steps = 1): void => {
       selectingFriendly = false; // a title select is always wager (online) or arcade (cpu)
       selectingAgentOf = ''; // …never a dare-vs-agent leftover
       // Cursor starts on the REMEMBERED fighter so select is one confirm away.
-      let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled);
-      if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled));
+      let fe = allRosters.findIndex((r) => r.id === lastFighter && !r.disabled && !r.boss);
+      if (fe < 0) fe = Math.max(0, allRosters.findIndex((r) => !r.disabled && !r.boss));
       picks = [fe, fe];
       // CONSUMABLES: refresh the stash so the equipped indicator is honest.
       if (signedIn) void fetchShop();
@@ -2589,7 +2709,7 @@ const frame = (steps = 1): void => {
       ctx.font = 'bold 13px system-ui, sans-serif';
       ctx.fillStyle = uiTick % 44 < 34 ? '#ffe9a3' : '#ffd166';
       ctx.textAlign = 'center';
-      ctx.fillText(`▶ RESUME ARCADE RUN · BATTLE ${resumable.battle + 1}/${resumable.total}`, x + w / 2, y + 22);
+      ctx.fillText(`▶ RESUME ARCADE RUN · ${resumable.battle} FIGHT${resumable.battle === 1 ? '' : 'S'} DEEP`, x + w / 2, y + 22);
       ctx.restore();
     }
     if (arcadeEntryConfirm) {
@@ -2610,7 +2730,10 @@ const frame = (steps = 1): void => {
       ctx.font = '600 12px system-ui, sans-serif';
       ctx.fillStyle = '#ffffffcc';
       ctx.fillText('ONE CREDIT BUYS THE WHOLE GAUNTLET · NON-REFUNDABLE', px + pw / 2, py + 72);
-      ctx.fillText(`BALANCE AFTER: ${Math.max(0, (account?.credits ?? 0) - 1)} CR · EVERY WIN PAYS +1`, px + pw / 2, py + 92);
+      // v2 economy (ADR 0008): wins pay XP — CREDITS come from extracting.
+      // The old "EVERY WIN PAYS +1" line was a leftover promise the server
+      // stopped honoring when the board became the earner.
+      ctx.fillText(`BALANCE AFTER: ${Math.max(0, (account?.credits ?? 0) - 1)} CR · EXTRACT THE BAG TO EARN`, px + pw / 2, py + 92);
       const btnW = 180, btnH = 44, gap = 26, btnY = py + ph - 62;
       const yesX = px + pw / 2 - btnW - gap / 2, noX = px + pw / 2 + gap / 2;
       tapZone(yesX, btnY, btnW, btnH, 'arcadeentry:yes');
@@ -2745,6 +2868,13 @@ const frame = (steps = 1): void => {
     // The highlight always points at a LEGAL route: the server owns where we
     // stand, so a refresh can move us and strand a stale selection.
     if (!options.includes(mapSel)) mapSel = options[0] ?? -1;
+    // Toasts fade on their own (loot sweeps, server hiccups) — but never the
+    // armed abandon prompt, which must stay up until the player answers it.
+    if (mapToast && !mapAbandonArmed) {
+      if (++mapToastAge > 420) { mapToast = ''; mapToastAge = 0; }
+    } else {
+      mapToastAge = 0;
+    }
     drawMap(ctx, uiTick, {
       board: arcade.board,
       at: arcade.at,
@@ -2814,14 +2944,31 @@ const frame = (steps = 1): void => {
       }
     }
   } else if (screen === 'extract' && extractView) {
-    drawExtract(ctx, uiTick, extractView);
+    extractAge++;
+    drawExtract(ctx, uiTick, extractView, extractAge);
     drawWalletStrip();
-    if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('start')) {
+    // RUN IT AGAIN before the dismiss check — its zone overlaps 'start'.
+    if (extractAge > 20 && (taps.has('again') || pressedThisFrame.has('KeyR'))) {
+      extractView = null;
+      arcadeRunAgain();
+    } else if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('start')) {
       extractView = null;
       endArcade();
       // Deepest exit earned a FREE pet roll → the slot machine, not the title.
       if (gachaFree) enterPetGacha('extract');
     }
+  } else if (screen === 'map' || screen === 'extract') {
+    // A ranked run's board is being minted / re-read (screen was switched
+    // before the server answered). Without this branch the previous screen's
+    // last frame stays frozen on the canvas with no sign anything is
+    // happening — draw the backdrop and say we're working.
+    drawMenuBackdrop(ctx);
+    ctx.fillStyle = 'rgba(6,4,14,0.7)';
+    ctx.fillRect(0, 0, VW, VH);
+    ctx.font = 'bold 20px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffd166';
+    ctx.fillText(`MINTING THE BOARD${'.'.repeat(1 + (Math.trunc(uiTick / 20) % 3))}`, VW / 2, VH / 2);
   } else if (screen === 'shop') {
     if (shopRevealAge >= 0) shopRevealAge++;
     if (shopErrAge >= 0 && ++shopErrAge > 240) { shopErrAge = -1; shopErr = ''; }
@@ -3093,7 +3240,7 @@ const frame = (steps = 1): void => {
     ctx.font = 'bold 14px "Courier New", monospace';
     ctx.fillStyle = '#ffd166';
     ctx.fillText(arcadeQ
-      ? 'RANKED GAUNTLET · 1 CREDIT PER RUN · BEAT EVERY AGENT'
+      ? 'RANKED GAUNTLET · 1 CREDIT PER RUN · EXTRACT THE BAG ALIVE'
       : friendlyQ
         ? `FRIENDLY · FREE · UNRANKED · ROOM ${friendlyRoom}`
         : solo
@@ -3429,6 +3576,10 @@ const frame = (steps = 1): void => {
         // practice runs pay nothing by design.
         if (game.winner === 0) {
           screen = 'results';
+          // THE WARDEN FELL: the run's biggest single moment. It gets the
+          // `credits` fanfare (the old full-clear jingle) instead of the
+          // per-fight win sting, and the results headline says what opened.
+          bossJustFell = arcadeFightKind === 'boss';
           // PRACTICE runs advance locally the way the server advances a ranked
           // one (practiceAdvance mirrors advanceRun, auto-collect included).
           // Ranked runs wait for the verdict and then re-read the server.
@@ -3437,7 +3588,7 @@ const frame = (steps = 1): void => {
             practiceAdvance(arcade, arcade.pending);
             arcade.pending = -1;
           }
-          void audio.playStinger('win', {
+          void audio.playStinger(bossJustFell ? 'credits' : 'win', {
             onEnded: () => void audio.playBgm('ranking', { fadeInSec: 1 }),
           });
         } else {
@@ -3524,7 +3675,9 @@ const frame = (steps = 1): void => {
     // path back to the select screen mid-run.
     drawResults(ctx, game, fighters!, uiTick, resultsAge, xpBanner,
       arcade
-        ? (`${arcade.bag.credits > 0 ? `CARRYING ${arcade.bag.credits} CR — UNBANKED` : 'ROUTE CLEARED'}`
+        ? (`${bossJustFell
+          ? '☠ WARDEN DOWN — THE DEEP EXIT IS OPEN'
+          : arcade.bag.credits > 0 ? `CARRYING ${arcade.bag.credits} CR — UNBANKED` : 'ROUTE CLEARED'}`
           + '        TAP / ENTER: BACK TO THE MAP        ESC: QUIT')
         : net
           ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : queuedMode === 'friendly' ? 'FREE' : '10 CR'}        ESC: CHANGE FIGHTER`
@@ -3610,8 +3763,12 @@ const frame = (steps = 1): void => {
     renderFight(game);
     drawGameOver(ctx, uiTick, gameOverAge, {
       by: fighters?.[1]?.bundle.name ?? 'THE HOUSE',
-      stage: (arcade?.fights ?? 0) + 1,
-      total: arcade?.total ?? 1,
+      fights: arcade?.fights ?? 0,
+      // Close the loop the map opened ("LOSE A FIGHT AND THIS IS GONE"):
+      // the death card states exactly what died with the run.
+      bagCredits: arcade?.bag.credits ?? 0,
+      bagDrinks: arcade?.bag.drinks.length ?? 0,
+      boss: arcadeFightKind === 'boss',
     });
     // Ranked run: the server's verdict (and the XP burn) land moments after
     // the KO — surface them on the card so the loss reads as settled.
@@ -3649,6 +3806,33 @@ const frame = (steps = 1): void => {
       ctx.fillText('bank credits & XP · unlock ranked · +10 free daily', VW / 2, by + 34);
       ctx.restore();
       tapZone(bx, by, bw, bh, 'signin');
+    } else {
+      // SIGNED-IN loss — "RUN IT BACK" is the revenge hook. Losing to the
+      // board (especially the warden) should funnel straight into the next
+      // attempt, not through the whole title → modal → select round trip.
+      // Same consent rule as the extract button: it opens the 1-CR modal,
+      // it never charges by itself. Drawn AFTER drawGameOver so the tap
+      // zone wins over its full-screen dismiss region.
+      const bw = 300, bh = 42, bx = VW / 2 - bw / 2, by = VH - 112;
+      ctx.save();
+      ctx.fillStyle = 'rgba(20,44,20,0.94)';
+      ctx.fillRect(bx, by, bw, bh);
+      ctx.strokeStyle = uiTick % 44 < 34 ? '#9dffb0' : '#7ddf8a';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 16px system-ui, sans-serif';
+      ctx.fillStyle = '#c8ffd0';
+      ctx.fillText('⟳ RUN IT BACK · 1 CR', VW / 2, by + 18);
+      ctx.font = '11px system-ui, sans-serif';
+      ctx.fillStyle = '#ffffffaa';
+      ctx.fillText('fresh board · R', VW / 2, by + 33);
+      ctx.restore();
+      tapZone(bx, by, bw, bh, 'again');
+    }
+    if (gameOverAge > 30 && (taps.has('again') || pressedThisFrame.has('KeyR'))) {
+      arcadeRunAgain();
+      return;
     }
     const dismiss = pressedThisFrame.has('Enter') || pressedThisFrame.has('Space')
       || pressedThisFrame.has('Escape') || taps.has('start');
