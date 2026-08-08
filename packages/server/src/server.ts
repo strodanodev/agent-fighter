@@ -1429,7 +1429,11 @@ export const createMatchServer = (opts: {
         || p.name.localeCompare(q.name),
       )[0]!;
       const info = await persistence.getAgent(pick.id);
-      const char = info?.config?.character && characterIds.includes(info.config.character)
+      // Boss monsters are never a solo opponent: a DB row claiming one (or a
+      // character later re-minted as a boss) falls back like a retired main.
+      const char = info?.config?.character
+        && characterIds.includes(info.config.character)
+        && !bossCharacterIds.includes(info.config.character)
         ? info.config.character
         : fallback.character;
       return {
@@ -1462,8 +1466,10 @@ export const createMatchServer = (opts: {
       if (!owner) return 'no fighter behind that code';
       const info = await persistence.getAgent(owner.sub);
       if (!info?.config) return `${owner.name} has not trained an agent yet`;
-      // Validated at PUT time, but the roster can shrink between then and now.
-      if (!characterIds.includes(info.config.character)) {
+      // Validated at PUT time, but the roster can shrink between then and now
+      // — and a character can be re-minted as a BOSS, which un-mains it too.
+      if (!characterIds.includes(info.config.character)
+        || bossCharacterIds.includes(info.config.character)) {
         return `${owner.name}'s agent mains a retired fighter — they need to re-coach`;
       }
       return {
@@ -2546,10 +2552,17 @@ export const createMatchServer = (opts: {
           try { parsed = JSON.parse(body || '{}') as Record<string, unknown>; }
           catch { return json(res, 400, { error: 'bad json' }); }
           const prev = (await persistence.getAgent(sub))?.config;
-          const character = typeof parsed.character === 'string' && characterIds.includes(parsed.character)
+          // Coached mains come from the PLAYABLE roster only — a boss monster
+          // is an opponent, never a main (same rule as the queue refusal).
+          const character = typeof parsed.character === 'string'
+            && characterIds.includes(parsed.character)
+            && !bossCharacterIds.includes(parsed.character)
             ? parsed.character
             : prev?.character;
-          if (!character) return json(res, 400, { error: `character required (one of: ${characterIds.join(', ')})` });
+          if (!character) {
+            const legal = characterIds.filter((id) => !bossCharacterIds.includes(id));
+            return json(res, 400, { error: `character required (one of: ${legal.join(', ')})` });
+          }
           const config = {
             character,
             // Merge over the previous coaching so a Mind can nudge one knob.
