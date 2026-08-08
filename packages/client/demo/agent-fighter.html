@@ -6158,7 +6158,7 @@ Object.assign(globalThis, {
  * random per battle (`nextRotationTrack`), not round-robin.
  *
  * SFX (SfxId): impact/block/combo clips (weight-classed by button, see
- * `hitSfxFor`), menu stingers (select_confirm, you_lose), the announcer's
+ * `hitSfxFor`), menu stingers (select_confirm, you_lose, title_intro), the announcer's
  * fight-call, and the character voice-bark pack (hit/ouch reactions on
  * taking damage, hiya kiai on some swings, shoryuken/hadouken callouts on
  * their matching motion specials). The client-side juice layer (main.ts) is
@@ -6203,6 +6203,10 @@ const SFX_FILES = {
     combo_accent: '/assets/audio/sfx/combo_accent.mp3',
     select_confirm: '/assets/audio/sfx/select_confirm.mp3',
     you_lose: '/assets/audio/sfx/you_lose.mp3',
+    // Main-scene (title) intro sting — one-shot on every entry into the title,
+    // see the `lastScreen` watcher at the top of main.ts `frame()`. ~11s and
+    // musical, so it is played with `vary: false` (no pitch wobble).
+    title_intro: '/assets/audio/sfx/title_intro.mp3',
     fight_call_a: '/assets/audio/voice/fight_call_a.mp3',
     fight_call_b: '/assets/audio/voice/fight_call_b.mp3',
     hit_1: '/assets/audio/voice/hit_1.mp3',
@@ -6605,16 +6609,22 @@ class AudioManager {
      * (P1's swing landing while P2's counter also connects). A small random
      * pitch/gain wobble keeps rapid-fire jabs from sounding mechanically
      * identical.
+     *
+     * `vary: false` turns that wobble off — required for anything MUSICAL
+     * (title_intro), where a ±6% playback-rate shift detunes the whole clip
+     * instead of reading as variation.
      */
     playSfx(id, opts = {}) {
         const ctx = this.ctxOf();
         const bus = HIT_SFX.has(id) ? this.hitsGain : this.sfxGain;
+        const vary = opts.vary ?? true;
         void this.load(id).then((buffer) => {
             const src = ctx.createBufferSource();
             src.buffer = buffer;
-            src.playbackRate.value = 0.94 + Math.random() * 0.12;
+            if (vary)
+                src.playbackRate.value = 0.94 + Math.random() * 0.12;
             const gain = ctx.createGain();
-            gain.gain.value = (opts.volume ?? 1) * (0.9 + Math.random() * 0.1);
+            gain.gain.value = (opts.volume ?? 1) * (vary ? 0.9 + Math.random() * 0.1 : 1);
             src.connect(gain);
             gain.connect(bus);
             src.start();
@@ -12985,6 +12995,8 @@ const tapAt = (clientX, clientY) => {
     }
 };
 let screen = 'loading';
+/** Screen the previous frame drew — drives the title-entry sting (see `frame`). */
+let lastScreen = 'loading';
 let mode = 'cpu';
 let net = null;
 let netInstalled = false;
@@ -15400,6 +15412,15 @@ const frame = (steps = 1) => {
     // than after) means a press landing between frames still hit-tests the
     // layout the player can actually see.
     resetTaps();
+    // MAIN-SCENE STING. Fires exactly once per ENTRY into the title, on every
+    // path in — boot, backing out of select/shop/ranks/invite, endArcade,
+    // quitMatch, a dead net match. Watched here rather than bolted onto the ~12
+    // `screen = 'title'` assignments so no entry point can forget it and none
+    // can double-fire; staying on the title never re-triggers it. `vary: false`
+    // because it is a musical clip, not a combat one (see audio.ts playSfx).
+    if (screen === 'title' && lastScreen !== 'title')
+        audio.playSfx('title_intro', { vary: false });
+    lastScreen = screen;
     if (screen === 'loading') {
         // Ease the bar toward the real fraction so milestone jumps don't stutter.
         loadDisplay += (loadProgress - loadDisplay) * 0.14;

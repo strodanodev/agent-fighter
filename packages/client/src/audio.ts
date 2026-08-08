@@ -14,7 +14,7 @@
  * random per battle (`nextRotationTrack`), not round-robin.
  *
  * SFX (SfxId): impact/block/combo clips (weight-classed by button, see
- * `hitSfxFor`), menu stingers (select_confirm, you_lose), the announcer's
+ * `hitSfxFor`), menu stingers (select_confirm, you_lose, title_intro), the announcer's
  * fight-call, and the character voice-bark pack (hit/ouch reactions on
  * taking damage, hiya kiai on some swings, shoryuken/hadouken callouts on
  * their matching motion specials). The client-side juice layer (main.ts) is
@@ -32,7 +32,7 @@ export type SfxId =
   | 'punch_light' | 'punch_medium' | 'punch_heavy_a' | 'punch_heavy_b'
   | 'kick_light' | 'kick_heavy' | 'special_hit'
   | 'block_hit' | 'combo_accent'
-  | 'select_confirm' | 'you_lose'
+  | 'select_confirm' | 'you_lose' | 'title_intro'
   | 'fight_call_a' | 'fight_call_b'
   | 'hit_1' | 'hit_2' | 'hit_3' | 'hit_4'
   | 'hiya_1' | 'hiya_2'
@@ -80,6 +80,10 @@ const SFX_FILES: Record<SfxId, string> = {
   combo_accent: '/assets/audio/sfx/combo_accent.mp3',
   select_confirm: '/assets/audio/sfx/select_confirm.mp3',
   you_lose: '/assets/audio/sfx/you_lose.mp3',
+  // Main-scene (title) intro sting — one-shot on every entry into the title,
+  // see the `lastScreen` watcher at the top of main.ts `frame()`. ~11s and
+  // musical, so it is played with `vary: false` (no pitch wobble).
+  title_intro: '/assets/audio/sfx/title_intro.mp3',
   fight_call_a: '/assets/audio/voice/fight_call_a.mp3',
   fight_call_b: '/assets/audio/voice/fight_call_b.mp3',
   hit_1: '/assets/audio/voice/hit_1.mp3',
@@ -497,16 +501,21 @@ class AudioManager {
    * (P1's swing landing while P2's counter also connects). A small random
    * pitch/gain wobble keeps rapid-fire jabs from sounding mechanically
    * identical.
+   *
+   * `vary: false` turns that wobble off — required for anything MUSICAL
+   * (title_intro), where a ±6% playback-rate shift detunes the whole clip
+   * instead of reading as variation.
    */
-  playSfx(id: SfxId, opts: { volume?: number } = {}): void {
+  playSfx(id: SfxId, opts: { volume?: number; vary?: boolean } = {}): void {
     const ctx = this.ctxOf();
     const bus = HIT_SFX.has(id) ? this.hitsGain! : this.sfxGain!;
+    const vary = opts.vary ?? true;
     void this.load(id).then((buffer) => {
       const src = ctx.createBufferSource();
       src.buffer = buffer;
-      src.playbackRate.value = 0.94 + Math.random() * 0.12;
+      if (vary) src.playbackRate.value = 0.94 + Math.random() * 0.12;
       const gain = ctx.createGain();
-      gain.gain.value = (opts.volume ?? 1) * (0.9 + Math.random() * 0.1);
+      gain.gain.value = (opts.volume ?? 1) * (vary ? 0.9 + Math.random() * 0.1 : 1);
       src.connect(gain);
       gain.connect(bus);
       src.start();

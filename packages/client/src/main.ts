@@ -200,6 +200,8 @@ const tapAt = (clientX: number, clientY: number): void => {
 type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'gameover' | 'ranks' | 'invite' | 'agent' | 'shop' | 'map' | 'extract' | 'petgacha';
 
 let screen: Screen = 'loading';
+/** Screen the previous frame drew — drives the title-entry sting (see `frame`). */
+let lastScreen: Screen = 'loading';
 let mode: Mode = 'cpu';
 let net: Session | null = null;
 let netInstalled = false;
@@ -2606,6 +2608,15 @@ const frame = (steps = 1): void => {
   // than after) means a press landing between frames still hit-tests the
   // layout the player can actually see.
   resetTaps();
+
+  // MAIN-SCENE STING. Fires exactly once per ENTRY into the title, on every
+  // path in — boot, backing out of select/shop/ranks/invite, endArcade,
+  // quitMatch, a dead net match. Watched here rather than bolted onto the ~12
+  // `screen = 'title'` assignments so no entry point can forget it and none
+  // can double-fire; staying on the title never re-triggers it. `vary: false`
+  // because it is a musical clip, not a combat one (see audio.ts playSfx).
+  if (screen === 'title' && lastScreen !== 'title') audio.playSfx('title_intro', { vary: false });
+  lastScreen = screen;
 
   if (screen === 'loading') {
     // Ease the bar toward the real fraction so milestone jumps don't stutter.
