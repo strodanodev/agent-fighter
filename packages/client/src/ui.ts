@@ -1,5 +1,6 @@
 import {
-  AI_PERSONALITY_RANGES, EXIT_BONUS, EXIT_FIGHT_FLOOR, REGION_NAME, REGION_SKILL,
+  AI_PERSONALITY_RANGES, EXIT_BONUS, EXIT_FIGHT_FLOOR, PET_RARITY_COLORS,
+  PET_RARITY_LABELS, REGION_NAME, REGION_SKILL,
   STAGE, TICKS_PER_SEC, TUNING, exitRoutes, nodeById, successors,
 } from '@af/core';
 import type { Board, BoardNode, BoardNodeKind, BoardRegion, ExitTier, GameState } from '@af/core';
@@ -1538,6 +1539,7 @@ export const drawTitle = (
       ]
       : [
         ['A · MY AGENT', 'myagent', '#8fd0ff'],
+        ['G · PET GACHA', 'petgacha', '#c084fc'],
         ['R · RANKINGS', 'ranks', '#ffffffcc'],
         ['L · SIGN OUT', 'signin', '#ffffff99'],
       ];
@@ -2076,6 +2078,293 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
   ctx.lineWidth = 1;
 };
 
+// ---------------------------------------------------------------- pet gacha
+/**
+ * PET GACHA (ADR 0011 + owner decisions 2026-08-04) — a THREE-REEL slot
+ * machine for pet rolls. Same architecture as the vending machine: the
+ * SERVER decides the pet the instant the roll is paid; the reels are pure
+ * theater, and main.ts holds the result back until they land. Staggered
+ * stops (left → middle → right) are what make it read as a slot machine
+ * rather than a loading spinner.
+ */
+export interface PetGachaReveal {
+  rowId: number;
+  name: string;
+  rarity: number;   // 1..3
+  tint: string;
+  /** Pre-rendered aura lines ("+4.6% ENERGY REGEN"); [] = cosmetic only. */
+  auraText: string[];
+  equipped: boolean;
+}
+
+export interface PetGachaView {
+  status: 'idle' | 'busy' | 'done' | 'fail';
+  credits: number | null;
+  tickets: number | null;
+  cost: number;         // credits per roll
+  costTickets: number;  // tickets per roll
+  ownedCount: number;
+  rollBusy: boolean;
+  reveal: PetGachaReveal | null;
+  revealAge: number;    // -1 = none
+  err: string;
+  errAge: number;       // -1 = hidden
+  /** Which payment the confirm modal is armed for; null = no modal. */
+  confirm: 'credits' | 'tickets' | null;
+  spinAge: number;      // -1 = not spinning
+  /** Adoptable catalog — the reels cycle these glyphs. */
+  catalog: { name: string; tint: string }[];
+  /** FREE ROLL mode (gauntlet cleared): one pull, no price, no confirm. */
+  free: boolean;
+  equipBusy: boolean;
+}
+
+/** Spin length — a beat longer than the shop so three stops fit the arc. */
+export const PET_SPIN_TICKS = 210;
+/** Where each reel freezes, as a fraction of the spin (left → right). */
+const REEL_STOPS = [0.5, 0.72, 0.94] as const;
+
+/** The procedural companion glyph, miniature (mirrors client pets.ts). */
+const petOrb = (
+  ctx: CanvasRenderingContext2D, x: number, y: number, r: number,
+  tint: string, mystery = false,
+): void => {
+  const body = ctx.createRadialGradient(x - r * 0.3, y - r * 0.4, r * 0.1, x, y, r);
+  body.addColorStop(0, '#ffffff');
+  body.addColorStop(0.5, mystery ? '#3a3f52' : tint);
+  body.addColorStop(1, '#0b0e13');
+  ctx.fillStyle = body;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+  if (mystery) {
+    label(ctx, '?', x, y + r * 0.4, Math.max(10, r), '#ffd166');
+  } else {
+    ctx.fillStyle = 'rgba(8,11,17,0.85)';
+    for (const d of [-1, 1]) {
+      ctx.beginPath();
+      ctx.arc(x + d * r * 0.34, y - r * 0.12, Math.max(1.4, r * 0.16), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+};
+
+export const drawPetGacha = (ctx: CanvasRenderingContext2D, tick: number, v: PetGachaView): void => {
+  drawMenuBackdrop(ctx);
+  ctx.fillStyle = 'rgba(6,4,14,0.74)';
+  ctx.fillRect(0, 0, VW, VH);
+  const cx = VW / 2;
+
+  display(ctx, v.free ? 'FREE PET ROLL' : 'PET GACHA', cx, 54, 40,
+    { glow: v.free ? 'rgba(124,255,160,0.55)' : 'rgba(255,209,102,0.5)' });
+  label(ctx,
+    v.free
+      ? 'GAUNTLET CLEARED — THE HOUSE OWES YOU ONE COMPANION'
+      : 'RANDOM PET · RANDOM AURA · ACCOUNT BOUND — EQUIP IT ON YOUR PROFILE',
+    cx, 78, 12, v.free ? '#7cffa0' : '#ffd166cc');
+
+  // Wallets (the GACHA identity's balances) + back.
+  if (v.credits !== null) drawCredits(ctx, 16, 34, v.credits, 19);
+  if (v.tickets !== null) label(ctx, `🎟 ${v.tickets}`, 30, 62, 15, '#ffd166', 'left');
+  tapZone(VW - 118, 10, 104, 30, 'back');
+  bevel(ctx, VW - 118, 10, 104, 30, PANEL, 'rgba(255,255,255,0.25)', 'rgba(0,0,0,0.5)', 2);
+  label(ctx, '← BACK', VW - 66, 30, 13, '#cfd8e3');
+
+  // ---- the CABINET: three reel windows on one gold chassis.
+  const cabW = 560, cabH = 260;
+  const cabX = cx - cabW / 2, cabY = 100;
+  ctx.save();
+  ctx.shadowColor = v.free ? 'rgba(124,255,160,0.4)' : 'rgba(255,209,102,0.35)';
+  ctx.shadowBlur = v.spinAge >= 0 ? 26 + 10 * Math.sin(tick / 4) : 14;
+  bevel(ctx, cabX, cabY, cabW, cabH, PANEL, GOLD_LT, GOLD_DK, 4);
+  ctx.restore();
+  display(ctx, 'COMPANION SLOTS', cx, cabY + 30, 18, { glow: 'rgba(255,209,102,0.4)' });
+
+  const spinning = v.spinAge >= 0;
+  const spinT = spinning ? clamp01(v.spinAge / PET_SPIN_TICKS) : 0;
+  const reelW = 156, reelH = 168, reelGap = 22;
+  const reelsX = cx - (reelW * 3 + reelGap * 2) / 2;
+  const reelY = cabY + 48;
+  const n = Math.max(1, v.catalog.length);
+
+  for (let rIdx = 0; rIdx < 3; rIdx++) {
+    const rx = reelsX + rIdx * (reelW + reelGap);
+    const stop = REEL_STOPS[rIdx]!;
+    const stopped = !spinning || spinT >= stop;
+    bevel(ctx, rx, reelY, reelW, reelH, '#0b0a14',
+      stopped && spinning ? GOLD : 'rgba(255,255,255,0.18)', 'rgba(0,0,0,0.6)', 2);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(rx + 6, reelY + 6, reelW - 12, reelH - 12);
+    ctx.clip();
+    const cyMid = reelY + reelH / 2;
+    const rowH = 74;
+
+    if (v.reveal && (!spinning || spinT >= stop)) {
+      // Landed on the RESULT: this reel shows the won pet, with a settle pop.
+      const age = v.revealAge >= 0 ? v.revealAge : 0;
+      const pop = spinning ? 1 : 0.8 + 0.2 * easeOutBack(clamp01((age - rIdx * 3) / 10));
+      petOrb(ctx, rx + reelW / 2, cyMid - 8, 34 * pop, v.reveal.tint);
+      label(ctx, v.reveal.name.slice(0, 14), rx + reelW / 2, cyMid + 48, 12,
+        PET_RARITY_COLORS[Math.max(1, Math.min(3, v.reveal.rarity))]!);
+    } else if (spinning) {
+      // Rolling: a decelerating strip of catalog glyphs. Each reel gets its
+      // own phase offset so the three never move in lockstep.
+      const local = clamp01(spinT / stop);
+      const speed = 0.85 * (1 - local) * (1 - local) + 0.03;
+      const pos = v.spinAge * speed + rIdx * 2.7;
+      const frac = pos % 1;
+      for (let k = -2; k <= 2; k++) {
+        const idx = ((Math.floor(pos) + k + rIdx * 7) % n + n) % n;
+        const entry = v.catalog[idx]!;
+        const y = cyMid + (k - frac) * rowH;
+        ctx.globalAlpha = Math.abs(y - cyMid) < rowH / 2 ? 1 : 0.3;
+        petOrb(ctx, rx + reelW / 2, y, 28, entry.tint);
+        ctx.globalAlpha = 1;
+      }
+      // Motion blur while fast.
+      if (speed > 0.25) {
+        ctx.globalAlpha = Math.min(0.45, speed);
+        ctx.fillStyle = '#ffffff22';
+        for (let s = 0; s < 3; s++) ctx.fillRect(rx + 20 + s * 40, reelY + 10, 2, reelH - 20);
+        ctx.globalAlpha = 1;
+      }
+    } else {
+      // Idle: slow mystery drift.
+      const pos = tick / 90 + rIdx * 1.4;
+      const frac = pos % 1;
+      for (let k = -1; k <= 1; k++) {
+        const y = cyMid + (k - frac) * rowH;
+        ctx.globalAlpha = Math.abs(y - cyMid) < rowH / 2 ? 0.9 : 0.25;
+        petOrb(ctx, rx + reelW / 2, y, 28, '#3a3f52', true);
+        ctx.globalAlpha = 1;
+      }
+    }
+    ctx.restore();
+  }
+  // Payline chevrons.
+  ctx.fillStyle = GOLD;
+  const cyMid = reelY + reelH / 2;
+  ctx.beginPath();
+  ctx.moveTo(cabX + 8, cyMid - 9); ctx.lineTo(cabX + 22, cyMid); ctx.lineTo(cabX + 8, cyMid + 9);
+  ctx.closePath(); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(cabX + cabW - 8, cyMid - 9); ctx.lineTo(cabX + cabW - 22, cyMid); ctx.lineTo(cabX + cabW - 8, cyMid + 9);
+  ctx.closePath(); ctx.fill();
+
+  if (spinning) {
+    label(ctx, 'ROLLING…', cx, cabY + cabH + 20, 12,
+      tick % 30 < 22 ? '#ffd166' : '#ffe9a3');
+  }
+
+  // ---- the REVEAL card (below the cabinet once the reels settle).
+  const landed = v.reveal && !spinning;
+  if (landed) {
+    const r = v.reveal!;
+    const rar = Math.max(1, Math.min(3, r.rarity));
+    const age = Math.max(0, v.revealAge);
+    const pop = easeOutBack(clamp01(age / 12));
+    const cw = 460, chh = 118 + r.auraText.length * 20;
+    const cxx = cx - cw / 2, cyy = cabY + cabH + 34;
+    ctx.save();
+    ctx.translate(cx, cyy + chh / 2);
+    ctx.scale(pop, pop);
+    ctx.translate(-cx, -(cyy + chh / 2));
+    ctx.shadowColor = PET_RARITY_COLORS[rar]!;
+    ctx.shadowBlur = rar === 3 ? 28 : 12;
+    bevel(ctx, cxx, cyy, cw, chh, 'rgba(12,8,24,0.94)', PET_RARITY_COLORS[rar]!, 'rgba(0,0,0,0.6)', 3);
+    ctx.shadowBlur = 0;
+    petOrb(ctx, cxx + 52, cyy + 52, 30, r.tint);
+    display(ctx, r.name, cxx + 100, cyy + 40, 24, { align: 'left' });
+    label(ctx, `${PET_RARITY_LABELS[rar]} · ${r.auraText.length || 'NO'} AURA LINE${r.auraText.length === 1 ? '' : 'S'}`,
+      cxx + 100, cyy + 62, 12, PET_RARITY_COLORS[rar]!, 'left');
+    r.auraText.forEach((line, i) => {
+      label(ctx, line, cxx + 100, cyy + 86 + i * 20, 13, '#7cffa0', 'left');
+    });
+    if (r.auraText.length === 0) {
+      label(ctx, 'COSMETIC ONLY — IT ROLLED NO AURA. IT IS STILL YOURS.', cxx + 100, cyy + 86, 12, '#8a91a8', 'left');
+    }
+    // Equip straight from the reveal (or show that it took).
+    const eqW = 150, eqH = 30, eqX = cxx + cw - eqW - 14, eqY = cyy + chh - eqH - 12;
+    if (r.equipped) {
+      label(ctx, '✓ EQUIPPED', eqX + eqW / 2, eqY + 20, 14, '#7cffa0');
+    } else {
+      tapZone(eqX, eqY, eqW, eqH, 'gacha:equip');
+      bevel(ctx, eqX, eqY, eqW, eqH, '#173a26', '#7cffa0', '#0b1f14', 2);
+      label(ctx, v.equipBusy ? '…' : 'E · EQUIP NOW', eqX + eqW / 2, eqY + 20, 13, '#c9ffdd');
+    }
+    ctx.restore();
+  }
+
+  // ---- ROLL controls (hidden while spinning; free mode gets ONE lever).
+  if (!spinning && !v.confirm) {
+    const by = landed ? VH - 92 : cabY + cabH + 44;
+    if (v.free) {
+      const bw = 360, bh = 54, bx = cx - bw / 2;
+      tapZone(bx, by, bw, bh, 'gacha:pull');
+      ctx.save();
+      ctx.shadowColor = 'rgba(124,255,160,0.5)';
+      ctx.shadowBlur = 14 + 8 * Math.sin(tick / 8);
+      bevel(ctx, bx, by, bw, bh, '#173a26', '#7cffa0', '#0b1f14', 3);
+      ctx.restore();
+      display(ctx, v.rollBusy ? '…' : 'PULL — FREE ROLL', cx, by + 36, 22);
+    } else {
+      const bw = 250, bh = 50, gap = 26;
+      const canCr = v.credits === null || v.credits >= v.cost;
+      const canTk = (v.tickets ?? 0) >= v.costTickets;
+      const bx1 = cx - bw - gap / 2, bx2 = cx + gap / 2;
+      // credits lever
+      ctx.globalAlpha = canCr && !v.rollBusy ? 1 : 0.45;
+      if (canCr && !v.rollBusy) tapZone(bx1, by, bw, bh, 'gacha:roll:credits');
+      bevel(ctx, bx1, by, bw, bh, '#3a2d14', GOLD, GOLD_DK, 3);
+      display(ctx, `ROLL · ${v.cost} CR`, bx1 + bw / 2, by + 33, 20);
+      ctx.globalAlpha = 1;
+      // tickets lever
+      ctx.globalAlpha = canTk && !v.rollBusy ? 1 : 0.45;
+      if (canTk && !v.rollBusy) tapZone(bx2, by, bw, bh, 'gacha:roll:tickets');
+      bevel(ctx, bx2, by, bw, bh, '#2a1f38', '#c084fc', '#3d2b57', 3);
+      display(ctx, `ROLL · ${v.costTickets} 🎟`, bx2 + bw / 2, by + 33, 20);
+      ctx.globalAlpha = 1;
+      if (!canTk) {
+        label(ctx, 'TICKETS COME FROM WINNING RANKED PVP', bx2 + bw / 2, by + bh + 16, 10, '#8a91a8');
+      }
+      // Odds, plainly (the drink-machine honesty rule).
+      label(ctx, 'ODDS · COMMON 70% (1 AURA) · RARE 25% (2) · LEGENDARY 5% (3)',
+        cx, by + bh + 34, 11, '#8fd0ff');
+      label(ctx, `YOU OWN ${v.ownedCount} PET${v.ownedCount === 1 ? '' : 'S'} · EQUIP ON THE PROFILE PAGE OR RIGHT HERE`,
+        cx, by + bh + 52, 10, '#8a91a8');
+    }
+  }
+
+  // ---- error line.
+  if (v.errAge >= 0 && v.err) {
+    label(ctx, v.err, cx, VH - 26, 13, v.errAge % 20 < 14 ? '#ff8d9d' : '#ffb3bd');
+  }
+
+  // ---- CONFIRM modal — nothing is charged until YES (owner rule: every
+  // credit/ticket spend confirms first). Drawn LAST so its zones win.
+  if (v.confirm) {
+    ctx.fillStyle = 'rgba(4,3,10,0.78)';
+    ctx.fillRect(0, 0, VW, VH);
+    const mw = 470, mh = 168, mx = cx - mw / 2, my = VH / 2 - mh / 2;
+    bevel(ctx, mx, my, mw, mh, PANEL, GOLD_LT, GOLD_DK, 3);
+    display(ctx, 'ROLL FOR A PET?', cx, my + 42, 26, { glow: 'rgba(255,209,102,0.5)' });
+    label(ctx,
+      v.confirm === 'credits'
+        ? `THIS SPENDS ${v.cost} CREDITS · NON-REFUNDABLE · RANDOM PET`
+        : `THIS REDEEMS ${v.costTickets} TICKETS · NON-REFUNDABLE · RANDOM PET`,
+      cx, my + 70, 12, '#ffd166');
+    const bw = 190, bh = 44, byy = my + mh - bh - 18;
+    const yx = cx - bw - 12, nx = cx + 12;
+    tapZone(yx, byy, bw, bh, 'gacha:yes');
+    bevel(ctx, yx, byy, bw, bh, '#173a26', '#7cffa0', '#0b1f14', 2);
+    display(ctx, 'Y · ROLL', yx + bw / 2, byy + 30, 18);
+    tapZone(nx, byy, bw, bh, 'gacha:no');
+    bevel(ctx, nx, byy, bw, bh, '#3a1420', '#ff8d9d', '#240810', 2);
+    display(ctx, 'N · BACK', nx + bw / 2, byy + 30, 18);
+  }
+};
+
 // ---------------------------------------------------------------- invite
 /** Hot-red display() treatment for the dare headline / CTA. */
 const DARE_OPTS: DisplayOpts = { from: '#ffe3e3', mid: '#ff5d7e', to: '#93202f', outline: '#2a060f' };
@@ -2110,6 +2399,12 @@ export interface InviteView {
   canShare: boolean;
   /** Friends who ever redeemed this player's code. */
   daresAccepted?: number;
+  /**
+   * Of those, how many have NOT paid the inviter yet (friend redeemed but
+   * has not finished a first decided match). Drawn so the screen can never
+   * again show "N took the bait" next to credits that never arrived.
+   */
+  daresPending?: number;
   /** Inviter payouts remaining in the rolling week (server caps at 10). */
   bountiesLeft?: number;
   /**
@@ -2305,14 +2600,31 @@ export const drawInvite = (
     label(ctx, v.refCode ? v.linkLabel : 'CONNECTING TO SERVER…', cx, by + bh + 20, 12, '#8fd0ff');
   }
 
-  // ---- the economics, as scarcity: the 10/week payout cap is urgency.
+  // ---- the economics, HONESTLY.
+  //
+  // The payout is TWO-STEP and asymmetric (0005_referrals.sql): the friend is
+  // paid the instant they sign in carrying the code, but YOU are only paid
+  // once that friend finishes a first DECIDED match. This line used to read
+  // "+25 CREDITS EACH WHEN THEY SIGN IN", which is not what the server does.
+  // A player invited a friend, the friend signed up and never fought, and the
+  // credits that never arrived read as a broken feature (incident
+  // 2026-08-04). Never promise the inviter's half on sign-up again.
   let iy = by + bh + 42;
-  label(ctx,
-    `+25 CREDITS EACH WHEN THEY SIGN IN${v.bountiesLeft !== undefined ? `   ·   ${v.bountiesLeft}/10 BOUNTIES LEFT THIS WEEK` : ''}`,
-    cx, iy, 13, v.bountiesLeft === 0 ? '#ff9d9d' : '#ffd166');
-  if ((v.daresAccepted ?? 0) > 0) {
+  label(ctx, '+25 TO THEM ON SIGN-UP   ·   +25 TO YOU WHEN THEY FINISH A FIGHT',
+    cx, iy, 13, '#ffd166');
+  // Second line = the standings. PENDING is the one that had to exist: an
+  // accepted count with no pending count is exactly what made a correctly
+  // waiting payout indistinguishable from a lost one.
+  const accepted = v.daresAccepted ?? 0;
+  const pending = v.daresPending ?? 0;
+  const bits: string[] = [];
+  if (accepted > 0) bits.push(`${accepted} TOOK THE BAIT`);
+  if (pending > 0) bits.push(`${pending} STILL ${pending === 1 ? 'OWES' : 'OWE'} YOU A FIGHT`);
+  if (v.bountiesLeft !== undefined) bits.push(`${v.bountiesLeft}/10 BOUNTIES LEFT`);
+  if (bits.length > 0) {
     iy += 19;
-    label(ctx, `${v.daresAccepted} FIGHTER${v.daresAccepted === 1 ? '' : 'S'} ALREADY TOOK THE BAIT`, cx, iy, 12, '#8fd0ff');
+    label(ctx, bits.join('   ·   '), cx, iy, 12,
+      v.bountiesLeft === 0 ? '#ff9d9d' : pending > 0 ? '#ffd166' : '#8fd0ff');
   }
 
   label(ctx,

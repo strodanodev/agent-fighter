@@ -139,6 +139,12 @@ export interface NetAccount {
   daresAccepted?: number;
   /** Inviter payouts credited in the rolling week (server caps at 10). */
   daresPaidWeek?: number;
+  /**
+   * Accepted dares whose inviter payout has NOT landed yet — the friend
+   * redeemed the code but has not finished a first decided match. Undefined
+   * on a server older than 0031.
+   */
+  daresPending?: number;
   /** Wager TICKETS (ADR 0009) — a cosmetic collectible, never spendable. */
   tickets?: number;
 }

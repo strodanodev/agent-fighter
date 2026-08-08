@@ -12,7 +12,7 @@ import {
   auraLineText, auraLines, clampAura,
   generateBoard, isLegalMove, itemById, nodeById, setCharacters, step, successors,
 } from '@af/core';
-import type { AiState, Board, BoardNode, GameState, InputFrame } from '@af/core';
+import type { AiState, Board, BoardNode, GameState, InputFrame, PetAura } from '@af/core';
 import {
   awardXp, cpuLevelFor, loadLever, loadProfile, saveLever, skillForCpuLevel, xpForNext,
 } from './progress.js';
@@ -25,10 +25,10 @@ import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
   currentStageBounds, currentStageCamLimits, drawAgent, drawExtract, drawGameOver, drawHud, drawInvite, drawLoading, drawMap, drawNetError, drawOpponentGone,
   drawRanks, drawReconnecting, drawResults, drawSelect, drawShop, drawStage, drawStageSelect, drawTitle,
-  drawVsCard, drawWallet, resetTaps, SHOP_SPIN_TICKS, setBgVideo, setGameLogo, setLogo,
+  drawPetGacha, drawVsCard, drawWallet, resetTaps, PET_SPIN_TICKS, SHOP_SPIN_TICKS, setBgVideo, setGameLogo, setLogo,
   setStageAsset, setUiKit, setVendingArt, tapHit, tapZone, worldTransform,
 } from './ui.js';
-import type { AgentOpponent, Cam, ExtractView, HudFx, HudId, Mode, RankRow, SeasonRow, ShopInventoryEntry, ShopReveal, XpInfo } from './ui.js';
+import type { AgentOpponent, Cam, ExtractView, HudFx, HudId, Mode, PetGachaReveal, RankRow, SeasonRow, ShopInventoryEntry, ShopReveal, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit, loadVendingArt } from './chrome.js';
 import type { BgVideo, StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
@@ -191,7 +191,7 @@ const tapAt = (clientX: number, clientY: number): void => {
 };
 
 // ---------------------------------------------------------------- state
-type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'gameover' | 'ranks' | 'invite' | 'agent' | 'shop' | 'map' | 'extract';
+type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight' | 'results' | 'gameover' | 'ranks' | 'invite' | 'agent' | 'shop' | 'map' | 'extract' | 'petgacha';
 
 let screen: Screen = 'loading';
 let mode: Mode = 'cpu';
@@ -326,7 +326,10 @@ const shareDare = (): void => {
   const lv = account?.level;
   const text = dareVsAgent
     ? `${currentTaunt()} — MY LV ${lv ?? '??'} AGENT FIGHTS FOR ME. Beat it and prove something. +25 credits when you sign in.`
-    : `${currentTaunt()}${lv ? ` I'M LV ${lv}.` : ''} I DARE YOU TO FIGHT. +25 credits if you can take one round.`;
+    // "+25 when you sign in" is the RECIPIENT's half and it is literal — they
+    // are credited at first authenticated contact carrying the code. The old
+    // "+25 if you can take one round" promised the wrong trigger.
+    : `${currentTaunt()}${lv ? ` I'M LV ${lv}.` : ''} I DARE YOU TO FIGHT. +25 credits when you sign in.`;
   const done = (): void => { inviteCopiedAge = 0; };
   const copyFallback = (): void => {
     void navigator.clipboard?.writeText(`${text}\n${link}`).then(done)
@@ -850,6 +853,166 @@ const enterShop = (): void => {
   // pull debits another — found live: wallet said 10 CR, buy 402'd at 0.)
   void fetchAccount();
   void fetchShop();
+};
+
+// ---------------------------------------------------------------- pet gacha
+// (ADR 0011 + owner decisions 2026-08-04.) Same spine as the vending machine:
+// headers resolved ONCE per visit, result held until the reels land, and a
+// confirm modal before anything is charged. `gachaFree` is the pre-granted
+// deepest-exit roll — the server already owns the result, so that pull can
+// never be lost to a dead tab, only its theater.
+let gachaFetch: 'idle' | 'busy' | 'done' | 'fail' = 'idle';
+let gachaHeaders: Record<string, string> | null = null;
+let gachaCredits: number | null = null;
+let gachaTickets: number | null = null;
+let gachaCost = 50;
+let gachaCostTickets = 5;
+let gachaCatalog: { name: string; tint: string }[] = [];
+let gachaOwned = 0;
+let gachaConfirm: 'credits' | 'tickets' | null = null;
+let gachaSpinAge = -1;
+let gachaRollBusy = false;
+let gachaEquipBusy = false;
+let gachaPending: PetGachaReveal | null = null;
+let gachaReveal: PetGachaReveal | null = null;
+let gachaRevealAge = -1;
+let gachaErr = '';
+let gachaErrAge = -1;
+/** The deepest-exit free roll carried over from extraction; null = paid mode. */
+let gachaFree: PetGachaReveal | null = null;
+/** Where BACK returns to ('extract' entries came off the end of a run). */
+let gachaFrom: 'title' | 'extract' = 'title';
+
+/** A /pets pet payload → the reveal card's shape. */
+const mapGachaPet = (pet: {
+  rowId?: number; petId?: string; rarity?: number;
+  aura?: Partial<PetAura>;
+  def?: { name?: string; tint?: string } | null;
+  equipped?: boolean;
+}): PetGachaReveal => ({
+  rowId: Number(pet.rowId ?? 0),
+  name: (pet.def?.name ?? String(pet.petId ?? 'PET')).toUpperCase(),
+  rarity: Math.max(1, Math.min(3, Number(pet.rarity ?? 1))),
+  tint: pet.def?.tint ?? '#6fd3ff',
+  auraText: auraLines(clampAura(pet.aura)).map((l) => auraLineText(l.kind, l.amount)),
+  equipped: !!pet.equipped,
+});
+
+const enterPetGacha = (from: 'title' | 'extract' = 'title'): void => {
+  screen = 'petgacha';
+  gachaFrom = from;
+  gachaConfirm = null;
+  gachaSpinAge = -1;
+  gachaPending = null;
+  gachaReveal = null;
+  gachaRevealAge = -1;
+  gachaErr = '';
+  gachaErrAge = -1;
+  gachaHeaders = null;
+  gachaFetch = 'busy';
+  void fetchAccount(); // same identity-race medicine as enterShop
+  void (async () => {
+    try {
+      gachaHeaders = await agentAuthHeaders();
+      if (!gachaHeaders) { gachaFetch = 'fail'; return; }
+      const res = await fetchT(`${matchHttpUrl()}/pets`, { headers: gachaHeaders });
+      if (!res.ok) { gachaFetch = 'fail'; return; }
+      const body = (await res.json()) as {
+        cost?: number; costTickets?: number; credits?: number | null; tickets?: number;
+        catalog?: Array<{ name?: string; tint?: string }>;
+        pets?: unknown[];
+      };
+      gachaCost = Number(body.cost ?? 50);
+      gachaCostTickets = Number(body.costTickets ?? 5);
+      gachaCredits = typeof body.credits === 'number' ? body.credits : null;
+      gachaTickets = typeof body.tickets === 'number' ? body.tickets : null;
+      gachaCatalog = (body.catalog ?? []).map((d) => ({
+        name: String(d.name ?? 'PET'), tint: d.tint ?? '#6fd3ff',
+      }));
+      gachaOwned = body.pets?.length ?? 0;
+      gachaFetch = 'done';
+    } catch {
+      gachaFetch = 'fail';
+    }
+  })();
+};
+
+/** Reels finished: swap the held result into the reveal. */
+const landGachaSpin = (): void => {
+  gachaSpinAge = -1;
+  if (!gachaPending) return;
+  gachaReveal = gachaPending;
+  gachaRevealAge = 0;
+  gachaOwned++;
+  gachaPending = null;
+  audio.blip({ freq: gachaReveal.rarity === 3 ? 1980 : 1560, volume: 0.55 });
+};
+
+/** One paid roll. The reel is already spinning; the result is held for it. */
+const rollGachaPet = async (pay: 'credits' | 'tickets'): Promise<void> => {
+  if (gachaRollBusy) return;
+  gachaRollBusy = true;
+  gachaErr = '';
+  gachaErrAge = -1;
+  try {
+    const headers = gachaHeaders ?? await agentAuthHeaders();
+    if (!headers) return;
+    const nonce = `g_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+    const res = await fetchT(`${matchHttpUrl()}/pets/adopt`, {
+      method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce, pay }),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      pet?: Parameters<typeof mapGachaPet>[0];
+      credits?: number | null; tickets?: number; error?: string; code?: string;
+    };
+    if (!res.ok) {
+      gachaErr = res.status === 402
+        ? (body.code === 'tickets'
+          ? `NOT ENOUGH TICKETS — A ROLL COSTS ${gachaCostTickets}`
+          : `NOT ENOUGH CREDITS — A ROLL COSTS ${gachaCost}`)
+        : (body.error ?? 'THE MACHINE JAMMED — NOTHING WAS CHARGED').toUpperCase().slice(0, 64);
+      gachaErrAge = 0;
+      gachaSpinAge = -1; // stop the reels dead — no result is coming
+      return;
+    }
+    if (body.pet) {
+      gachaPending = mapGachaPet(body.pet);
+      if (gachaSpinAge < 0) landGachaSpin();
+    }
+    if (typeof body.credits === 'number') {
+      gachaCredits = body.credits;
+      if (account) account.credits = body.credits;
+    }
+    if (typeof body.tickets === 'number') {
+      gachaTickets = body.tickets;
+      if (account) account.tickets = body.tickets;
+    }
+  } catch {
+    gachaErr = 'SERVER UNREACHABLE — NOTHING WAS CHARGED';
+    gachaErrAge = 0;
+    gachaSpinAge = -1;
+  } finally {
+    gachaRollBusy = false;
+  }
+};
+
+/** Equip the revealed pet without leaving the machine. */
+const equipGachaPet = async (): Promise<void> => {
+  const r = gachaReveal;
+  if (!r || r.equipped || gachaEquipBusy || r.rowId <= 0) return;
+  gachaEquipBusy = true;
+  try {
+    const headers = gachaHeaders ?? await agentAuthHeaders();
+    if (!headers) return;
+    const res = await fetchT(`${matchHttpUrl()}/pets/equip`, {
+      method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rowId: r.rowId }),
+    });
+    if (res.ok && gachaReveal === r) gachaReveal = { ...r, equipped: true };
+  } catch { /* the profile page remains the fallback */ } finally {
+    gachaEquipBusy = false;
+  }
 };
 let uiTick = 0;
 let allRosters: Roster[] = [];
@@ -1602,6 +1765,7 @@ const arcadeExtract = (node: BoardNode): void => {
         exitTier?: number; bonus?: number; bag?: number; granted?: number;
         multiplierPct?: number; credits?: number | null;
         drinks?: unknown[]; drinksLeftBehind?: number; fights?: number; error?: string;
+        petRoll?: { pet?: Parameters<typeof mapGachaPet>[0] } | null;
       };
       if (!res.ok) {
         mapToast = (body.error ?? 'EXTRACTION FAILED').toUpperCase().slice(0, 46);
@@ -1610,6 +1774,10 @@ const arcadeExtract = (node: BoardNode): void => {
       if (typeof body.credits === 'number' && account) {
         account = { ...account, credits: body.credits };
       }
+      // FREE PET ROLL (deepest exit): the grant already happened server-side,
+      // atomically with the extraction — this only parks the reveal for the
+      // slot-machine screen the continue button routes to.
+      if (body.petRoll?.pet) gachaFree = mapGachaPet(body.petRoll.pet);
       extractView = {
         exitTier: body.exitTier ?? tier,
         bonus: body.bonus ?? EXIT_BONUS[tier],
@@ -2435,6 +2603,9 @@ const frame = (steps = 1): void => {
     } else if (pressedThisFrame.has('KeyB') || taps.has('shop')) {
       // VENDING MACHINE (ADR 0007): gacha energy drinks for credits.
       if (signedIn) enterShop(); else void authLogin();
+    } else if (pressedThisFrame.has('KeyG') || taps.has('petgacha')) {
+      // PET GACHA (ADR 0011): roll companions for credits or tickets.
+      if (signedIn) enterPetGacha('title'); else void authLogin();
     } else if (tappedMode) {
       mode = tappedMode;
       launchMode();
@@ -2558,6 +2729,8 @@ const frame = (steps = 1): void => {
     if (pressedThisFrame.has('Enter') || pressedThisFrame.has('Escape') || taps.has('start')) {
       extractView = null;
       endArcade();
+      // Deepest exit earned a FREE pet roll → the slot machine, not the title.
+      if (gachaFree) enterPetGacha('extract');
     }
   } else if (screen === 'shop') {
     if (shopRevealAge >= 0) shopRevealAge++;
@@ -2614,6 +2787,76 @@ const frame = (steps = 1): void => {
     } else if (shopSpinAge < 0 && (pressedThisFrame.has('Escape') || taps.has('back'))) {
       screen = 'title';
     }
+  } else if (screen === 'petgacha') {
+    if (gachaRevealAge >= 0) gachaRevealAge++;
+    if (gachaErrAge >= 0 && ++gachaErrAge > 240) { gachaErrAge = -1; gachaErr = ''; }
+    // Three staggered reels: advance; land the held result at the end.
+    if (gachaSpinAge >= 0) {
+      gachaSpinAge++;
+      const spinT = Math.min(1, gachaSpinAge / PET_SPIN_TICKS);
+      const tickEvery = 3 + Math.round(spinT * spinT * 21);
+      if (gachaSpinAge % tickEvery === 0) {
+        audio.blip({ freq: 660 + 260 * (1 - spinT), volume: 0.18 });
+      }
+      // Each reel freezing gets its own clunk (the stagger IS the drama).
+      const prevT = (gachaSpinAge - 1) / PET_SPIN_TICKS;
+      for (const stop of [0.5, 0.72, 0.94]) {
+        if (prevT < stop && spinT >= stop) audio.blip({ freq: 1180, volume: 0.4 });
+      }
+      if (gachaSpinAge >= PET_SPIN_TICKS && gachaPending) landGachaSpin();
+    }
+    drawPetGacha(ctx, uiTick, {
+      status: gachaFetch,
+      credits: gachaCredits ?? (account ? account.credits : null),
+      tickets: gachaTickets ?? account?.tickets ?? null,
+      cost: gachaCost,
+      costTickets: gachaCostTickets,
+      ownedCount: gachaOwned,
+      rollBusy: gachaRollBusy,
+      reveal: gachaReveal,
+      revealAge: gachaRevealAge,
+      err: gachaErr,
+      errAge: gachaErrAge,
+      confirm: gachaConfirm,
+      spinAge: gachaSpinAge,
+      catalog: gachaCatalog.length > 0 ? gachaCatalog : [{ name: 'PET', tint: '#6fd3ff' }],
+      free: gachaFree !== null,
+      equipBusy: gachaEquipBusy,
+    });
+    if (gachaConfirm) {
+      // Modal owns the input: YES rolls, NO/ESC backs out (owner rule: every
+      // credit/ticket spend confirms first). The reel starts NOW — the roll
+      // races it and always wins.
+      if (pressedThisFrame.has('Enter') || pressedThisFrame.has('KeyY') || taps.has('gacha:yes')) {
+        const pay = gachaConfirm;
+        gachaConfirm = null;
+        gachaReveal = null;
+        gachaRevealAge = -1;
+        gachaSpinAge = 0;
+        void rollGachaPet(pay);
+      } else if (pressedThisFrame.has('Escape') || pressedThisFrame.has('KeyN') || taps.has('gacha:no')) {
+        gachaConfirm = null;
+      }
+    } else if (gachaFree && gachaSpinAge < 0
+      && (pressedThisFrame.has('Enter') || pressedThisFrame.has('Space') || taps.has('gacha:pull'))) {
+      // FREE ROLL: the pet is already granted — no charge, so no confirm.
+      // The pull only starts the theater.
+      gachaPending = gachaFree;
+      gachaFree = null;
+      gachaReveal = null;
+      gachaRevealAge = -1;
+      gachaSpinAge = 0;
+    } else if (!gachaRollBusy && gachaSpinAge < 0 && taps.has('gacha:roll:credits')) {
+      gachaConfirm = 'credits';
+    } else if (!gachaRollBusy && gachaSpinAge < 0 && taps.has('gacha:roll:tickets')) {
+      gachaConfirm = 'tickets';
+    } else if (pressedThisFrame.has('KeyE') || taps.has('gacha:equip')) {
+      void equipGachaPet();
+    } else if (gachaSpinAge < 0 && (pressedThisFrame.has('Escape') || taps.has('back'))) {
+      // An un-pulled FREE roll survives leaving: the pet is already in the
+      // inventory server-side, and gachaFree persists until it is pulled.
+      screen = 'title';
+    }
   } else if (screen === 'ranks') {
     drawRanks(ctx, ranksRows, ranksTab, ranksErr, uiTick,
       authName() ?? (DEV_GUEST ?? undefined), seasonRows);
@@ -2644,6 +2887,7 @@ const frame = (steps = 1): void => {
       copiedAge: inviteCopiedAge,
       canShare: shareViaSheet(),
       daresAccepted: account?.daresAccepted,
+      daresPending: account?.daresPending,
       bountiesLeft: account
         ? Math.max(0, REFERRAL_WEEKLY_CAP - (account.daresPaidWeek ?? 0))
         : undefined,
@@ -3485,9 +3729,9 @@ canvas.addEventListener('pointerdown', () => {
   // button, so fire it in-gesture and drop the taps. AGENT ARCADE (mode:cpu),
   // rankings, and change-fighter are NOT here: guests reach those freely.
   if (screen === 'title' && !audioMenuOpen && !isSignedIn()
-    && (taps.has('mode:online') || taps.has('shop') || taps.has('myagent') || taps.has('dare'))) {
+    && (taps.has('mode:online') || taps.has('shop') || taps.has('petgacha') || taps.has('myagent') || taps.has('dare'))) {
     void authLogin();
-    taps.delete('mode:online'); taps.delete('shop'); taps.delete('myagent'); taps.delete('dare');
+    taps.delete('mode:online'); taps.delete('shop'); taps.delete('petgacha'); taps.delete('myagent'); taps.delete('dare');
     return;
   }
   // GAME OVER (guest arcade loss): the "SIGN IN TO PLAY MORE" CTA is the same

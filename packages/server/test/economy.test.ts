@@ -10,8 +10,8 @@ import { test } from 'node:test';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  DAILY_CREDITS, InsufficientCredits, SOLO_FEE, WAGER_FEE, XP_LOSS, XP_WIN,
-  memoryPersistence,
+  DAILY_CREDITS, InsufficientCredits, REFERRAL_CREDITS, SOLO_FEE, WAGER_FEE,
+  XP_LOSS, XP_WIN, memoryPersistence,
 } from '../src/persist.js';
 import type { MatchRecord } from '../src/persist.js';
 import { createMatchServer } from '../src/server.js';
@@ -351,4 +351,93 @@ test('sweeper: a young orphan is left alone until the cutoff passes', async () =
   await p.escrowMatch('young', ['u9', null], SOLO_FEE);
   assert.equal(await p.sweepOrphanedEscrow(30), 0, '30-min cutoff spares a fresh escrow');
   assert.equal((await p.getAccount(id('u9'), 'U9', false)).credits, DAILY_CREDITS - SOLO_FEE);
+});
+
+/**
+ * ---- REFERRAL DARES (0005 + 0031) ----
+ *
+ * Incident 2026-08-04: a player shared their DARE LINK, the friend redeemed it
+ * and took the invitee +25, and the inviter was never credited. Nothing was
+ * broken — the inviter half is gated on the invitee finishing a first DECIDED
+ * match, and that friend had entered the arcade once and abandoned it without
+ * ever settling one. What WAS broken: no surface said "pending", and nothing
+ * but a later match by that same invitee could ever release it.
+ */
+test('referral: the invitee is paid on redemption, the inviter is NOT', async () => {
+  const p = memoryPersistence();
+  const inviter = await p.getAccount(id('inv'), 'INV', false);
+  const code = inviter.refCode;
+
+  const friend = await p.getAccount(id('friend'), 'FRIEND', false, code);
+  assert.equal(friend.referralGranted, REFERRAL_CREDITS, 'invitee paid immediately');
+  assert.equal(friend.credits, DAILY_CREDITS + REFERRAL_CREDITS);
+
+  // The inviter's half is still owed — this is the exact state the incident hit.
+  const after = await p.getAccount(id('inv'), 'INV', false);
+  assert.equal(after.credits, DAILY_CREDITS, 'inviter NOT paid on sign-up');
+  assert.equal(after.daresAccepted, 1);
+  assert.equal(after.daresPending, 1, 'and the screen can now say so');
+  assert.equal(after.daresPaidWeek, 0);
+});
+
+test('referral: a friend who never fights leaves the payout pending, not lost', async () => {
+  const p = memoryPersistence();
+  const code = (await p.getAccount(id('inv'), 'INV', false)).refCode;
+  await p.getAccount(id('friend'), 'FRIEND', false, code);
+
+  // No decided match on record → neither path pays. Repeatedly.
+  assert.equal(await p.releaseReferral('friend'), 0);
+  assert.equal(await p.sweepPendingReferrals(), 0, 'the sweep respects the same gate');
+  assert.equal((await p.getAccount(id('inv'), 'INV', false)).credits, DAILY_CREDITS);
+  assert.equal((await p.getAccount(id('inv'), 'INV', false)).daresPending, 1);
+
+  // The friend finally fights. THE SWEEP alone must be able to release it —
+  // that is the path that did not exist, and the reason the credits could be
+  // stranded forever if the invitee never returned while a settlement ran.
+  await p.recordMatch(baseRecord({
+    matchId: 'first', identities: [id('friend'), id('other')],
+    names: ['FRIEND', 'OTHER'], winner: 0,
+  }));
+  assert.equal(await p.sweepPendingReferrals(), 1, 'now due — the sweep pays it');
+
+  const paid = await p.getAccount(id('inv'), 'INV', false);
+  assert.equal(paid.credits, DAILY_CREDITS + REFERRAL_CREDITS);
+  assert.equal(paid.daresPending, 0, 'nothing left owing');
+  assert.equal(paid.daresPaidWeek, 1);
+});
+
+test('referral: the sweep is idempotent and never double-pays', async () => {
+  const p = memoryPersistence();
+  const code = (await p.getAccount(id('inv'), 'INV', false)).refCode;
+  await p.getAccount(id('friend'), 'FRIEND', false, code);
+  await p.recordMatch(baseRecord({
+    matchId: 'first', identities: [id('friend'), id('other')],
+    names: ['FRIEND', 'OTHER'], winner: 0,
+  }));
+
+  assert.equal(await p.sweepPendingReferrals(), 1);
+  assert.equal(await p.sweepPendingReferrals(), 0, 'second sweep pays nothing');
+  // And settlement's own call cannot re-pay what the sweep already released.
+  assert.equal(await p.releaseReferral('friend'), 0);
+  assert.equal(
+    (await p.getAccount(id('inv'), 'INV', false)).credits,
+    DAILY_CREDITS + REFERRAL_CREDITS, 'paid exactly once',
+  );
+});
+
+test('referral: self-dares and second redemptions are refused', async () => {
+  const p = memoryPersistence();
+  const own = await p.getAccount(id('inv'), 'INV', false);
+  // Own code → nothing, no matter how many times it is presented.
+  const self = await p.getAccount(id('inv'), 'INV', false, own.refCode);
+  assert.equal(self.referralGranted, 0);
+  assert.equal(self.daresAccepted, 0);
+
+  const other = await p.getAccount(id('two'), 'TWO', false);
+  const first = await p.getAccount(id('friend'), 'FRIEND', false, own.refCode);
+  assert.equal(first.referralGranted, REFERRAL_CREDITS);
+  // One referral per account, ever — a second code pays nothing.
+  const second = await p.getAccount(id('friend'), 'FRIEND', false, other.refCode);
+  assert.equal(second.referralGranted, 0, 'one referral per account, ever');
+  assert.equal((await p.getAccount(id('two'), 'TWO', false)).daresAccepted, 0);
 });

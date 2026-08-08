@@ -32,7 +32,7 @@ export { ITEM_SLOTS, setMatchItems } from './state.js';
 export type { ItemDef, ItemEffect, ItemEffectKind, ItemTier } from './items.js';
 export {
   AURA_LINES, AURA_LABELS, AURA_MIN, AURA_MAX, AURA_LINES_BY_RARITY,
-  PET_RARITY_ODDS, PET_RARITY_COLORS, PET_RARITY_LABELS, PET_COST,
+  PET_RARITY_ODDS, PET_RARITY_COLORS, PET_RARITY_LABELS, PET_COST, PET_ROLL_TICKETS,
   PET_REGEN_PERIOD_TICKS, PET_CRIT_BONUS, PET_CRIT_FLASH_TICKS,
   NO_AURA, clampAura, auraIsEmpty, auraLines, auraLineText, PET_MOTIONS,
 } from './pets.js';

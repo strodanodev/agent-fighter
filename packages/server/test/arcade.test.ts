@@ -586,3 +586,59 @@ test('ENTRY REPLAY: a retried nonce charges once (dropped response, double tap)'
   assert.equal(a.credits, DAILY_CREDITS - ARCADE_FEE, 'charged at enter');
   assert.equal(b.credits, DAILY_CREDITS - ARCADE_FEE, 'replayed nonce charges nothing');
 });
+
+test('FREE PET ROLL: the deepest exit grants one; shallow exits never do', async (t) => {
+  // ADR 0011 + owner decision 2026-08-04: "finishing the gauntlet" = the
+  // tier-3 exit behind the boss line. Anything shallower banks credits only —
+  // a 2-fight bag paying a ~50 CR pet roll would make the shallow farm the
+  // best move in the whole game.
+  const persistence = memoryPersistence();
+  const server = await createMatchServer({ port: 0, persistence, noPaceCheck: true, arcadeSkill: () => 0 });
+  t.after(() => server.close());
+  const http = `http://localhost:${server.port}`;
+  const H = { 'X-Dev-Name': 'Clearer', 'Content-Type': 'application/json' };
+  await fetch(`${http}/me`, { headers: H });
+  // Fund the runs (entry is 1 CR each; the daily grant covers it anyway).
+  const player = enabledIds()[0]!;
+
+  /** Fight every node on the cheapest path to `tier`'s exit, then extract. */
+  const clearTo = async (tier: 1 | 3, nonce: string): Promise<Record<string, unknown>> => {
+    const state = await openRun(http, H, player, nonce);
+    const board = state.board;
+    const exit = exitNodes(board).find((e) => e.exitTier === tier)!;
+    const line = pathTo(board, state.at, exit.id).map((id) => nodeById(board, id)!);
+    const c = arcadeClient(`ws://127.0.0.1:${server.port}`, 'Clearer');
+    await c.ready;
+    for (const node of line) {
+      if (node.id === exit.id || node.id === state.at) continue;
+      assert.ok(isFightNode(node), `the cheapest line to exit ${tier} is pure fights`);
+      await winFight(c, player, state.token, node.id);
+    }
+    c.close();
+    const res = await fetch(`${http}/arcade/extract`, {
+      method: 'POST', headers: H, body: JSON.stringify({ token: state.token, node: exit.id }),
+    });
+    assert.equal(res.status, 200, `extract at tier ${tier} failed: ${await res.clone().text()}`);
+    return await res.json() as Record<string, unknown>;
+  };
+
+  // Shallow bank: credits, no companion.
+  const shallow = await clearTo(1, 'petroll-shallow-01');
+  assert.equal(shallow.petRoll ?? null, null, 'a 2-fight bag earns NO pet roll');
+
+  // Full clear: the free roll rides the extract response, already granted.
+  const deep = await clearTo(3, 'petroll-deep-01');
+  const roll = deep.petRoll as { pet?: { rowId?: number; petId?: string; rarity?: number } } | null;
+  assert.ok(roll?.pet && Number(roll.pet.rowId) > 0, 'the deep clear grants a pet');
+  assert.ok((roll.pet.rarity ?? 0) >= 1 && (roll.pet.rarity ?? 0) <= 3);
+
+  // The grant is DURABLE — in the inventory even if the reveal is never seen —
+  // and cost nothing (only the entries were paid).
+  const owned = await (await fetch(`${http}/pets`, { headers: H })).json() as {
+    pets: Array<{ rowId: number }>;
+  };
+  assert.ok(owned.pets.some((p) => p.rowId === Number(roll.pet!.rowId)),
+    'the free pet is in the inventory');
+  const ledgerFree = await persistence.getCredits('dev:Clearer');
+  assert.ok((ledgerFree ?? 0) > 0, 'no 50 CR was charged for the free roll');
+});

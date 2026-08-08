@@ -189,6 +189,13 @@ export interface Account {
   /** Inviter payouts credited in the rolling week (vs REFERRAL_WEEKLY_CAP). */
   daresPaidWeek: number;
   /**
+   * Accepted dares still AWAITING the inviter payout — the friend redeemed
+   * the code but has not finished a first decided match yet (0031). Surfaced
+   * because the absence of this number is what made a correctly-pending
+   * payout look like a lost one (incident 2026-08-04).
+   */
+  daresPending: number;
+  /**
    * Wager tickets (ADR 0009), PHASE A (owner decision 2026-07-27):
    * non-transferable, never spendable, and no redemption catalog TODAY —
    * a collectible. Phase B opens redemption for esports seats and other
@@ -276,6 +283,11 @@ export interface XpAward {
 /** Thrown by escrowMatch when a side can't cover the fee. */
 export class InsufficientCredits extends Error {
   constructor(public side: 0 | 1) { super(`INSUFFICIENT:${side}`); }
+}
+
+/** A ticket roll on too few tickets — the 402 {code:'tickets'} surface. */
+export class InsufficientTickets extends Error {
+  constructor() { super('INSUFFICIENT_TICKETS'); }
 }
 
 /**
@@ -387,6 +399,19 @@ export interface Persistence {
    * Call AFTER recordMatch settles — the check reads the matches table.
    */
   releaseReferral: (inviteeSub: string) => Promise<number>;
+  /**
+   * Referral twin of sweepOrphanedEscrow (0031). `releaseReferral` only ever
+   * runs for players in a match that just settled, so a payout blocked at the
+   * time — invitee had no decided match yet, or the inviter's rolling-week cap
+   * was full — retries ONLY if that same invitee plays again. If they churn,
+   * the inviter's credits are stranded forever.
+   *
+   * This offers every uncredited referral back to release_referral, which
+   * re-applies the identical gates, so the sweep can never pay something
+   * settlement would not have. Returns the number actually credited. Run at
+   * startup + periodically, exactly like the escrow sweep.
+   */
+  sweepPendingReferrals: () => Promise<number>;
   leaderboard: (limit?: number) => Promise<unknown[]>;
   /**
    * THE season ladder (ADR 0009 step 2) — the `season_board` view. Ranked on
@@ -542,6 +567,24 @@ export interface Persistence {
   setEquippedPet: (sub: string, rowId: number | null) => Promise<void>;
   /** The equipped pet, or null. Read at queue time to pin the aura. */
   equippedPet: (sub: string) => Promise<OwnedPet | null>;
+  /**
+   * PET GACHA (ADR 0009 phase B): pay for a roll with TICKETS instead of
+   * credits — redeem the `count` oldest unredeemed tickets and grant the
+   * SERVER-rolled pet atomically (the roll still happens in server.ts).
+   * Idempotent by `nonce` exactly like buyPet: a replay returns the stored
+   * grant and redeems nothing. Throws InsufficientTickets when the balance
+   * can't cover it. `tickets` in the result = unredeemed balance after.
+   */
+  redeemTicketsForPet: (
+    sub: string, count: number, petId: string, rarity: number, aura: PetAura,
+    nonce: string,
+  ) => Promise<PetPurchase & { tickets: number }>;
+  /**
+   * Unredeemed ticket count — a plain read, like getCredits: the gacha
+   * screen shows THIS identity's balance, because the /me wallet can be a
+   * different identity mid-AIR-rehydration (the shop lesson, twice).
+   */
+  countTickets: (sub: string) => Promise<number>;
 }
 
 /** One owned pet: the catalog id plus the aura this individual rolled. */
@@ -694,6 +737,21 @@ export const memoryPersistence = (): Persistence => {
   const names = new Map<string, { name: string; agent: boolean }>();
   /** invitee sub → inviter sub + whether the inviter payout released. */
   const referrals = new Map<string, { inviter: string; released: boolean }>();
+  /**
+   * The inviter payout gate, in ONE place — `releaseReferral` and
+   * `sweepPendingReferrals` must never drift apart on who is owed what
+   * (mirrors release_referral in 0005/0031). Returns credits granted.
+   * Bodies below run after the factory returns, so `prof` is initialised.
+   */
+  const releaseRef = (inviteeSub: string): number => {
+    const r = referrals.get(inviteeSub);
+    const p = profiles.get(inviteeSub);
+    // Released only once the invitee has a decided match on record.
+    if (!r || r.released || !p || p.wins + p.losses === 0) return 0;
+    r.released = true;
+    prof(r.inviter).credits += REFERRAL_CREDITS;
+    return REFERRAL_CREDITS;
+  };
   /** sub → trained agent config + key (ADR 0006). */
   const agents = new Map<string, { config: AgentConfig | null; keyHash: string | null; keyCreatedAt: string | null }>();
   /** agent:<uuid> → AIR/dev owner sub (operator who minted it). */
@@ -803,6 +861,7 @@ export const memoryPersistence = (): Persistence => {
         dailyGranted, refCode: refCodeOf(identity.sub), referralGranted,
         daresAccepted: mine.length,
         daresPaidWeek: mine.filter((r) => r.released).length,
+        daresPending: mine.filter((r) => !r.released).length,
         tickets: ticketsOf(identity.sub),
       };
     },
@@ -955,14 +1014,15 @@ export const memoryPersistence = (): Persistence => {
       }
       return released;
     },
-    releaseReferral: async (inviteeSub) => {
-      const r = referrals.get(inviteeSub);
-      const p = profiles.get(inviteeSub);
-      // Released only once the invitee has a decided match on record.
-      if (!r || r.released || !p || p.wins + p.losses === 0) return 0;
-      r.released = true;
-      prof(r.inviter).credits += REFERRAL_CREDITS;
-      return REFERRAL_CREDITS;
+    releaseReferral: async (inviteeSub) => releaseRef(inviteeSub),
+    sweepPendingReferrals: async () => {
+      let paid = 0;
+      // Oldest first, like the SQL — Map preserves insertion order, and
+      // insertion order IS redemption order here.
+      for (const [invitee, r] of referrals) {
+        if (!r.released && releaseRef(invitee) > 0) paid++;
+      }
+      return paid;
     },
     leaderboard: async (limit = 20) =>
       [...profiles.entries()]
@@ -1217,6 +1277,32 @@ export const memoryPersistence = (): Persistence => {
       const row = ownedPets.find((p) => p.sub === sub && p.equipped);
       return row ? petView(row) : null;
     },
+    countTickets: async (sub) => ticketsOf(sub),
+    // Mirrors 0032_pet_roll_tickets.sql redeem_tickets_for_pet — keep in sync.
+    redeemTicketsForPet: async (sub, count, petId, rarity, aura, nonce) => {
+      const replay = ownedPets.find((p) => p.sub === sub && p.nonce === nonce);
+      if (replay) {
+        // Same pet, same aura, nothing redeemed — a retry can never re-roll.
+        return { ...petView(replay), credits: prof(sub).credits, tickets: ticketsOf(sub), duplicate: true };
+      }
+      // The `count` OLDEST unredeemed tickets (Map iteration = insertion
+      // order = mint order, mirroring the SQL's ORDER BY created_at).
+      const mine = [...tickets.entries()].filter(([, t]) => t.sub === sub && !t.redeemed);
+      if (mine.length < count) throw new InsufficientTickets();
+      for (const [, t] of mine.slice(0, count)) t.redeemed = true;
+      const row = {
+        sub,
+        nonce,
+        rowId: nextPetRow++,
+        petId,
+        rarity,
+        aura: clampAura(aura),
+        equipped: false,
+        createdAt: new Date().toISOString(),
+      };
+      ownedPets.unshift(row);
+      return { ...petView(row), credits: prof(sub).credits, tickets: ticketsOf(sub), duplicate: false };
+    },
     equippedItems: async (sub) =>
       ownedItems
         .filter((i) => i.sub === sub && !i.consumedMatchId && i.slot !== null && i.slot !== undefined)
@@ -1333,6 +1419,19 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
       } catch (e) {
         console.log(`[tickets] count failed for ${identity.sub}: ${String(e)}`);
       }
+      // Accepted-but-unpaid dares (0031) — a separate rpc for the same reason
+      // ticket_count is. Best-effort in the same spirit: on a deployment whose
+      // DB predates 0031 this 404s, and a missing display counter must never
+      // block a login. 0 then reads as "nothing pending", which is also what
+      // the pre-0031 screen showed.
+      let daresPending = 0;
+      try {
+        daresPending = Number(await call('/rest/v1/rpc/dares_pending', {
+          method: 'POST', body: JSON.stringify({ _profile: identity.sub }),
+        }) ?? 0) | 0;
+      } catch (e) {
+        console.log(`[referral] pending count failed for ${identity.sub}: ${String(e)}`);
+      }
       return {
         credits: Number(row.credits ?? 0), level: Number(row.level ?? 1),
         xp: Number(row.xp ?? 0), wins: Number(row.wins ?? 0), losses: Number(row.losses ?? 0),
@@ -1341,6 +1440,7 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         referralGranted: Number(row.referral_granted ?? 0),
         daresAccepted: Number(row.dares_accepted ?? 0),
         daresPaidWeek: Number(row.dares_paid_week ?? 0),
+        daresPending,
         tickets,
       };
     },
@@ -1412,6 +1512,12 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
       const n = (await call('/rest/v1/rpc/release_referral', {
         method: 'POST',
         body: JSON.stringify({ _invitee: inviteeSub }),
+      })) as number;
+      return n | 0;
+    },
+    sweepPendingReferrals: async () => {
+      const n = (await call('/rest/v1/rpc/sweep_pending_referrals', {
+        method: 'POST', body: '{}',
       })) as number;
       return n | 0;
     },
@@ -1742,6 +1848,56 @@ export const supabasePersistence = (url: string, serviceKey: string): Persistenc
         { method: 'GET' },
       )) as Array<Record<string, unknown>>;
       return rows?.[0] ? petRow(rows[0]) : null;
+    },
+    countTickets: async (sub) => {
+      const rows = (await call(
+        `/rest/v1/tickets?select=id&profile_id=eq.${encodeURIComponent(sub)}`
+        + '&redeemed_at=is.null&limit=1000',
+        { method: 'GET' },
+      )) as Array<unknown>;
+      return rows.length;
+    },
+    // PET GACHA — mirrors 0032_pet_roll_tickets.sql redeem_tickets_for_pet.
+    redeemTicketsForPet: async (sub, count, petId, rarity, aura, nonce) => {
+      const a = clampAura(aura);
+      let rows: Array<Record<string, unknown>>;
+      try {
+        rows = (await call('/rest/v1/rpc/redeem_tickets_for_pet', {
+          method: 'POST',
+          body: JSON.stringify({
+            _profile: sub, _count: count | 0, _pet: petId, _rarity: rarity | 0,
+            _atk: a.atk, _def: a.def, _hp: a.hpRegen, _crit: a.crit,
+            _energy: a.energyRegen, _nonce: nonce,
+          }),
+        })) as Array<Record<string, unknown>>;
+      } catch (e) {
+        // The RPC raises INSUFFICIENT:0 (the escrow_match surface); translate
+        // it to the typed error the endpoint maps to 402 {code:'tickets'}.
+        if (String((e as Error).message ?? e).includes('INSUFFICIENT')) {
+          throw new InsufficientTickets();
+        }
+        throw e;
+      }
+      const row = rows?.[0] ?? {};
+      return {
+        rowId: Number(row.row_id ?? 0),
+        petId: String(row.granted_pet ?? petId),
+        rarity: Number(row.granted_rarity ?? rarity),
+        // Read the aura BACK: on a duplicate replay these are the originally
+        // rolled values, not the ones this call proposed.
+        aura: clampAura({
+          atk: Number(row.atk ?? 0),
+          def: Number(row.def ?? 0),
+          hpRegen: Number(row.hp_regen ?? 0),
+          crit: Number(row.crit ?? 0),
+          energyRegen: Number(row.energy_regen ?? 0),
+        }),
+        equipped: false,
+        createdAt: new Date().toISOString(),
+        credits: 0, // tickets path — the endpoint reports the credit balance separately
+        tickets: Number(row.tickets ?? 0),
+        duplicate: Boolean(row.duplicate),
+      };
     },
     equippedItems: async (sub) => {
       const rows = (await call(

@@ -22,7 +22,7 @@ import {
   generateBoard, isFightNode,
   isLegalMove, itemById, loadCharacter, minFights, nodeById, setCharacters,
   setMatchItems, stateHash, step, successors, validateAllTemplates,
-  AURA_LINES, AURA_LINES_BY_RARITY, AURA_MAX, AURA_MIN, PET_COST,
+  AURA_LINES, AURA_LINES_BY_RARITY, AURA_MAX, AURA_MIN, PET_COST, PET_ROLL_TICKETS,
   PET_RARITY_ODDS, auraIsEmpty, clampAura, setMatchPets,
 } from '@af/core';
 import type {
@@ -39,7 +39,7 @@ import { verifyAirToken } from './airjwt.js';
 import type { AirIdentity } from './airjwt.js';
 import {
   ARCADE_FEE,
-  InsufficientCredits, SOLO_FEE, WAGER_FEE, createPersistence, loadDotEnv,
+  InsufficientCredits, InsufficientTickets, SOLO_FEE, WAGER_FEE, createPersistence, loadDotEnv,
 } from './persist.js';
 import type { Account, ArcadeExtract, MatchMode, Persistence, StableRow } from './persist.js';
 import { createAirIssuer, loadIssuerConfig } from './air-issuer.js';
@@ -1773,7 +1773,7 @@ export const createMatchServer = (opts: {
                   credits: 0, level: info?.level ?? 1, xp: info?.xp ?? 0,
                   wins: info?.wins ?? 0, losses: info?.losses ?? 0,
                   dailyGranted: false, refCode: '', referralGranted: 0,
-                  daresAccepted: 0, daresPaidWeek: 0,
+                  daresAccepted: 0, daresPaidWeek: 0, daresPending: 0,
                   // Inert extends to TICKETS (ADR 0009): agent-class accounts
                   // never mint, so this is 0 by construction, not by lookup.
                   tickets: 0,
@@ -2135,6 +2135,15 @@ export const createMatchServer = (opts: {
     void persistence.sweepOrphanedItems()
       .then((n) => { if (n > 0) console.log(`[sweep] released ${n} item(s) stranded by a crash`); })
       .catch((e) => console.log(`[sweep] items failed: ${String((e as Error).message ?? e)}`));
+    // Referral dares (0031): releaseReferral only fires for players in a match
+    // that just settled, so a payout that was not yet due — or that the
+    // rolling-week cap refused — retries ONLY if that same invitee plays
+    // again. This is the path that pays an inviter whose friend redeemed the
+    // code, went quiet, and came back weeks later. Same gates, so it can never
+    // pay what settlement would not have.
+    void persistence.sweepPendingReferrals()
+      .then((n) => { if (n > 0) console.log(`[sweep] released ${n} pending referral payout(s)`); })
+      .catch((e) => console.log(`[sweep] referrals failed: ${String((e as Error).message ?? e)}`));
   };
   sweepEscrow();
   const escrowSweep = setInterval(sweepEscrow, 60 * 60 * 1000);
@@ -2483,6 +2492,28 @@ export const createMatchServer = (opts: {
             console.log(`[arcade] drink grant failed for ${run.sub}: ${String(err)}`);
           }
         }
+        // FREE PET ROLL (owner decision 2026-08-04): the DEEPEST exit only —
+        // beating the whole gauntlet, not banking a 2-fight bag. Granted here,
+        // atomically with extraction, on the board-drink free-pull pattern:
+        // cost 0, deterministic nonce, so pets(profile,nonce) makes a retried
+        // extraction re-reveal the SAME pet rather than re-roll. The client's
+        // FREE ROLL slot machine is pure reveal theater over this grant — the
+        // pet is already yours even if the tab dies before the reel lands.
+        let petRoll: Record<string, unknown> | null = null;
+        if (node.exitTier === 3 && adoptablePets.length > 0) {
+          const def = adoptablePets[Math.floor(Math.random() * adoptablePets.length)]!;
+          const rarity = rollRarity();
+          try {
+            const r = await persistence.buyPet(
+              run.sub, 0, def.id, rarity, rollAura(rarity), `petxtr:${token}`);
+            petRoll = { pet: { ...r, def: petById(r.petId) ?? null }, free: true };
+            console.log(`[pets] ${run.sub} FREE roll ${r.petId} (R${r.rarity}) — gauntlet cleared`);
+          } catch (err) {
+            // A blipped grant must not un-bank the run — the extraction paid;
+            // the player just misses the bonus this once. Logged, not fatal.
+            console.log(`[pets] free roll failed for ${run.sub}: ${String(err)}`);
+          }
+        }
         arcadeRuns.delete(token); // paid and banked — now it is safe to forget
         console.log(`[arcade] ${run.sub} EXTRACTED at tier ${node.exitTier} after ${run.fights} fights — loot ${run.bag.credits} × ${paid.multiplierPct}% + bonus ${bonus} = ${paid.granted} CR, ${drinks.length}/${run.bag.drinks.length} drink(s)`);
         return json(res, 200, {
@@ -2495,6 +2526,7 @@ export const createMatchServer = (opts: {
           drinks,
           drinksLeftBehind: Math.max(0, run.bag.drinks.length - drinks.length),
           fights: run.fights,
+          petRoll,
         });
       })().catch((e) => json(res, 502, { error: String(e) }));
       return;
@@ -2636,15 +2668,27 @@ export const createMatchServer = (opts: {
         }
 
         if (path === '/pets/adopt') {
-          if (req.method !== 'POST') return json(res, 405, { error: 'POST {nonce} to adopt' });
+          if (req.method !== 'POST') return json(res, 405, { error: 'POST {nonce, pay?} to roll' });
           if (adoptablePets.length === 0) {
             return json(res, 503, { error: 'no pets have been published yet' });
           }
           const body = await readCappedBody(req, res);
           if (body === null) return;
           let nonce = '';
-          try { nonce = String((JSON.parse(body || '{}') as Record<string, unknown>).nonce ?? ''); }
-          catch { return json(res, 400, { error: 'bad json' }); }
+          let pay: 'credits' | 'tickets' = 'credits';
+          try {
+            const parsed = JSON.parse(body || '{}') as Record<string, unknown>;
+            nonce = String(parsed.nonce ?? '');
+            // The GACHA (owner decision 2026-08-04): one roll = PET_COST
+            // credits OR PET_ROLL_TICKETS wager tickets — the first real
+            // ticket sink (ADR 0009 phase B). Anything else is a client bug.
+            if (parsed.pay !== undefined) {
+              if (parsed.pay !== 'credits' && parsed.pay !== 'tickets') {
+                return json(res, 400, { error: "pay: 'credits' or 'tickets'" });
+              }
+              pay = parsed.pay;
+            }
+          } catch { return json(res, 400, { error: 'bad json' }); }
           nonce = nonce.trim();
           if (nonce.length < 8 || nonce.length > 64) {
             return json(res, 400, { error: 'nonce: 8-64 characters (client adoption id)' });
@@ -2653,12 +2697,30 @@ export const createMatchServer = (opts: {
           const rarity = rollRarity();
           const aura = rollAura(rarity);
           try {
+            // On a duplicate replay the ROLL above is discarded either way —
+            // the stored grant wins, so a retried roll can never re-roll.
+            // (This also means retrying a credits roll as a tickets roll
+            // replays the ORIGINAL grant and charges nothing — the nonce is
+            // the identity of the purchase, not the payment method.)
+            if (pay === 'tickets') {
+              const r = await persistence.redeemTicketsForPet(
+                identity.sub, PET_ROLL_TICKETS, def.id, rarity, aura, nonce);
+              if (!r.duplicate) {
+                console.log(`[pets] ${identity.sub} rolled ${r.petId} (R${r.rarity}) for ${PET_ROLL_TICKETS} tickets`);
+              }
+              return json(res, 200, {
+                pet: { ...r, def: petById(r.petId) ?? null },
+                credits: await persistence.getCredits(identity.sub),
+                tickets: r.tickets,
+                duplicate: r.duplicate,
+                cost: 0,
+                costTickets: r.duplicate ? 0 : PET_ROLL_TICKETS,
+              });
+            }
             const r = await persistence.buyPet(
               identity.sub, PET_COST, def.id, rarity, aura, nonce);
-            // On a duplicate replay the ROLL above is discarded — the stored
-            // grant wins, so a retried adoption can never re-roll.
             if (!r.duplicate) {
-              console.log(`[pets] ${identity.sub} adopted ${r.petId} (R${r.rarity}) for ${PET_COST}`);
+              console.log(`[pets] ${identity.sub} rolled ${r.petId} (R${r.rarity}) for ${PET_COST}`);
             }
             return json(res, 200, {
               pet: { ...r, def: petById(r.petId) ?? null },
@@ -2669,7 +2731,12 @@ export const createMatchServer = (opts: {
           } catch (e) {
             if (e instanceof InsufficientCredits) {
               return json(res, 402, {
-                error: `insufficient credits — adopting costs ${PET_COST}`, code: 'credits',
+                error: `insufficient credits — a roll costs ${PET_COST}`, code: 'credits',
+              });
+            }
+            if (e instanceof InsufficientTickets) {
+              return json(res, 402, {
+                error: `insufficient tickets — a roll costs ${PET_ROLL_TICKETS}`, code: 'tickets',
               });
             }
             throw e;
@@ -2679,8 +2746,10 @@ export const createMatchServer = (opts: {
         const owned = await persistence.listPets(identity.sub, 50);
         return json(res, 200, {
           cost: PET_COST,
+          costTickets: PET_ROLL_TICKETS,
           catalog: adoptablePets,
           credits: await persistence.getCredits(identity.sub),
+          tickets: await persistence.countTickets(identity.sub),
           pets: owned.map((p) => ({ ...p, def: petById(p.petId) ?? null })),
         });
       })().catch((e) => json(res, 502, { error: String(e) }));

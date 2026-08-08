@@ -112,3 +112,52 @@ test('every money RPC impl declares its FULL parameter list', () => {
     );
   }
 });
+
+/**
+ * Referral sweeper + pending counter (0031). Added with the functions, per the
+ * coupling this file exists to enforce: the SQL signatures are
+ * `sweep_pending_referrals()` (no args) and `dares_pending(_profile text)`.
+ */
+test('sweepPendingReferrals posts to the no-arg RPC and returns the count', async () => {
+  const calls = await capture(3, (p) => p.sweepPendingReferrals());
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]!.url, /\/rest\/v1\/rpc\/sweep_pending_referrals$/);
+  assert.deepEqual(calls[0]!.body, {}, 'the SQL function takes no arguments');
+});
+
+test('getAccount asks for the pending-dare count with _profile', async () => {
+  const calls = await capture(
+    [{ credits: 10, ref_code: 'A-1', dares_accepted: 2, dares_paid_week: 1 }],
+    (p) => p.getAccount({ sub: 'sub-1' }, 'NAME', false),
+  );
+  const pending = calls.find((c) => /rpc\/dares_pending$/.test(c.url));
+  assert.ok(pending, 'the invite screen needs a pending count to render honestly');
+  assert.deepEqual(pending.body, { _profile: 'sub-1' });
+});
+
+/**
+ * The pending count must never be able to break a login. On a deployment whose
+ * database predates 0031 the RPC 404s; getAccount has to survive that and
+ * simply report 0 pending — the same thing the pre-0031 screen showed.
+ */
+test('a missing dares_pending RPC degrades to 0 instead of failing the login', async () => {
+  const realFetchLocal = globalThis.fetch;
+  globalThis.fetch = (async (input: unknown) => {
+    const url = String(input);
+    if (/rpc\/dares_pending$/.test(url)) {
+      return { ok: false, status: 404, text: async () => 'Not Found' } as unknown as Response;
+    }
+    const body = /rpc\/ticket_count$/.test(url)
+      ? '0'
+      : JSON.stringify([{ credits: 10, ref_code: 'A-1', dares_accepted: 2, dares_paid_week: 1 }]);
+    return { ok: true, status: 200, text: async () => body } as unknown as Response;
+  }) as typeof fetch;
+  try {
+    const p = supabasePersistence('https://stub.supabase.co', 'service-key');
+    const acct = await p.getAccount({ sub: 'sub-1' }, 'NAME', false);
+    assert.equal(acct.daresPending, 0);
+    assert.equal(acct.credits, 10, 'the login itself still succeeds');
+  } finally {
+    globalThis.fetch = realFetchLocal;
+  }
+});

@@ -222,3 +222,102 @@ describe('pets: the aura reaches the match', () => {
     }
   });
 });
+
+describe('pet gacha: rolling with tickets (ADR 0009 phase B)', () => {
+  let server: MatchServer;
+  let mem: Persistence;
+  let http = '';
+  const OWNER = { 'X-Dev-Name': 'Roller', 'Content-Type': 'application/json' };
+
+  /** Mint one wager ticket the legitimate way: a decided human wager win. */
+  const mintTicket = async (i: number): Promise<void> => {
+    await mem.recordMatch({
+      matchId: `tkt-${i}`, mode: 'wager', fee: 10,
+      identities: [{ sub: 'dev:Roller' }, { sub: 'dev:Victim' }] as never,
+      names: ['Roller', 'Victim'], agents: [false, false],
+      chars: ['analog', 'vector'], winner: 0, reason: 'verified',
+      rounds: [2, 0], endTick: 1000, hash: 1, engine: ENGINE_VERSION,
+    });
+  };
+
+  before(async () => {
+    mem = memoryPersistence();
+    server = await createMatchServer({ port: 0, persistence: mem, noPaceCheck: true });
+    http = `http://localhost:${server.port}`;
+    await fetch(`${http}/me`, { headers: OWNER });
+    await fetch(`${http}/me`, { headers: { 'X-Dev-Name': 'Victim' } });
+  });
+  after(() => server.close());
+
+  it('GET /pets reports BOTH prices and the ticket balance', async () => {
+    for (let i = 0; i < 5; i++) await mintTicket(i);
+    const body = await (await fetch(`${http}/pets`, { headers: OWNER })).json() as {
+      cost: number; costTickets: number; tickets: number;
+    };
+    assert.equal(body.cost, PET_COST);
+    assert.equal(body.costTickets, 5);
+    assert.equal(body.tickets, 5, 'five wager wins = five unredeemed tickets');
+  });
+
+  it('a bogus pay method is a 400, and charges nothing', async () => {
+    const res = await fetch(`${http}/pets/adopt`, {
+      method: 'POST', headers: OWNER,
+      body: JSON.stringify({ nonce: 'roll-bogus-01', pay: 'iou' }),
+    });
+    assert.equal(res.status, 400);
+  });
+
+  it('pay:tickets redeems exactly 5 and grants a pet — credits untouched', async () => {
+    const beforeCr = await mem.getCredits('dev:Roller');
+    const res = await fetch(`${http}/pets/adopt`, {
+      method: 'POST', headers: OWNER,
+      body: JSON.stringify({ nonce: 'roll-tickets-01', pay: 'tickets' }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as {
+      pet: OwnedPetBody; tickets: number; credits: number | null;
+      cost: number; costTickets: number;
+    };
+    assert.ok(body.pet.rowId > 0);
+    assert.equal(body.tickets, 0, 'all five tickets redeemed');
+    assert.equal(body.cost, 0, 'no credits price on a ticket roll');
+    assert.equal(body.costTickets, 5);
+    assert.equal(await mem.getCredits('dev:Roller'), beforeCr, 'credits never moved');
+    const aura = clampAura(body.pet.aura);
+    for (const v of Object.values(aura)) assert.ok(v >= 0 && v <= AURA_MAX);
+  });
+
+  it('a replayed ticket nonce redeems NOTHING and returns the same pet', async () => {
+    const res = await fetch(`${http}/pets/adopt`, {
+      method: 'POST', headers: OWNER,
+      body: JSON.stringify({ nonce: 'roll-tickets-01', pay: 'tickets' }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as {
+      pet: OwnedPetBody; tickets: number; duplicate: boolean; costTickets: number;
+    };
+    assert.equal(body.duplicate, true);
+    assert.equal(body.costTickets, 0, 'a replay is free');
+    assert.equal(body.tickets, 0, 'balance did not move again');
+  });
+
+  it('rolling on an empty ticket wallet is a clean 402 {code:tickets}', async () => {
+    const res = await fetch(`${http}/pets/adopt`, {
+      method: 'POST', headers: OWNER,
+      body: JSON.stringify({ nonce: 'roll-tickets-02', pay: 'tickets' }),
+    });
+    assert.equal(res.status, 402);
+    assert.equal((await res.json() as { code: string }).code, 'tickets');
+  });
+
+  it('4 tickets is not 5: partial balances redeem nothing at all', async () => {
+    for (let i = 10; i < 14; i++) await mintTicket(i);
+    const res = await fetch(`${http}/pets/adopt`, {
+      method: 'POST', headers: OWNER,
+      body: JSON.stringify({ nonce: 'roll-tickets-03', pay: 'tickets' }),
+    });
+    assert.equal(res.status, 402);
+    const body = await (await fetch(`${http}/pets`, { headers: OWNER })).json() as { tickets: number };
+    assert.equal(body.tickets, 4, 'the failed roll redeemed none of the four');
+  });
+});

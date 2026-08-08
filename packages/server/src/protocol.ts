@@ -402,6 +402,12 @@ export interface SAccount {
   /** Inviter payouts credited in the rolling week (capped at 10). */
   daresPaidWeek: number;
   /**
+   * Friends who redeemed this code but whose inviter payout has NOT been
+   * released yet — they have not finished a first decided match. The invite
+   * screen shows this so "accepted" never silently outruns "paid".
+   */
+  daresPending: number;
+  /**
    * Unredeemed wager TICKETS (ADR 0009). Non-transferable prize tokens minted
    * by winning a decided wager; always 0 for agent-class accounts.
    */

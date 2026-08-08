@@ -131,8 +131,21 @@ export const AURA_LINES_BY_RARITY = [0, 1, 2, 3] as const;
 export const PET_RARITY_COLORS = ['', '#cfd8e3', '#6fd3ff', '#ffd166'] as const;
 export const PET_RARITY_LABELS = ['', 'COMMON', 'RARE', 'LEGENDARY'] as const;
 
-/** Price of one adoption, in credits (mirrored in the pets migration docs). */
-export const PET_COST = 25;
+/**
+ * Price of one pet roll, in credits — THE price, everywhere (owner decision
+ * 2026-08-04): the profile page and the in-game gacha charge the same number,
+ * so there is no cheaper door to the identical product.
+ * (Was 25 at ADR 0011 launch; raised when the in-game gacha shipped.)
+ */
+export const PET_COST = 50;
+
+/**
+ * Alternate price of one roll, in wager TICKETS (ADR 0009 phase B — the
+ * FIRST real ticket sink; until now they were leaderboard cosmetics). A
+ * ticket takes roughly two decided wagers to mint, so this is deliberately a
+ * premium path for players swimming in tickets, not a discount.
+ */
+export const PET_ROLL_TICKETS = 5;
 
 // --------------------------------------------------------------------------
 // Sim-facing constants

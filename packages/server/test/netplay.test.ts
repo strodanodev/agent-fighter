@@ -75,13 +75,14 @@ describe('persistence hook (Phase B)', () => {
       getAccount: async () => ({
         credits: 100, level: 1, xp: 0, wins: 0, losses: 0, dailyGranted: false,
         refCode: 'TEST-0000', referralGranted: 0, daresAccepted: 0, daresPaidWeek: 0,
-        tickets: 0,
+        daresPending: 0, tickets: 0,
       }),
       escrowMatch: async () => {},
       recordMatch: async (r) => { records.push(r); return []; },
       sweepOrphanedEscrow: async () => 0,
       sweepOrphanedItems: async () => 0,
       releaseReferral: async () => 0,
+      sweepPendingReferrals: async () => 0,
       leaderboard: async () => [],
       seasonBoard: async () => [],
       stable: async () => [],
@@ -116,6 +117,12 @@ describe('persistence hook (Phase B)', () => {
       listPets: async () => [],
       setEquippedPet: async () => {},
       equippedPet: async () => null,
+      countTickets: async () => 0,
+      redeemTicketsForPet: async () => ({
+        rowId: 0, petId: 'none', rarity: 1, equipped: false, createdAt: '',
+        aura: { atk: 0, def: 0, hpRegen: 0, crit: 0, energyRegen: 0 },
+        credits: 100, tickets: 0, duplicate: false,
+      }),
       debitCredits: async () => ({ credits: 100, duplicate: false }),
       arcadeExtract: async () => ({
         credits: 100, granted: 0, multiplierPct: 100, drinkBudget: 3, duplicate: false,
