@@ -18,17 +18,17 @@ import {
 } from './progress.js';
 import type { Profile } from './progress.js';
 import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './atlas.js';
-import { drawPet, loadMatchPets } from './pets.js';
+import { drawPet, loadMatchPets, loadPet } from './pets.js';
 import type { LoadedPet } from './pets.js';
 import type { Roster } from './atlas.js';
 import {
   CONTENT_BOT, CONTENT_TOP, P_COLORS, RANK_TABS, VH, VW, ZOOM_MAX, ZOOM_MIN,
   currentStageBounds, currentStageCamLimits, drawAgent, drawExtract, drawGameOver, drawHud, drawInvite, drawLoading, drawMap, drawNetError, drawOpponentGone,
   drawRanks, drawReconnecting, drawResults, drawSelect, drawShop, drawStage, drawStageSelect, drawTitle,
-  drawPetGacha, drawVsCard, drawWallet, resetTaps, PET_SPIN_TICKS, SHOP_SPIN_TICKS, setBgVideo, setGameLogo, setLogo,
+  drawPetGacha, drawVsCard, drawWallet, resetTaps, PET_SPIN_TICKS, SHOP_SPIN_TICKS, setBgVideo, setGameLogo, setHover, setLogo, setTitlePetArt,
   setStageAsset, setUiKit, setVendingArt, tapHit, tapZone, worldTransform,
 } from './ui.js';
-import type { AgentOpponent, Cam, ExtractView, HudFx, HudId, Mode, PetGachaReveal, RankRow, SeasonRow, ShopInventoryEntry, ShopReveal, XpInfo } from './ui.js';
+import type { AgentOpponent, Cam, ExtractView, HudFx, HudId, Mode, PetGachaArt, PetGachaOwned, PetGachaReveal, RankRow, SeasonRow, ShopInventoryEntry, ShopReveal, XpInfo } from './ui.js';
 import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadStage, loadUiKit, loadVendingArt } from './chrome.js';
 import type { BgVideo, StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
@@ -176,14 +176,20 @@ const pollLocal = (g: GameState, edges = true): InputFrame => {
  * Mouse and touch both land here, so clicking menus works on desktop too.
  */
 const taps = new Set<string>();
-const tapAt = (clientX: number, clientY: number): void => {
+const toVirtual = (clientX: number, clientY: number): [number, number] | null => {
   const r = canvas.getBoundingClientRect();
-  if (r.width === 0 || r.height === 0) return;
+  if (r.width === 0 || r.height === 0) return null;
   // CSS-scaled + letterboxed canvas → virtual 960×540 space.
   const vx = ((clientX - r.left) / r.width) * VW;
   const vy = ((clientY - r.top) / r.height) * VH;
-  if (vx < 0 || vy < 0 || vx > VW || vy > VH) return;
-  const action = tapHit(vx, vy);
+  if (vx < 0 || vy < 0 || vx > VW || vy > VH) return null;
+  return [vx, vy];
+};
+
+const tapAt = (clientX: number, clientY: number): void => {
+  const v = toVirtual(clientX, clientY);
+  if (!v) return;
+  const action = tapHit(v[0], v[1]);
   if (action) {
     audio.blip(); // UI feedback: a tap that lands on a real menu zone clicks
     taps.add(action);
@@ -867,8 +873,23 @@ let gachaCredits: number | null = null;
 let gachaTickets: number | null = null;
 let gachaCost = 50;
 let gachaCostTickets = 5;
-let gachaCatalog: { name: string; tint: string }[] = [];
-let gachaOwned = 0;
+let gachaCatalog: { id: string; name: string; tint: string }[] = [];
+/** The EQUIP PET rack (everything owned, newest first). */
+let gachaOwnedList: PetGachaOwned[] = [];
+/** Loaded pet sprites by pet id — fed by loadPet (cached, never fatal). */
+const gachaArt: PetGachaArt = {};
+
+/** Kick off (cached) art loads for a set of pet ids; repaints as they land. */
+const loadGachaArt = (ids: string[]): void => {
+  for (const id of ids) {
+    if (gachaArt[id]) continue;
+    void loadPet(id).then((pet) => {
+      if (pet && pet.frames.length > 0) {
+        gachaArt[id] = { frames: pet.frames, fps: pet.def.fps ?? 8 };
+      }
+    });
+  }
+};
 let gachaConfirm: 'credits' | 'tickets' | null = null;
 let gachaSpinAge = -1;
 let gachaRollBusy = false;
@@ -891,12 +912,36 @@ const mapGachaPet = (pet: {
   equipped?: boolean;
 }): PetGachaReveal => ({
   rowId: Number(pet.rowId ?? 0),
+  petId: String(pet.petId ?? ''),
   name: (pet.def?.name ?? String(pet.petId ?? 'PET')).toUpperCase(),
   rarity: Math.max(1, Math.min(3, Number(pet.rarity ?? 1))),
   tint: pet.def?.tint ?? '#6fd3ff',
   auraText: auraLines(clampAura(pet.aura)).map((l) => auraLineText(l.kind, l.amount)),
   equipped: !!pet.equipped,
 });
+
+/** One-shot: real pet sprites for the title's gacha icon (signed-in only). */
+let titlePetArtLoaded = false;
+const loadTitlePetArt = (): void => {
+  if (titlePetArtLoaded) return;
+  titlePetArtLoaded = true;
+  void (async () => {
+    try {
+      const headers = await agentAuthHeaders();
+      if (!headers) { titlePetArtLoaded = false; return; }
+      const res = await fetchT(`${matchHttpUrl()}/pets`, { headers });
+      if (!res.ok) { titlePetArtLoaded = false; return; }
+      const body = (await res.json()) as { catalog?: Array<{ id?: string }> };
+      const ids = (body.catalog ?? []).map((d) => String(d.id ?? '')).filter(Boolean);
+      const arts: CanvasImageSource[] = [];
+      for (const id of ids) {
+        const pet = await loadPet(id);
+        if (pet && pet.frames.length > 0) arts.push(pet.frames[0]!);
+      }
+      if (arts.length > 0) setTitlePetArt(arts);
+    } catch { titlePetArtLoaded = false; }
+  })();
+};
 
 const enterPetGacha = (from: 'title' | 'extract' = 'title'): void => {
   screen = 'petgacha';
@@ -919,7 +964,7 @@ const enterPetGacha = (from: 'title' | 'extract' = 'title'): void => {
       if (!res.ok) { gachaFetch = 'fail'; return; }
       const body = (await res.json()) as {
         cost?: number; costTickets?: number; credits?: number | null; tickets?: number;
-        catalog?: Array<{ name?: string; tint?: string }>;
+        catalog?: Array<{ id?: string; name?: string; tint?: string }>;
         pets?: unknown[];
       };
       gachaCost = Number(body.cost ?? 50);
@@ -927,9 +972,18 @@ const enterPetGacha = (from: 'title' | 'extract' = 'title'): void => {
       gachaCredits = typeof body.credits === 'number' ? body.credits : null;
       gachaTickets = typeof body.tickets === 'number' ? body.tickets : null;
       gachaCatalog = (body.catalog ?? []).map((d) => ({
-        name: String(d.name ?? 'PET'), tint: d.tint ?? '#6fd3ff',
+        id: String(d.id ?? ''), name: String(d.name ?? 'PET'), tint: d.tint ?? '#6fd3ff',
       }));
-      gachaOwned = body.pets?.length ?? 0;
+      gachaOwnedList = (body.pets ?? []).map((raw) => {
+        const r = mapGachaPet(raw as Parameters<typeof mapGachaPet>[0]);
+        return { rowId: r.rowId, petId: r.petId, name: r.name, tint: r.tint,
+          rarity: r.rarity, equipped: r.equipped, auraText: r.auraText };
+      });
+      // Real sprites for the reels, the rack and the reveal.
+      loadGachaArt([
+        ...gachaCatalog.map((c) => c.id),
+        ...gachaOwnedList.map((o) => o.petId),
+      ]);
       gachaFetch = 'done';
     } catch {
       gachaFetch = 'fail';
@@ -943,7 +997,12 @@ const landGachaSpin = (): void => {
   if (!gachaPending) return;
   gachaReveal = gachaPending;
   gachaRevealAge = 0;
-  gachaOwned++;
+  const r = gachaReveal;
+  if (!gachaOwnedList.some((o) => o.rowId === r.rowId)) {
+    gachaOwnedList.unshift({ rowId: r.rowId, petId: r.petId, name: r.name,
+      tint: r.tint, rarity: r.rarity, equipped: r.equipped, auraText: r.auraText });
+    loadGachaArt([r.petId]);
+  }
   gachaPending = null;
   audio.blip({ freq: gachaReveal.rarity === 3 ? 1980 : 1560, volume: 0.55 });
 };
@@ -997,22 +1056,44 @@ const rollGachaPet = async (pay: 'credits' | 'tickets'): Promise<void> => {
   }
 };
 
-/** Equip the revealed pet without leaving the machine. */
-const equipGachaPet = async (): Promise<void> => {
-  const r = gachaReveal;
-  if (!r || r.equipped || gachaEquipBusy || r.rowId <= 0) return;
+/** The armed equip/unequip confirmation (null = no modal). */
+let gachaEquipConfirm: { rowId: number | null; name: string; off: boolean } | null = null;
+
+/** Arm the confirm modal for a rack row (owner rule: loadout changes ask first). */
+const requestEquipRow = (rowId: number): void => {
+  const target = gachaOwnedList.find((o) => o.rowId === rowId);
+  if (!target || gachaEquipBusy) return;
+  gachaEquipConfirm = target.equipped
+    ? { rowId: null, name: target.name, off: true }
+    : { rowId, name: target.name, off: false };
+};
+
+/** Perform the (already confirmed) equip/unequip. */
+const equipGachaRowConfirmed = async (nextRow: number | null): Promise<void> => {
+  if (gachaEquipBusy) return;
   gachaEquipBusy = true;
   try {
     const headers = gachaHeaders ?? await agentAuthHeaders();
     if (!headers) return;
     const res = await fetchT(`${matchHttpUrl()}/pets/equip`, {
       method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rowId: r.rowId }),
+      body: JSON.stringify({ rowId: nextRow }),
     });
-    if (res.ok && gachaReveal === r) gachaReveal = { ...r, equipped: true };
+    if (res.ok) {
+      gachaOwnedList = gachaOwnedList.map((o) => ({ ...o, equipped: o.rowId === nextRow }));
+      if (gachaReveal) gachaReveal = { ...gachaReveal, equipped: gachaReveal.rowId === nextRow };
+      audio.blip({ freq: 1320, volume: 0.35 });
+    }
   } catch { /* the profile page remains the fallback */ } finally {
     gachaEquipBusy = false;
   }
+};
+
+/** Reveal card E·EQUIP: arms the same confirm as a rack tap. */
+const equipGachaPet = (): void => {
+  const r = gachaReveal;
+  if (!r || r.equipped || gachaEquipBusy || r.rowId <= 0) return;
+  gachaEquipConfirm = { rowId: r.rowId, name: r.name, off: false };
 };
 let uiTick = 0;
 let allRosters: Roster[] = [];
@@ -1213,6 +1294,13 @@ const px = (v: number): number => Math.trunc(v / 256);
 // Menus are tappable/clickable: hit-test the layout the last frame drew.
 // The in-match arcade overlay (touch.ts) sits above this and swallows its own
 // presses, so a fight's controls never leak through as menu taps.
+// Hover position for tooltips (mouse only — a touch leaves no hover, and
+// pointerleave clears it so a tooltip can't strand on screen).
+canvas.addEventListener('pointermove', (e) => {
+  const v = toVirtual(e.clientX, e.clientY);
+  setHover(v ? v[0] : -1, v ? v[1] : -1);
+});
+canvas.addEventListener('pointerleave', () => setHover(-1, -1));
 canvas.addEventListener('pointerdown', (e) => {
   audio.unlock(); // same first-gesture unlock the keydown path does
   tapAt(e.clientX, e.clientY);
@@ -2406,6 +2494,8 @@ const frame = (steps = 1): void => {
       pendingAgentOf = '';
       startAgentDare(code);
     }
+    // Corner gacha icon cycles REAL pet sprites — load them once, lazily.
+    if (signedIn) loadTitlePetArt();
     drawTitle(ctx, allRosters, uiTick, {
       mode, cpuLevel: cpuLevelFor(profile, lever),
       authLabel: authName() ?? (DEV_GUEST ? `DEV·${DEV_GUEST.toUpperCase()}` : null),
@@ -2811,7 +2901,6 @@ const frame = (steps = 1): void => {
       tickets: gachaTickets ?? account?.tickets ?? null,
       cost: gachaCost,
       costTickets: gachaCostTickets,
-      ownedCount: gachaOwned,
       rollBusy: gachaRollBusy,
       reveal: gachaReveal,
       revealAge: gachaRevealAge,
@@ -2819,11 +2908,34 @@ const frame = (steps = 1): void => {
       errAge: gachaErrAge,
       confirm: gachaConfirm,
       spinAge: gachaSpinAge,
-      catalog: gachaCatalog.length > 0 ? gachaCatalog : [{ name: 'PET', tint: '#6fd3ff' }],
+      catalog: gachaCatalog.length > 0 ? gachaCatalog : [{ id: '', name: 'PET', tint: '#6fd3ff' }],
+      owned: gachaOwnedList,
+      art: gachaArt,
       free: gachaFree !== null,
       equipBusy: gachaEquipBusy,
+      equipConfirm: gachaEquipConfirm
+        ? { name: gachaEquipConfirm.name, off: gachaEquipConfirm.off }
+        : null,
     });
-    if (gachaConfirm) {
+    // EQUIP PET rack taps arm the confirm modal (never mutate directly).
+    if (!gachaEquipConfirm) {
+      for (const t of taps) {
+        if (t.startsWith('gacha:equiprow:')) {
+          const rowId = Number(t.slice('gacha:equiprow:'.length));
+          if (Number.isFinite(rowId) && rowId > 0) requestEquipRow(rowId);
+        }
+      }
+    }
+    if (gachaEquipConfirm) {
+      // The equip modal owns the input while armed.
+      if (pressedThisFrame.has('Enter') || pressedThisFrame.has('KeyY') || taps.has('gacha:eq:yes')) {
+        const req = gachaEquipConfirm;
+        gachaEquipConfirm = null;
+        void equipGachaRowConfirmed(req.rowId);
+      } else if (pressedThisFrame.has('Escape') || pressedThisFrame.has('KeyN') || taps.has('gacha:eq:no')) {
+        gachaEquipConfirm = null;
+      }
+    } else if (gachaConfirm) {
       // Modal owns the input: YES rolls, NO/ESC backs out (owner rule: every
       // credit/ticket spend confirms first). The reel starts NOW — the roll
       // races it and always wins.
@@ -2851,7 +2963,7 @@ const frame = (steps = 1): void => {
     } else if (!gachaRollBusy && gachaSpinAge < 0 && taps.has('gacha:roll:tickets')) {
       gachaConfirm = 'tickets';
     } else if (pressedThisFrame.has('KeyE') || taps.has('gacha:equip')) {
-      void equipGachaPet();
+      equipGachaPet();
     } else if (gachaSpinAge < 0 && (pressedThisFrame.has('Escape') || taps.has('back'))) {
       // An un-pulled FREE roll survives leaving: the pet is already in the
       // inventory server-side, and gachaFree persists until it is pulled.

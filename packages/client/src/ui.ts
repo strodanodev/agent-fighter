@@ -39,7 +39,37 @@ export const setGameLogo = (img: HTMLImageElement | null): void => {
 export const setBgVideo = (v: BgVideo | null): void => { bgVideo = v; };
 // Vending-machine art (ADR 0007) — already alpha-matted tight, no bbox pass.
 let vendingImg: HTMLImageElement | null = null;
-export const setVendingArt = (img: HTMLImageElement | null): void => { vendingImg = img; };
+/** Fraction bounds of the VISIBLE machine body inside the art (0..1). */
+let vendingBox = { l: 0, r: 1 };
+export const setVendingArt = (img: HTMLImageElement | null): void => {
+  vendingImg = img;
+  vendingBox = { l: 0, r: 1 };
+  if (!img || img.naturalWidth === 0) return;
+  // The art carries thin glow WIRES trailing off one side; centering the
+  // label on the raw alpha bbox re-centers on the wires. Density scan: a
+  // column only counts as machine BODY if a real share of it is opaque —
+  // 1-2px wires never reach the bar.
+  try {
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth;
+    c.height = img.naturalHeight;
+    const cx2 = c.getContext('2d', { willReadFrequently: true })!;
+    cx2.drawImage(img, 0, 0);
+    const d = cx2.getImageData(0, 0, c.width, c.height).data;
+    const need = Math.max(4, Math.floor(c.height * 0.10));
+    let l = -1, r = -1;
+    for (let x = 0; x < c.width; x++) {
+      let n = 0;
+      for (let y = 0; y < c.height; y++) if (d[(y * c.width + x) * 4 + 3]! > 60) n++;
+      if (n >= need) { if (l < 0) l = x; r = x; }
+    }
+    if (l >= 0 && r > l) vendingBox = { l: l / c.width, r: (r + 1) / c.width };
+  } catch { /* cross-origin taint etc — the box default is harmless */ }
+};
+
+/** Title pet art (frame 0 of each pet with sprites) — the gacha icon cycles it. */
+let titlePetArt: CanvasImageSource[] = [];
+export const setTitlePetArt = (arts: CanvasImageSource[]): void => { titlePetArt = arts; };
 
 /**
  * Menu backdrop: the looping ambient video when it's playing, falling back
@@ -119,6 +149,13 @@ export const CONTENT_BOT = VH - 12;
  * `action` is semantic ('mode:cpu', 'pick:3'), NOT a key code — the screen
  * handlers in main.ts decide what each one means.
  */
+/** Latest pointer position in canvas space (-1 = no pointer / touch device). */
+let hoverX = -1;
+let hoverY = -1;
+export const setHover = (x: number, y: number): void => { hoverX = x; hoverY = y; };
+const hoverIn = (x: number, y: number, w: number, h: number): boolean =>
+  hoverX >= x && hoverX < x + w && hoverY >= y && hoverY < y + h;
+
 export interface TapRegion { x: number; y: number; w: number; h: number; action: string }
 let tapRegions: TapRegion[] = [];
 export const resetTaps = (): void => { tapRegions = []; };
@@ -1539,7 +1576,6 @@ export const drawTitle = (
       ]
       : [
         ['A · MY AGENT', 'myagent', '#8fd0ff'],
-        ['G · PET GACHA', 'petgacha', '#c084fc'],
         ['R · RANKINGS', 'ranks', '#ffffffcc'],
         ['L · SIGN OUT', 'signin', '#ffffff99'],
       ];
@@ -1559,9 +1595,13 @@ export const drawTitle = (
     });
     ctx.lineWidth = 1;
 
-    // VENDING MACHINE (ADR 0007) — upper-RIGHT corner, the only chrome that
-    // lives there on the title. Signed-in only: pulls cost credits.
-    if (!guest) drawVendingIcon(ctx, tick);
+    // THE SHOP CLUSTER (owner layout 2026-08-04) — upper-RIGHT corner:
+    // PET GACHA on the left, VENDING MACHINE on the right, each with its
+    // label centered under its own art. Signed-in only: both cost credits.
+    if (!guest) {
+      const machineLeft = drawVendingIcon(ctx, tick);
+      drawPetGachaIcon(ctx, tick, machineLeft);
+    }
   }
 
   // Account/wallet block — upper LEFT, under the audio chip (M5 spec).
@@ -1671,7 +1711,44 @@ const drawCan = (
  * otherwise empty; the account block owns the upper-LEFT). Whole thing is
  * one tap target: 'shop'.
  */
-const drawVendingIcon = (ctx: CanvasRenderingContext2D, tick: number): void => {
+/**
+ * PET GACHA icon — a compact frame showing a REAL pet sprite, cycling to the
+ * next catalog pet every ~3 seconds (owner call 2026-08-09: simpler, smaller,
+ * actual pets — not a procedural cabinet). Sits tight against the vending
+ * machine's VISIBLE left edge; falls back to an orb until art loads.
+ */
+const drawPetGachaIcon = (ctx: CanvasRenderingContext2D, tick: number, machineLeft: number): void => {
+  const glowMix = fxPulse(tick, 0.06);
+  const w = 56, h = 62;
+  const x = machineLeft - 12 - w, y = 12;
+  tapZone(x - 4, y - 4, w + 8, h + 28, 'petgacha');
+  ctx.save();
+  ctx.shadowColor = `rgba(192,132,252,${0.35 + 0.3 * glowMix})`;
+  ctx.shadowBlur = 12;
+  bevel(ctx, x, y, w, h, PANEL, '#c084fc', '#3d2b57', 2);
+  ctx.restore();
+  ctx.fillStyle = '#0a0812';
+  ctx.fillRect(x + 4, y + 4, w - 8, h - 8);
+  const cxm = x + w / 2, cym = y + h / 2 + 1;
+  if (titlePetArt.length > 0) {
+    // Cycle pets every 180 ticks with a little pop on each change.
+    const slot = Math.floor(tick / 180);
+    const img = titlePetArt[slot % titlePetArt.length]!;
+    const age = tick - slot * 180;
+    const pop = 0.85 + 0.15 * easeOutBack(clamp01(age / 10));
+    const iw = (img as HTMLImageElement).width || 48;
+    const ih = (img as HTMLImageElement).height || 48;
+    const fit = Math.min((w - 12) / iw, (h - 14) / ih) * pop;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(img, cxm - (iw * fit) / 2, cym - (ih * fit) / 2, iw * fit, ih * fit);
+  } else {
+    petOrb(ctx, cxm, cym, 14, '#c084fc');
+  }
+  label(ctx, 'G · PETS', cxm, y + h + 14, 11,
+    tick % 44 < 36 ? '#e3c7ff' : '#c084fc');
+};
+
+const drawVendingIcon = (ctx: CanvasRenderingContext2D, tick: number): number => {
   const glowMix = fxPulse(tick, 0.06);
   if (vendingImg && vendingImg.naturalWidth > 0) {
     // Authored machine art (wider than tall) — contain-fit into the corner.
@@ -1683,13 +1760,18 @@ const drawVendingIcon = (ctx: CanvasRenderingContext2D, tick: number): void => {
     ctx.shadowBlur = 16;
     ctx.drawImage(vendingImg, x, y, dw, dh);
     ctx.restore();
-    label(ctx, 'B · SHOP', x + dw / 2, y + dh + 14, 11,
+    // Center the label under the VISIBLE machine, not the file box — the art
+    // trails glow wiring off one side and the raw box center sits on it.
+    const visL = x + dw * vendingBox.l;
+    const visR = x + dw * vendingBox.r;
+    label(ctx, 'B · SHOP', (visL + visR) / 2, y + dh + 14, 11,
       tick % 44 < 36 ? '#ffd166' : '#ffe9a3');
-    return;
+    return visL;
   }
   const w = 74, h = 96;
   const x = VW - 14 - w, y = 10;
   tapZone(x - 4, y - 4, w + 8, h + 26, 'shop');
+  const visLeft = x;
   ctx.save();
   ctx.shadowColor = `rgba(255,209,102,${0.35 + 0.3 * glowMix})`;
   ctx.shadowBlur = 14;
@@ -1718,6 +1800,7 @@ const drawVendingIcon = (ctx: CanvasRenderingContext2D, tick: number): void => {
   ctx.fillRect(x + 6, y + h - 20, w - 12, 12);
   label(ctx, 'B · SHOP', x + w / 2, y + h + 14, 11,
     tick % 44 < 36 ? '#ffd166' : '#ffe9a3');
+  return visLeft;
 };
 
 export interface ShopInventoryEntry {
@@ -2086,9 +2169,16 @@ export const drawShop = (ctx: CanvasRenderingContext2D, tick: number, v: ShopVie
  * theater, and main.ts holds the result back until they land. Staggered
  * stops (left → middle → right) are what make it read as a slot machine
  * rather than a loading spinner.
+ *
+ * LAYOUT IS BANDED, on purpose (the first cut let the reveal card, the roll
+ * buttons and the hint text share a region and they piled on top of each
+ * other): the owned rack owns the LEFT column, the cabinet owns the middle,
+ * and below the cabinet exactly ONE of {roll controls, reveal card} is
+ * drawn — never both in the same band.
  */
 export interface PetGachaReveal {
   rowId: number;
+  petId: string;
   name: string;
   rarity: number;   // 1..3
   tint: string;
@@ -2097,13 +2187,27 @@ export interface PetGachaReveal {
   equipped: boolean;
 }
 
+/** One owned pet in the EQUIP PET rack. */
+export interface PetGachaOwned {
+  rowId: number;
+  petId: string;
+  name: string;
+  tint: string;
+  rarity: number;
+  equipped: boolean;
+  /** Pre-rendered aura lines — the rack's hover tooltip shows them. */
+  auraText: string[];
+}
+
+/** Loaded pet art, keyed by pet id (main.ts loads it; absent = procedural). */
+export type PetGachaArt = Record<string, { frames: CanvasImageSource[]; fps: number }>;
+
 export interface PetGachaView {
   status: 'idle' | 'busy' | 'done' | 'fail';
   credits: number | null;
   tickets: number | null;
   cost: number;         // credits per roll
   costTickets: number;  // tickets per roll
-  ownedCount: number;
   rollBusy: boolean;
   reveal: PetGachaReveal | null;
   revealAge: number;    // -1 = none
@@ -2112,11 +2216,17 @@ export interface PetGachaView {
   /** Which payment the confirm modal is armed for; null = no modal. */
   confirm: 'credits' | 'tickets' | null;
   spinAge: number;      // -1 = not spinning
-  /** Adoptable catalog — the reels cycle these glyphs. */
-  catalog: { name: string; tint: string }[];
+  /** Adoptable catalog — the reels cycle these. */
+  catalog: { id: string; name: string; tint: string }[];
+  /** Everything this account owns — the EQUIP PET rack. */
+  owned: PetGachaOwned[];
+  /** Real pet sprites (frame loops); pets without art draw procedurally. */
+  art: PetGachaArt;
   /** FREE ROLL mode (gauntlet cleared): one pull, no price, no confirm. */
   free: boolean;
   equipBusy: boolean;
+  /** Equip/unequip confirmation modal (owner rule: ask before loadout changes). */
+  equipConfirm: { name: string; off: boolean } | null;
 }
 
 /** Spin length — a beat longer than the shop so three stops fit the arc. */
@@ -2149,42 +2259,102 @@ const petOrb = (
   }
 };
 
+/**
+ * One pet, ACTUAL SPRITE first: contain-fit the current frame into a box of
+ * height `size` centered on (x, y); only pets with no art fall back to the
+ * procedural orb. `animate` picks the frame from the loop by tick.
+ */
+const drawPetSprite = (
+  ctx: CanvasRenderingContext2D, x: number, y: number, size: number,
+  petId: string, tint: string, art: PetGachaArt, tick: number, animate = false,
+): void => {
+  const a = art[petId];
+  if (!a || a.frames.length === 0) {
+    petOrb(ctx, x, y, size * 0.42, tint);
+    return;
+  }
+  const frame = animate
+    ? a.frames[Math.floor((tick * Math.max(1, Math.min(30, a.fps))) / 60) % a.frames.length]!
+    : a.frames[0]!;
+  const iw = (frame as HTMLImageElement).width || size;
+  const ih = (frame as HTMLImageElement).height || size;
+  const h = size;
+  const w = Math.min(size * 1.4, (iw / ih) * h);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(frame, x - w / 2, y - h / 2, w, h);
+};
+
 export const drawPetGacha = (ctx: CanvasRenderingContext2D, tick: number, v: PetGachaView): void => {
   drawMenuBackdrop(ctx);
-  ctx.fillStyle = 'rgba(6,4,14,0.74)';
+  ctx.fillStyle = 'rgba(6,4,14,0.78)';
   ctx.fillRect(0, 0, VW, VH);
   const cx = VW / 2;
 
+  // ---- band 1: header (0..92).
   display(ctx, v.free ? 'FREE PET ROLL' : 'PET GACHA', cx, 54, 40,
     { glow: v.free ? 'rgba(124,255,160,0.55)' : 'rgba(255,209,102,0.5)' });
   label(ctx,
     v.free
       ? 'GAUNTLET CLEARED — THE HOUSE OWES YOU ONE COMPANION'
-      : 'RANDOM PET · RANDOM AURA · ACCOUNT BOUND — EQUIP IT ON YOUR PROFILE',
+      : 'RANDOM PET · RANDOM AURA · ACCOUNT BOUND',
     cx, 78, 12, v.free ? '#7cffa0' : '#ffd166cc');
-
-  // Wallets (the GACHA identity's balances) + back.
   if (v.credits !== null) drawCredits(ctx, 16, 34, v.credits, 19);
-  if (v.tickets !== null) label(ctx, `🎟 ${v.tickets}`, 30, 62, 15, '#ffd166', 'left');
+  if (v.tickets !== null) label(ctx, `🎟 ${v.tickets} TICKETS`, 30, 62, 13, '#ffd166', 'left');
   tapZone(VW - 118, 10, 104, 30, 'back');
   bevel(ctx, VW - 118, 10, 104, 30, PANEL, 'rgba(255,255,255,0.25)', 'rgba(0,0,0,0.5)', 2);
   label(ctx, '← BACK', VW - 66, 30, 13, '#cfd8e3');
 
-  // ---- the CABINET: three reel windows on one gold chassis.
-  const cabW = 560, cabH = 260;
-  const cabX = cx - cabW / 2, cabY = 100;
+  // ---- band 2, LEFT column: EQUIP PET rack (your pets, tap to equip).
+  const rackX = 26, rackW = 250, rackY = 108;
+  bevel(ctx, rackX, rackY, rackW, VH - rackY - 40, 'rgba(12,8,24,0.85)',
+    'rgba(255,255,255,0.2)', 'rgba(0,0,0,0.5)', 2);
+  display(ctx, 'EQUIP PET', rackX + rackW / 2, rackY + 28, 18, { glow: 'rgba(143,208,255,0.4)' });
+  label(ctx, v.owned.length > 0 ? 'TAP A PET TO SEND IT INTO YOUR MATCHES' : 'ROLL YOUR FIRST COMPANION →',
+    rackX + rackW / 2, rackY + 46, 9, '#8fd0ff');
+  const rowH = 56;
+  const maxRows = Math.floor((VH - rackY - 40 - 64) / rowH);
+  let hoveredPet: PetGachaOwned | null = null;
+  let hoveredRowY = 0;
+  v.owned.slice(0, maxRows).forEach((p, i) => {
+    const ry = rackY + 58 + i * rowH;
+    const rar = Math.max(1, Math.min(3, p.rarity));
+    if (hoverIn(rackX + 6, ry, rackW - 12, rowH - 6)) { hoveredPet = p; hoveredRowY = ry; }
+    if (!v.equipBusy) tapZone(rackX + 6, ry, rackW - 12, rowH - 6, `gacha:equiprow:${p.rowId}`);
+    ctx.fillStyle = p.equipped ? 'rgba(23,58,38,0.9)'
+      : hoveredPet === p ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.05)';
+    ctx.fillRect(rackX + 6, ry, rackW - 12, rowH - 6);
+    if (p.equipped) {
+      ctx.strokeStyle = '#7cffa0';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(rackX + 6.5, ry + 0.5, rackW - 13, rowH - 7);
+      ctx.lineWidth = 1;
+    }
+    drawPetSprite(ctx, rackX + 32, ry + (rowH - 6) / 2, 40, p.petId, p.tint, v.art, tick, p.equipped);
+    label(ctx, p.name.slice(0, 15), rackX + 58, ry + 20, 12, '#ffffff', 'left');
+    label(ctx, PET_RARITY_LABELS[rar]!, rackX + 58, ry + 36, 9, PET_RARITY_COLORS[rar]!, 'left');
+    if (p.equipped) label(ctx, '✓ EQUIPPED', rackX + rackW - 18, ry + 20, 9, '#7cffa0', 'right');
+  });
+  if (v.owned.length > maxRows) {
+    label(ctx, `+${v.owned.length - maxRows} MORE ON YOUR PROFILE PAGE`,
+      rackX + rackW / 2, VH - 52, 9, '#8a91a8');
+  }
+
+  // ---- band 2, CENTER: the cabinet.
+  const cabW = 520, cabH = 236;
+  const cabX = cx - cabW / 2 + 60, cabY = 100; // +60: breathing room off the rack
+  const cabCx = cabX + cabW / 2;
   ctx.save();
   ctx.shadowColor = v.free ? 'rgba(124,255,160,0.4)' : 'rgba(255,209,102,0.35)';
   ctx.shadowBlur = v.spinAge >= 0 ? 26 + 10 * Math.sin(tick / 4) : 14;
   bevel(ctx, cabX, cabY, cabW, cabH, PANEL, GOLD_LT, GOLD_DK, 4);
   ctx.restore();
-  display(ctx, 'COMPANION SLOTS', cx, cabY + 30, 18, { glow: 'rgba(255,209,102,0.4)' });
+  display(ctx, 'COMPANION SLOTS', cabCx, cabY + 26, 16, { glow: 'rgba(255,209,102,0.4)' });
 
   const spinning = v.spinAge >= 0;
   const spinT = spinning ? clamp01(v.spinAge / PET_SPIN_TICKS) : 0;
-  const reelW = 156, reelH = 168, reelGap = 22;
-  const reelsX = cx - (reelW * 3 + reelGap * 2) / 2;
-  const reelY = cabY + 48;
+  const reelW = 148, reelH = 156, reelGap = 18;
+  const reelsX = cabCx - (reelW * 3 + reelGap * 2) / 2;
+  const reelY = cabY + 40;
   const n = Math.max(1, v.catalog.length);
 
   for (let rIdx = 0; rIdx < 3; rIdx++) {
@@ -2198,18 +2368,19 @@ export const drawPetGacha = (ctx: CanvasRenderingContext2D, tick: number, v: Pet
     ctx.rect(rx + 6, reelY + 6, reelW - 12, reelH - 12);
     ctx.clip();
     const cyMid = reelY + reelH / 2;
-    const rowH = 74;
+    const stripH = 72;
 
     if (v.reveal && (!spinning || spinT >= stop)) {
-      // Landed on the RESULT: this reel shows the won pet, with a settle pop.
+      // Landed on the RESULT: the won pet's REAL sprite, with a settle pop.
       const age = v.revealAge >= 0 ? v.revealAge : 0;
       const pop = spinning ? 1 : 0.8 + 0.2 * easeOutBack(clamp01((age - rIdx * 3) / 10));
-      petOrb(ctx, rx + reelW / 2, cyMid - 8, 34 * pop, v.reveal.tint);
-      label(ctx, v.reveal.name.slice(0, 14), rx + reelW / 2, cyMid + 48, 12,
+      drawPetSprite(ctx, rx + reelW / 2, cyMid - 10, 76 * pop,
+        v.reveal.petId, v.reveal.tint, v.art, tick, true);
+      label(ctx, v.reveal.name.slice(0, 14), rx + reelW / 2, cyMid + 56, 11,
         PET_RARITY_COLORS[Math.max(1, Math.min(3, v.reveal.rarity))]!);
     } else if (spinning) {
-      // Rolling: a decelerating strip of catalog glyphs. Each reel gets its
-      // own phase offset so the three never move in lockstep.
+      // Rolling: a decelerating strip of REAL catalog sprites. Each reel gets
+      // its own phase offset so the three never move in lockstep.
       const local = clamp01(spinT / stop);
       const speed = 0.85 * (1 - local) * (1 - local) + 0.03;
       const pos = v.spinAge * speed + rIdx * 2.7;
@@ -2217,12 +2388,11 @@ export const drawPetGacha = (ctx: CanvasRenderingContext2D, tick: number, v: Pet
       for (let k = -2; k <= 2; k++) {
         const idx = ((Math.floor(pos) + k + rIdx * 7) % n + n) % n;
         const entry = v.catalog[idx]!;
-        const y = cyMid + (k - frac) * rowH;
-        ctx.globalAlpha = Math.abs(y - cyMid) < rowH / 2 ? 1 : 0.3;
-        petOrb(ctx, rx + reelW / 2, y, 28, entry.tint);
+        const y = cyMid + (k - frac) * stripH;
+        ctx.globalAlpha = Math.abs(y - cyMid) < stripH / 2 ? 1 : 0.3;
+        drawPetSprite(ctx, rx + reelW / 2, y, 58, entry.id, entry.tint, v.art, tick);
         ctx.globalAlpha = 1;
       }
-      // Motion blur while fast.
       if (speed > 0.25) {
         ctx.globalAlpha = Math.min(0.45, speed);
         ctx.fillStyle = '#ffffff22';
@@ -2230,13 +2400,15 @@ export const drawPetGacha = (ctx: CanvasRenderingContext2D, tick: number, v: Pet
         ctx.globalAlpha = 1;
       }
     } else {
-      // Idle: slow mystery drift.
+      // Idle: the real catalog drifting by slowly, unlabelled — a shop window.
       const pos = tick / 90 + rIdx * 1.4;
       const frac = pos % 1;
       for (let k = -1; k <= 1; k++) {
-        const y = cyMid + (k - frac) * rowH;
-        ctx.globalAlpha = Math.abs(y - cyMid) < rowH / 2 ? 0.9 : 0.25;
-        petOrb(ctx, rx + reelW / 2, y, 28, '#3a3f52', true);
+        const idx = ((Math.floor(pos) + k + rIdx * 3) % n + n) % n;
+        const entry = v.catalog[idx]!;
+        const y = cyMid + (k - frac) * stripH;
+        ctx.globalAlpha = Math.abs(y - cyMid) < stripH / 2 ? 0.9 : 0.25;
+        drawPetSprite(ctx, rx + reelW / 2, y, 58, entry.id, entry.tint, v.art, tick);
         ctx.globalAlpha = 1;
       }
     }
@@ -2252,93 +2424,117 @@ export const drawPetGacha = (ctx: CanvasRenderingContext2D, tick: number, v: Pet
   ctx.moveTo(cabX + cabW - 8, cyMid - 9); ctx.lineTo(cabX + cabW - 22, cyMid); ctx.lineTo(cabX + cabW - 8, cyMid + 9);
   ctx.closePath(); ctx.fill();
 
-  if (spinning) {
-    label(ctx, 'ROLLING…', cx, cabY + cabH + 20, 12,
-      tick % 30 < 22 ? '#ffd166' : '#ffe9a3');
-  }
+  // ---- band 3: BELOW the cabinet — exactly one of {spin note, reveal card,
+  // roll controls}. The bands cannot overlap because each path returns early.
+  const bandY = cabY + cabH + 16; // 352 in the 960x540 space
 
-  // ---- the REVEAL card (below the cabinet once the reels settle).
-  const landed = v.reveal && !spinning;
-  if (landed) {
-    const r = v.reveal!;
+  if (spinning) {
+    label(ctx, 'ROLLING…', cabCx, bandY + 8, 12, tick % 30 < 22 ? '#ffd166' : '#ffe9a3');
+  } else if (v.reveal) {
+    // Reveal card, then compact ROLL AGAIN row placed FROM the card's bottom.
+    const r = v.reveal;
     const rar = Math.max(1, Math.min(3, r.rarity));
     const age = Math.max(0, v.revealAge);
     const pop = easeOutBack(clamp01(age / 12));
-    const cw = 460, chh = 118 + r.auraText.length * 20;
-    const cxx = cx - cw / 2, cyy = cabY + cabH + 34;
+    // Compact card: even a 3-line legendary must leave room for the ROLL
+    // AGAIN row above VH — the first cut grew past the canvas and the
+    // buttons rendered cropped (owner screenshot, 2026-08-09).
+    const cw = 470, chh = 74 + Math.max(1, r.auraText.length) * 16;
+    const cxx = cabCx - cw / 2, cyy = bandY;
     ctx.save();
-    ctx.translate(cx, cyy + chh / 2);
+    ctx.translate(cabCx, cyy + chh / 2);
     ctx.scale(pop, pop);
-    ctx.translate(-cx, -(cyy + chh / 2));
+    ctx.translate(-cabCx, -(cyy + chh / 2));
     ctx.shadowColor = PET_RARITY_COLORS[rar]!;
-    ctx.shadowBlur = rar === 3 ? 28 : 12;
+    ctx.shadowBlur = rar === 3 ? 26 : 10;
     bevel(ctx, cxx, cyy, cw, chh, 'rgba(12,8,24,0.94)', PET_RARITY_COLORS[rar]!, 'rgba(0,0,0,0.6)', 3);
     ctx.shadowBlur = 0;
-    petOrb(ctx, cxx + 52, cyy + 52, 30, r.tint);
-    display(ctx, r.name, cxx + 100, cyy + 40, 24, { align: 'left' });
+    drawPetSprite(ctx, cxx + 52, cyy + chh / 2, Math.min(62, chh - 16), r.petId, r.tint, v.art, tick, true);
+    display(ctx, r.name, cxx + 100, cyy + 30, 20, { align: 'left' });
     label(ctx, `${PET_RARITY_LABELS[rar]} · ${r.auraText.length || 'NO'} AURA LINE${r.auraText.length === 1 ? '' : 'S'}`,
-      cxx + 100, cyy + 62, 12, PET_RARITY_COLORS[rar]!, 'left');
-    r.auraText.forEach((line, i) => {
-      label(ctx, line, cxx + 100, cyy + 86 + i * 20, 13, '#7cffa0', 'left');
-    });
+      cxx + 100, cyy + 48, 10, PET_RARITY_COLORS[rar]!, 'left');
     if (r.auraText.length === 0) {
-      label(ctx, 'COSMETIC ONLY — IT ROLLED NO AURA. IT IS STILL YOURS.', cxx + 100, cyy + 86, 12, '#8a91a8', 'left');
+      label(ctx, 'COSMETIC ONLY — IT ROLLED NO AURA. STILL YOURS.', cxx + 100, cyy + 68, 11, '#8a91a8', 'left');
+    } else {
+      r.auraText.forEach((line, i) => {
+        label(ctx, line, cxx + 100, cyy + 68 + i * 16, 11, '#7cffa0', 'left');
+      });
     }
-    // Equip straight from the reveal (or show that it took).
-    const eqW = 150, eqH = 30, eqX = cxx + cw - eqW - 14, eqY = cyy + chh - eqH - 12;
+    const eqW = 132, eqH = 26, eqX = cxx + cw - eqW - 12, eqY = cyy + chh - eqH - 8;
     if (r.equipped) {
-      label(ctx, '✓ EQUIPPED', eqX + eqW / 2, eqY + 20, 14, '#7cffa0');
+      label(ctx, '✓ EQUIPPED', eqX + eqW / 2, eqY + 19, 13, '#7cffa0');
     } else {
       tapZone(eqX, eqY, eqW, eqH, 'gacha:equip');
       bevel(ctx, eqX, eqY, eqW, eqH, '#173a26', '#7cffa0', '#0b1f14', 2);
-      label(ctx, v.equipBusy ? '…' : 'E · EQUIP NOW', eqX + eqW / 2, eqY + 20, 13, '#c9ffdd');
+      label(ctx, v.equipBusy ? '…' : 'E · EQUIP NOW', eqX + eqW / 2, eqY + 19, 12, '#c9ffdd');
     }
     ctx.restore();
-  }
-
-  // ---- ROLL controls (hidden while spinning; free mode gets ONE lever).
-  if (!spinning && !v.confirm) {
-    const by = landed ? VH - 92 : cabY + cabH + 44;
-    if (v.free) {
-      const bw = 360, bh = 54, bx = cx - bw / 2;
-      tapZone(bx, by, bw, bh, 'gacha:pull');
-      ctx.save();
-      ctx.shadowColor = 'rgba(124,255,160,0.5)';
-      ctx.shadowBlur = 14 + 8 * Math.sin(tick / 8);
-      bevel(ctx, bx, by, bw, bh, '#173a26', '#7cffa0', '#0b1f14', 3);
-      ctx.restore();
-      display(ctx, v.rollBusy ? '…' : 'PULL — FREE ROLL', cx, by + 36, 22);
-    } else {
-      const bw = 250, bh = 50, gap = 26;
-      const canCr = v.credits === null || v.credits >= v.cost;
-      const canTk = (v.tickets ?? 0) >= v.costTickets;
-      const bx1 = cx - bw - gap / 2, bx2 = cx + gap / 2;
-      // credits lever
-      ctx.globalAlpha = canCr && !v.rollBusy ? 1 : 0.45;
-      if (canCr && !v.rollBusy) tapZone(bx1, by, bw, bh, 'gacha:roll:credits');
-      bevel(ctx, bx1, by, bw, bh, '#3a2d14', GOLD, GOLD_DK, 3);
-      display(ctx, `ROLL · ${v.cost} CR`, bx1 + bw / 2, by + 33, 20);
-      ctx.globalAlpha = 1;
-      // tickets lever
-      ctx.globalAlpha = canTk && !v.rollBusy ? 1 : 0.45;
-      if (canTk && !v.rollBusy) tapZone(bx2, by, bw, bh, 'gacha:roll:tickets');
-      bevel(ctx, bx2, by, bw, bh, '#2a1f38', '#c084fc', '#3d2b57', 3);
-      display(ctx, `ROLL · ${v.costTickets} 🎟`, bx2 + bw / 2, by + 33, 20);
-      ctx.globalAlpha = 1;
-      if (!canTk) {
-        label(ctx, 'TICKETS COME FROM WINNING RANKED PVP', bx2 + bw / 2, by + bh + 16, 10, '#8a91a8');
-      }
-      // Odds, plainly (the drink-machine honesty rule).
-      label(ctx, 'ODDS · COMMON 70% (1 AURA) · RARE 25% (2) · LEGENDARY 5% (3)',
-        cx, by + bh + 34, 11, '#8fd0ff');
-      label(ctx, `YOU OWN ${v.ownedCount} PET${v.ownedCount === 1 ? '' : 'S'} · EQUIP ON THE PROFILE PAGE OR RIGHT HERE`,
-        cx, by + bh + 52, 10, '#8a91a8');
+    // ROLL AGAIN row: off the CARD BOTTOM, clamped inside the canvas.
+    if (!v.free) {
+      const by = Math.min(cyy + chh + 12, VH - 44);
+      drawRollButtons(ctx, tick, v, cabCx, by, true);
     }
+  } else if (v.free) {
+    const bw = 340, bh = 52, bx = cabCx - bw / 2;
+    tapZone(bx, bandY, bw, bh, 'gacha:pull');
+    ctx.save();
+    ctx.shadowColor = 'rgba(124,255,160,0.5)';
+    ctx.shadowBlur = 14 + 8 * Math.sin(tick / 8);
+    bevel(ctx, bx, bandY, bw, bh, '#173a26', '#7cffa0', '#0b1f14', 3);
+    ctx.restore();
+    display(ctx, v.rollBusy ? '…' : 'PULL — FREE ROLL', cabCx, bandY + 35, 22);
+  } else {
+    drawRollButtons(ctx, tick, v, cabCx, bandY + 6, false);
   }
 
-  // ---- error line.
-  if (v.errAge >= 0 && v.err) {
-    label(ctx, v.err, cx, VH - 26, 13, v.errAge % 20 < 14 ? '#ff8d9d' : '#ffb3bd');
+  // ---- error line (its own reserved band at the very bottom).
+  if (v.errAge >= 0 && v.err && !(v.reveal && !spinning)) {
+    label(ctx, v.err, cabCx, VH - 10, 12, v.errAge % 20 < 14 ? '#ff8d9d' : '#ffb3bd');
+  }
+
+  // ---- rack hover tooltip: the full aura sheet for the pet under the
+  // pointer, floated beside the rack (drawn late so it rides over bands).
+  if (hoveredPet && !v.confirm && !v.equipConfirm) {
+    const hp = hoveredPet as PetGachaOwned;
+    const lines = hp.auraText.length > 0 ? hp.auraText : ['COSMETIC ONLY — NO AURA'];
+    const tw = 236, th = 52 + lines.length * 16;
+    const tx = rackX + rackW + 10;
+    const ty = Math.min(hoveredRowY, VH - th - 12);
+    const trar = Math.max(1, Math.min(3, hp.rarity));
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.6)';
+    ctx.shadowBlur = 12;
+    bevel(ctx, tx, ty, tw, th, 'rgba(10,7,20,0.96)', PET_RARITY_COLORS[trar]!, 'rgba(0,0,0,0.6)', 2);
+    ctx.restore();
+    label(ctx, hp.name, tx + 12, ty + 20, 13, '#ffffff', 'left');
+    label(ctx, PET_RARITY_LABELS[trar]!, tx + tw - 12, ty + 20, 10, PET_RARITY_COLORS[trar]!, 'right');
+    lines.forEach((line, i) => {
+      label(ctx, line, tx + 12, ty + 42 + i * 16, 11,
+        hp.auraText.length > 0 ? '#7cffa0' : '#8a91a8', 'left');
+    });
+  }
+
+  // ---- EQUIP confirm modal (owner rule 2026-08-09: loadout changes ask
+  // first, same as spends). Only one modal can be armed at a time.
+  if (v.equipConfirm) {
+    ctx.fillStyle = 'rgba(4,3,10,0.78)';
+    ctx.fillRect(0, 0, VW, VH);
+    const mw = 470, mh = 150, mx = cx - mw / 2, my = VH / 2 - mh / 2;
+    bevel(ctx, mx, my, mw, mh, PANEL, v.equipConfirm.off ? '#ff8d9d' : '#7cffa0', 'rgba(0,0,0,0.6)', 3);
+    display(ctx, v.equipConfirm.off ? 'UNEQUIP PET?' : 'EQUIP PET?', cx, my + 40, 24,
+      { glow: v.equipConfirm.off ? 'rgba(255,141,157,0.4)' : 'rgba(124,255,160,0.4)' });
+    label(ctx,
+      v.equipConfirm.off
+        ? `${v.equipConfirm.name} SITS OUT — YOUR NEXT MATCH RUNS WITHOUT AN AURA`
+        : `${v.equipConfirm.name} RIDES INTO EVERY MATCH YOU PLAY`,
+      cx, my + 66, 11, '#cfd8e3');
+    const bw2 = 180, bh2 = 40, byy2 = my + mh - bh2 - 16;
+    tapZone(cx - bw2 - 12, byy2, bw2, bh2, 'gacha:eq:yes');
+    bevel(ctx, cx - bw2 - 12, byy2, bw2, bh2, '#173a26', '#7cffa0', '#0b1f14', 2);
+    display(ctx, v.equipConfirm.off ? 'Y · UNEQUIP' : 'Y · EQUIP', cx - 12 - bw2 / 2, byy2 + 27, 16);
+    tapZone(cx + 12, byy2, bw2, bh2, 'gacha:eq:no');
+    bevel(ctx, cx + 12, byy2, bw2, bh2, '#3a1420', '#ff8d9d', '#240810', 2);
+    display(ctx, 'N · KEEP', cx + 12 + bw2 / 2, byy2 + 27, 16);
   }
 
   // ---- CONFIRM modal — nothing is charged until YES (owner rule: every
@@ -2363,6 +2559,41 @@ export const drawPetGacha = (ctx: CanvasRenderingContext2D, tick: number, v: Pet
     bevel(ctx, nx, byy, bw, bh, '#3a1420', '#ff8d9d', '#240810', 2);
     display(ctx, 'N · BACK', nx + bw / 2, byy + 30, 18);
   }
+};
+
+/**
+ * The two price levers (+ odds when there is room). `compact` = the
+ * ROLL-AGAIN row under a reveal card: buttons only, no odds copy.
+ */
+const drawRollButtons = (
+  ctx: CanvasRenderingContext2D, tick: number, v: PetGachaView,
+  cabCx: number, by: number, compact: boolean,
+): void => {
+  const bw = compact ? 210 : 240;
+  const bh = compact ? 36 : 46;
+  const gap = 24;
+  const canCr = v.credits === null || v.credits >= v.cost;
+  const canTk = (v.tickets ?? 0) >= v.costTickets;
+  const bx1 = cabCx - bw - gap / 2, bx2 = cabCx + gap / 2;
+  ctx.globalAlpha = canCr && !v.rollBusy ? 1 : 0.45;
+  if (canCr && !v.rollBusy) tapZone(bx1, by, bw, bh, 'gacha:roll:credits');
+  bevel(ctx, bx1, by, bw, bh, '#3a2d14', GOLD, GOLD_DK, 3);
+  display(ctx, `ROLL · ${v.cost} CR`, bx1 + bw / 2, by + bh / 2 + 8, compact ? 16 : 20);
+  ctx.globalAlpha = 1;
+  ctx.globalAlpha = canTk && !v.rollBusy ? 1 : 0.45;
+  if (canTk && !v.rollBusy) tapZone(bx2, by, bw, bh, 'gacha:roll:tickets');
+  bevel(ctx, bx2, by, bw, bh, '#2a1f38', '#c084fc', '#3d2b57', 3);
+  display(ctx, `ROLL · ${v.costTickets} 🎟`, bx2 + bw / 2, by + bh / 2 + 8, compact ? 16 : 20);
+  ctx.globalAlpha = 1;
+  if (compact) return;
+  // Idle mode has the band to itself — the explanatory copy fits cleanly.
+  if (!canTk) {
+    label(ctx, 'TICKETS COME FROM WINNING RANKED PVP', bx2 + bw / 2, by + bh + 16, 10, '#8a91a8');
+  }
+  label(ctx, 'ODDS · COMMON 70% (1 AURA) · RARE 25% (2) · LEGENDARY 5% (3)',
+    cabCx, by + bh + 38, 11, '#8fd0ff');
+  label(ctx, 'EVERY AURA LINE ROLLS 1–8% · EQUIP ONE PET AT A TIME',
+    cabCx, by + bh + 56, 10, '#8a91a8');
 };
 
 // ---------------------------------------------------------------- invite
