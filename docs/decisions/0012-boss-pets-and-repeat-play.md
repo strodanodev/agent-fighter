@@ -1,17 +1,41 @@
 # 0012 — PETS: the warden's cache (deep-clear gacha) + the repeat-play ladder
 
-Status: **PROPOSED — needs owner sign-off before any code.**
-RENUMBERED 0011 -> 0012 on the pets/boss merge (2026-08-09): 0011 was
-already taken by the SHIPPED pets ADR. **Read 0011 first** — the deep-clear
-gacha, the pet gacha screen and the aura system described here as unbuilt
-are LIVE on prod. Reconcile this design against what shipped before
-building from it. The owner floated
-the core idea ("free random pet gacha at the end of the gauntlet, if users
-defeat the boss", 2026-08-08); this ADR turns it into a buildable design that
-survives the rules locked in 0004/0007/0008/0009. Nothing here is built.
-Date: 2026-08-08
+Status: **SUPERSEDED IN PART by 0011 — the pet half SHIPPED, and shipped
+DIFFERENTLY. The repeat-play ladder (§"The rest of the repeat-play ladder")
+is still PROPOSED and still unbuilt.**
+
+Date: 2026-08-08 · reconciled against prod 2026-08-09
 Builds on: 0007 (gacha plumbing), 0008 (gauntlet map), 0009 (cosmetic-first
 collectibles, bots-never-mint, no-prize-promises)
+Superseded by: [0011](0011-pets-and-auras.md) for everything pet-related
+
+> **Read this first.** This ADR was written as a proposal on 2026-08-08 and
+> renumbered 0011 → 0012 during the pets/boss merge, because 0011 was already
+> taken by the pets ADR that had SHIPPED. It is kept because its repeat-play
+> ladder is still live design work — but **do not build the pet design below**:
+> it was overtaken by what actually went to prod, and on three points the two
+> documents flatly contradict each other. The table immediately below is the
+> reconciliation; the original text is left intact underneath it as the record
+> of what was proposed, not as instructions.
+
+## Reconciliation — proposed here vs LIVE on prod (0011)
+
+| This ADR proposed | What actually shipped | Note |
+| --- | --- | --- |
+| **Cosmetic only, forever. A pet has NO gameplay effect.** | **Pets carry auras** — per-mille +atk / +def / +crit / +hp regen / +energy regen, applied in SOLO and RANKED | The single biggest divergence. The owner asked for auras directly when commissioning pets. This crossed the paid-power line this ADR argued to keep shut, so it is 0011's call to defend, not this one's |
+| No paid pulls; **earned only** ("the warden pays pets") | Pets are **bought**: 50 credits or 5 tickets a roll, plus the free deep-clear roll | The deep-clear roll survived exactly as designed; the credit/ticket sink did not exist in this proposal |
+| No ENGINE_VERSION bump; goldens untouched | **ENGINE_VERSION → af-core-8**, goldens re-blessed | Follows from auras: they are in the sim, so they are in the hash |
+| Phase 2, deferred: in-match presence | **Shipped in phase 1** — the pet floats or walks behind the fighter, with a HUD aura strip | |
+| Phase 1 procedural art | **Studio-authored sprites** (bird, circuitmoth, nullpup, sparkbit); procedural is the fallback for art-less pets | |
+| Dupes add a ★ to the owned pet | **No star system** — each pet is its own row, account-bound | Never built; still an open idea |
+| Kennel shelf on the shop screen | **PET GACHA screen** (slot machine, confirm-before-spend) + an EQUIP PET section, plus equipping on the landing profile | |
+| Trigger: tier-3 extraction, idempotent per run token | **Shipped as proposed** — nonce `petxtr:<token>` | |
+| Rarity 70 / 25 / 5 | **Shipped as proposed** | |
+| Bots and guests mint nothing | **Shipped as proposed** | |
+
+Everything below this line is the original 2026-08-08 proposal text.
+
+---
 
 ## The feature in one line
 
@@ -65,6 +89,11 @@ shot at the species/rarity you're missing — the collection IS the pity timer.
 | Leaderboard | **No column for now** | 0009: currency ≠ status, and the board already gained tickets recently; the kennel is the showcase |
 
 ## What this is NOT (so it never drifts there)
+
+> **OVERTAKEN — this section describes prod incorrectly.** It drifted there:
+> pets ARE a power system (auras) and ARE purchasable with credits. Both were
+> owner calls made after this was written. Kept verbatim because the argument
+> against each is the one to answer if anyone wants to walk it back.
 
 - Not a power system. Not tradeable. Not burnable for credits. No paid pulls
   with credits — the pet pull is EARNED ONLY (the vending machine sells

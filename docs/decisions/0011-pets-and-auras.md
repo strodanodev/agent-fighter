@@ -1,8 +1,12 @@
 # ADR 0011 — PETS: companions with rolled auras
 
-Status: **ACCEPTED** (owner decisions locked 2026-08-03)
+Status: **ACCEPTED** (owner decisions locked 2026-08-03) — **SHIPPED and LIVE**
 Supersedes nothing. Extends ADR 0007 (consumable items) — read that first;
 pets reuse its entire spine.
+Supersedes in part: [0012](0012-boss-pets-and-repeat-play.md), a later,
+independently-written pet proposal that assumed pets would stay cosmetic and
+earned-only. This ADR is the one that shipped; 0012 carries the reconciliation
+table and survives only for its repeat-play ladder.
 
 ## Context
 

@@ -37,6 +37,16 @@
  *      404 for that pet's art in prod. Frames left untracked because they
  *      looked like rejects became a real animation a session later. So every
  *      referenced frame must exist on disk AND be tracked/staged, or we abort.
+ *   7. "NOTHING TO SHIP" IS A QUESTION FOR PROD, NOT FOR GIT (2026-08-09). This
+ *      script used to abort whenever the working tree held no asset edits — but
+ *      a clean tree is the NORMAL state right after a hand-commit, and it says
+ *      nothing about what prod is serving. Committing your assets and then
+ *      running `ship` got you a refusal while prod stayed stale. So when the
+ *      tree is clean we ask the live tiers instead: every character's pinned
+ *      versionHash off Vercel, the character + pet ids off the Railway health
+ *      endpoint. Drift ⇒ redeploy (no commit — there is nothing to commit).
+ *      No drift ⇒ exit 0, because "prod is already correct" is success.
+ *      Server unreachable ⇒ abort: drift is unknowable, so do not guess.
  *
  * Usage:
  *   npm run ship -- [-m "commit message"] [flags]
@@ -60,8 +70,13 @@ import { fileURLToPath } from 'node:url';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CHARACTERS = join(ROOT, 'characters');
 const PETS = join(ROOT, 'pets');
-const HEALTH = 'https://match-server-production.up.railway.app/';
-const VERCEL_ALIAS = 'https://agent-fighter.vercel.app';
+// Prod endpoints. Overridable so the drift check can be pointed at a staging
+// tier — or at a deliberately-wrong host to exercise the drift path itself.
+// NOTE: use the project ALIAS, never a deployment-specific *-<hash>.vercel.app
+// URL — those sit behind Vercel's deployment-protection wall and answer every
+// request with a 200 HTML login page, which reads as "asset missing".
+const HEALTH = process.env.AF_HEALTH_URL ?? 'https://match-server-production.up.railway.app/';
+const VERCEL_ALIAS = process.env.AF_CLIENT_URL ?? 'https://agent-fighter.vercel.app';
 
 // ── tiny log helpers ────────────────────────────────────────────────────────
 const c = { dim: '\x1b[2m', red: '\x1b[31m', grn: '\x1b[32m', ylw: '\x1b[33m', cyn: '\x1b[36m', b: '\x1b[1m', x: '\x1b[0m' };
@@ -204,12 +219,73 @@ if (petProblems.length) {
     '  Fix the pet.json sprite list in Studio (Pets tab), or restore the files.');
 }
 
+// ── 2c. nothing dirty? then ask PROD, not git ───────────────────────────────
+// The working tree is only a proxy for "there is something to ship". It is the
+// WRONG proxy the moment the assets are already committed — which is the normal
+// state after any hand-commit, and which used to abort the ship outright even
+// though prod was serving stale art (2026-08-09).
+//
+// The real question this tool exists to answer is "does prod match disk?", so
+// when the tree is clean we go and ASK prod. Both tiers, because either can lag:
+//   · Vercel serves each character.json → compare the pinned versionHash;
+//   · Railway lists its character + pet ids in /health → compare membership.
+// Drift ⇒ redeploy-only run (nothing to commit, so no commit/push).
+// No drift ⇒ genuinely nothing to do, and that is a SUCCESS, not a failure.
+const fetchJsonOr = async (url) => {
+  try {
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+};
+let redeployOnly = false;
+const driftedChars = [];
+const driftedPets = [];
 if (touchedChars.size === 0 && touchedPets.size === 0) {
-  fail('no character or pet changes in the working tree — nothing to ship. (Author or edit one in Studio first.)');
+  step('No asset edits in the working tree — comparing prod against disk');
+  const health = await fetchJsonOr(HEALTH);
+  if (!health) {
+    fail('no asset edits to ship AND the match server is unreachable, so drift cannot be judged.\n' +
+      `  Check ${HEALTH} — if it is genuinely down, that is the thing to fix, not this deploy.`);
+  }
+  // characters: hash pin is the sim contract, so compare THAT, not just presence
+  const liveChars = new Set(health.characters ?? []);
+  for (const id of charDirs) {
+    if (isDisabled(id)) continue;
+    const mine = bundleOf(id)?.versionHash ?? null;
+    const theirs = await fetchJsonOr(`${VERCEL_ALIAS}/characters/${id}/character.json`);
+    if (!theirs) { driftedChars.push(`${id} (missing on Vercel)`); continue; }
+    if (mine && theirs.versionHash !== mine) driftedChars.push(`${id} (hash ${String(theirs.versionHash).slice(0, 8)} → ${String(mine).slice(0, 8)})`);
+    else if (!liveChars.has(id)) driftedChars.push(`${id} (missing on Railway)`);
+  }
+  // pets: no hash to pin, so compare catalog membership + that the art resolves
+  const livePets = new Set(Array.isArray(health.pets) ? health.pets : []);
+  for (const id of petDirs) {
+    if (petDef(id)?.disabled) continue;
+    if (!livePets.has(id)) { driftedPets.push(`${id} (missing from the server catalog)`); continue; }
+    const first = petDef(id)?.sprites?.[0];
+    if (!first) continue;
+    const art = await fetch(`${VERCEL_ALIAS}/pets/${id}/${first}`, { cache: 'no-store' }).catch(() => null);
+    if (!art?.ok) driftedPets.push(`${id} (art ${first} does not resolve on Vercel)`);
+  }
+  if (!driftedChars.length && !driftedPets.length) {
+    ok(`prod already matches disk — ${charDirs.length} characters, ${petDirs.length} pets, engine ${health.engine}`);
+    log(`\n${c.grn}${c.b}✓ nothing to ship.${c.x} ${c.dim}(Author or edit an asset in Studio, and re-run.)${c.x}`);
+    process.exit(0);
+  }
+  redeployOnly = true;
+  driftedChars.forEach((d) => warn(`character drift: ${d}`));
+  driftedPets.forEach((d) => warn(`pet drift: ${d}`));
+  ok('drift found — redeploying (nothing to commit; the tree is already clean)');
 }
 
 // ── 3. the plan ─────────────────────────────────────────────────────────────
 step('Plan');
+if (redeployOnly) {
+  log(`  ${c.ylw}redeploy only:${c.x} assets are already committed; prod is behind.`);
+  driftedChars.forEach((d) => log(`      character ${d}`));
+  driftedPets.forEach((d) => log(`      pet ${d}`));
+}
 if (newChars.length) log(`  ${c.grn}new characters:${c.x} ${newChars.join(', ')}`);
 if (changedChars.length) log(`  ${c.cyn}updated characters:${c.x} ${changedChars.join(', ')}`);
 if (newPets.length) log(`  ${c.grn}new pets:${c.x} ${newPets.join(', ')}`);
@@ -250,7 +326,9 @@ if (incompleteEnabled.length && !flags.includeWip) {
 // commit only COMPLETE new characters (packed atlas); skip WIP unless opted in.
 // (enabled+incomplete already hard-aborted above; this handles disabled+incomplete.)
 const commitNew = flags.includeWip ? newChars : newChars.filter((id) => hasAtlas(id));
-if (!message) {
+if (!message && redeployOnly) {
+  message = 'build: refresh ship artifacts for a prod-drift redeploy';
+} else if (!message) {
   const parts = [];
   if (commitNew.length) parts.push(`add ${commitNew.join(', ')}`);
   if (changedChars.length) parts.push(`update ${changedChars.join(', ')}`);
@@ -260,7 +338,7 @@ if (!message) {
     : touchedPets.size ? 'pets' : 'roster';
   message = `feat(${scope}): ${parts.join('; ') || 'ship asset changes'}`;
 }
-log(`\n  ${c.b}commit:${c.x} ${message}`);
+log(`\n  ${c.b}commit:${c.x} ${redeployOnly ? `${message} ${c.dim}(only if the rebuild changes anything)${c.x}` : message}`);
 log(`  ${c.b}deploy:${c.x} ${flags.noDeploy ? 'NO (--no-deploy) — commit + push only' : 'Railway (server) + Vercel (client), paired'}`);
 log(`  ${c.b}verify:${c.x} ${flags.skipVerify ? 'SKIPPED (--skip-verify)' : 'npm run verify (typecheck + tests)'}`);
 
@@ -283,11 +361,31 @@ ok(`roster manifest: ${expectedRoster.length} characters`);
 // ── 6. commit ───────────────────────────────────────────────────────────────
 step('Commit');
 exec('git add', 'git', ['add', 'characters/', 'pets/', 'packages/client/demo/']);
+// A redeploy-only run has nothing of its own to commit — but the rebuild above
+// can still churn the demo bundle, and `deploy.mjs` (correctly) refuses a dirty
+// tree because `railway up` uploads the WORKING TREE. So: commit if the rebuild
+// moved anything, skip the commit entirely if it did not.
+if (redeployOnly) {
+  if (flags.all || otherTracked.length) exec('git add (tracked)', 'git', ['add', '-u']);
+  if (gitLines('diff --cached --name-only').length) {
+    const rb = `${message}\n\nNo asset edits — prod had drifted from committed assets and the\nrebuild refreshed these artifacts. Shipped via \`npm run ship\`.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n`;
+    const rc = spawnSync('git', ['commit', '-q', '-F', '-'], { cwd: ROOT, input: rb, encoding: 'utf8' });
+    if (rc.status !== 0) fail(`git commit failed: ${rc.stderr ?? ''}`);
+    ok(`committed rebuild artifacts: ${git('log -1 --oneline')}`);
+    step('Push to GitHub');
+    exec('git push', 'git', ['push', 'origin', branch]);
+    ok('pushed');
+  } else {
+    ok('rebuild produced no changes — nothing to commit, going straight to deploy');
+  }
+}
 
 // THE PET ART CONTRACT, asserted after staging and before the commit: every
 // frame a shipping pet.json names must now be in the index. Staging pets/
 // wholesale should guarantee it — but this is the failure that already reached
-// a commit once, so it gets checked rather than assumed.
+// a commit once, so it gets checked rather than assumed. It runs on a
+// redeploy-only pass too: "already committed" is exactly when a frame that was
+// never added stops being obvious.
 {
   const staged = new Set(gitLines('diff --cached --name-only'));
   const orphans = [];
@@ -303,25 +401,27 @@ exec('git add', 'git', ['add', 'characters/', 'pets/', 'packages/client/demo/'])
   }
   ok('pet art contract: every referenced frame is committed or staged');
 }
-if (flags.all || otherTracked.length) {
-  // stage the already-modified tracked files so the tree is clean for deploy
-  exec('git add (tracked)', 'git', ['add', '-u']);
-}
-// unstage untracked WIP we chose not to ship
-for (const id of newChars) {
-  if (!commitNew.includes(id)) exec(`unstage wip ${id}`, 'git', ['reset', '-q', '--', `characters/${id}`]);
-}
-if (!gitLines('diff --cached --name-only').length) fail('nothing staged to commit.');
-// message via stdin (-F -), NOT -m: avoids all shell-quoting/newline breakage on Windows.
-const body = `${message}\n\nShipped via \`npm run ship\`. rehash --check clean, verify ${flags.skipVerify ? 'SKIPPED' : 'green'}.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n`;
-const commit = spawnSync('git', ['commit', '-q', '-F', '-'], { cwd: ROOT, input: body, encoding: 'utf8' });
-if (commit.status !== 0) fail(`git commit failed: ${commit.stderr ?? ''}`);
-ok(`committed: ${git('log -1 --oneline')}`);
+if (!redeployOnly) {
+  if (flags.all || otherTracked.length) {
+    // stage the already-modified tracked files so the tree is clean for deploy
+    exec('git add (tracked)', 'git', ['add', '-u']);
+  }
+  // unstage untracked WIP we chose not to ship
+  for (const id of newChars) {
+    if (!commitNew.includes(id)) exec(`unstage wip ${id}`, 'git', ['reset', '-q', '--', `characters/${id}`]);
+  }
+  if (!gitLines('diff --cached --name-only').length) fail('nothing staged to commit.');
+  // message via stdin (-F -), NOT -m: avoids all shell-quoting/newline breakage on Windows.
+  const body = `${message}\n\nShipped via \`npm run ship\`. rehash --check clean, verify ${flags.skipVerify ? 'SKIPPED' : 'green'}.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n`;
+  const commit = spawnSync('git', ['commit', '-q', '-F', '-'], { cwd: ROOT, input: body, encoding: 'utf8' });
+  if (commit.status !== 0) fail(`git commit failed: ${commit.stderr ?? ''}`);
+  ok(`committed: ${git('log -1 --oneline')}`);
 
-// ── 7. push ─────────────────────────────────────────────────────────────────
-step('Push to GitHub');
-exec('git push', 'git', ['push', 'origin', branch]);
-ok('pushed');
+  // ── 7. push ───────────────────────────────────────────────────────────────
+  step('Push to GitHub');
+  exec('git push', 'git', ['push', 'origin', branch]);
+  ok('pushed');
+}
 
 if (flags.noDeploy) { log(`\n${c.grn}${c.b}✓ committed + pushed. Deploy skipped (--no-deploy).${c.x}`); process.exit(0); }
 
@@ -342,8 +442,12 @@ const fetchJson = async (url) => { try { const r = await fetch(url, { cache: 'no
 // Pets must land on both tiers too: the client SERVES the art, the server
 // CATALOGS it. Checking one proves nothing about the other.
 const wantPets = new Set(petDirs.filter((id) => !petDef(id)?.disabled));
+// What this run is responsible for proving live. On a redeploy-only pass the
+// tree is clean, so `touchedPets` is empty and every check below would pass
+// VACUOUSLY — the drifted pets are precisely the ones to re-check.
+const verifyPets = new Set([...touchedPets, ...driftedPets.map((d) => d.split(' ')[0])]);
 const petsLive = async () => {
-  for (const id of touchedPets) {
+  for (const id of verifyPets) {
     const def = petDef(id);
     if (!def) return false;
     const r = await fetch(`${VERCEL_ALIAS}/pets/${id}/pet.json`, { cache: 'no-store' }).catch(() => null);
@@ -364,7 +468,7 @@ for (let i = 1; i <= 16 && !(serverOk && clientOk); i++) {
     health = await fetchJson(HEALTH);
     // `pets` is absent on a server older than the ADR 0011 build — treat that
     // as "not updated yet" only when we are actually shipping pets.
-    const serverPetsOk = touchedPets.size === 0
+    const serverPetsOk = verifyPets.size === 0
       || (Array.isArray(health?.pets) && [...wantPets].every((id) => health.pets.includes(id)));
     serverOk = health && superset(health.characters) && serverPetsOk
       && (!expectedEngine || health.engine === expectedEngine);
@@ -379,10 +483,10 @@ for (let i = 1; i <= 16 && !(serverOk && clientOk); i++) {
 }
 
 log('');
-const petNote = touchedPets.size ? ` + ${touchedPets.size} pet(s) with their art` : '';
+const petNote = verifyPets.size ? ` + ${verifyPets.size} pet(s) with their art` : '';
 if (clientOk) ok(`Vercel client: ${VERCEL_ALIAS} serves all ${want.size} characters${petNote}`); else warn(`Vercel client did not show everything yet — check ${VERCEL_ALIAS}/api/characters and /pets/<id>/pet.json`);
-if (serverOk) ok(`Railway server: full roster${touchedPets.size ? `, ${health.pets?.length ?? 0} pets in the catalog` : ''}, engine ${health.engine}`); else warn(`Railway server not updated yet (async build) — expected engine ${expectedEngine}; poll ${HEALTH}`);
-if (touchedPets.size && health && !Array.isArray(health.pets)) {
+if (serverOk) ok(`Railway server: full roster${verifyPets.size ? `, ${health.pets?.length ?? 0} pets in the catalog` : ''}, engine ${health.engine}`); else warn(`Railway server not updated yet (async build) — expected engine ${expectedEngine}; poll ${HEALTH}`);
+if (verifyPets.size && health && !Array.isArray(health.pets)) {
   warn('this server build predates the pets health field — it cannot confirm its catalog. Redeploy the server, or check its logs for "[pets] N in the catalog".');
 }
 if (health && expectedEngine && health.engine !== expectedEngine) warn(`ENGINE SKEW: server ${health.engine} ≠ client ${expectedEngine} — online play will hello-reject until both match. Redeploy the lagging tier.`);
