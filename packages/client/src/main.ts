@@ -202,6 +202,14 @@ type Screen = 'loading' | 'title' | 'select' | 'stageSelect' | 'online' | 'fight
 let screen: Screen = 'loading';
 /** Screen the previous frame drew — drives the title-entry sting (see `frame`). */
 let lastScreen: Screen = 'loading';
+/**
+ * Playback level for the main-scene sting, RELATIVE to the SFX bus (which is
+ * already at SFX_LEVEL). 0.8 = the authored mix down 20% (owner call). The
+ * trim is only half the fix — the sting also DUCKS the home theme under it
+ * (it runs through `playStinger`), which is what stops the two mixing into
+ * mush at full level.
+ */
+const TITLE_INTRO_LEVEL = 0.8;
 let mode: Mode = 'cpu';
 let net: Session | null = null;
 let netInstalled = false;
@@ -2613,9 +2621,14 @@ const frame = (steps = 1): void => {
   // path in — boot, backing out of select/shop/ranks/invite, endArcade,
   // quitMatch, a dead net match. Watched here rather than bolted onto the ~12
   // `screen = 'title'` assignments so no entry point can forget it and none
-  // can double-fire; staying on the title never re-triggers it. `vary: false`
-  // because it is a musical clip, not a combat one (see audio.ts playSfx).
-  if (screen === 'title' && lastScreen !== 'title') audio.playSfx('title_intro', { vary: false });
+  // can double-fire; staying on the title never re-triggers it. It runs as a
+  // STINGER, not a plain SFX: that ducks the home theme under it and restores
+  // on end, gets it the no-pitch-wobble path a musical clip needs, and makes
+  // it exclusive — a win/game-over jingle still ringing when you land back on
+  // the title is cut rather than layered.
+  if (screen === 'title' && lastScreen !== 'title') {
+    void audio.playStinger('title_intro', { volume: TITLE_INTRO_LEVEL });
+  }
   lastScreen = screen;
 
   if (screen === 'loading') {

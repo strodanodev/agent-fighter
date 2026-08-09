@@ -11,10 +11,12 @@
  * picked at random per title-screen entry, see `nextHomeTrack`), and 6
  * dedicated stage tracks (`stage_1`..`stage_6`, sounds/7. Stage Music/)
  * that make up ROTATION, the in-match stage-BGM pool — also picked at
- * random per battle (`nextRotationTrack`), not round-robin.
+ * random per battle (`nextRotationTrack`), not round-robin. `title_intro`
+ * is music-typed for the same reason `vs`/`win` are: it is played through
+ * `playStinger`, so it ducks the bed and can never stack.
  *
  * SFX (SfxId): impact/block/combo clips (weight-classed by button, see
- * `hitSfxFor`), menu stingers (select_confirm, you_lose, title_intro), the announcer's
+ * `hitSfxFor`), menu stingers (select_confirm, you_lose), the announcer's
  * fight-call, and the character voice-bark pack (hit/ouch reactions on
  * taking damage, hiya kiai on some swings, shoryuken/hadouken callouts on
  * their matching motion specials). The client-side juice layer (main.ts) is
@@ -24,7 +26,7 @@
 
 export type MusicId =
   | 'continue' | 'game_over' | 'here_comes_a_new_challenger' | 'hurry_up' | 'player_select' | 'ranking'
-  | 'vs' | 'win' | 'credits' | 'home_screen' | 'home_screen_alt'
+  | 'vs' | 'win' | 'credits' | 'home_screen' | 'home_screen_alt' | 'title_intro'
   | 'stage_1' | 'stage_2' | 'stage_3' | 'stage_4' | 'stage_5' | 'stage_6';
 
 export type SfxId =
@@ -32,7 +34,7 @@ export type SfxId =
   | 'punch_light' | 'punch_medium' | 'punch_heavy_a' | 'punch_heavy_b'
   | 'kick_light' | 'kick_heavy' | 'special_hit'
   | 'block_hit' | 'combo_accent'
-  | 'select_confirm' | 'you_lose' | 'title_intro'
+  | 'select_confirm' | 'you_lose'
   | 'fight_call_a' | 'fight_call_b'
   | 'hit_1' | 'hit_2' | 'hit_3' | 'hit_4'
   | 'hiya_1' | 'hiya_2'
@@ -57,6 +59,11 @@ const MUSIC_FILES: Record<MusicId, string> = {
   // The dedicated title-screen pool — mp3-only, same fallback note as credits.
   home_screen: '/assets/audio/bgm/home_screen.mp3',
   home_screen_alt: '/assets/audio/bgm/home_screen_alt.mp3',
+  // MAIN-SCENE sting — one-shot on every entry into the title, fired by the
+  // `lastScreen` watcher at the top of main.ts `frame()`. Music-typed because
+  // it goes through `playStinger` (ducks the home theme under it, exclusive so
+  // it can never stack), but it is an SFX ASSET and lives under sfx/.
+  title_intro: '/assets/audio/sfx/title_intro.mp3',
   // In-match stage BGM pool (sounds/7. Stage Music/) — mp3-only.
   stage_1: '/assets/audio/bgm/stage_1.mp3',
   stage_2: '/assets/audio/bgm/stage_2.mp3',
@@ -80,10 +87,6 @@ const SFX_FILES: Record<SfxId, string> = {
   combo_accent: '/assets/audio/sfx/combo_accent.mp3',
   select_confirm: '/assets/audio/sfx/select_confirm.mp3',
   you_lose: '/assets/audio/sfx/you_lose.mp3',
-  // Main-scene (title) intro sting — one-shot on every entry into the title,
-  // see the `lastScreen` watcher at the top of main.ts `frame()`. ~11s and
-  // musical, so it is played with `vary: false` (no pitch wobble).
-  title_intro: '/assets/audio/sfx/title_intro.mp3',
   fight_call_a: '/assets/audio/voice/fight_call_a.mp3',
   fight_call_b: '/assets/audio/voice/fight_call_b.mp3',
   hit_1: '/assets/audio/voice/hit_1.mp3',
@@ -119,7 +122,7 @@ export const HOME_ROTATION: MusicId[] = ['home_screen', 'home_screen_alt'];
  * keeping decoded so stingers stay instant. The LONG tracks are everything
  * else in MUSIC_FILES and are decode-on-play + evicted (see preload()).
  */
-const BGM_STINGERS: MusicId[] = ['vs', 'here_comes_a_new_challenger', 'hurry_up', 'win'];
+const BGM_STINGERS: MusicId[] = ['vs', 'here_comes_a_new_challenger', 'hurry_up', 'win', 'title_intro'];
 
 /** Every button's normal-hit weight class → which impact clip(s) to draw from. */
 const PUNCH: Record<'L' | 'M' | 'H', SfxId[]> = {
@@ -203,7 +206,11 @@ class AudioManager {
    * extracting through EXIT 3 fires `credits` AGAIN a few seconds later,
    * while the first is still playing.
    */
-  private stinger: { id: MusicId; src: AudioBufferSourceNode; cancelled: boolean } | null = null;
+  private stinger: {
+    id: MusicId; src: AudioBufferSourceNode; cancelled: boolean;
+    /** Whether this sting is holding the BGM bed down — see `playBgm`. */
+    duck: boolean;
+  } | null = null;
   private bgmGain: GainNode | null = null;
   private sfxGain: GainNode | null = null;
   private hitsGain: GainNode | null = null;
@@ -417,7 +424,12 @@ class AudioManager {
       src.buffer = buffer;
       src.loop = true;
       src.connect(this.bgmGain!);
-      const target = this.musicLevel();
+      // A sting already sounding OWNS the bed: come up ducked and let its
+      // onEnded do the swell to full. Without this, a track that finishes
+      // decoding mid-sting ramps straight to full volume and cancels the
+      // duck — which is exactly the title case, where `title_intro` is warm
+      // from preload() but home_screen.mp3 (1.6MB) is not.
+      const target = this.stinger?.duck ? this.duckLevel() : this.musicLevel();
       const fade = opts.fadeInSec ?? 0;
       if (fade > 0 && this.bgmGain && target > 0) {
         this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
@@ -451,10 +463,14 @@ class AudioManager {
    * music — re-triggering it would restart the jingle from zero, which reads
    * as a stutter. The boss/extract pair uses this: the warden's fanfare plays
    * straight through into the CORE CLEARED receipt instead of restarting.
+   *
+   * `volume` trims THIS sting only (still under the SFX bus / mute toggles) —
+   * the title sting sits at 0.8 because it is mixed hotter than the arcade
+   * jingles.
    */
   async playStinger(
     id: MusicId,
-    opts: { duck?: boolean; onEnded?: () => void; skipIfPlaying?: boolean } = {},
+    opts: { duck?: boolean; onEnded?: () => void; skipIfPlaying?: boolean; volume?: number } = {},
   ): Promise<void> {
     if (opts.skipIfPlaying && this.stinger?.id === id) return;
     try {
@@ -470,13 +486,16 @@ class AudioManager {
       }
       const src = ctx.createBufferSource();
       src.buffer = buffer;
-      src.connect(this.sfxGain!);
+      const trim = ctx.createGain();
+      trim.gain.value = opts.volume ?? 1;
+      src.connect(trim);
+      trim.connect(this.sfxGain!);
       const duck = opts.duck ?? true;
       if (duck && this.bgmGain) {
         this.bgmGain.gain.cancelScheduledValues(ctx.currentTime);
         this.bgmGain.gain.setTargetAtTime(this.duckLevel(), ctx.currentTime, 0.05);
       }
-      const mine = { id, src, cancelled: false };
+      const mine = { id, src, cancelled: false, duck };
       this.stinger = mine;
       src.onended = () => {
         if (this.stinger === mine) this.stinger = null;
@@ -501,21 +520,16 @@ class AudioManager {
    * (P1's swing landing while P2's counter also connects). A small random
    * pitch/gain wobble keeps rapid-fire jabs from sounding mechanically
    * identical.
-   *
-   * `vary: false` turns that wobble off — required for anything MUSICAL
-   * (title_intro), where a ±6% playback-rate shift detunes the whole clip
-   * instead of reading as variation.
    */
-  playSfx(id: SfxId, opts: { volume?: number; vary?: boolean } = {}): void {
+  playSfx(id: SfxId, opts: { volume?: number } = {}): void {
     const ctx = this.ctxOf();
     const bus = HIT_SFX.has(id) ? this.hitsGain! : this.sfxGain!;
-    const vary = opts.vary ?? true;
     void this.load(id).then((buffer) => {
       const src = ctx.createBufferSource();
       src.buffer = buffer;
-      if (vary) src.playbackRate.value = 0.94 + Math.random() * 0.12;
+      src.playbackRate.value = 0.94 + Math.random() * 0.12;
       const gain = ctx.createGain();
-      gain.gain.value = (opts.volume ?? 1) * (vary ? 0.9 + Math.random() * 0.1 : 1);
+      gain.gain.value = (opts.volume ?? 1) * (0.9 + Math.random() * 0.1);
       src.connect(gain);
       gain.connect(bus);
       src.start();

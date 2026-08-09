@@ -54,8 +54,11 @@ map for re-running the conversion.
   (copied as-is, mp3) — the MAIN-SCENE sting. ~11s, musical, fires once on
   every entry into the title screen and never loops; the trigger is the
   `lastScreen` watcher at the top of `frame()` in `main.ts`, so it covers
-  boot and every back-out path without any call site opting in. Played with
-  `vary: false` so `playSfx`'s combat pitch wobble doesn't detune it.
+  boot and every back-out path without any call site opting in. It is the
+  one MusicId whose asset lives under `sfx/`: it plays through
+  `playStinger` (ducks the home theme, exclusive, no pitch wobble) at
+  `TITLE_INTRO_LEVEL` 0.8, because at full level over an undacked bed the
+  two just mixed into mush.
 - **`5. Voice FX/`** → `voice/fight_call_a.mp3` / `fight_call_b.mp3` (copied
   as-is from `Main FX 1.mp3` / `Main FX 3.mp3`). **Guessed mapping** — the
   source names aren't self-describing like the other categories, so these
