@@ -163,6 +163,11 @@ interface Client {
   account: Account | null;
   /** AIR-account email — only the reputation write-back target (ADR 0004). */
   email: string;
+  /** litnode player key from hello (64 hex) or '' — see CHello.playerKey. */
+  playerKey: string;
+  /** The friendly room this client parked in / paired through, '' otherwise.
+   *  A `LIT-…` room is a mesh-placed match: its ledger is archived. */
+  room: string;
   /**
    * Measured round-trip to this client in ms (EMA; -1 = unknown). Fed by
    * the lobby ping loop's pong echoes; read once at pair time to size the
@@ -194,6 +199,11 @@ interface Match {
   bounds?: { left: number; right: number };
   chars: [string, string];
   names: [string, string];
+  /** litnode player keys per side ('' when the client sent none). Pinned into
+   *  the archived ledger so the mesh settles under the keys it placed. */
+  playerKeys: [string, string];
+  /** Friendly room code, '' otherwise. `LIT-<32 hex>` = a mesh-placed match. */
+  room: string;
   /** Local-sim solo: the deterministic house AI the client must simulate.
    *  `personality` present = a TRAINED agent opponent (dare-vs-agent /
    *  sparring, ADR 0006) — verification re-derives the AI with it. */
@@ -1169,7 +1179,10 @@ export const createMatchServer = (opts: {
     //
     // Wrapped in its OWN try/catch and fire-and-forget: an archival failure
     // must never touch a settled result. Settlement is money; replays are not.
-    if (persistence?.saveLedger && m.mode === 'wager') {
+    // …plus friendlies placed by the LIT GAMES mesh (room `LIT-…`): those are
+    // the matches a litnode witness replays, so their ledger IS the product.
+    const meshPlaced = m.mode === 'friendly' && m.room.startsWith('LIT-');
+    if (persistence?.saveLedger && (m.mode === 'wager' || meshPlaced)) {
       try {
         const pin = {
           seed: m.seed,
@@ -1181,6 +1194,10 @@ export const createMatchServer = (opts: {
           // a retuned bundle stops reproducing exactly like a bumped engine.
           charDigests: [charDigest(m.chars[0]), charDigest(m.chars[1])],
           names: m.names,
+          // litnode: which mesh match this was (room) and who the mesh placed
+          // (player keys) — tools/af-watch.mjs settles under these.
+          room: m.room || null,
+          playerKeys: m.playerKeys,
           agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
           delay: m.delay,
           items: m.items,
@@ -1297,6 +1314,8 @@ export const createMatchServer = (opts: {
       stage: stagePool.length > 0 ? stagePool[matchSeed % stagePool.length]! : '',
       chars: [c0.character, c1 ? c1.character : solo!.character],
       names: [c0.name, c1?.name ?? houseName],
+      playerKeys: [c0.playerKey, c1?.playerKey ?? ''],
+      room: mode === 'friendly' ? (c0.room || c1?.room || '') : '',
       solo: solo ? { skill: solo.skill, aiSeed: solo.aiSeed, personality: solo.personality } : null,
       arcadeRun: arcadeRun ?? null,
       items,
@@ -1773,6 +1792,7 @@ export const createMatchServer = (opts: {
         if (msg.engine !== ENGINE_VERSION) return send(c, { t: 'error', msg: `engine ${ENGINE_VERSION} required (got ${msg.engine})` });
         c.name = String(msg.name ?? 'anon').slice(0, 24) || 'anon';
         c.agent = !!msg.agent;
+        c.playerKey = typeof msg.playerKey === 'string' && /^[0-9a-f]{64}$/i.test(msg.playerKey) ? msg.playerKey.toLowerCase() : '';
         // Attestation target only — progression keys on the VERIFIED sub.
         const email = String(msg.email ?? '').slice(0, 120);
         c.email = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : '';
@@ -1887,6 +1907,7 @@ export const createMatchServer = (opts: {
               return send(c, { t: 'error', msg: 'friendly challenge needs a room code' });
             }
             const waiter = rooms.get(room);
+            c.room = room;
             if (waiter && waiter !== c && waiter.ws.readyState === WebSocket.OPEN && waiter.state === 'queued') {
               rooms.delete(room);
               c.state = 'queued';
@@ -3039,6 +3060,8 @@ export const createMatchServer = (opts: {
       identityReady: Promise.resolve(),
       account: null,
       email: '',
+      playerKey: '',
+      room: '',
       rtt: -1,
     };
     clients.add(c);

@@ -116,6 +116,15 @@ export interface CHello {
   agent?: boolean;
   engine: string; // ENGINE_VERSION — pinned
   /**
+   * litnode player key (optional): the 64-hex ed25519 public key the LIT GAMES
+   * cabinet queued with. Carried into the match ledger's pin so the mesh
+   * settles the result under the key that was placed, not a display name.
+   * NOT verified here — the server cannot check an ed25519 signature cheaply
+   * and does not need to: the mesh's own attestation covers it. Never an
+   * identity for progression; that stays on the verified AIR `sub`.
+   */
+  playerKey?: string;
+  /**
    * AIR-account email — the TARGET for the reputation-credential write-back
    * (ADR 0004), nothing else. Progression keys on the verified token's sub;
    * this only addresses where AIR delivers the attestation.

@@ -222,6 +222,7 @@ export class NetSession {
     private email?: string, // AIR-account email — reputation write-back target only
     private ref?: string, // stashed dare code (?ref=) — redeemed server-side once
     private room?: string, // friendly rendezvous code (mode 'friendly' only)
+    private playerKey?: string, // litnode player key (?player=) — pinned into the ledger, never an identity
   ) {
     this.connect(false);
   }
@@ -231,7 +232,7 @@ export class NetSession {
     const ws = new WebSocket(this.url);
     this.ws = ws;
     ws.onopen = () => {
-      this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email, ref: this.ref });
+      this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email, ref: this.ref, playerKey: this.playerKey });
       if (resume && this.setup?.resume) {
         this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
       } else {

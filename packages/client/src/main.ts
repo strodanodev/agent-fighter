@@ -309,6 +309,9 @@ let inviteFrom: 'title' | 'results' = 'title'; // where ESC returns to
 // friend straight into the inviter's room — after the AIR sign-in gate.
 let friendlyRoom = ''; // the room the current/last friendly queued into
 let pendingRoom = ''; // ?room= from a challenge link, waiting on sign-in
+/** ?player= from the LIT GAMES cabinet: the litnode key this match was placed
+ *  under. Sent in hello, pinned into the ledger by the server. In-memory only. */
+let meshPlayerKey = '';
 // The select screen is shared by wager and friendly (both PvP, one fighter to
 // pick). This flag tells its lock handler which to queue — set true only for
 // the friendly path, reset false on every normal (wager/cpu) select entry.
@@ -1404,6 +1407,8 @@ const applyBootDeepLink = (): void => {
   if (roomQ && /^[A-Za-z0-9-]{3,40}$/.test(roomQ)) {
     pendingRoom = roomQ.toUpperCase();
   }
+  const playerQ = q.get('player');
+  if (playerQ && /^[0-9a-f]{64}$/i.test(playerQ)) meshPlayerKey = playerQ.toLowerCase();
 
   // Dare-vs-agent (?agent=1 riding a ?ref= dare link): after the sign-in
   // gate, the title auto-routes into a solo match vs the SENDER's trained
@@ -1507,7 +1512,7 @@ const startOnline = (
     // solo house AI for the trained agent behind a dare code.
     net = m === 'wager' || m === 'friendly'
       ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(),
-        m === 'friendly' ? friendlyRoom : undefined)
+        m === 'friendly' ? friendlyRoom : undefined, meshPlayerKey || undefined)
       : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(),
         m === 'arcade' ? { runToken, node: arcadeNode } : undefined,
         m === 'solo' ? agentOf : undefined);
