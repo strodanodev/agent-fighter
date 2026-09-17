@@ -18,6 +18,7 @@ import {
 } from './progress.js';
 import type { Profile } from './progress.js';
 import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './atlas.js';
+import { cachedRelay, refreshRelay } from './mesh.js';
 import { drawPet, loadMatchPets, loadPet } from './pets.js';
 import type { LoadedPet } from './pets.js';
 import type { Roster } from './atlas.js';
@@ -387,24 +388,29 @@ const drawWalletStrip = (): void => {
 };
 
 /**
- * The deployed match server (Railway). MUST be wss:// — the game is served
- * over https and browsers block ws:// from an https origin as mixed content,
- * so a ws:// default here means online play dies before a packet moves.
- * Railway terminates TLS; the server itself still speaks plain ws.
+ * Last-resort match server address. The real one is DISCOVERED: the relay
+ * runs on an operator's machine behind a tunnel whose hostname changes, and
+ * the operator's litnode publishes the current wss:// on litVM (mesh.ts).
+ * This constant only answers when the chain cannot be read and nothing is
+ * cached; Railway is gone, so that is "offline", honestly. MUST be wss://
+ * — the game is served over https and browsers block ws:// from it.
  */
 const PROD_MATCH_WS = 'wss://match-server-production.up.railway.app';
 
 /**
- * Match-server endpoints. `?ws=` overrides everything (dev/staging/testing);
- * an https page uses the deployed server; anything else is a local dev box
- * running the server beside the page (`npm run play`).
+ * Match-server endpoints. `?ws=` overrides everything (the LIT GAMES
+ * cabinet passes the drawn host's relay this way); an https page uses the
+ * relay the mesh announced (cached by mesh.ts, refreshed at boot), then the
+ * constant; anything else is a local dev box running the server beside the
+ * page (`npm run play`).
  */
 const matchWsUrl = (): string => {
   const override = new URLSearchParams(location.search).get('ws');
   if (override) return override;
-  if (location.protocol === 'https:') return PROD_MATCH_WS;
+  if (location.protocol === 'https:') return cachedRelay() ?? PROD_MATCH_WS;
   return `ws://${location.hostname}:8477`;
 };
+if (location.protocol === 'https:') refreshRelay();
 const matchHttpUrl = (): string => matchWsUrl().replace(/^ws/, 'http');
 
 // Public standings (drawRanks) — fetched from the match server on entry.
