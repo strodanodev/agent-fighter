@@ -58,6 +58,7 @@ const ORDER = [
   // The companion renderer — cosmetic, reads FighterState only, so anywhere
   // before main.js works.
   'client/src/pets.js',
+  'client/src/mesh.js',   // relay discovery from the litnode mesh (no deps of its own)
   'client/src/main.js',
 ];
 
