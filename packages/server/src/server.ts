@@ -36,6 +36,7 @@ import {
 } from './protocol.js';
 import type { ClientMsg, ItemPin, PetPin, SMatch, SResult, ServerMsg } from './protocol.js';
 import { verifyAirToken } from './airjwt.js';
+import { meshLedger } from './mesh-ledger.js';
 import type { AirIdentity } from './airjwt.js';
 import {
   ARCADE_FEE,
@@ -165,6 +166,8 @@ interface Client {
   email: string;
   /** litnode player key from hello (64 hex) or '' — see CHello.playerKey. */
   playerKey: string;
+  /** litnode ledger signature (CSign) for the match just finished, '' until it arrives. */
+  ledgerSig: string;
   /** The friendly room this client parked in / paired through, '' otherwise.
    *  A `LIT-…` room is a mesh-placed match: its ledger is archived. */
   room: string;
@@ -964,6 +967,10 @@ export const createMatchServer = (opts: {
         rounds: v.rounds, endTick: v.endTick, hash: v.hash, deviator,
       };
     }
+    // litnode (protocol 3): a mesh-placed match tells both players what to
+    // sign — the ledger head exactly as a mesh node rebuilds it. Their
+    // signatures come back as CSign and are archived with the ledger below.
+    if (m.mode === 'friendly' && m.room.startsWith('LIT-')) result.ledger = meshLedger([m.inputs[0], m.inputs[1]]);
 
     // Solo pace sanity: the client sims locally, so wall time is the only
     // pacing signal. Scripted fast-forward or tool-assisted slow-motion
@@ -1182,7 +1189,7 @@ export const createMatchServer = (opts: {
     // …plus friendlies placed by the LIT GAMES mesh (room `LIT-…`): those are
     // the matches a litnode witness replays, so their ledger IS the product.
     const meshPlaced = m.mode === 'friendly' && m.room.startsWith('LIT-');
-    if (persistence?.saveLedger && (m.mode === 'wager' || meshPlaced)) {
+    const archive = (): void => {
       try {
         const pin = {
           seed: m.seed,
@@ -1198,6 +1205,9 @@ export const createMatchServer = (opts: {
           // (player keys) — tools/af-watch.mjs settles under these.
           room: m.room || null,
           playerKeys: m.playerKeys,
+          // Their signatures over SResult.ledger (CSign), by player key —
+          // present for the sides that answered before archival.
+          signatures: Object.fromEntries(m.clients.flatMap((cl, i) => (cl?.playerKey && cl.ledgerSig && cl.playerKey === m.playerKeys[i] ? [[cl.playerKey, cl.ledgerSig]] : []))),
           agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
           delay: m.delay,
           items: m.items,
@@ -1225,7 +1235,9 @@ export const createMatchServer = (opts: {
             ledger, pin,
           ]))
           .digest('hex');
-        void persistence.saveLedger({
+        const store = persistence; // narrowed for the closure: archive() runs later
+        if (!store?.saveLedger) return;
+        void store.saveLedger({
           matchId: m.id,
           ledger,
           pin,
@@ -1238,7 +1250,11 @@ export const createMatchServer = (opts: {
       } catch (e) {
         console.log(`[match ${m.id}] ledger encode failed: ${String(e)}`);
       }
-    }
+    };
+    // Mesh-placed: give both players a moment to answer `result` with their
+    // ledger signatures so the pin archives them. Nothing waits on this — a
+    // signature that never comes archives the ledger as relay-attested.
+    if (persistence?.saveLedger && (m.mode === 'wager' || meshPlaced)) setTimeout(archive, meshPlaced ? 3000 : 0);
 
     if (process.env.AF_DEBUG_LEDGER) {
       // Forensics: dump the canonical ledger for offline diffing (sync — the
@@ -2151,6 +2167,14 @@ export const createMatchServer = (opts: {
         c.rtt = c.rtt < 0 ? sample : Math.round(c.rtt * 0.7 + sample * 0.3);
         return;
       }
+      case 'sign': {
+        // litnode: the player's signature over the mesh ledger body the server
+        // named in `result` (produced by the cabinet shell). Kept on the client
+        // record; the delayed archival copies it into the ledger pin.
+        const sig = typeof (msg as { sig?: unknown }).sig === 'string' && /^[0-9a-f]{128}$/i.test((msg as { sig: string }).sig) ? (msg as { sig: string }).sig.toLowerCase() : '';
+        if (sig && c.playerKey) c.ledgerSig = sig;
+        return;
+      }
       case 'over': {
         const m = c.match;
         if (!m || m.finished) return;
@@ -3061,6 +3085,7 @@ export const createMatchServer = (opts: {
       account: null,
       email: '',
       playerKey: '',
+      ledgerSig: '',
       room: '',
       rtt: -1,
     };

@@ -313,6 +313,12 @@ let pendingRoom = ''; // ?room= from a challenge link, waiting on sign-in
 /** ?player= from the LIT GAMES cabinet: the litnode key this match was placed
  *  under. Sent in hello, pinned into the ledger by the server. In-memory only. */
 let meshPlayerKey = '';
+// litnode (protocol 3): the mesh match and build this client was launched for
+// (?match= ?build= from the cabinet). At `result` the client asks the cabinet
+// shell to sign the ledger body and forwards the signature to the relay.
+let meshMatchId = '';
+let meshBuildHash = '';
+let meshSignAsked = false;
 // The select screen is shared by wager and friendly (both PvP, one fighter to
 // pick). This flag tells its lock handler which to queue — set true only for
 // the friendly path, reset false on every normal (wager/cpu) select entry.
@@ -1415,6 +1421,17 @@ const applyBootDeepLink = (): void => {
   }
   const playerQ = q.get('player');
   if (playerQ && /^[0-9a-f]{64}$/i.test(playerQ)) meshPlayerKey = playerQ.toLowerCase();
+  const matchQ = q.get('match');
+  if (matchQ && /^[0-9a-f]{64}$/i.test(matchQ)) meshMatchId = matchQ.toLowerCase();
+  const buildQ = q.get('build');
+  if (buildQ && /^[0-9a-f]{64}$/i.test(buildQ)) meshBuildHash = buildQ.toLowerCase();
+  // The cabinet shell answers a `cabinet:sign` request with the player's
+  // signature; the key itself never enters this page.
+  window.addEventListener('message', (e: MessageEvent) => {
+    const d = e.data as { type?: string; matchId?: string; sig?: string } | null;
+    if (!d || d.type !== 'cabinet:signed' || !meshMatchId || d.matchId !== meshMatchId) return;
+    if (typeof d.sig === 'string' && net && 'signLedger' in net) (net as { signLedger: (s: string) => void }).signLedger(d.sig);
+  });
 
   // Dare-vs-agent (?agent=1 riding a ?ref= dare link): after the sign-in
   // gate, the title auto-routes into a solo match vs the SENDER's trained
@@ -3613,6 +3630,13 @@ const frame = (steps = 1): void => {
       fx.announce = '';
       fx.comboOwner = -1;
       resultsAge = 0;
+      // Mesh-placed: ask the cabinet shell (parent window) to sign the ledger
+      // body the relay named. Once per match; the answer arrives as
+      // `cabinet:signed` and goes to the relay as CSign.
+      if (!meshSignAsked && net.result.ledger && meshMatchId && window.parent !== window) {
+        meshSignAsked = true;
+        window.parent.postMessage({ type: 'cabinet:sign', body: { matchId: meshMatchId, ticks: net.result.ledger.ticks, head: net.result.ledger.head, buildHash: meshBuildHash || null } }, '*');
+      }
       const lostIt = net.result.winner === 1 - localSide() || net.result.winner === -1;
       if (arcade) {
         if (net.result.reason === 'incomplete' && !arcade.practice) {

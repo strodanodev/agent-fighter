@@ -114,6 +114,8 @@ export interface NetResult {
   endTick: number;
   hash: number;
   deviator?: 0 | 1;
+  /** Mesh-placed matches: the litnode ledger commitment to sign (SResult.ledger). */
+  ledger?: { head: string; ticks: number };
 }
 
 export type NetStatus = 'connecting' | 'queued' | 'playing' | 'reconnecting' | 'done' | 'error';
@@ -306,6 +308,11 @@ export class NetSession {
 
   private stopPing(): void {
     if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+  }
+
+  /** litnode (protocol 3): forward the cabinet shell's ledger signature to the relay. */
+  signLedger(sig: string): void {
+    if (/^[0-9a-f]{128}$/i.test(sig)) this.send({ t: 'sign', sig: sig.toLowerCase() });
   }
 
   private send(msg: unknown): void {

@@ -245,7 +245,16 @@ export interface CPong { t: 'pong'; ts: number }
  * setup — only its owner ever received it, so possession IS authorization.
  */
 export interface CResume { t: 'resume'; matchId: string; token: string }
-export type ClientMsg = CHello | CQueue | CInput | CHash | COver | CResume | CPing | CPong;
+/**
+ * litnode (protocol 3): the player's Ed25519 signature over the mesh ledger
+ * body `{matchId, ticks, head, buildHash}` that SResult.ledger named,
+ * produced by the LIT GAMES cabinet shell (the key never enters this client).
+ * Archived into the ledger pin; a mesh node holding both signatures settles
+ * the result as 'players' provenance instead of 'relay'. Additive: a server
+ * that does not know it ignores it, a client that never sends it loses nothing.
+ */
+export interface CSign { t: 'sign'; sig: string }
+export type ClientMsg = CHello | CQueue | CInput | CHash | COver | CResume | CPing | CPong | CSign;
 
 // ---- server → client
 export interface SWelcome { t: 'welcome'; id: string; engine: string }
@@ -375,6 +384,13 @@ export interface SResult {
   endTick: number;
   hash: number; // server re-sim final stateHash (0 for forfeit)
   deviator?: 0 | 1; // side whose reported hashes diverged from the re-sim
+  /**
+   * Mesh-placed matches (a `LIT-` room) only: the litnode ledger commitment
+   * over the archived input tracks — the head a mesh node rebuilds and the
+   * tick count it covers. What each player signs (CSign) together with the
+   * mesh match id and build the cabinet launched them with.
+   */
+  ledger?: { head: string; ticks: number };
 }
 export interface SError { t: 'error'; msg: string; code?: 'credits' | 'auth' }
 /**
