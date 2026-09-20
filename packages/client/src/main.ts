@@ -18,7 +18,7 @@ import {
 } from './progress.js';
 import type { Profile } from './progress.js';
 import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './atlas.js';
-import { cachedRelay, refreshRelay } from './mesh.js';
+import { cachedRelay, refreshRelay, relayFailed } from './mesh.js';
 import { drawPet, loadMatchPets, loadPet } from './pets.js';
 import type { LoadedPet } from './pets.js';
 import type { Roster } from './atlas.js';
@@ -1508,11 +1508,16 @@ const resetMatchFx = (g: GameState): void => {
  * 'friendly' = private challenge (v5): PvP paired by `friendlyRoom` instead
  *   of the public queue. FREE and UNRANKED — verified winner, nothing else.
  */
+/** The last startOnline() arguments, so a relay re-resolve can retry the
+ *  same queue; and when the last automatic retry happened (one per minute). */
+let lastOnlineArgs: ['solo' | 'wager' | 'arcade' | 'friendly', string | undefined, string | undefined, number | undefined] | null = null;
+let relayRetryAt = 0;
 const startOnline = (
   m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: string, agentOf?: string,
   /** ARCADE v2: the board node being moved to — the move IS the queue. */
   arcadeNode?: number,
 ): void => {
+  lastOnlineArgs = [m, runToken, agentOf, arcadeNode];
   const roster = allRosters[picks[0]]!;
   lastFighter = roster.id;
   safeSetItem(LAST_FIGHTER_KEY, lastFighter); // powers title quick play
@@ -3316,6 +3321,19 @@ const frame = (steps = 1): void => {
     const arcadeQ = queuedMode === 'arcade';
     const friendlyQ = queuedMode === 'friendly';
     const failed = net?.status === 'error';
+    // The mesh-announced relay refused us: its node may have restarted onto a
+    // new tunnel hostname. Re-read the directory once and, if it names a
+    // different relay, queue again there by ourselves — the player sees a
+    // longer CONNECTING, not OFFLINE. (?ws= and dev boxes are left alone.)
+    if (failed && net?.error === 'connection failed' && location.protocol === 'https:' && !new URLSearchParams(location.search).get('ws')
+      && lastOnlineArgs && Date.now() - relayRetryAt > 60_000) {
+      relayRetryAt = Date.now();
+      const before = matchWsUrl();
+      const args = lastOnlineArgs;
+      void relayFailed().then((addr) => {
+        if (addr && addr !== before && screen === 'online' && net?.status === 'error') { net = null; startOnline(...args); }
+      });
+    }
     const soloOpp = solo ? resolveAgentOpp() : null;
     const soloCall = soloOpp
       ? `CALLING ${soloOpp.name.toUpperCase()}${dots}`

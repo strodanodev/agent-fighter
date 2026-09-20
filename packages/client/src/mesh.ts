@@ -26,7 +26,9 @@ const NODE_DIRECTORY = '0x278e4550F8a45B5D7d630a606d577F9Fb6cBE4c1';
 const NODE_STAKE = '0x53822d9a334082e88AB70103F58AD65eBEF73801';
 const SEL = { keys: '0x307540f6', entryOf: '0x82fb8643', standingOf: '0x43aa9ad3' } as const;
 const CACHE_KEY = 'af.mesh-relay';
-const CACHE_MS = 10 * 60_000;
+// Short: a node behind a quick tunnel gets a new hostname on every restart,
+// and a client holding the old one for ten minutes saw 'server offline'.
+const CACHE_MS = 2 * 60_000;
 /** An entry older than this is a node that stopped announcing (litnode FRESH_S). */
 const FRESH_S = 7 * 24 * 3600;
 
@@ -80,6 +82,14 @@ export async function discoverRelay(): Promise<string | null> {
   const wsAddr = found[0]?.wsAddr ?? null;
   try { if (wsAddr) localStorage.setItem(CACHE_KEY, JSON.stringify({ wsAddr, at: Date.now() } satisfies Cached)); } catch { /* private mode */ }
   return wsAddr;
+}
+
+/** The cached relay refused a connection: forget it and read the directory
+ *  again, now. Returns the relay the mesh names now (may be the same one:
+ *  then the relay itself is down, not merely moved). */
+export async function relayFailed(): Promise<string | null> {
+  try { localStorage.removeItem(CACHE_KEY); } catch { /* private mode */ }
+  try { return await discoverRelay(); } catch { return null; }
 }
 
 /** Refresh in the background; returns immediately. Call once at boot. */
