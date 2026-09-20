@@ -19,8 +19,11 @@
  * at boot. `?ws=` still overrides everything.
  */
 const RPC = 'https://liteforge.rpc.caldera.xyz/http';
-const NODE_DIRECTORY = '0xf63AA4590fDCa66fD9FA3005C588E9deb09767b4';
-const NODE_STAKE = '0x11C984bE3ee572eb7280334501B57c82001F397F';
+// The v2 set (litnode contracts/deployed.testnet.json, 19 Sep 2026). The v1
+// directory at 0xf63AA459… is retired: nodes announce only here, so a client
+// reading v1 resolves a relay hostname that no longer exists ('server offline').
+const NODE_DIRECTORY = '0x278e4550F8a45B5D7d630a606d577F9Fb6cBE4c1';
+const NODE_STAKE = '0x53822d9a334082e88AB70103F58AD65eBEF73801';
 const SEL = { keys: '0x307540f6', entryOf: '0x82fb8643', standingOf: '0x43aa9ad3' } as const;
 const CACHE_KEY = 'af.mesh-relay';
 const CACHE_MS = 10 * 60_000;
