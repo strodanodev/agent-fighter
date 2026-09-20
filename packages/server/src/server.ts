@@ -1221,6 +1221,7 @@ export const createMatchServer = (opts: {
             hash: result.hash, deviator: result.deviator ?? null,
           },
         };
+        if (meshPlaced) console.log(`[match ${m.id}] archiving mesh ledger with ${Object.keys(pin.signatures).length}/2 player signatures`);
         const ledger = encodeLedger([m.inputs[0], m.inputs[1]]);
         // Canonical digest — hashed over CANONICAL json (sorted keys), not
         // JSON.stringify. The pin is stored as Postgres jsonb, which does not
@@ -2172,7 +2173,7 @@ export const createMatchServer = (opts: {
         // named in `result` (produced by the cabinet shell). Kept on the client
         // record; the delayed archival copies it into the ledger pin.
         const sig = typeof (msg as { sig?: unknown }).sig === 'string' && /^[0-9a-f]{128}$/i.test((msg as { sig: string }).sig) ? (msg as { sig: string }).sig.toLowerCase() : '';
-        if (sig && c.playerKey) c.ledgerSig = sig;
+        if (sig && c.playerKey) { c.ledgerSig = sig; if (c.match) console.log(`[match ${c.match.id}] ledger signature from side ${c.side}`); }
         return;
       }
       case 'over': {

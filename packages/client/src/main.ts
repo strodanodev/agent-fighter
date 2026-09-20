@@ -1533,6 +1533,7 @@ const startOnline = (
     // zero added latency; the server re-derives the AI to verify. Wager and
     // friendly: rollback PvP over the relay. `agentOf` (ADR 0006) swaps the
     // solo house AI for the trained agent behind a dare code.
+    meshSignAsked = false; // a new session: its own result gets its own signature
     net = m === 'wager' || m === 'friendly'
       ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(),
         m === 'friendly' ? friendlyRoom : undefined, meshPlayerKey || undefined)
@@ -3630,13 +3631,6 @@ const frame = (steps = 1): void => {
       fx.announce = '';
       fx.comboOwner = -1;
       resultsAge = 0;
-      // Mesh-placed: ask the cabinet shell (parent window) to sign the ledger
-      // body the relay named. Once per match; the answer arrives as
-      // `cabinet:signed` and goes to the relay as CSign.
-      if (!meshSignAsked && net.result.ledger && meshMatchId && window.parent !== window) {
-        meshSignAsked = true;
-        window.parent.postMessage({ type: 'cabinet:sign', body: { matchId: meshMatchId, ticks: net.result.ledger.ticks, head: net.result.ledger.head, buildHash: meshBuildHash || null } }, '*');
-      }
       const lostIt = net.result.winner === 1 - localSide() || net.result.winner === -1;
       if (arcade) {
         if (net.result.reason === 'incomplete' && !arcade.practice) {
@@ -4012,7 +4006,20 @@ const drawPerf = (): void => {
   ctx.restore();
 };
 
+/** Mesh-placed match (launched by the LIT GAMES cabinet with ?match=): once
+ *  the relay's `result` names the ledger head, ask the cabinet shell (the
+ *  parent window) to sign it. The answer arrives as `cabinet:signed` and goes
+ *  to the relay as CSign. Checked every frame, whatever phase the local sim is
+ *  in — the first version only asked on the "server settled under a live
+ *  fight" path, so a match that ended normally was never signed. */
+const askMeshSign = (): void => {
+  if (meshSignAsked || !net?.result?.ledger || !meshMatchId || window.parent === window) return;
+  meshSignAsked = true;
+  window.parent.postMessage({ type: 'cabinet:sign', body: { matchId: meshMatchId, ticks: net.result.ledger.ticks, head: net.result.ledger.head, buildHash: meshBuildHash || null } }, '*');
+};
+
 const loop = (now: number): void => {
+  askMeshSign();
   const rafDt = now - last;
   acc = Math.min(acc + rafDt, 200); // tab-switch guard
   last = now;
