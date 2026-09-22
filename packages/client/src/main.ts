@@ -18,7 +18,7 @@ import {
 } from './progress.js';
 import type { Profile } from './progress.js';
 import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './atlas.js';
-import { cachedRelay, refreshRelay, relayFailed } from './mesh.js';
+import { cachedRelay, refreshRelay, relayFailed, useCabinetContracts } from './mesh.js';
 import { drawPet, loadMatchPets, loadPet } from './pets.js';
 import type { LoadedPet } from './pets.js';
 import type { Roster } from './atlas.js';
@@ -1437,7 +1437,10 @@ const applyBootDeepLink = (): void => {
   // The cabinet shell answers a `cabinet:sign` request with the player's
   // signature; the key itself never enters this page.
   window.addEventListener('message', (e: MessageEvent) => {
-    const d = e.data as { type?: string; matchId?: string; sig?: string } | null;
+    const d = e.data as { type?: string; matchId?: string; sig?: string; chain?: unknown } | null;
+    // The shell's cabinet:init carries the CURRENT litVM contract set (cabinet/contracts.json): relay
+    // discovery reads it ahead of the arcade's copy and the baked pair (mesh.ts).
+    if (d?.type === 'cabinet:init' && d.chain) { useCabinetContracts(d.chain); return; }
     if (!d || d.type !== 'cabinet:signed' || !meshMatchId || d.matchId !== meshMatchId) return;
     if (typeof d.sig === 'string' && net && 'signLedger' in net) (net as { signLedger: (s: string) => void }).signLedger(d.sig);
   });
