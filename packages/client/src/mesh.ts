@@ -19,11 +19,14 @@
  * at boot. `?ws=` still overrides everything.
  */
 const RPC = 'https://liteforge.rpc.caldera.xyz/http';
-// The v2 set (litnode contracts/deployed.testnet.json, 19 Sep 2026). The v1
-// directory at 0xf63AA459… is retired: nodes announce only here, so a client
-// reading v1 resolves a relay hostname that no longer exists ('server offline').
-const NODE_DIRECTORY = '0x278e4550F8a45B5D7d630a606d577F9Fb6cBE4c1';
-const NODE_STAKE = '0x53822d9a334082e88AB70103F58AD65eBEF73801';
+// The generation-3 set (litnode contracts/deployed.testnet.json, 21 Sep 2026).
+// Nodes announce only on the CURRENT generation's directory: v1 (0xf63AA459…)
+// and v2 (0x278e4550…) are retired, and a client still reading v2 resolved the
+// desktop's relay hostname from 20 Sep — a quick tunnel dead for two days —
+// and showed SERVER OFFLINE on every launch the cabinet did not hand a ?ws=
+// to (22 Sep 2026). When litnode moves to generation 4, this moves with it.
+const NODE_DIRECTORY = '0xac0C73008028E3eAA05Bc5C72f0C233F94b4E3df';
+const NODE_STAKE = '0x3CFe2D006d946A1E0E5Cf6B3E0958aFc3fF73717';
 const SEL = { keys: '0x307540f6', entryOf: '0x82fb8643', standingOf: '0x43aa9ad3' } as const;
 const CACHE_KEY = 'af.mesh-relay';
 // Short: a node behind a quick tunnel gets a new hostname on every restart,
