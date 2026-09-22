@@ -13,6 +13,17 @@
  * The partner id is a PUBLIC client identifier (like a Firebase app id) —
  * committing it is fine; the secretless client can do nothing privileged
  * with it. Override with ?partner= / ?airenv= for other environments.
+ *
+ * Universal login: framed by the litVM arcade (arcade.litvm.games), the
+ * client does NOT load AIR Kit. The arcade already holds the player's AIR
+ * session, and lends it over postMessage (litnode cabinet/app.js):
+ *   game → arcade  { type:'cabinet:air', id, token?:true } · { type:'cabinet:air-login', id } · { type:'cabinet:air-logout', id }
+ *   arcade → game  { type:'cabinet:air', re?, signedIn, user:{id,email,address,name}|null, token?, error? }
+ * Sign in inside the arcade opens the ARCADE's dialog; the token is the
+ * arcade partner's (same AIR developer account → the same `sub`, so the same
+ * progression rows). On agentfighter.wtf itself nothing changes. When the
+ * arcade does not answer (an older arcade build) the client falls back to
+ * its own AIR Kit, as before.
  */
 
 interface AirLoginLite {
@@ -52,6 +63,81 @@ export interface AuthState {
 }
 
 export const auth: AuthState = { status: 'out', id: '', address: '', email: '', token: '', error: '' };
+
+// ── universal login: the arcade's session, when the arcade frames us ─────────
+const ARCADE_AUTH_ORIGINS = ['https://arcade.litvm.games', 'https://litvm.games', 'https://www.litvm.games'];
+const ARCADE_AUTH_PROBE_MS = 8000;
+const ARCADE_AUTH_TOKEN_MS = 15_000;
+const ARCADE_AUTH_LOGIN_MS = 10 * 60_000; // a person choosing an account, typing an email code
+
+interface ArcadeAirMsg {
+  type: 'cabinet:air';
+  re?: string | null;
+  signedIn?: boolean;
+  user?: { id?: string | null; email?: string | null; address?: string | null } | null;
+  token?: string | null;
+  error?: string;
+}
+
+/** The arcade origin framing this page, else null. ancestorOrigins names the
+ *  parent exactly (Chromium, Safari); Firefox falls back to the referrer. A
+ *  wrong guess is harmless: nothing posted to it reaches another origin, and
+ *  replies are checked against it. ?arcade= adds one (a local arcade). */
+const arcadeAuthOrigin = (): string | null => {
+  if (window.parent === window) return null;
+  const extra = new URLSearchParams(location.search).get('arcade');
+  const allowed = new Set([...ARCADE_AUTH_ORIGINS, ...(extra ? [extra] : [])]);
+  const anc = (location as Location & { ancestorOrigins?: DOMStringList }).ancestorOrigins;
+  let parent: string | null = null;
+  if (anc) parent = anc.length > 0 ? anc[0]! : null;
+  else { try { parent = document.referrer ? new URL(document.referrer).origin : null; } catch { parent = null; } }
+  return parent && allowed.has(parent) ? parent : null;
+};
+
+const arcadeAuth = { origin: null as string | null, on: false, seq: 0, pending: new Map<string, (m: ArcadeAirMsg) => void>() };
+let arcadeAuthReady: Promise<boolean> | null = null;
+
+const arcadeApply = (m: ArcadeAirMsg): void => {
+  if (m.signedIn && m.user?.id) {
+    auth.status = 'in';
+    auth.id = m.user.id;
+    auth.email = m.user.email ?? '';
+    auth.address = m.user.address ?? '';
+    auth.error = '';
+  } else if (auth.status !== 'busy') {
+    auth.status = 'out';
+    auth.id = ''; auth.address = ''; auth.email = ''; auth.token = '';
+  }
+};
+
+const arcadeAsk = (type: string, ms: number, extra: Record<string, unknown> = {}): Promise<ArcadeAirMsg | null> =>
+  new Promise((resolve) => {
+    const id = `af-${Date.now().toString(36)}-${++arcadeAuth.seq}`;
+    const timer = setTimeout(() => { arcadeAuth.pending.delete(id); resolve(null); }, ms);
+    arcadeAuth.pending.set(id, (m) => { clearTimeout(timer); resolve(m); });
+    window.parent.postMessage({ type, id, ...extra }, arcadeAuth.origin!);
+  });
+
+/** Decided once: is the arcade lending us its sign-in? */
+const arcadeAuthStart = (): Promise<boolean> => {
+  arcadeAuthReady ??= (async () => {
+    arcadeAuth.origin = arcadeAuthOrigin();
+    if (!arcadeAuth.origin) return false;
+    window.addEventListener('message', (e: MessageEvent) => {
+      if (e.source !== window.parent || e.origin !== arcadeAuth.origin) return;
+      const m = e.data as ArcadeAirMsg | null;
+      if (!m || m.type !== 'cabinet:air') return;
+      const answer = m.re ? arcadeAuth.pending.get(m.re) : undefined;
+      if (m.re && answer) { arcadeAuth.pending.delete(m.re); answer(m); }
+      if (arcadeAuth.on || answer) arcadeApply(m);
+    });
+    const first = await arcadeAsk('cabinet:air', ARCADE_AUTH_PROBE_MS);
+    arcadeAuth.on = !!first;
+    if (!first) console.warn(`[auth] framed by ${arcadeAuth.origin}, which did not answer; using AIR Kit here`);
+    return arcadeAuth.on;
+  })();
+  return arcadeAuthReady;
+};
 
 let service: AirServiceLite | null = null;
 let sdkLoading: Promise<void> | null = null;
@@ -97,6 +183,7 @@ const ensureService = async (): Promise<AirServiceLite> => {
 
 /** Silent boot probe: restores a previous session without any UI. */
 export const authRehydrate = async (): Promise<void> => {
+  if (await arcadeAuthStart()) return; // the arcade's session (applied as it answers)
   try { await ensureService(); } catch { /* SDK missing/offline — stay out */ }
 };
 
@@ -105,6 +192,13 @@ export const authLogin = async (): Promise<void> => {
   if (auth.status === 'busy' || auth.status === 'in') return;
   auth.status = 'busy';
   auth.error = '';
+  if (await arcadeAuthStart()) {
+    // The arcade opens ITS dialog: the click that got us here lends it the gesture.
+    const r = await arcadeAsk('cabinet:air-login', ARCADE_AUTH_LOGIN_MS);
+    if (r) arcadeApply(r); // 'in' when it worked; a cancel leaves us busy
+    if ((auth.status as AuthStatus) === 'busy') { auth.status = 'out'; auth.error = r?.error ?? ''; }
+    return;
+  }
   try {
     const svc = await ensureService();
     // ensureService may already have rehydrated us into 'in'.
@@ -119,6 +213,7 @@ export const authLogin = async (): Promise<void> => {
 };
 
 export const authLogout = async (): Promise<void> => {
+  if (arcadeAuth.on) await arcadeAsk('cabinet:air-logout', ARCADE_AUTH_TOKEN_MS); // one session: the arcade signs out too
   try { await service?.logout(); } catch { /* session already gone */ }
   auth.status = 'out';
   auth.id = ''; auth.address = ''; auth.email = ''; auth.token = '';
@@ -126,6 +221,11 @@ export const authLogout = async (): Promise<void> => {
 
 /** A fresh session token (they expire) — call right before connecting. */
 export const authToken = async (): Promise<string | undefined> => {
+  if (arcadeAuth.on) {
+    const r = await arcadeAsk('cabinet:air', ARCADE_AUTH_TOKEN_MS, { token: true });
+    if (r?.signedIn && typeof r.token === 'string' && r.token) { auth.token = r.token; return r.token; }
+    return undefined;
+  }
   if (auth.status !== 'in' || !service) return undefined;
   try {
     const { token } = await service.getAccessToken();
