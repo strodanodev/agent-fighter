@@ -319,6 +319,14 @@ let meshPlayerKey = '';
 let meshMatchId = '';
 let meshBuildHash = '';
 let meshSignAsked = false;
+/** The room the cabinet placed this page for (?room=LIT-<matchId> with ?match=). A cabinet launch is ONE placed
+ *  match: every PvP entry in this page — the RANKED row, the select lock, the rematch — goes to this room, never to
+ *  the server's wager queue. Two players launched for a placed match and pressed RANKED in-game on 21 Sep 2026;
+ *  the relay matchmade them into a fresh wager room (mmu9ze8aw9438-…) that no node had placed, so the mesh settled
+ *  it "relay · unplaced" and the placed match was never played. Once the placed match has a result the page is
+ *  done: the next ranked match is placed by the cabinet, not queued here. */
+let meshRoom = '';
+let meshPlayed = false;
 // The select screen is shared by wager and friendly (both PvP, one fighter to
 // pick). This flag tells its lock handler which to queue — set true only for
 // the friendly path, reset false on every normal (wager/cpu) select entry.
@@ -1423,6 +1431,7 @@ const applyBootDeepLink = (): void => {
   if (playerQ && /^[0-9a-f]{64}$/i.test(playerQ)) meshPlayerKey = playerQ.toLowerCase();
   const matchQ = q.get('match');
   if (matchQ && /^[0-9a-f]{64}$/i.test(matchQ)) meshMatchId = matchQ.toLowerCase();
+  if (meshMatchId && pendingRoom.startsWith('LIT-')) meshRoom = pendingRoom;
   const buildQ = q.get('build');
   if (buildQ && /^[0-9a-f]{64}$/i.test(buildQ)) meshBuildHash = buildQ.toLowerCase();
   // The cabinet shell answers a `cabinet:sign` request with the player's
@@ -2592,6 +2601,11 @@ const tickSelect = (): void => {
         // "change fighter" is bounced to sign-in rather than queued unpaid.
         locked = [false, false];
         void authLogin();
+      } else if (meshRoom) {
+        // "change fighter" inside a cabinet launch: still the placed room
+        if (meshPlayed) { locked = [false, false]; screen = 'title'; showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE'); return; }
+        friendlyRoom = meshRoom;
+        startOnline('friendly');
       } else startOnline('wager');
     }
     return;
@@ -2750,6 +2764,8 @@ const frame = (steps = 1): void => {
       // fired in-gesture from the pointerdown handler; this covers desktop
       // Enter and any keyboard fall-through — authLogin() no-ops if already busy.)
       if (mode === 'online' && !isSignedIn()) { void authLogin(); return; }
+      // A cabinet launch: RANKED is the placed room, never the wager queue.
+      if (mode === 'online' && meshRoom) { if (meshPlayed) { showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE'); return; } startFriendly(meshRoom); return; }
       // AGENT ARCADE (ADR 0007 credits rework): a SIGNED-IN player pays the
       // 1-credit entry BEFORE character select (when the live economy is
       // reachable). GUESTS skip straight to select → the run starts locally,
@@ -3355,7 +3371,7 @@ const frame = (steps = 1): void => {
     ctx.fillText(arcadeQ
       ? 'RANKED GAUNTLET · 1 CREDIT PER RUN · EXTRACT THE BAG ALIVE'
       : friendlyQ
-        ? `FRIENDLY · FREE · UNRANKED · ROOM ${friendlyRoom}`
+        ? (meshRoom && friendlyRoom === meshRoom ? `RANKED · PLACED BY THE MESH · ROOM ${friendlyRoom}` : `FRIENDLY · FREE · UNRANKED · ROOM ${friendlyRoom}`)
         : solo
           ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
           : 'RANKED PVP · 10 CR ENTRY EACH · BOTH BURN · WINNER TAKES A 🎟 TICKET', VW / 2, VH / 2 - 4);
@@ -3793,7 +3809,7 @@ const frame = (steps = 1): void => {
           : arcade.bag.credits > 0 ? `CARRYING ${arcade.bag.credits} CR — UNBANKED` : 'ROUTE CLEARED'}`
           + '        TAP / ENTER: BACK TO THE MAP        ESC: QUIT')
         : net
-          ? `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : queuedMode === 'friendly' ? 'FREE' : '10 CR'}        ESC: CHANGE FIGHTER`
+          ? meshRoom ? 'TAP / ENTER: BACK TO THE ARCADE        ESC: TITLE' : `TAP / ENTER: REMATCH · ${queuedMode === 'solo' ? '1 CR' : queuedMode === 'friendly' ? 'FREE' : '10 CR'}        ESC: CHANGE FIGHTER`
           : undefined,
       canDare, net?.result?.winner);
     // Online: the server's verdict is the real result (ADR 0003).
@@ -3826,6 +3842,12 @@ const frame = (steps = 1): void => {
     } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
       if (arcade) {
         endArcade(); // quitting the gauntlet → title, never the select screen
+      } else if (meshRoom) {
+        meshPlayed = meshPlayed || !!net?.result; // a placed match that reached a result is played; leaving mid-fight is not
+        net?.close();
+        net = null;
+        selectingFriendly = false;
+        screen = 'title';
       } else if (queuedMode === 'friendly') {
         // Friendly done → back to the invite screen (a wager-mode select here
         // would be an accidental 10-credit queue). Rematch is still ENTER.
@@ -3848,6 +3870,14 @@ const frame = (steps = 1): void => {
         net = null;
         enterMap();
         if (!arcade.practice) refreshArcadeRun();
+      } else if (net && meshRoom) {
+        // A cabinet launch played its placed match: a rematch here would be a room no node placed. Hand back.
+        meshPlayed = true;
+        net.close();
+        net = null;
+        screen = 'title';
+        showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE');
+        if (window.parent !== window) window.parent.postMessage({ type: 'cabinet:played', matchId: meshMatchId }, '*');
       } else if (net) {
         // INSTANT REMATCH (P0): one input → straight back into the queue
         // with the same fighter and mode. No select detour, no re-confirm.
@@ -4031,6 +4061,7 @@ const drawPerf = (): void => {
  *  in — the first version only asked on the "server settled under a live
  *  fight" path, so a match that ended normally was never signed. */
 const askMeshSign = (): void => {
+  if (meshRoom && net?.result && queuedMode === 'friendly') meshPlayed = true;
   if (meshSignAsked || !net?.result?.ledger || !meshMatchId || window.parent === window) return;
   meshSignAsked = true;
   window.parent.postMessage({ type: 'cabinet:sign', body: { matchId: meshMatchId, ticks: net.result.ledger.ticks, head: net.result.ledger.head, buildHash: meshBuildHash || null } }, '*');
