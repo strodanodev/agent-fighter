@@ -101,8 +101,9 @@ for (const rel of ORDER) {
     .replace(/^import\s[^;]*;\s*$/gm, '')
     .replace(/^export\s*\{[^}]*\}\s*(from\s*[^;]*)?;\s*$/gm, '')
     .replace(/^export\s+/gm, '');
-  // Loud collision guard.
-  for (const m of src.matchAll(/^(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)/gm)) {
+  // Loud collision guard. `async function` is a definition too: `export async function relayFailed`
+  // (mesh.ts, 1125829) was imported by main and read as undefined here — the Vercel build failed on it for a day.
+  for (const m of src.matchAll(/^(?:const|let|var|(?:async\s+)?function|class)\s+([A-Za-z_$][\w$]*)/gm)) {
     const name = m[1];
     if (seen.has(name)) throw new Error(`Top-level name collision: ${name} in ${rel} and ${seen.get(name)}`);
     seen.set(name, rel);
