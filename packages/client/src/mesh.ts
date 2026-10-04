@@ -178,6 +178,25 @@ export async function relayFailed(): Promise<string | null> {
   try { return await discoverRelay(); } catch { return null; }
 }
 
+/**
+ * Is any publisher relay answering? Wagers escrow credits in the publisher's database, so they run only on the
+ * publisher's relays and pause while none answers (MVP decision, 5 Oct 2026: wagers stay off-chain). Ranked and
+ * casual play in the arcade do not depend on this. Probed at most every PUBLISHER_MS; a failed probe counts as
+ * down, since the wager would connect to the same host.
+ */
+const PUBLISHER_MS = 30_000;
+let publisherCheck: { at: number; up: boolean } | null = null;
+export async function publisherOnline(force = false): Promise<boolean> {
+  if (!force && publisherCheck && Date.now() - publisherCheck.at < PUBLISHER_MS) return publisherCheck.up;
+  await relayReady();
+  if (!publisherRelays().length) { try { await discoverRelay(); } catch { /* chain unreachable */ } }
+  const probes = await Promise.all(publisherRelays().map(probeRelay));
+  publisherCheck = { at: Date.now(), up: probes.includes('ok') };
+  return publisherCheck.up;
+}
+/** The last answer of publisherOnline(): true/false, or null before the first probe. Synchronous. */
+export const publisherUp = (): boolean | null => publisherCheck?.up ?? null;
+
 let inflight: Promise<unknown> | null = null;
 /** Refresh in the background; returns immediately. Call once at boot. */
 export function refreshRelay(): void {

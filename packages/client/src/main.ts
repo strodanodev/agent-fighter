@@ -18,7 +18,7 @@ import {
 } from './progress.js';
 import type { Profile } from './progress.js';
 import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './atlas.js';
-import { cachedRelay, isPublisherRelay, refreshRelay, relayFailed, relayReady, useCabinetContracts } from './mesh.js';
+import { cachedRelay, isPublisherRelay, publisherOnline, publisherUp, refreshRelay, relayFailed, relayReady, useCabinetContracts } from './mesh.js';
 import { drawPet, loadMatchPets, loadPet } from './pets.js';
 import type { LoadedPet } from './pets.js';
 import type { Roster } from './atlas.js';
@@ -449,6 +449,18 @@ const matchWsUrl = (): string => {
   return `ws://${location.hostname}:8477`;
 };
 if (location.protocol === 'https:') refreshRelay();
+/**
+ * Wagers escrow credits in the publisher's database, so they run only on the publisher's relays: with none
+ * answering they are PAUSED rather than queued into a relay that cannot take the entry (mesh.ts publisherOnline).
+ * A dev box and a ?ws= override are never paused. Re-probed every minute in the background.
+ */
+const wagerChecked = location.protocol === 'https:' && !new URLSearchParams(location.search).get('ws');
+const wagersPaused = (): boolean => wagerChecked && publisherUp() === false;
+const WAGERS_PAUSED = 'WAGERS PAUSED — THE PUBLISHER IS OFFLINE';
+if (wagerChecked) {
+  void publisherOnline().catch(() => {});
+  setInterval(() => { void publisherOnline().catch(() => {}); }, 60_000);
+}
 const matchHttpUrl = (): string => matchWsUrl().replace(/^ws/, 'http');
 /**
  * The player's AIR token, for the relay this page talks to, only when that relay is one the publisher runs
@@ -1622,6 +1634,8 @@ const resetMatchFx = (g: GameState): void => {
  *  same queue; and when the last automatic retry happened (one per minute). */
 let lastOnlineArgs: ['solo' | 'wager' | 'arcade' | 'friendly', string | undefined, string | undefined, number | undefined] | null = null;
 let relayRetryAt = 0;
+/** When a failed wager last re-probed the publisher's relays (once per 30 s). */
+let wagerProbeAt = 0;
 const startOnline = (
   m: 'solo' | 'wager' | 'arcade' | 'friendly', runToken?: string, agentOf?: string,
   /** ARCADE v2: the board node being moved to — the move IS the queue. */
@@ -2714,6 +2728,11 @@ const tickSelect = (): void => {
         if (meshPlayed) { locked = [false, false]; screen = 'title'; showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE'); return; }
         friendlyRoom = meshRoom;
         startOnline('friendly');
+      } else if (wagersPaused()) {
+        // The publisher went offline while this player was picking: nothing is escrowed yet.
+        locked = [false, false];
+        screen = 'title';
+        showToast(WAGERS_PAUSED);
       } else startOnline('wager');
     }
     return;
@@ -2874,6 +2893,8 @@ const frame = (steps = 1): void => {
       if (mode === 'online' && !isSignedIn() && !meshSeated()) { void authLogin(); return; }
       // A cabinet launch: RANKED is the placed room, never the wager queue.
       if (mode === 'online' && meshRoom) { if (meshPlayed) { showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE'); return; } startFriendly(meshRoom); return; }
+      // The wager queue needs the publisher's escrow: paused while no publisher relay answers (re-probed on press).
+      if (mode === 'online' && wagersPaused()) { showToast(WAGERS_PAUSED); void publisherOnline(true).catch(() => {}); return; }
       // AGENT ARCADE (ADR 0007 credits rework): a SIGNED-IN player pays the
       // 1-credit entry BEFORE character select (when the live economy is
       // reachable). GUESTS skip straight to select → the run starts locally,
@@ -3468,7 +3489,12 @@ const frame = (steps = 1): void => {
     const soloCall = soloOpp
       ? `CALLING ${soloOpp.name.toUpperCase()}${dots}`
       : `CALLING THE HOUSE AGENT${dots}`;
+    // A wager whose relay failed: if no publisher relay answers either, say why and what happens to the entry.
+    // The escrow sweep runs inside the publisher's relay (hourly, for entries over 30 min old), so a held
+    // entry comes back after a publisher relay is running again, not before.
+    if (failed && queuedMode === 'wager' && wagerChecked && Date.now() - wagerProbeAt > 30_000) { wagerProbeAt = Date.now(); void publisherOnline(true).catch(() => {}); }
     const msg = !net ? `CONNECTING${dots}` // token fetch in flight
+      : failed && queuedMode === 'wager' && wagersPaused() ? WAGERS_PAUSED
       : failed ? `OFFLINE: ${net.error}`
       : net.setup ? 'OPPONENT FOUND — STARTING'
       : net.status === 'queued'
@@ -3494,6 +3520,7 @@ const frame = (steps = 1): void => {
     ctx.fillText(failed
       ? (arcadeQ ? 'TAP / ENTER: PRACTICE GAUNTLET (no fee · no XP · no records)'
         : solo ? 'TAP / ENTER: FREE PRACTICE (no fee · no XP · no records)'
+        : queuedMode === 'wager' && wagersPaused() ? 'an entry already held is refunded within ~90 min of the publisher\'s return'
         : 'is the match server running?  npm run server')
       : friendlyQ
         ? 'challenge link copied — paste it to your friend, they must join while you wait  ·  ESC: cancel'
@@ -4000,7 +4027,8 @@ const frame = (steps = 1): void => {
         const againAgent = queuedAgentOf || undefined;
         net.close();
         net = null;
-        startOnline(again, undefined, againAgent);
+        if (again === 'wager' && wagersPaused()) { screen = 'title'; showToast(WAGERS_PAUSED); }
+        else startOnline(again, undefined, againAgent);
       } else {
         startFight();
       }
