@@ -38,6 +38,11 @@ console.log(`[gauntlet] agent-fighter match ${g.matchId.slice(0, 12)} (${g.place
 
 process.on('SIGTERM', () => exit(0));
 process.on('SIGINT', () => exit(0));
-// One match per process: a stray error must not end the match it is serving.
-process.on('unhandledRejection', (reason) => console.error('[gauntlet] unhandledRejection (kept alive):', reason));
-process.on('uncaughtException', (err) => console.error('[gauntlet] uncaughtException (kept alive):', err));
+// The node reads this process's output through pipes. A write error there means the node is gone, and a match
+// nobody can settle has no reason to go on: exit. Logging that error to the same dead pipe from the handlers
+// below would loop, and a node in that loop stopped reading request bodies (litnode, m16, 4 Oct 2026).
+const brokenOutput = (e: unknown): boolean => ['EPIPE', 'EOF', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_WRITE_AFTER_END'].includes((e as { code?: string })?.code ?? '');
+for (const s of [process.stdout, process.stderr]) s.on('error', () => process.exit(0));
+// One match per process: any other stray error must not end the match it is serving.
+process.on('unhandledRejection', (reason) => { if (brokenOutput(reason)) process.exit(0); console.error('[gauntlet] unhandledRejection (kept alive):', reason); });
+process.on('uncaughtException', (err) => { if (brokenOutput(err)) process.exit(0); console.error('[gauntlet] uncaughtException (kept alive):', err); });
