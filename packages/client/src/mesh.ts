@@ -7,8 +7,9 @@
  * github.com/strodanodev/litnode, docs/WALLET-IDENTITY.md and the
  * "decentralized bootstrap" notes). This module reads that list straight
  * from the chain: every announced node key, its entry (url, wsAddr,
- * updatedAt), and whether NodeStake still shows it bonded. The newest bonded
- * seed that advertises a relay is the match server.
+ * updatedAt), and whether NodeStake still shows it bonded. Of the bonded
+ * seeds that advertise a relay, the first in PREFERRED_RELAYS order whose
+ * /health answers `game: agent-fighter` is the match server.
  *
  * Read-only, no wallet, no library: three eth_call shapes and their ABI
  * decoding are inlined below (the selectors are keccak-derived in litnode's
@@ -61,6 +62,19 @@ const CACHE_KEY = 'af.mesh-relay';
 const CACHE_MS = 2 * 60_000;
 /** An entry older than this is a node that stopped announcing (litnode FRESH_S). */
 const FRESH_S = 7 * 24 * 3600;
+/**
+ * The order every client tries relays in. The relay is the matchmaker, so two
+ * players only meet when they pick the SAME one. "Newest announcement wins"
+ * followed whichever node last rotated its quick tunnel, and kept naming a
+ * machine that died without withdrawing its entry (the desktop, 27 Sep 2026).
+ * So: the desktop, then the m16 standby, then any other bonded relay (newest
+ * first) — and a relay counts only while its /health says agent-fighter.
+ */
+const PREFERRED_RELAYS = [
+  '5b703f1288765c0ca3734ab0625df161121ef45a9eabafaaae539be1add95151', // desktop
+  '50bb1da9d3dbd72f10c27bfbb709643e7fe6055ddc09879d7d2a8146055c2e05', // m16 standby
+];
+const HEALTH_MS = 6000;
 
 let id = 0;
 async function rpc(method: string, params: unknown[]): Promise<string> {
@@ -98,20 +112,36 @@ export function cachedRelay(): string | null {
   return c && Date.now() - c.at < CACHE_MS ? c.wsAddr : null;
 }
 
-/** Read NodeDirectory + NodeStake and cache the newest bonded relay. */
+/** 'ok' = an Agent Fighter relay answered; 'other' = some other title's server (never ours); 'down' = no answer. */
+async function probeRelay(wsAddr: string): Promise<'ok' | 'other' | 'down'> {
+  try {
+    const r = await fetch(new URL('/health', wsAddr.replace(/^wss:/, 'https:')), { signal: AbortSignal.timeout(HEALTH_MS), cache: 'no-store' });
+    if (!r.ok) return 'down';
+    const j = (await r.json()) as { game?: unknown };
+    return j.game === 'agent-fighter' ? 'ok' : 'other';
+  } catch { return 'down'; }
+}
+
+/** Read NodeDirectory + NodeStake and cache the first live relay in PREFERRED_RELAYS order. */
 export async function discoverRelay(): Promise<string | null> {
   await loadContracts();
   const { NODE_DIRECTORY, NODE_STAKE } = contracts;
   const keys = decodeKeys(await call(NODE_DIRECTORY, SEL.keys));
   const nowS = Math.floor(Date.now() / 1000);
-  const found: { wsAddr: string; updatedAt: number }[] = [];
+  const found: { nodeId: string; wsAddr: string; updatedAt: number }[] = [];
   await Promise.all(keys.map(async (k) => {
     const [entry, standing] = await Promise.all([call(NODE_DIRECTORY, SEL.entryOf + k), call(NODE_STAKE, SEL.standingOf + k)]);
     const e = decodeEntry(entry);
-    if (e.wsAddr && /^wss:\/\//.test(e.wsAddr) && nowS - e.updatedAt <= FRESH_S && decodeActive(standing)) found.push({ wsAddr: e.wsAddr, updatedAt: e.updatedAt });
+    if (e.wsAddr && /^wss:\/\//.test(e.wsAddr) && nowS - e.updatedAt <= FRESH_S && decodeActive(standing)) found.push({ nodeId: k.toLowerCase(), wsAddr: e.wsAddr, updatedAt: e.updatedAt });
   }));
-  found.sort((a, b) => b.updatedAt - a.updatedAt);
-  const wsAddr = found[0]?.wsAddr ?? null;
+  const rank = (nodeId: string): number => { const i = PREFERRED_RELAYS.indexOf(nodeId); return i < 0 ? PREFERRED_RELAYS.length : i; };
+  found.sort((a, b) => rank(a.nodeId) - rank(b.nodeId) || b.updatedAt - a.updatedAt);
+  // Probe them all at once, then take the first that answers in that order. When none answers
+  // (every relay down, or this network blocks the probe) fall back to the first that is not
+  // another title's, as before — the lobby's connect-failure path re-reads from here.
+  const probes = await Promise.all(found.map((f) => probeRelay(f.wsAddr)));
+  const pick = found[probes.indexOf('ok')] ?? found[probes.indexOf('down')];
+  const wsAddr = pick?.wsAddr ?? null;
   try { if (wsAddr) localStorage.setItem(CACHE_KEY, JSON.stringify({ wsAddr, at: Date.now() } satisfies Cached)); } catch { /* private mode */ }
   return wsAddr;
 }
