@@ -450,13 +450,17 @@ const matchWsUrl = (): string => {
 };
 if (location.protocol === 'https:') refreshRelay();
 /**
- * Wagers escrow credits in the publisher's database, so they run only on the publisher's relays: with none
- * answering they are PAUSED rather than queued into a relay that cannot take the entry (mesh.ts publisherOnline).
+ * The paid modes (wagers, AGENT ARCADE runs, dares vs a trained agent) spend credits in the publisher's database,
+ * so they run only on the publisher's relays (MVP decision, 5 Oct 2026: the economy stays off-chain). With none
+ * answering they are PAUSED rather than queued into a relay that cannot take the entry (mesh.ts publisherOnline);
+ * the arcade falls back to its free local practice run. Matches launched from the litVM arcade never pause.
  * A dev box and a ?ws= override are never paused. Re-probed every minute in the background.
  */
 const wagerChecked = location.protocol === 'https:' && !new URLSearchParams(location.search).get('ws');
-const wagersPaused = (): boolean => wagerChecked && publisherUp() === false;
+const publisherPaused = (): boolean => wagerChecked && publisherUp() === false;
 const WAGERS_PAUSED = 'WAGERS PAUSED — THE PUBLISHER IS OFFLINE';
+const DARES_PAUSED = 'AGENT DARES PAUSED — THE PUBLISHER IS OFFLINE';
+const ARCADE_PRACTICE = 'PUBLISHER OFFLINE — PRACTICE RUN: NO FEE, NO XP';
 if (wagerChecked) {
   void publisherOnline().catch(() => {});
   setInterval(() => { void publisherOnline().catch(() => {}); }, 60_000);
@@ -2056,6 +2060,9 @@ const arcadeGo = (nodeId: number): void => {
   if (!isLegalMove(run.board, run.at, nodeId)) return;
   const node = nodeById(run.board, nodeId);
   if (!node) return;
+  // A paid run lives in the publisher's database: with the publisher offline it waits on the board, saved
+  // (a fight or an extraction would both need it). Practice runs are local and never wait.
+  if (!run.practice && publisherPaused()) { mapToast = 'PUBLISHER OFFLINE · YOUR RUN IS SAVED'; mapToastAge = 0; void publisherOnline(true).catch(() => {}); return; }
   if (node.kind === 'exit') { arcadeExtract(node); return; }
   run.pending = nodeId;
   arcadeFightKind = node.kind; // cosmetic: boss/gate presentation downstream
@@ -2700,12 +2707,17 @@ const tickSelect = (): void => {
     // the fee). ARCADE: the pick is sealed for the whole gauntlet — no
     // switching until the run ends — and queues the RANKED run (1 credit).
     if (locked[0]) {
-      if (selectingAgentOf) startOnline('solo', undefined, selectingAgentOf);
-      else if (selectingFriendly) startOnline('friendly');
+      if (selectingAgentOf) {
+        // A dare costs a credit in the publisher's database: paused while it is offline.
+        if (publisherPaused()) { selectingAgentOf = ''; locked = [false, false]; screen = 'title'; showToast(DARES_PAUSED); }
+        else startOnline('solo', undefined, selectingAgentOf);
+      } else if (selectingFriendly) startOnline('friendly');
       else if (mode === 'cpu') {
         // GUEST: the same gauntlet, run fully LOCAL and reward-free — no fee,
         // no account, no server. The GAME OVER card invites them to sign in.
         if (!isSignedIn()) { startArcadePractice(); return; }
+        // SIGNED-IN with the publisher offline: no entry can be paid, so the same free practice run.
+        if (publisherPaused() && !pendingArcadeToken) { showToast(ARCADE_PRACTICE); startArcadePractice(); return; }
         // SIGNED-IN (ADR 0008): the pre-paid token now LOCKS the fighter and
         // mints the board, then the map screen takes over. No token means the
         // entry never landed — bounce to the title rather than play unpaid.
@@ -2728,7 +2740,7 @@ const tickSelect = (): void => {
         if (meshPlayed) { locked = [false, false]; screen = 'title'; showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE'); return; }
         friendlyRoom = meshRoom;
         startOnline('friendly');
-      } else if (wagersPaused()) {
+      } else if (publisherPaused()) {
         // The publisher went offline while this player was picking: nothing is escrowed yet.
         locked = [false, false];
         screen = 'title';
@@ -2894,12 +2906,14 @@ const frame = (steps = 1): void => {
       // A cabinet launch: RANKED is the placed room, never the wager queue.
       if (mode === 'online' && meshRoom) { if (meshPlayed) { showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE'); return; } startFriendly(meshRoom); return; }
       // The wager queue needs the publisher's escrow: paused while no publisher relay answers (re-probed on press).
-      if (mode === 'online' && wagersPaused()) { showToast(WAGERS_PAUSED); void publisherOnline(true).catch(() => {}); return; }
+      if (mode === 'online' && publisherPaused()) { showToast(WAGERS_PAUSED); void publisherOnline(true).catch(() => {}); return; }
       // AGENT ARCADE (ADR 0007 credits rework): a SIGNED-IN player pays the
       // 1-credit entry BEFORE character select (when the live economy is
       // reachable). GUESTS skip straight to select → the run starts locally,
       // reward-free (handled at the select lock). Server-down / dev-no-persist
       // signed-in players also fall through to the legacy select→queue path.
+      // Publisher offline: no entry can be paid, so a signed-in player goes to select for the free practice run.
+      if (mode === 'cpu' && isSignedIn() && !pendingArcadeToken && publisherPaused()) { void publisherOnline(true).catch(() => {}); enterSelect(); return; }
       if (mode === 'cpu' && isSignedIn() && accountFetch === 'done' && account) {
         if (pendingArcadeToken) { enterSelectForArcade(); return; } // already paid
         arcadeEntryConfirm = true;
@@ -3494,7 +3508,7 @@ const frame = (steps = 1): void => {
     // entry comes back after a publisher relay is running again, not before.
     if (failed && queuedMode === 'wager' && wagerChecked && Date.now() - wagerProbeAt > 30_000) { wagerProbeAt = Date.now(); void publisherOnline(true).catch(() => {}); }
     const msg = !net ? `CONNECTING${dots}` // token fetch in flight
-      : failed && queuedMode === 'wager' && wagersPaused() ? WAGERS_PAUSED
+      : failed && queuedMode === 'wager' && publisherPaused() ? WAGERS_PAUSED
       : failed ? `OFFLINE: ${net.error}`
       : net.setup ? 'OPPONENT FOUND — STARTING'
       : net.status === 'queued'
@@ -3520,7 +3534,7 @@ const frame = (steps = 1): void => {
     ctx.fillText(failed
       ? (arcadeQ ? 'TAP / ENTER: PRACTICE GAUNTLET (no fee · no XP · no records)'
         : solo ? 'TAP / ENTER: FREE PRACTICE (no fee · no XP · no records)'
-        : queuedMode === 'wager' && wagersPaused() ? 'an entry already held is refunded within ~90 min of the publisher\'s return'
+        : queuedMode === 'wager' && publisherPaused() ? 'an entry already held is refunded within ~90 min of the publisher\'s return'
         : 'is the match server running?  npm run server')
       : friendlyQ
         ? 'challenge link copied — paste it to your friend, they must join while you wait  ·  ESC: cancel'
@@ -4027,7 +4041,7 @@ const frame = (steps = 1): void => {
         const againAgent = queuedAgentOf || undefined;
         net.close();
         net = null;
-        if (again === 'wager' && wagersPaused()) { screen = 'title'; showToast(WAGERS_PAUSED); }
+        if ((again === 'wager' || again === 'solo') && publisherPaused()) { screen = 'title'; showToast(again === 'wager' ? WAGERS_PAUSED : DARES_PAUSED); }
         else startOnline(again, undefined, againAgent);
       } else {
         startFight();
