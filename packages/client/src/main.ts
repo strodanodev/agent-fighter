@@ -333,6 +333,22 @@ let meshPlayed = false;
  * seat to claim (it fronts the relay), so the placed room plays on the relay as before.
  */
 let meshSeat: { ticket: string; ws: string } | null = null;
+/**
+ * Progression on the mesh for the key the arcade launched us with: XP, level and record folded by the node
+ * from ranked results final on chain (litnode /progress, protocol/progression.js). Publisher-independent:
+ * no account, no database. Shown on the fighter card in place of the AIR account when present.
+ */
+interface MeshProgress { level: number; xp: number; xpForNext: number | null; wins: number; losses: number; draws: number; streak: number; rating: number }
+let meshProgress: MeshProgress | null = null;
+let meshNodeUrl = '';
+const fetchMeshProgress = async (): Promise<void> => {
+  if (!meshNodeUrl || !meshPlayerKey) return;
+  try {
+    const r = await fetch(`${meshNodeUrl.replace(/\/+$/, '')}/progress?ruleset=agent-fighter.v1&player=${meshPlayerKey}`, { signal: AbortSignal.timeout(8000), cache: 'no-store' });
+    const j = (await r.json()) as Partial<MeshProgress> & { error?: string };
+    if (r.ok && typeof j.level === 'number') meshProgress = { level: j.level, xp: j.xp ?? 0, xpForNext: j.xpForNext ?? null, wins: j.wins ?? 0, losses: j.losses ?? 0, draws: j.draws ?? 0, streak: j.streak ?? 0, rating: j.rating ?? 1200 };
+  } catch { /* a node older than 0.11.21, or unreachable: keep what we had */ }
+};
 let meshSeatState: 'idle' | 'claiming' | 'seated' | 'none' | 'failed' = 'idle';
 let seatSigned: ((m: { sig?: string; error?: string }) => void) | null = null;
 // The select screen is shared by wager and friendly (both PvP, one fighter to
@@ -1511,12 +1527,21 @@ const applyBootDeepLink = (): void => {
     // The shell's cabinet:init carries the CURRENT litVM contract set (cabinet/contracts.json): relay
     // discovery reads it ahead of the arcade's copy and the baked pair (mesh.ts). Only from a first-party
     // arcade origin: a contract set picks the directory, and the directory picks the relay.
-    if (d?.type === 'cabinet:init' && d.chain) { if (isFirstPartyArcade(e.origin)) useCabinetContracts(d.chain); return; }
+    if (d?.type === 'cabinet:init') {
+      if (d.chain && isFirstPartyArcade(e.origin)) useCabinetContracts(d.chain);
+      // The node the arcade talks to, for this player's mesh progression (display only). A node-served arcade
+      // IS its node, so its origin is the address.
+      const node = (d as { node?: { url?: unknown } }).node?.url;
+      const url = isFirstPartyArcade(e.origin) && typeof node === 'string' && /^https?:\/\//.test(node) ? node : /^https?:\/\//.test(e.origin) ? e.origin : '';
+      if (url && url !== meshNodeUrl) { meshNodeUrl = url; void fetchMeshProgress(); }
+      return;
+    }
     if (d?.type === 'cabinet:seat-signed') { seatSigned?.(d as { sig?: string; error?: string }); return; }
     if (!d || d.type !== 'cabinet:signed' || !meshMatchId || d.matchId !== meshMatchId) return;
     if (typeof d.sig === 'string' && net && 'signLedger' in net) (net as { signLedger: (s: string) => void }).signLedger(d.sig);
   });
   if (meshRoom) void claimMeshSeat();
+  if (meshPlayerKey) setInterval(() => { void fetchMeshProgress(); }, 60_000);
 
   // Dare-vs-agent (?agent=1 riding a ?ref= dare link): after the sign-in
   // gate, the title auto-routes into a solo match vs the SENDER's trained
@@ -3398,7 +3423,13 @@ const frame = (steps = 1): void => {
     drawSelect(ctx, allRosters, picks, locked, uiTick, badge,
       mode === 'cpu' ? { practice: !isSignedIn() } : undefined,
       selectingFriendly,
-      account
+      // An arcade launch plays as its mesh key: the node's progression for that key comes first.
+      meshPlayerKey && meshProgress
+        ? {
+          level: meshProgress.level, xp: meshProgress.xp, xpNeed: meshProgress.xpForNext ?? meshProgress.xp,
+          wins: meshProgress.wins, losses: meshProgress.losses,
+        }
+        : account
         ? {
           level: account.level, xp: account.xp, xpNeed: xpForNext(account.level),
           wins: account.wins, losses: account.losses,
