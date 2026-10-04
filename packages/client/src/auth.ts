@@ -66,6 +66,9 @@ export const auth: AuthState = { status: 'out', id: '', address: '', email: '', 
 
 // ── universal login: the arcade's session, when the arcade frames us ─────────
 const ARCADE_AUTH_ORIGINS = ['https://arcade.litvm.games', 'https://litvm.games', 'https://www.litvm.games'];
+/** The litVM arcade's own origins, and nothing a URL parameter can add: what main.ts takes from the shell
+ *  that steers the game (the contract set, hence the relay) is taken only from these. */
+export const isFirstPartyArcade = (origin: string): boolean => ARCADE_AUTH_ORIGINS.includes(origin);
 const ARCADE_AUTH_PROBE_MS = 8000;
 const ARCADE_AUTH_TOKEN_MS = 15_000;
 const ARCADE_AUTH_LOGIN_MS = 10 * 60_000; // a person choosing an account, typing an email code

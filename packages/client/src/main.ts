@@ -18,7 +18,7 @@ import {
 } from './progress.js';
 import type { Profile } from './progress.js';
 import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './atlas.js';
-import { cachedRelay, refreshRelay, relayFailed, useCabinetContracts } from './mesh.js';
+import { cachedRelay, isPublisherRelay, refreshRelay, relayFailed, relayReady, useCabinetContracts } from './mesh.js';
 import { drawPet, loadMatchPets, loadPet } from './pets.js';
 import type { LoadedPet } from './pets.js';
 import type { Roster } from './atlas.js';
@@ -34,7 +34,7 @@ import { listStages, loadBgVideo, loadDisplayFont, loadGameLogo, loadLogo, loadS
 import type { BgVideo, StageAsset } from './chrome.js';
 import { audio, hitSfxFor, swingSfx } from './audio.js';
 import type { AudioChannel, SfxId } from './audio.js';
-import { auth, authLogin, authLogout, authName, authRehydrate, authToken } from './auth.js';
+import { auth, authLogin, authLogout, authName, authRehydrate, authToken, isFirstPartyArcade } from './auth.js';
 import { NetSession, SoloSession } from './net.js';
 import type { NetAccount, Session } from './net.js';
 import {
@@ -426,6 +426,25 @@ const matchWsUrl = (): string => {
 };
 if (location.protocol === 'https:') refreshRelay();
 const matchHttpUrl = (): string => matchWsUrl().replace(/^ws/, 'http');
+/**
+ * The player's AIR token, for the relay this page talks to, only when that relay is one the publisher runs
+ * (mesh.ts isPublisherRelay). The account API IS the relay, any bonded node may run one, and the token is a
+ * bearer credential for the whole API, so a relay the publisher does not run never sees it: the player plays
+ * there without an account (casual, nothing credited), never with their account in a stranger's hands.
+ */
+/** The origin of the shell that frames us (ancestorOrigins; Firefox: the referrer), so a message goes to that
+ *  page and not to whatever the frame's parent navigated to since. '*' only when neither names it. */
+const shellOrigin = (): string => {
+  const anc = (location as Location & { ancestorOrigins?: DOMStringList }).ancestorOrigins;
+  if (anc && anc.length > 0) return anc[0]!;
+  try { if (document.referrer) return new URL(document.referrer).origin; } catch { /* no referrer */ }
+  return '*';
+};
+const relayAuthToken = async (): Promise<string | undefined> => {
+  await relayReady();
+  if (!isPublisherRelay(matchWsUrl())) return undefined;
+  return authToken();
+};
 
 // Public standings (drawRanks) — fetched from the match server on entry.
 let ranksRows: RankRow[] | null = null;
@@ -562,7 +581,7 @@ const fetchAccount = async (): Promise<void> => {
   accountFetch = 'busy';
   try {
     const headers: Record<string, string> = {};
-    const token = await authToken();
+    const token = await relayAuthToken();
     if (token) headers.Authorization = `Bearer ${token}`;
     else if (DEV_GUEST) headers['X-Dev-Name'] = DEV_GUEST;
     else { accountFetch = 'idle'; return; }
@@ -616,7 +635,7 @@ let keyCopiedAge = -1; // ≥0 → the "copied" flash is animating
 
 const agentAuthHeaders = async (): Promise<Record<string, string> | null> => {
   const headers: Record<string, string> = {};
-  const token = await authToken();
+  const token = await relayAuthToken();
   if (token) headers.Authorization = `Bearer ${token}`;
   else if (DEV_GUEST) headers['X-Dev-Name'] = DEV_GUEST;
   else return null;
@@ -1437,10 +1456,13 @@ const applyBootDeepLink = (): void => {
   // The cabinet shell answers a `cabinet:sign` request with the player's
   // signature; the key itself never enters this page.
   window.addEventListener('message', (e: MessageEvent) => {
+    // Only the shell that frames us: any page can frame Agent Fighter and post to it.
+    if (window.parent === window || e.source !== window.parent) return;
     const d = e.data as { type?: string; matchId?: string; sig?: string; chain?: unknown } | null;
     // The shell's cabinet:init carries the CURRENT litVM contract set (cabinet/contracts.json): relay
-    // discovery reads it ahead of the arcade's copy and the baked pair (mesh.ts).
-    if (d?.type === 'cabinet:init' && d.chain) { useCabinetContracts(d.chain); return; }
+    // discovery reads it ahead of the arcade's copy and the baked pair (mesh.ts). Only from a first-party
+    // arcade origin: a contract set picks the directory, and the directory picks the relay.
+    if (d?.type === 'cabinet:init' && d.chain) { if (isFirstPartyArcade(e.origin)) useCabinetContracts(d.chain); return; }
     if (!d || d.type !== 'cabinet:signed' || !meshMatchId || d.matchId !== meshMatchId) return;
     if (typeof d.sig === 'string' && net && 'signLedger' in net) (net as { signLedger: (s: string) => void }).signLedger(d.sig);
   });
@@ -1543,7 +1565,7 @@ const startOnline = (
   // Play under the AIR identity (fresh token; the server verifies it against
   // the JWKS and settles credits/XP). ?dev=NAME plays a dev-economy account.
   const name = authName() ?? DEV_GUEST ?? `PLAYER-${(profile.wins + profile.losses) % 1000}`;
-  void authToken().then((token) => {
+  void relayAuthToken().then((token) => {
     if (screen !== 'online' || net) return; // player backed out while fetching
     const email = auth.email || undefined; // AIR write-back target (ADR 0004)
     // Solo/arcade (v3/v4): pure LOCAL simulation of the pinned house AI —
@@ -3880,7 +3902,7 @@ const frame = (steps = 1): void => {
         net = null;
         screen = 'title';
         showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE');
-        if (window.parent !== window) window.parent.postMessage({ type: 'cabinet:played', matchId: meshMatchId }, '*');
+        if (window.parent !== window) window.parent.postMessage({ type: 'cabinet:played', matchId: meshMatchId }, shellOrigin());
       } else if (net) {
         // INSTANT REMATCH (P0): one input → straight back into the queue
         // with the same fighter and mode. No select detour, no re-confirm.
@@ -4067,7 +4089,7 @@ const askMeshSign = (): void => {
   if (meshRoom && net?.result && queuedMode === 'friendly') meshPlayed = true;
   if (meshSignAsked || !net?.result?.ledger || !meshMatchId || window.parent === window) return;
   meshSignAsked = true;
-  window.parent.postMessage({ type: 'cabinet:sign', body: { matchId: meshMatchId, ticks: net.result.ledger.ticks, head: net.result.ledger.head, buildHash: meshBuildHash || null } }, '*');
+  window.parent.postMessage({ type: 'cabinet:sign', body: { matchId: meshMatchId, ticks: net.result.ledger.ticks, head: net.result.ledger.head, buildHash: meshBuildHash || null } }, shellOrigin());
 };
 
 const loop = (now: number): void => {

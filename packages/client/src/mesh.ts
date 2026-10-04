@@ -112,6 +112,28 @@ export function cachedRelay(): string | null {
   return c && Date.now() - c.at < CACHE_MS ? c.wsAddr : null;
 }
 
+/**
+ * The relays the PUBLISHER runs: the wsAddr each PREFERRED_RELAYS node announced at the last directory read.
+ * A NodeDirectory entry is written by that node's own announcer, so the address is the node's. Agent Fighter's
+ * account API is the relay itself and any bonded node may run one, so only these may receive the player's AIR
+ * token (a bearer credential for the whole API: /me, /items/buy, /agent/key). Anything else is played without it.
+ */
+const PUBLISHER_KEY = 'af.mesh-publisher-relays';
+let publisherList: string[] = [];
+function publisherRelays(): string[] {
+  if (publisherList.length) return publisherList;
+  try { const c = JSON.parse(localStorage.getItem(PUBLISHER_KEY) ?? 'null') as { relays?: unknown } | null; if (Array.isArray(c?.relays)) publisherList = c.relays.filter((r): r is string => typeof r === 'string'); } catch { /* private mode */ }
+  return publisherList;
+}
+const originOf = (u: string): string | null => { try { const x = new URL(u); return `${x.protocol}//${x.host}`; } catch { return null; } };
+/** May this relay see the player's AIR token? The publisher's relays, and a dev box serving the page itself. */
+export function isPublisherRelay(wsUrl: string): boolean {
+  const o = originOf(wsUrl);
+  if (!o) return false;
+  if (location.protocol !== 'https:' && o === `ws://${location.hostname}:8477`) return true; // npm run play: the server beside the page
+  return publisherRelays().some((r) => originOf(r) === o);
+}
+
 /** 'ok' = an Agent Fighter relay answered; 'other' = some other title's server (never ours); 'down' = no answer. */
 async function probeRelay(wsAddr: string): Promise<'ok' | 'other' | 'down'> {
   try {
@@ -142,6 +164,8 @@ export async function discoverRelay(): Promise<string | null> {
   const probes = await Promise.all(found.map((f) => probeRelay(f.wsAddr)));
   const pick = found[probes.indexOf('ok')] ?? found[probes.indexOf('down')];
   const wsAddr = pick?.wsAddr ?? null;
+  publisherList = found.filter((f) => PREFERRED_RELAYS.includes(f.nodeId)).map((f) => f.wsAddr);
+  try { localStorage.setItem(PUBLISHER_KEY, JSON.stringify({ relays: publisherList, at: Date.now() })); } catch { /* private mode */ }
   try { if (wsAddr) localStorage.setItem(CACHE_KEY, JSON.stringify({ wsAddr, at: Date.now() } satisfies Cached)); } catch { /* private mode */ }
   return wsAddr;
 }
@@ -154,9 +178,12 @@ export async function relayFailed(): Promise<string | null> {
   try { return await discoverRelay(); } catch { return null; }
 }
 
+let inflight: Promise<unknown> | null = null;
 /** Refresh in the background; returns immediately. Call once at boot. */
 export function refreshRelay(): void {
   const c = readCache();
-  if (c && Date.now() - c.at < CACHE_MS) return;
-  void discoverRelay().catch(() => { /* chain unreachable: keep whatever we had */ });
+  if (c && Date.now() - c.at < CACHE_MS && publisherRelays().length) return;
+  inflight = discoverRelay().catch(() => { /* chain unreachable: keep whatever we had */ }).finally(() => { inflight = null; });
 }
+/** Resolves once the boot discovery (if any) is done, so a caller deciding where a token may go reads its answer. */
+export const relayReady = (): Promise<unknown> => inflight ?? Promise.resolve();
