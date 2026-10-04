@@ -225,6 +225,7 @@ export class NetSession {
     private ref?: string, // stashed dare code (?ref=) — redeemed server-side once
     private room?: string, // friendly rendezvous code (mode 'friendly' only)
     private playerKey?: string, // litnode player key (?player=) — pinned into the ledger, never an identity
+    private ticket?: string, // litnode gauntlet seat ticket: the host node's per-match server seats only by it
   ) {
     this.connect(false);
   }
@@ -234,7 +235,7 @@ export class NetSession {
     const ws = new WebSocket(this.url);
     this.ws = ws;
     ws.onopen = () => {
-      this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email, ref: this.ref, playerKey: this.playerKey });
+      this.send({ t: 'hello', v: NET_PROTOCOL, name: this.name, engine: ENGINE_VERSION, auth: this.authToken, email: this.email, ref: this.ref, playerKey: this.playerKey, ticket: this.ticket });
       if (resume && this.setup?.resume) {
         this.send({ t: 'resume', matchId: this.setup.matchId, token: this.setup.resume });
       } else {
@@ -308,6 +309,19 @@ export class NetSession {
 
   private stopPing(): void {
     if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+  }
+
+  /**
+   * litnode: THIS client's own record of the log, side order, for the first `ticks` ticks. The arcade hashes
+   * it before it signs (cabinet:sign with entries), so a host cannot get a signature over a log it edited.
+   */
+  ledgerEntries(ticks: number): { k: number; inputs: [number, number] }[] | null {
+    const side = this.setup?.side;
+    if (side === undefined || !Number.isInteger(ticks) || ticks <= 0) return null;
+    return Array.from({ length: ticks }, (_, k) => {
+      const mine = this.myInputs[k] ?? 0, opp = this.oppInputs[k] ?? 0;
+      return { k, inputs: (side === 0 ? [mine | 0, opp | 0] : [opp | 0, mine | 0]) as [number, number] };
+    });
   }
 
   /** litnode (protocol 3): forward the cabinet shell's ledger signature to the relay. */

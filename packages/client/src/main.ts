@@ -327,6 +327,14 @@ let meshSignAsked = false;
  *  done: the next ranked match is placed by the cabinet, not queued here. */
 let meshRoom = '';
 let meshPlayed = false;
+/**
+ * A cabinet launch onto a host that runs Agent Fighter as a GAUNTLET (one server per placed match, litnode
+ * node/gauntlet.js): the seat ticket and the match's own room URL, once claimed. 'none' = this host has no
+ * seat to claim (it fronts the relay), so the placed room plays on the relay as before.
+ */
+let meshSeat: { ticket: string; ws: string } | null = null;
+let meshSeatState: 'idle' | 'claiming' | 'seated' | 'none' | 'failed' = 'idle';
+let seatSigned: ((m: { sig?: string; error?: string }) => void) | null = null;
 // The select screen is shared by wager and friendly (both PvP, one fighter to
 // pick). This flag tells its lock handler which to queue — set true only for
 // the friendly path, reset false on every normal (wager/cpu) select entry.
@@ -440,6 +448,47 @@ const shellOrigin = (): string => {
   try { if (document.referrer) return new URL(document.referrer).origin; } catch { /* no referrer */ }
   return '*';
 };
+interface SeatChallenge { matchId: string; room: string; player: string; nonce: string }
+/** Ask the arcade that launched us to sign a seat challenge with the player key it holds (cabinet:sign-seat). */
+const askSeatSignature = (challenge: SeatChallenge): Promise<string> => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => { seatSigned = null; reject(new Error('the arcade did not answer the seat challenge')); }, 10_000);
+  seatSigned = (m) => { clearTimeout(timer); seatSigned = null; if (typeof m.sig === 'string') resolve(m.sig); else reject(new Error(m.error ?? 'the arcade did not sign the seat')); };
+  window.parent.postMessage({ type: 'cabinet:sign-seat', challenge }, shellOrigin());
+});
+/**
+ * Claim this player's seat on the placed host's gateway. The gateway answers with a one-time challenge,
+ * the arcade signs it, and the signed ask returns the seat ticket and the match's room URL. A host with no
+ * gauntlet for this room (it fronts the relay) answers 404, or the relay's own /health: no seat, the relay
+ * plays the placed room as before.
+ */
+const claimMeshSeat = async (): Promise<void> => {
+  const ws = new URLSearchParams(location.search).get('ws');
+  if (!ws || !meshRoom || !meshPlayerKey || window.parent === window) { meshSeatState = 'none'; return; }
+  meshSeatState = 'claiming';
+  const base = `${ws.replace(/^ws/, 'http').replace(/\/+$/, '')}/${meshRoom}/ticket?player=${meshPlayerKey}`;
+  try {
+    let r = await fetch(base, { signal: AbortSignal.timeout(10_000), cache: 'no-store' });
+    if (r.status === 401) {
+      const { challenge } = (await r.json()) as { challenge?: SeatChallenge };
+      if (!challenge?.nonce) throw new Error('the host asked for a signature without a challenge');
+      const sig = await askSeatSignature(challenge);
+      r = await fetch(`${base}&nonce=${challenge.nonce}&sig=${sig}`, { signal: AbortSignal.timeout(10_000), cache: 'no-store' });
+    }
+    if (r.status === 404) { meshSeatState = 'none'; return; }
+    const j = (await r.json().catch(() => ({}))) as { ticket?: string; ws?: string; error?: string };
+    if (r.ok && j.ticket && j.ws) { meshSeat = { ticket: j.ticket, ws: j.ws }; meshSeatState = 'seated'; return; }
+    if (r.ok) { meshSeatState = 'none'; return; }
+    throw new Error(j.error ?? `the host answered ${r.status}`);
+  } catch (e) {
+    meshSeatState = 'failed';
+    console.warn('[mesh] seat claim failed; trying the relay:', e);
+    showToast('COULD NOT CLAIM THE SEAT ON THE HOST — TRYING THE RELAY');
+  }
+};
+/** The placed match runs on a gauntlet and this player holds its seat: no sign-in, no account, no token. */
+const meshSeated = (): boolean => !!meshRoom && meshSeatState === 'seated' && !!meshSeat;
+/** A placed launch waits for its seat claim before falling back to the relay. */
+const meshSeatPending = (): boolean => !!meshRoom && (meshSeatState === 'idle' || meshSeatState === 'claiming');
 const relayAuthToken = async (): Promise<string | undefined> => {
   await relayReady();
   if (!isPublisherRelay(matchWsUrl())) return undefined;
@@ -1463,9 +1512,11 @@ const applyBootDeepLink = (): void => {
     // discovery reads it ahead of the arcade's copy and the baked pair (mesh.ts). Only from a first-party
     // arcade origin: a contract set picks the directory, and the directory picks the relay.
     if (d?.type === 'cabinet:init' && d.chain) { if (isFirstPartyArcade(e.origin)) useCabinetContracts(d.chain); return; }
+    if (d?.type === 'cabinet:seat-signed') { seatSigned?.(d as { sig?: string; error?: string }); return; }
     if (!d || d.type !== 'cabinet:signed' || !meshMatchId || d.matchId !== meshMatchId) return;
     if (typeof d.sig === 'string' && net && 'signLedger' in net) (net as { signLedger: (s: string) => void }).signLedger(d.sig);
   });
+  if (meshRoom) void claimMeshSeat();
 
   // Dare-vs-agent (?agent=1 riding a ?ref= dare link): after the sign-in
   // gate, the title auto-routes into a solo match vs the SENDER's trained
@@ -1565,7 +1616,9 @@ const startOnline = (
   // Play under the AIR identity (fresh token; the server verifies it against
   // the JWKS and settles credits/XP). ?dev=NAME plays a dev-economy account.
   const name = authName() ?? DEV_GUEST ?? `PLAYER-${(profile.wins + profile.losses) % 1000}`;
-  void relayAuthToken().then((token) => {
+  // A seated placed match plays on the host's gauntlet: its own room URL, the seat ticket, no AIR token.
+  const seat = m === 'friendly' && friendlyRoom === meshRoom && meshSeated() ? meshSeat : null;
+  void (seat ? Promise.resolve(undefined) : relayAuthToken()).then((token) => {
     if (screen !== 'online' || net) return; // player backed out while fetching
     const email = auth.email || undefined; // AIR write-back target (ADR 0004)
     // Solo/arcade (v3/v4): pure LOCAL simulation of the pinned house AI —
@@ -1574,8 +1627,8 @@ const startOnline = (
     // solo house AI for the trained agent behind a dare code.
     meshSignAsked = false; // a new session: its own result gets its own signature
     net = m === 'wager' || m === 'friendly'
-      ? new NetSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, email, storedRef(),
-        m === 'friendly' ? friendlyRoom : undefined, meshPlayerKey || undefined)
+      ? new NetSession(seat ? seat.ws : matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, m, seat ? undefined : email, seat ? undefined : storedRef(),
+        m === 'friendly' ? friendlyRoom : undefined, meshPlayerKey || undefined, seat?.ticket)
       : new SoloSession(matchWsUrl(), name, roster.id, roster.bundle.versionHash, token, email, storedRef(),
         m === 'arcade' ? { runToken, node: arcadeNode } : undefined,
         m === 'solo' ? agentOf : undefined);
@@ -2621,6 +2674,11 @@ const tickSelect = (): void => {
         pendingArcadeToken = '';
         if (!token) { screen = 'title'; showToast('ENTER AGENT ARCADE FROM THE TITLE'); return; }
         startArcadeRanked(token);
+      } else if (meshSeated()) {
+        // A placed match on a gauntlet: the seat ticket is the admission — no account, nothing escrowed.
+        if (meshPlayed) { locked = [false, false]; screen = 'title'; showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE'); return; }
+        friendlyRoom = meshRoom;
+        startOnline('friendly');
       } else if (!isSignedIn()) {
         // RANKED PVP needs the account for escrow — a guest who reached select via
         // "change fighter" is bounced to sign-in rather than queued unpaid.
@@ -2720,7 +2778,7 @@ const frame = (steps = 1): void => {
     // A challenge link (?room=) auto-joins the friend's room the moment the
     // sign-in gate clears — clicking the link WAS the consent. One last
     // title frame draws beneath; the lobby takes over next frame.
-    if (signedIn && accountFetch === 'done' && pendingRoom) {
+    if (pendingRoom && (meshSeated() || (signedIn && accountFetch === 'done' && !meshSeatPending()))) {
       const room = pendingRoom;
       pendingRoom = '';
       startFriendly(room);
@@ -2788,7 +2846,7 @@ const frame = (steps = 1): void => {
       // A guest here opens sign-in instead of queuing. (On touch the dialog is
       // fired in-gesture from the pointerdown handler; this covers desktop
       // Enter and any keyboard fall-through — authLogin() no-ops if already busy.)
-      if (mode === 'online' && !isSignedIn()) { void authLogin(); return; }
+      if (mode === 'online' && !isSignedIn() && !meshSeated()) { void authLogin(); return; }
       // A cabinet launch: RANKED is the placed room, never the wager queue.
       if (mode === 'online' && meshRoom) { if (meshPlayed) { showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE'); return; } startFriendly(meshRoom); return; }
       // AGENT ARCADE (ADR 0007 credits rework): a SIGNED-IN player pays the
@@ -4089,7 +4147,10 @@ const askMeshSign = (): void => {
   if (meshRoom && net?.result && queuedMode === 'friendly') meshPlayed = true;
   if (meshSignAsked || !net?.result?.ledger || !meshMatchId || window.parent === window) return;
   meshSignAsked = true;
-  window.parent.postMessage({ type: 'cabinet:sign', body: { matchId: meshMatchId, ticks: net.result.ledger.ticks, head: net.result.ledger.head, buildHash: meshBuildHash || null } }, shellOrigin());
+  // With our OWN record of the log the arcade computes the head itself and signs only that (litnode 0.11.19+);
+  // an older arcade signs the head as before.
+  const entries = 'ledgerEntries' in net ? (net as NetSession).ledgerEntries(net.result.ledger.ticks) : null;
+  window.parent.postMessage({ type: 'cabinet:sign', body: { matchId: meshMatchId, ticks: net.result.ledger.ticks, head: net.result.ledger.head, buildHash: meshBuildHash || null }, ...(entries ? { entries } : {}) }, shellOrigin());
 };
 
 const loop = (now: number): void => {

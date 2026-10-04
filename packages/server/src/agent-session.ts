@@ -66,7 +66,19 @@ export interface AgentOptions {
    * cheapest line to the deep exit. Agent-class accounts bank nothing
    * either way, so the loot they walk past is nobody's money.
    */
-  mode?: 'wager' | 'solo' | 'arcade';
+  mode?: 'wager' | 'solo' | 'arcade' | 'friendly';
+  /** Friendly only: the rendezvous room (a mesh-placed match: its `LIT-…` code). */
+  room?: string;
+  /** litnode player key carried in hello (a mesh-placed match). */
+  playerKey?: string;
+  /** litnode gauntlet seat ticket (gauntlet.ts): required by a gauntlet-mode server. */
+  ticket?: string;
+  /**
+   * Mesh-placed matches: sign the ledger the result names. Called with the server's ledger and THIS
+   * agent's own record of the log (its inputs and the opponent's, side order) up to the same tick, so the
+   * signer can check the head itself before signing. Return the signature (128 hex), or null to refuse.
+   */
+  signLedger?: (ledger: { head: string; ticks: number }, entries: { k: number; inputs: [number, number] }[]) => Promise<string | null> | string | null;
   /**
    * Arcade continuation: the run token from the previous battle's result.
    * A run must first be opened with POST /arcade/enter + POST /arcade/run
@@ -89,6 +101,8 @@ export interface AgentOptions {
 
 export interface AgentResult {
   result: SResult;
+  /** This agent's own record of the log (side order), up to the ledger's ticks when the result named one. */
+  entries?: { k: number; inputs: [number, number] }[];
   localHash: number; // my sim's final hash — must equal result.hash
   localTicks: number;
   /** Arcade battles: run position + the token that queues the NEXT battle. */
@@ -171,12 +185,13 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
     };
 
     ws.on('open', () => {
-      sendMsg({ t: 'hello', v: PROTOCOL_VERSION, name: opts.name, agent: true, engine: ENGINE_VERSION, auth: opts.authToken, agentKey: opts.agentKey, email: opts.email });
+      sendMsg({ t: 'hello', v: PROTOCOL_VERSION, name: opts.name, agent: true, engine: ENGINE_VERSION, auth: opts.authToken, agentKey: opts.agentKey, email: opts.email, playerKey: opts.playerKey, ticket: opts.ticket });
       sendMsg({
         t: 'queue',
         character: opts.character,
         bundleHash: bundleOf(opts.character).versionHash,
         mode: opts.mode ?? 'wager',
+        room: opts.room,
         runToken: opts.runToken,
         agentOf: opts.agentOf,
         item: opts.item,
@@ -267,8 +282,19 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
               );
             } catch { /* debug only */ }
           }
-          ws.close();
-          return resolve({ result: msg, localHash, localTicks: simTick, arcade: setup?.arcade });
+          const done = (entries?: AgentResult['entries']): void => { ws.close(); resolve({ result: msg, localHash, localTicks: simTick, arcade: setup?.arcade, entries }); };
+          if (!msg.ledger) return done();
+          const n = msg.ledger.ticks;
+          const entries = Array.from({ length: n }, (_, k) => {
+            const mine = myInputs[k] ?? 0, theirs = oppInputs[k] ?? 0;
+            return { k, inputs: (side === 0 ? [mine | 0, theirs | 0] : [theirs | 0, mine | 0]) as [number, number] };
+          });
+          if (!opts.signLedger) return done(entries);
+          void Promise.resolve(opts.signLedger(msg.ledger, entries)).then((sig) => {
+            if (sig) sendMsg({ t: 'sign', sig } as ClientMsg);
+            setTimeout(() => done(entries), 200); // let the signature leave before the socket closes
+          }, () => done(entries));
+          return;
         }
         default:
           return;

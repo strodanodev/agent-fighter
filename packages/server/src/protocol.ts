@@ -125,6 +125,11 @@ export interface CHello {
    */
   playerKey?: string;
   /**
+   * litnode gauntlet seat ticket (optional): minted by the host node for ONE placed player of ONE match
+   * and verified by a gauntlet-mode server (gauntlet.ts). The ordinary relay ignores it.
+   */
+  ticket?: string;
+  /**
    * AIR-account email — the TARGET for the reputation-credential write-back
    * (ADR 0004), nothing else. Progression keys on the verified token's sub;
    * this only addresses where AIR delivers the attestation.
@@ -392,7 +397,7 @@ export interface SResult {
    */
   ledger?: { head: string; ticks: number };
 }
-export interface SError { t: 'error'; msg: string; code?: 'credits' | 'auth' }
+export interface SError { t: 'error'; msg: string; code?: 'credits' | 'auth' | 'seat' }
 /**
  * PvP heads-up (v6): the OPPONENT's socket just dropped. Sent to the SURVIVOR
  * the instant it happens so the client can show "OPPONENT DISCONNECTED —

@@ -37,6 +37,7 @@ import {
 import type { ClientMsg, ItemPin, PetPin, SMatch, SResult, ServerMsg } from './protocol.js';
 import { verifyAirToken } from './airjwt.js';
 import { meshLedger } from './mesh-ledger.js';
+import { verifyTicket, type GauntletConfig, type GauntletOutcome } from './gauntlet.js';
 import type { AirIdentity } from './airjwt.js';
 import {
   ARCADE_FEE,
@@ -171,6 +172,8 @@ interface Client {
   /** The friendly room this client parked in / paired through, '' otherwise.
    *  A `LIT-…` room is a mesh-placed match: its ledger is archived. */
   room: string;
+  /** Gauntlet mode: the team this socket's seat ticket names (side 0 or 1); -1 = not seated. */
+  seat: -1 | 0 | 1;
   /**
    * Measured round-trip to this client in ms (EMA; -1 = unknown). Fed by
    * the lobby ping loop's pong echoes; read once at pair time to size the
@@ -533,6 +536,12 @@ export const createMatchServer = (opts: {
   /** Connection caps (v1.02_scale). Default from AF_MAX_CONNS[_PER_IP] env. */
   maxConns?: number;
   maxConnsPerIp?: number;
+  /**
+   * Gauntlet mode (gauntlet.ts): this process serves ONE mesh-placed match for a litnode node. No .env, no
+   * persistence, no AIR; only the two placed keys, by the node's seat tickets; the placement's seed; the
+   * result goes to the node. Unset = the ordinary relay.
+   */
+  gauntlet?: GauntletConfig;
 } = {}): Promise<MatchServer> => {
   const root = opts.root ?? REPO_ROOT;
   // Input-silence forfeit window. The idle sweep is a REALTIME liveness
@@ -553,8 +562,11 @@ export const createMatchServer = (opts: {
     ?? (opts.noPaceCheck ? Number.MAX_SAFE_INTEGER : IDLE_FORFEIT_MS);
   const charactersDir = join(root, 'characters');
   const stagesDir = join(root, 'stages');
-  loadDotEnv(root); // SUPABASE_URL / SUPABASE_SERVICE_KEY / AIR_* config
-  const persistence = opts.persistence !== undefined ? opts.persistence : createPersistence();
+  const gauntlet = opts.gauntlet ?? null;
+  // A gauntlet never reads the checkout's .env: the node started it on an operator's machine, and the
+  // database and AIR keys in there are the publisher's, not this match's.
+  if (!gauntlet) loadDotEnv(root); // SUPABASE_URL / SUPABASE_SERVICE_KEY / AIR_* config
+  const persistence = gauntlet ? null : opts.persistence !== undefined ? opts.persistence : createPersistence();
   // The pace check is the only thing between local-sim ranked play and
   // tool-assisted slow-motion — disabling it on a REAL economy must be
   // impossible no matter which env flags are set (an env-flag-only guard
@@ -715,6 +727,9 @@ export const createMatchServer = (opts: {
    * escrowed, so a waiter who never gets a challenger strands nothing.
    */
   const rooms = new Map<string, Client>();
+  // Gauntlet mode: the seated sockets waiting for the other seat, and whether the one match has started.
+  const gauntletWaiting = new Set<Client>();
+  let gauntletStarted = false;
   /** In-flight matches by id — the CResume lookup. */
   const liveMatches = new Map<string, Match>();
   /** True once shutdown() starts — new queues/entries are refused. */
@@ -927,6 +942,46 @@ export const createMatchServer = (opts: {
     if (c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(msg));
   };
 
+  /**
+   * Gauntlet mode: hand the finished match to the node that started this process. Wait (bounded) for both
+   * players' ledger signatures, then POST the replayable submission to <nodeUrl>/ledger: the input log up to
+   * the end, the pin (characters, seed, stage bounds) with the bundles, and the signatures. The node replays
+   * it, settles it, and ends this process; onDone lets the entry point exit on its own as well.
+   */
+  const handOff = async (
+    m: Match, result: SResult,
+    pinOf: () => { signatures: Record<string, string>; chars: readonly string[] },
+  ): Promise<void> => {
+    const g = gauntlet!;
+    const keys = [m.playerKeys[0], m.playerKeys[1]];
+    const signed = (): number => m.clients.filter((cl, i) => !!cl?.ledgerSig && cl.playerKey === keys[i]).length;
+    const deadline = Date.now() + (g.signWaitMs ?? 20_000);
+    while (result.ledger && signed() < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 250));
+    const pin = pinOf();
+    const ticks = result.ledger?.ticks ?? Math.min(m.inputs[0].length, m.inputs[1].length);
+    const entries = Array.from({ length: ticks }, (_, k) => ({ k, inputs: [m.inputs[0][k]! | 0, m.inputs[1][k]! | 0] }));
+    const both = keys.every((k) => typeof pin.signatures[k] === 'string');
+    const submission = {
+      matchId: g.matchId, rulesetId: g.rulesetId, ...(g.buildHash ? { buildHash: g.buildHash } : {}), mode: g.placedMode,
+      participants: keys, entries,
+      hydration: { pin, bundles: Object.fromEntries(pin.chars.map((id) => [id, JSON.parse(readFileSync(join(charactersDir, id, 'character.json'), 'utf8')) as unknown])) },
+      ...(both ? { signatures: Object.fromEntries(keys.map((k) => [k, pin.signatures[k]!])) } : {}),
+      expected: { hash: result.hash, winner: result.winner, rounds: result.rounds, endTick: result.endTick, reason: result.reason },
+    };
+    const sigs = Object.keys(pin.signatures).length;
+    let outcome: GauntletOutcome;
+    try {
+      const res = await fetch(`${g.nodeUrl}/ledger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission), signal: AbortSignal.timeout(60_000) });
+      const body = (await res.json().catch(() => ({}))) as { error?: string; attestation?: string };
+      outcome = { posted: res.ok, status: res.status, error: res.ok ? undefined : body.error, signatures: sigs };
+      console.log(`[gauntlet ${g.matchId.slice(0, 12)}] ${ticks} ticks, ${sigs}/2 signatures: node ${res.ok ? `settled it (${body.attestation ?? '?'})` : `refused it: ${body.error ?? res.status}`}`);
+    } catch (e) {
+      outcome = { posted: false, error: String(e), signatures: sigs };
+      console.log(`[gauntlet ${g.matchId.slice(0, 12)}] could not reach the node: ${String(e)}`);
+    }
+    g.onDone?.(outcome);
+  };
+
   const finishMatch = (m: Match, forfeitLoser: 0 | 1 | null): void => {
     if (m.finished) return;
     m.finished = true;
@@ -970,7 +1025,12 @@ export const createMatchServer = (opts: {
     // litnode (protocol 3): a mesh-placed match tells both players what to
     // sign — the ledger head exactly as a mesh node rebuilds it. Their
     // signatures come back as CSign and are archived with the ledger below.
-    if (m.mode === 'friendly' && m.room.startsWith('LIT-')) result.ledger = meshLedger([m.inputs[0], m.inputs[1]]);
+    if (m.mode === 'friendly' && m.room.startsWith('LIT-')) {
+      // A gauntlet's log is the match: exactly the ticks up to the final KO when it reached one, so the
+      // head both players sign and the node replays covers what was fought and nothing after it.
+      const end = gauntlet && v.reachedEnd ? v.endTick : Math.min(m.inputs[0].length, m.inputs[1].length);
+      result.ledger = meshLedger([m.inputs[0].slice(0, end), m.inputs[1].slice(0, end)]);
+    }
 
     // Solo pace sanity: the client sims locally, so wall time is the only
     // pacing signal. Scripted fast-forward or tool-assisted slow-motion
@@ -1189,9 +1249,8 @@ export const createMatchServer = (opts: {
     // …plus friendlies placed by the LIT GAMES mesh (room `LIT-…`): those are
     // the matches a litnode witness replays, so their ledger IS the product.
     const meshPlaced = m.mode === 'friendly' && m.room.startsWith('LIT-');
-    const archive = (): void => {
-      try {
-        const pin = {
+    const pinOf = () => {
+      return {
           seed: m.seed,
           bounds: m.bounds ?? null,
           stage: m.stage,
@@ -1221,6 +1280,10 @@ export const createMatchServer = (opts: {
             hash: result.hash, deviator: result.deviator ?? null,
           },
         };
+    };
+    const archive = (): void => {
+      try {
+        const pin = pinOf();
         if (meshPlaced) console.log(`[match ${m.id}] archiving mesh ledger with ${Object.keys(pin.signatures).length}/2 player signatures`);
         const ledger = encodeLedger([m.inputs[0], m.inputs[1]]);
         // Canonical digest — hashed over CANONICAL json (sorted keys), not
@@ -1256,6 +1319,7 @@ export const createMatchServer = (opts: {
     // ledger signatures so the pin archives them. Nothing waits on this — a
     // signature that never comes archives the ledger as relay-attested.
     if (persistence?.saveLedger && (m.mode === 'wager' || meshPlaced)) setTimeout(archive, meshPlaced ? 3000 : 0);
+    if (gauntlet && m.id === gauntlet.matchId) void handOff(m, result, pinOf);
 
     if (process.env.AF_DEBUG_LEDGER) {
       // Forensics: dump the canonical ledger for offline diffing (sync — the
@@ -1323,12 +1387,14 @@ export const createMatchServer = (opts: {
     const isBossFight = !!arcadeRun?.board
       && nodeById(arcadeRun.board, arcadeRun.pending)?.kind === 'boss';
     const stagePool = isBossFight && bossStageIds.length > 0 ? bossStageIds : rotationStageIds;
+    // A gauntlet plays the placement's seed (the one witnesses replay with); the relay rolls its own.
+    const seed = gauntlet ? gauntlet.seedInt : (matchSeed = (matchSeed * 1103515245 + 12345) & 0x7fffffff);
     const m: Match = {
       id: id ?? newMatchId(),
       mode, fee,
       clients: [c0, c1],
-      seed: (matchSeed = (matchSeed * 1103515245 + 12345) & 0x7fffffff),
-      stage: stagePool.length > 0 ? stagePool[matchSeed % stagePool.length]! : '',
+      seed,
+      stage: stagePool.length > 0 ? stagePool[seed % stagePool.length]! : '',
       chars: [c0.character, c1 ? c1.character : solo!.character],
       names: [c0.name, c1?.name ?? houseName],
       playerKeys: [c0.playerKey, c1?.playerKey ?? ''],
@@ -1810,6 +1876,19 @@ export const createMatchServer = (opts: {
         c.name = String(msg.name ?? 'anon').slice(0, 24) || 'anon';
         c.agent = !!msg.agent;
         c.playerKey = typeof msg.playerKey === 'string' && /^[0-9a-f]{64}$/i.test(msg.playerKey) ? msg.playerKey.toLowerCase() : '';
+        if (gauntlet) {
+          // One placed match: the player IS the key the node's ticket names, never what hello claims.
+          const claims = verifyTicket(msg.ticket, gauntlet.secret);
+          const seat = claims && claims.matchId === gauntlet.matchId && claims.exp > Date.now()
+            ? gauntlet.seats.find((st) => st.sub === claims.sub) : undefined;
+          if (!seat) {
+            send(c, { t: 'error', code: 'seat', msg: 'this server runs one placed match: a valid seat ticket from the host node is required' });
+            c.ws.close();
+            return;
+          }
+          c.playerKey = seat.sub;
+          c.seat = seat.team === 1 ? 1 : 0;
+        }
         // Attestation target only — progression keys on the VERIFIED sub.
         const email = String(msg.email ?? '').slice(0, 120);
         c.email = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : '';
@@ -1913,6 +1992,25 @@ export const createMatchServer = (opts: {
           if (c.state !== 'lobby' || c.ws.readyState !== WebSocket.OPEN) return;
           if (persistence && !c.identity) {
             return send(c, { t: 'error', code: 'auth', msg: 'sign in to play online matches' });
+          }
+          if (gauntlet) {
+            // The placed match, and nothing else: the two seats meet, side 0 = team 0, once.
+            if (c.seat < 0) return send(c, { t: 'error', code: 'seat', msg: 'no seat in this match' });
+            if (gauntletStarted) return send(c, { t: 'error', msg: 'this placed match has been played; the next one is placed in the arcade' });
+            c.room = gauntlet.room;
+            const other = [...gauntletWaiting].find((w) => w !== c && w.seat !== c.seat && w.state === 'queued' && w.ws.readyState === WebSocket.OPEN);
+            if (other) {
+              gauntletWaiting.delete(other);
+              gauntletStarted = true;
+              c.state = 'queued';
+              send(c, { t: 'queued' });
+              const [a, b] = c.seat === 0 ? [c, other] : [other, c];
+              return startMatch(a, b, 'friendly', 0, gauntlet.matchId);
+            }
+            for (const w of gauntletWaiting) if (w.seat === c.seat) gauntletWaiting.delete(w); // a reconnect replaces its seat
+            gauntletWaiting.add(c);
+            c.state = 'queued';
+            return send(c, { t: 'queued' });
           }
           if (mode === 'friendly') {
             // Private challenge (v5): symmetric rendezvous by room code —
@@ -2192,6 +2290,7 @@ export const createMatchServer = (opts: {
 
   const onClose = (c: Client): void => {
     clients.delete(c);
+    gauntletWaiting.delete(c);
     const qi = queue.indexOf(c);
     if (qi >= 0) queue.splice(qi, 1);
     // A friendly waiter leaving empties their room (nothing was escrowed).
@@ -3088,6 +3187,7 @@ export const createMatchServer = (opts: {
       playerKey: '',
       ledgerSig: '',
       room: '',
+      seat: -1,
       rtt: -1,
     };
     clients.add(c);
