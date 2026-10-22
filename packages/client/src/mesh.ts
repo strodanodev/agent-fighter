@@ -44,7 +44,7 @@ export interface ContractSet {
   rpc: string;
   /** Every contract the set names, by its litnode name (MatchBook, EpochAnchor, TitleRegistry, …). */
   addresses: Record<string, string>;
-  /** Block explorer base URL, when the set names one (for MatchBook / EpochAnchor links). */
+  /** Block explorer base URL the set names (litnode 0.12.0 contracts.json `explorer`): EpochAnchor links; null = none. */
   explorer: string | null;
   /** The arcade origin the set came from — its receipt pages (#/match/<id>) explain a result. */
   arcade: string | null;

@@ -1,6 +1,6 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHmac, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,7 +8,7 @@ import { WebSocket } from 'ws';
 import { createMatchServer, type MatchServer } from '../src/server.js';
 import { playOneMatch } from '../src/agent-session.js';
 import { gauntletFromEnv, seedIntOf, verifyTicket, type GauntletConfig, type GauntletOutcome } from '../src/gauntlet.js';
-import { meshLedger } from '../src/mesh-ledger.js';
+import { descriptorProblem, meshLedger } from '../src/mesh-ledger.js';
 import { ENGINE_VERSION } from '@af/core';
 import { PROTOCOL_VERSION } from '../src/protocol.js';
 
@@ -26,6 +26,15 @@ const mintTicket = (claims: object, secret: string): string => {
   const payload = Buffer.from(JSON.stringify(claims)).toString('base64url');
   return `${payload}.${createHmac('sha256', secret).update(payload).digest('base64url')}`;
 };
+
+/** litnode protocol/canonical.js + keys.js: an envelope { body, signer, sig } signed `tag NUL canonical(body)`. */
+const canonical = (v: unknown): string => JSON.stringify(v, (_k, x: unknown) => (x && typeof x === 'object' && !Array.isArray(x)
+  ? Object.fromEntries(Object.keys(x as object).sort().map((k) => [k, (x as Record<string, unknown>)[k]]))
+  : x));
+const placer = generateKeyPairSync('ed25519');
+const placerKey = (placer.publicKey.export({ format: 'der', type: 'spki' }) as Buffer).subarray(-32).toString('hex');
+const seal = (body: Record<string, unknown>, key = placer.privateKey): { body: Record<string, unknown>; signer: string; sig: string } =>
+  ({ body, signer: placerKey, sig: sign(null, Buffer.from(`match\0${canonical(body)}`, 'utf8'), key).toString('hex') });
 
 const matchId = hex(32);
 const room = `LIT-${matchId.slice(0, 32).toUpperCase()}`;
@@ -94,10 +103,15 @@ describe('gauntlet mode: one placed match for a litnode node', () => {
       assert.equal(own.head, ledger.head, 'the client\'s own log gives the head the server names');
       return 'ab'.repeat(64);
     };
+    // The placement both were served (litnode GET /match `envelope`). B sends a forgery, A the real one: only a
+    // descriptor naming this match with its placer's signature reaches the node.
+    const placement = { matchId, rulesetId: 'agent-fighter.v1', mode: 'ranked', participants: [keys[0], keys[1]], host: hex(32), computedBy: placerKey, protocol: 4, beacon: hex(32) };
+    const real = seal(placement);
+    const forged = { ...seal(placement, generateKeyPairSync('ed25519').privateKey) };
     // Team 1 arrives first: seats follow the tickets, not arrival order.
     const [b, a] = await Promise.all([
-      playOneMatch({ url: `ws://localhost:${server.port}`, name: 'B', character: 'vector', skill: 55, charactersDir, aiSeed: 2, paceMs: 1, mode: 'friendly', room, ticket: ticketFor(1), playerKey: hex(32), signLedger: signer }),
-      new Promise((r) => setTimeout(r, 300)).then(() => playOneMatch({ url: `ws://localhost:${server.port}`, name: 'A', character: 'analog', skill: 70, charactersDir, aiSeed: 1, paceMs: 1, mode: 'friendly', room, ticket: ticketFor(0), signLedger: signer })),
+      playOneMatch({ url: `ws://localhost:${server.port}`, name: 'B', character: 'vector', skill: 55, charactersDir, aiSeed: 2, paceMs: 1, mode: 'friendly', room, ticket: ticketFor(1), playerKey: hex(32), signLedger: signer, descriptor: forged }),
+      new Promise((r) => setTimeout(r, 300)).then(() => playOneMatch({ url: `ws://localhost:${server.port}`, name: 'A', character: 'analog', skill: 70, charactersDir, aiSeed: 1, paceMs: 1, mode: 'friendly', room, ticket: ticketFor(0), signLedger: signer, descriptor: real })),
     ]);
     assert.equal(a.result.reason, 'verified'); assert.equal(b.result.reason, 'verified');
     assert.deepEqual(a.placed, { intake: 'gauntlet', mode: 'ranked' }, 'the client is told who serves it, at which level');
@@ -116,6 +130,7 @@ describe('gauntlet mode: one placed match for a litnode node', () => {
     assert.equal(sub.hydration.pin.seed, seedIntOf(seed), 'the placement\'s seed, not one the server rolled');
     assert.deepEqual(sub.hydration.pin.chars, ['analog', 'vector']);
     assert.equal((sub.hydration.pin as { intake?: string }).intake, 'gauntlet');
+    assert.deepEqual((sub as { descriptor?: unknown }).descriptor, real, 'the placement the players were served travels with the ledger (litnode 0.11.31)');
     assert.ok(sub.hydration.bundles.analog && sub.hydration.bundles.vector, 'the character bundles travel with the pin');
   });
 
@@ -169,5 +184,21 @@ describe('gauntlet mode: the only ranked intake (ADR 0014)', () => {
       await srv.close();
       fake.close();
     }
+  });
+});
+
+describe('gauntlet mode: the placement descriptor (litnode 0.11.31 binding)', () => {
+  const want = { matchId: 'aa'.repeat(32), rulesetId: 'agent-fighter.v1', mode: 'ranked' as const, participants: ['11'.repeat(32), '22'.repeat(32)] };
+  const body = { matchId: want.matchId, rulesetId: want.rulesetId, mode: 'ranked', participants: [...want.participants].reverse(), host: 'h', computedBy: placerKey, protocol: 4 };
+  it('accepts the placer-signed envelope of this match, seats in any order', () => {
+    assert.equal(descriptorProblem(seal(body), want), null);
+  });
+  it('refuses another match, another mode, other seats, a forged or misattributed signature', () => {
+    assert.match(descriptorProblem(seal({ ...body, matchId: 'bb'.repeat(32) }), want) ?? '', /another match/);
+    assert.match(descriptorProblem(seal({ ...body, mode: 'casual' }), want) ?? '', /mode casual/);
+    assert.match(descriptorProblem(seal({ ...body, participants: [want.participants[0], '33'.repeat(32)] }), want) ?? '', /participants/);
+    assert.match(descriptorProblem({ ...seal(body), sig: 'ab'.repeat(64) }, want) ?? '', /signature/);
+    assert.match(descriptorProblem(seal({ ...body, computedBy: '44'.repeat(32) }), want) ?? '', /not signed by the node/);
+    assert.match(descriptorProblem('nonsense', want) ?? '', /not an envelope/);
   });
 });

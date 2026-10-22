@@ -59,12 +59,46 @@ const ED25519_SPKI = Buffer.from('302a300506032b6570032100', 'hex');
  * the very log being archived (ADR 0014, identity).
  */
 export function verifyLedgerSig(body: LedgerBody, sigHex: string, playerKey: string): boolean {
-  if (!HEX64.test(playerKey) || !SIG_HEX.test(sigHex) || !HEX64.test(body.matchId)) return false;
+  if (!HEX64.test(body.matchId)) return false;
+  return verifyTagged('ledger', { matchId: body.matchId, ticks: body.ticks, head: body.head, buildHash: body.buildHash }, sigHex, playerKey);
+}
+
+/** litnode protocol/keys.js verify(): ed25519 over `tag NUL canonical(body)`, key and signature as hex. Never throws. */
+function verifyTagged(tag: string, body: unknown, sigHex: string, keyHex: string): boolean {
+  if (!HEX64.test(keyHex) || !SIG_HEX.test(sigHex)) return false;
   try {
-    const key = createPublicKey({ key: Buffer.concat([ED25519_SPKI, Buffer.from(playerKey, 'hex')]), format: 'der', type: 'spki' });
-    const bytes = Buffer.from(`ledger\0${canonical({ matchId: body.matchId, ticks: body.ticks, head: body.head, buildHash: body.buildHash })}`, 'utf8');
-    return edVerify(null, bytes, key, Buffer.from(sigHex, 'hex'));
+    const key = createPublicKey({ key: Buffer.concat([ED25519_SPKI, Buffer.from(keyHex, 'hex')]), format: 'der', type: 'spki' });
+    return edVerify(null, Buffer.from(`${tag}\0${canonical(body)}`, 'utf8'), key, Buffer.from(sigHex, 'hex'));
   } catch {
     return false;
   }
+}
+
+/** A placement envelope as litnode's GET /match serves it and the arcade hands it on (cabinet:init match.descriptor). */
+export interface DescriptorEnvelope { body: Record<string, unknown>; signer: string; sig: string }
+
+/**
+ * Why this envelope is not the placement of the match a gauntlet is serving, or null when it is.
+ *
+ * litnode 0.11.31 binds a ranked ledger to the placement the CLIENT was served: the submission carries the
+ * host's signed envelope as `descriptor`, so the match still settles after the host's own book let the
+ * placement go (15 min TTL, a rival, a restart). Players hand it back; this checks it names THIS match —
+ * id, ruleset, mode, the two seated keys — and that its placer signed it (`match NUL canonical(body)`, the
+ * placer being `computedBy`). Whether that placer was bonded at the pinned block, and the beacon, only the node
+ * can check (node/litnode.js verifyDescriptor); it does, on every envelope a ledger carries.
+ */
+export function descriptorProblem(
+  env: unknown,
+  want: { matchId: string; rulesetId: string; mode: 'ranked' | 'casual'; participants: readonly string[] },
+): string | null {
+  const e = env as Partial<DescriptorEnvelope> | null;
+  const d = e?.body;
+  if (!e || typeof e !== 'object' || !d || typeof d !== 'object' || typeof e.signer !== 'string' || typeof e.sig !== 'string') return 'not an envelope { body, signer, sig }';
+  if (d.matchId !== want.matchId) return 'names another match';
+  if (d.rulesetId !== want.rulesetId) return `binds ${String(d.rulesetId)}`;
+  if ((d.mode ?? 'casual') !== want.mode) return `mode ${String(d.mode ?? 'casual')}, this match is ${want.mode}`;
+  const ps = Array.isArray(d.participants) ? (d.participants as unknown[]) : [];
+  if (ps.length !== want.participants.length || !want.participants.every((p) => ps.includes(p))) return 'participants differ from the seats';
+  if (d.computedBy !== e.signer) return 'not signed by the node that computed it';
+  return verifyTagged('match', d, e.sig, e.signer) ? null : 'bad placer signature';
 }

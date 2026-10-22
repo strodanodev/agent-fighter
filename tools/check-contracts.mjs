@@ -54,5 +54,6 @@ if (process.argv.includes('--arcade')) {
   const need = ['NodeDirectory', 'NodeStake', 'MatchBook', 'EpochAnchor'];
   const missing = need.filter((k) => !isAddr(doc?.contracts?.[k]?.address));
   if (missing.length) { console.error(`check-contracts: ${url} lacks ${missing.join(', ')}`); process.exit(1); }
-  console.log(`check-contracts: the arcade serves generation ${doc.generation ?? '?'} (chain ${doc.chainId ?? '?'}) with ${need.join(', ')}${doc.explorer ? ` and explorer ${doc.explorer}` : ' (no explorer field: links fall back to the arcade receipt page)'}`);
+  if (!doc.explorer) console.warn("check-contracts: the arcade's contracts.json names no `explorer` (litnode < 0.12.0): EpochAnchor links stay off until it does");
+  console.log(`check-contracts: the arcade serves generation ${doc.generation ?? '?'} (chain ${doc.chainId ?? '?'}) with ${need.join(', ')}${doc.explorer ? ` and explorer ${doc.explorer}` : ''}`);
 }

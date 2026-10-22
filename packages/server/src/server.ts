@@ -36,7 +36,7 @@ import {
 } from './protocol.js';
 import type { ClientMsg, ItemPin, PetPin, SMatch, SResult, ServerMsg } from './protocol.js';
 import { verifyAirToken } from './airjwt.js';
-import { meshLedger, roomCodeFor, verifyLedgerSig } from './mesh-ledger.js';
+import { descriptorProblem, meshLedger, roomCodeFor, verifyLedgerSig } from './mesh-ledger.js';
 import { verifyTicket, type GauntletConfig, type GauntletOutcome } from './gauntlet.js';
 import type { AirIdentity } from './airjwt.js';
 import {
@@ -171,6 +171,9 @@ interface Client {
   ledgerSig: string;
   /** What that signature says it covers: the mesh match id and build the arcade signed for (CSign). */
   ledgerSigFor: { matchId: string; buildHash: string | null } | null;
+  /** The placement envelope the arcade served this player (CSign.descriptor), handed on to the node unverified
+   *  here except for descriptorProblem(); null when the client sent none. */
+  descriptor: unknown;
   /** The friendly room this client parked in / paired through, '' otherwise.
    *  A `LIT-…` room is a mesh-placed match: its ledger is archived. */
   room: string;
@@ -961,6 +964,17 @@ export const createMatchServer = (opts: {
     const entries = Array.from({ length: ticks }, (_, k) => ({ k, inputs: [m.inputs[0][k]! | 0, m.inputs[1][k]! | 0] }));
     const both = keys.every((k) => typeof pin.signatures[k] === 'string');
     const sigs = Object.keys(pin.signatures).length;
+    // The placement the players were served (litnode 0.11.31): the first envelope a seated player sent back that
+    // names this match and carries its placer's signature. The node verifies it again (bonded placer, beacon);
+    // without one, a ranked match settles only while the host's book still holds the placement.
+    const want = { matchId: g.matchId, rulesetId: g.rulesetId, mode: g.placedMode, participants: keys };
+    let descriptor: unknown = null;
+    for (const cl of m.clients) {
+      if (!cl?.descriptor || descriptor) continue;
+      const why = descriptorProblem(cl.descriptor, want);
+      if (why) console.log(`[gauntlet ${g.matchId.slice(0, 12)}] side ${cl.side}'s placement descriptor dropped: ${why}`);
+      else descriptor = cl.descriptor;
+    }
     // ADR 0014: the gauntlet with both players signing is the ONLY ranked intake. A ranked placement binds the
     // mode, so an unsigned log cannot settle casual either (the node refuses a mode that differs from the
     // descriptor); say so here instead of posting a submission the node can only refuse.
@@ -975,6 +989,7 @@ export const createMatchServer = (opts: {
       participants: keys, entries,
       hydration: { pin, bundles: Object.fromEntries(pin.chars.map((id) => [id, JSON.parse(readFileSync(join(charactersDir, id, 'character.json'), 'utf8')) as unknown])) },
       ...(both ? { signatures: Object.fromEntries(keys.map((k) => [k, pin.signatures[k]!])) } : {}),
+      ...(descriptor ? { descriptor } : {}),
       expected: { hash: result.hash, winner: result.winner, rounds: result.rounds, endTick: result.endTick, reason: result.reason },
     };
     let outcome: GauntletOutcome;
@@ -982,7 +997,7 @@ export const createMatchServer = (opts: {
       const res = await fetch(`${g.nodeUrl}/ledger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission), signal: AbortSignal.timeout(60_000) });
       const body = (await res.json().catch(() => ({}))) as { error?: string; attestation?: string };
       outcome = { posted: res.ok, status: res.status, error: res.ok ? undefined : body.error, signatures: sigs };
-      console.log(`[gauntlet ${g.matchId.slice(0, 12)}] ${ticks} ticks, ${sigs}/2 signatures: node ${res.ok ? `settled it (${body.attestation ?? '?'})` : `refused it: ${body.error ?? res.status}`}`);
+      console.log(`[gauntlet ${g.matchId.slice(0, 12)}] ${ticks} ticks, ${sigs}/2 signatures, ${descriptor ? 'with' : 'no'} placement descriptor: node ${res.ok ? `settled it (${body.attestation ?? '?'})` : `refused it: ${body.error ?? res.status}`}`);
     } catch (e) {
       outcome = { posted: false, error: String(e), signatures: sigs };
       console.log(`[gauntlet ${g.matchId.slice(0, 12)}] could not reach the node: ${String(e)}`);
@@ -2315,6 +2330,11 @@ export const createMatchServer = (opts: {
         if (sig && c.playerKey) {
           c.ledgerSig = sig;
           c.ledgerSigFor = /^[0-9a-f]{64}$/.test(sm) ? { matchId: sm, buildHash: /^[0-9a-f]{64}$/.test(sb) ? sb : null } : null;
+          // litnode 0.11.31: the placement envelope the arcade served (cabinet:init match.descriptor), sent back
+          // with the ledger so a ranked match binds to it even after the host's book let it go. Bounded; it is
+          // checked against the match in handOff and verified by the node.
+          const desc = (msg as { descriptor?: unknown }).descriptor;
+          if (desc && typeof desc === 'object' && JSON.stringify(desc).length <= 16_384) c.descriptor = desc;
           if (c.match) console.log(`[match ${c.match.id}] ledger signature from side ${c.side}`);
         }
         return;
@@ -3232,6 +3252,7 @@ export const createMatchServer = (opts: {
       playerKey: '',
       ledgerSig: '',
       ledgerSigFor: null,
+      descriptor: null,
       room: '',
       seat: -1,
       rtt: -1,

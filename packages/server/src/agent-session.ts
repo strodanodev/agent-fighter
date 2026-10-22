@@ -82,6 +82,8 @@ export interface AgentOptions {
   /** The mesh match id (and build) the signature covers, sent with it so a relay can verify it (CSign). */
   meshMatchId?: string;
   meshBuildHash?: string | null;
+  /** The placement envelope to send back with the signature (cabinet:init match.descriptor; CSign.descriptor). */
+  descriptor?: unknown;
   /**
    * Arcade continuation: the run token from the previous battle's result.
    * A run must first be opened with POST /arcade/enter + POST /arcade/run
@@ -276,7 +278,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
           });
           if (!opts.signLedger) return done(entries);
           void Promise.resolve(opts.signLedger(msg.ledger, entries)).then((sig) => {
-            if (sig) sendMsg({ t: 'sign', sig, ...(opts.meshMatchId ? { matchId: opts.meshMatchId, buildHash: opts.meshBuildHash ?? null } : {}) } as ClientMsg);
+            if (sig) sendMsg({ t: 'sign', sig, ...(opts.meshMatchId ? { matchId: opts.meshMatchId, buildHash: opts.meshBuildHash ?? null } : {}), ...(opts.descriptor ? { descriptor: opts.descriptor } : {}) } as ClientMsg);
             setTimeout(() => done(entries), 200); // let the signature leave before the socket closes
           }, () => done(entries));
           return;

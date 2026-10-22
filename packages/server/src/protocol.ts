@@ -262,8 +262,10 @@ export interface CResume { t: 'resume'; matchId: string; token: string }
  * The player's litnode ledger signature (produced by the arcade shell). `matchId` / `buildHash` name what the
  * arcade signed — the mesh match and build — so the relay can verify the signature and only then record the
  * player's key as a participant (ADR 0014). A gauntlet needs neither: its seat ticket already proved the key.
+ * `descriptor` is the placement envelope the arcade served (cabinet:init match.descriptor, litnode GET /match
+ * `envelope`): a gauntlet passes it on as the submission's `descriptor` (litnode 0.11.31 binding).
  */
-export interface CSign { t: 'sign'; sig: string; matchId?: string; buildHash?: string | null }
+export interface CSign { t: 'sign'; sig: string; matchId?: string; buildHash?: string | null; descriptor?: unknown }
 export type ClientMsg = CHello | CQueue | CInput | CHash | COver | CResume | CPing | CPong | CSign;
 
 // ---- server → client

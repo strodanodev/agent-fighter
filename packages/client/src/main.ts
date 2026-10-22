@@ -320,6 +320,13 @@ let meshPlayerKey = '';
 // shell to sign the ledger body and forwards the signature to the relay.
 let meshMatchId = '';
 let meshBuildHash = '';
+/**
+ * The placement envelope the arcade was served for this match (cabinet:init `match.descriptor`, litnode GET /match
+ * `envelope`, signed by the node that placed it). Sent back with the ledger signature so the match binds to the
+ * placement this client was served, not to the host's memory of it (litnode 0.11.31): a ranked match then still
+ * settles after the host's book let the placement go. The gauntlet and the node both check it; null = none sent.
+ */
+let meshDescriptor: unknown = null;
 let meshSignAsked = false;
 /** The room the cabinet placed this page for (?room=LIT-<matchId> with ?match=). A cabinet launch is ONE placed
  *  match: every PvP entry in this page — the RANKED row, the select lock, the rematch — goes to this room, never to
@@ -1624,12 +1631,15 @@ const applyBootDeepLink = (): void => {
       const node = (d as { node?: { url?: unknown } }).node?.url;
       const url = isFirstPartyArcade(e.origin) && typeof node === 'string' && /^https?:\/\//.test(node) ? node : /^https?:\/\//.test(e.origin) ? e.origin : '';
       if (url && url !== meshNodeUrl) { meshNodeUrl = url; void fetchMeshProgress(); }
+      // The placement descriptor for the match this page was launched for (the arcade sends `match` only then).
+      const match = (d as { match?: { matchId?: unknown; descriptor?: unknown } }).match;
+      if (match && String(match.matchId ?? '').toLowerCase() === meshMatchId && !!meshMatchId && match.descriptor && typeof match.descriptor === 'object') meshDescriptor = match.descriptor;
       return;
     }
     if (d?.type === 'cabinet:seat-signed') { seatSigned?.(d as { sig?: string; error?: string }); return; }
     if (!d || d.type !== 'cabinet:signed' || !meshMatchId || d.matchId !== meshMatchId) return;
     if (typeof d.sig === 'string' && net && 'signLedger' in net) {
-      (net as NetSession).signLedger(d.sig, { matchId: meshMatchId, buildHash: meshBuildHash || null });
+      (net as NetSession).signLedger(d.sig, { matchId: meshMatchId, buildHash: meshBuildHash || null, ...(meshDescriptor ? { descriptor: meshDescriptor } : {}) });
     }
   });
   if (meshRoom) void claimMeshSeat();

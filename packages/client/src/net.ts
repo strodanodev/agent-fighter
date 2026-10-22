@@ -334,9 +334,11 @@ export class NetSession {
 
   /**
    * litnode (protocol 3): forward the cabinet shell's ledger signature to the relay, with the mesh match id and
-   * build it covers — the relay verifies it and only then records the arcade key as a participant (ADR 0014).
+   * build it covers — the relay verifies it and only then records the arcade key as a participant (ADR 0014) —
+   * and the placement envelope the arcade was served, which a gauntlet passes on as the submission's
+   * `descriptor` (litnode 0.11.31 binding).
    */
-  signLedger(sig: string, signedFor?: { matchId: string; buildHash: string | null }): void {
+  signLedger(sig: string, signedFor?: { matchId: string; buildHash: string | null; descriptor?: unknown }): void {
     if (/^[0-9a-f]{128}$/i.test(sig)) this.send({ t: 'sign', sig: sig.toLowerCase(), ...(signedFor ?? {}) });
   }
 
