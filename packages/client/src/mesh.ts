@@ -34,14 +34,24 @@ const CONTRACTS_KEY = 'af.mesh-contracts';
 const CONTRACTS_MS = 10 * 60_000;
 /** A set older than this is not trusted even as a stand-in: a generation may have moved since. */
 const CONTRACTS_MAX_MS = 7 * 24 * 3600_000;
-/** RPC to read the chain through when the set names none (contracts.json does: `rpc`). Not an address. */
-const DEFAULT_RPC = 'https://liteforge.rpc.caldera.xyz/http';
+/**
+ * RPC endpoints for the same chain, tried after the set's own (`rpc`, then `rpcFallback` when it names one). The
+ * same list, in the same order, as litnode's sdk/court DEFAULT_RPCS. Not addresses.
+ *
+ * One endpoint is not enough: on 23 Oct 2026 Caldera's public `/http` answered every call with "Bandwidth limit
+ * exceeded", relay discovery read nothing, and the game showed SERVER OFFLINE to everyone who did not arrive
+ * through the arcade with a `?ws=`.
+ */
+const DEFAULT_RPCS = ['https://liteforge.rpc.caldera.xyz/http', 'https://liteforge.rpc.caldera.xyz/infra-partner-http'];
+const DEFAULT_RPC = DEFAULT_RPCS[0]!;
 export interface ContractSet {
   NODE_DIRECTORY: string;
   NODE_STAKE: string;
   generation: number | null;
   chainId: number | null;
   rpc: string;
+  /** Further endpoints for the same chain the set names (litnode `rpcFallback`), tried in order after `rpc`. */
+  rpcFallback?: string[];
   /** Every contract the set names, by its litnode name (MatchBook, EpochAnchor, TitleRegistry, …). */
   addresses: Record<string, string>;
   /** Block explorer base URL the set names (litnode 0.12.0 contracts.json `explorer`): EpochAnchor links; null = none. */
@@ -55,7 +65,7 @@ const isAddr = (v: unknown): v is string => typeof v === 'string' && /^0x[0-9a-f
 const isHttps = (v: unknown): v is string => typeof v === 'string' && /^https:\/\/[^\s"'<>]+$/.test(v);
 /** litnode's contracts.json shape: { generation, chainId, rpc, explorer?, contracts: { NodeDirectory: { address }, … } }. */
 function takeContractSet(doc: unknown, source: string, arcade: string | null): boolean {
-  const d = doc as { generation?: unknown; chainId?: unknown; rpc?: unknown; explorer?: unknown; contracts?: Record<string, { address?: string }> } | null;
+  const d = doc as { generation?: unknown; chainId?: unknown; rpc?: unknown; rpcFallback?: unknown; explorer?: unknown; contracts?: Record<string, { address?: string }> } | null;
   const dir = d?.contracts?.NodeDirectory?.address, stake = d?.contracts?.NodeStake?.address;
   if (!isAddr(dir) || !isAddr(stake)) { console.warn(`[mesh] ${source} is not a contract set (no NodeDirectory / NodeStake)`); return false; }
   const addresses: Record<string, string> = {};
@@ -65,6 +75,7 @@ function takeContractSet(doc: unknown, source: string, arcade: string | null): b
     generation: typeof d?.generation === 'number' ? d.generation : null,
     chainId: typeof d?.chainId === 'number' ? d.chainId : null,
     rpc: isHttps(d?.rpc) ? d.rpc : DEFAULT_RPC,
+    rpcFallback: Array.isArray(d?.rpcFallback) ? d.rpcFallback.filter(isHttps) : [],
     addresses,
     explorer: isHttps(d?.explorer) ? d.explorer.replace(/\/+$/, '') : null,
     arcade, at: Date.now(),
@@ -122,11 +133,37 @@ const PREFERRED_RELAYS = [
 const HEALTH_MS = 6000;
 
 let id = 0;
+/** An endpoint that just failed in transit sits out a minute, then is preferred again in list order. */
+const benchedUntil = new Map<string, number>();
+const BENCH_MS = 60_000;
+/**
+ * One JSON-RPC call, across every endpoint for the chain: the set's `rpc`, its `rpcFallback`, then DEFAULT_RPCS.
+ * A transport failure, a non-2xx answer or an endpoint-side error (rate or bandwidth limit, overload) moves on to
+ * the next endpoint; a revert is the chain's answer and is returned as an error at once, from any endpoint.
+ */
 async function rpc(method: string, params: unknown[]): Promise<string> {
-  const r = await fetch(contracts?.rpc ?? DEFAULT_RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }), signal: AbortSignal.timeout(8000) });
-  const j = (await r.json()) as { result?: string; error?: { message: string } };
-  if (j.error) throw new Error(j.error.message);
-  return j.result ?? '0x';
+  const all = [...new Set([contracts?.rpc ?? DEFAULT_RPC, ...(contracts?.rpcFallback ?? []), ...DEFAULT_RPCS])];
+  const now = Date.now();
+  const order = [...all.filter((u) => (benchedUntil.get(u) ?? 0) <= now), ...all.filter((u) => (benchedUntil.get(u) ?? 0) > now)];
+  let last: unknown = null;
+  for (const url of order) {
+    try {
+      const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }), signal: AbortSignal.timeout(8000) });
+      if (!r.ok) throw new Error(`${url} answered ${r.status}`);
+      const j = (await r.json()) as { result?: string; error?: { message?: string; code?: number } };
+      if (j.error) {
+        if (/revert/i.test(j.error.message ?? '') || j.error.code === 3) throw Object.assign(new Error(j.error.message ?? 'reverted'), { revert: true });
+        throw new Error(`${url}: ${j.error.message ?? `error ${j.error.code}`}`);
+      }
+      benchedUntil.delete(url);
+      return j.result ?? '0x';
+    } catch (e) {
+      if ((e as { revert?: boolean }).revert) throw e;
+      last = e;
+      benchedUntil.set(url, Date.now() + BENCH_MS);
+    }
+  }
+  throw last instanceof Error ? last : new Error('no RPC endpoint answered');
 }
 const call = (to: string, data: string): Promise<string> => rpc('eth_call', [{ to, data }, 'latest']);
 const word = (d: string, i: number): string => d.slice(i * 64, i * 64 + 64);
