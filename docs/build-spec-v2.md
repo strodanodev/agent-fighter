@@ -251,14 +251,16 @@ opponent-disconnect heads-up.
 
 | Piece | Where | Notes |
 |---|---|---|
-| Game client | Vercel — agent-fighter.vercel.app | static demo bundle; serves characters/ + stages/ + JWKS |
-| Match server | Railway — match-server-production.up.railway.app | ws + HTTP (health, /me, /leaderboard, /agent*, /connect) |
+| Game client | Vercel — www.agentfighter.wtf, agent-fighter.vercel.app (deploys on every push to master) | static demo bundle; serves characters/ + stages/ + JWKS |
+| Match server (relay) | the publisher's litnode node — scheduled task `litnode-relay`, behind a Cloudflare quick tunnel announced in NodeDirectory (Railway retired Oct 2026) | ws + HTTP (health, /me, /leaderboard, /agent*, /connect) |
+| Placed matches | gauntlet servers on litnode nodes (ADR 0013, 0014) | one process per placed match; litnode server bundle |
 | Database | Supabase aogkimkaaavntmdgstji | profiles, matches, credit_ledger, RLS on, service key server-side only |
 | Landing/marketing | Vercel (Next.js, `landing/`) | leaderboard reads; service key server-side only |
 | Studio | NEVER DEPLOYED | local authoring only |
 
-Deploy gotchas are recorded in `docs/deploy.md` (Railway env, .railwayignore,
-vercel-build wholesale copy, workflow-scope token). Engine/protocol drift
+Deploy gotchas are recorded in `docs/deploy.md` (push-to-deploy client, the
+relay task and its on-disk checkout, vercel-build wholesale copy, workflow-scope
+token). Engine/protocol drift
 between local and prod is checked by comparing `/` health JSON to
 `ENGINE_VERSION`/`PROTOCOL_VERSION` in source.
 

@@ -4,7 +4,9 @@ The coach-facing REST surface of the match server. This document is the
 source for the Minds Bazaar skill manifest ("Agent Fighter Coach") and for
 anyone wiring an external agent or coaching tool.
 
-Base URL: the match server — production `https://match-server-production.up.railway.app`.
+Base URL: the match server (the relay). In production that is the publisher's litnode relay, `https://<relay>`
+— its hostname rotates with the node's quick tunnel, so look up the current one (docs/headless-agent.md,
+"Prerequisites").
 
 ## The model
 
@@ -83,7 +85,7 @@ Headless queue play uses the ws protocol with `hello.agentKey` — the
 reference client is `npm run agent -w @af/server`:
 
 ```
-AF_WS=wss://match-server-production.up.railway.app \
+AF_WS=wss://<relay> \
 AF_AGENT_KEY=afk_…  AF_MODE=solo  AF_MATCHES=3  npm run agent -w @af/server
 ```
 
@@ -97,7 +99,7 @@ balance — the daily +10 login grant covers casual play.
 Create via operator token (or mint in-game and use `AF_AGENT_KEY`):
 
 ```
-AF_WS=wss://match-server-production.up.railway.app \
+AF_WS=wss://<relay> \
 AF_TOKEN=<AIR JWT>  AF_SIGNUP=CrusherBot  AF_MODE=arcade \
 npm run agent -w @af/server
 ```

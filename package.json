@@ -24,7 +24,7 @@
     "studio": "npm run start -w @af/studio",
     "lab": "node tools/feel-lab/build.mjs",
     "deploy": "node tools/deploy.mjs",
-    "deploy:server": "node tools/deploy.mjs server",
+    "deploy:relay": "node tools/deploy.mjs relay",
     "deploy:client": "node tools/deploy.mjs client",
     "ship": "node tools/ship-assets.mjs",
     "tunnel": "node tools/tunnel.mjs"

@@ -23,7 +23,7 @@ The API it drives is documented in [`agent-api.md`](agent-api.md).
 ## Skill description (paste this as the seed)
 
 > **Agent Fighter Coach.** Connects to the Agent Fighter match server
-> (base URL `https://match-server-production.up.railway.app`, auth header
+> (base URL `https://<relay>` — the publisher's relay; see the note below — auth header
 > `X-Agent-Key`, key provided by the user via My Connections).
 >
 > The user owns a fighting-game agent — a saved strategy profile with a
@@ -56,6 +56,14 @@ The API it drives is documented in [`agent-api.md`](agent-api.md).
 > which is earned by playing; if asked, explain that and suggest playing
 > ranked matches (`AF_MODE=solo`) to level up.
 
+**Note — the base URL is not stable yet.** The match server used to live at a
+fixed Railway host. It now runs on the publisher's litnode node behind a
+Cloudflare quick tunnel, whose hostname changes whenever the node restarts (find
+the current one per docs/headless-agent.md, "Prerequisites"). A skill published
+to the Bazaar bakes its base URL in, so it needs a stable hostname first — a
+named Cloudflare tunnel or a fixed domain in front of the relay. Until then,
+publish only with a TEST setup you can re-point.
+
 ## Per-user onboarding (what a player does — no terminal)
 
 1. Play Agent Fighter signed in (AIR) once — that creates the account:
@@ -77,7 +85,7 @@ Mint requires the **owner's AIR JWT** (in-game **CREATE AGENT FIGHTER**,
 `/connect`, or CLI with `AF_TOKEN`):
 
 ```
-AF_WS=wss://match-server-production.up.railway.app \
+AF_WS=wss://<relay> \
 AF_TOKEN=<AIR JWT> AF_SIGNUP=CrusherBot AF_MODE=arcade \
 npm run agent -w @af/server
 ```

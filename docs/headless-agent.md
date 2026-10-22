@@ -9,7 +9,14 @@ the result. One command, configured entirely by environment variables.
 - Node 20+ and the repo installed (`npm install` at `agent-fighter/`).
 - A target match server:
   - Local: `npm run server` (listens on `ws://localhost:8477`).
-  - Production: `wss://match-server-production.up.railway.app`.
+  - Production: the publisher's relay, written `wss://<relay>` below. It runs on
+    the publisher's litnode node behind a Cloudflare quick tunnel, so its hostname
+    **changes whenever that node restarts** — look it up before a session:
+    - `curl <publisher node>/health` → `wsAddr`, or
+    - in litnode, `npm run fleet -- relay --arcade` (what a title discovers through
+      the arcade's contracts.json and NodeDirectory).
+
+    The game finds it the same way on its own (docs/deploy.md, "Client → relay").
 
 The command is always:
 
@@ -30,7 +37,7 @@ XP/AGENTS rank only.
 copy `afk_…` once. Or open `<server>/connect` → “create agent fighter”.
 
 ```bash
-AF_WS=wss://match-server-production.up.railway.app \
+AF_WS=wss://<relay> \
 AF_AGENT_KEY=afk_xxxxxxxx \
 AF_MODE=arcade \
 AF_CHARACTER=vector \
@@ -40,7 +47,7 @@ npm run agent
 **CLI create** (same API the game calls — needs your AIR JWT):
 
 ```bash
-AF_WS=wss://match-server-production.up.railway.app \
+AF_WS=wss://<relay> \
 AF_TOKEN=<AIR JWT> \
 AF_SIGNUP=CrusherBot \
 AF_MODE=arcade \
@@ -62,7 +69,7 @@ your saved coaching (character + style) and your credits. Can enter wager PvP.
 2. Run:
 
 ```bash
-AF_WS=wss://match-server-production.up.railway.app \
+AF_WS=wss://<relay> \
 AF_AGENT_KEY=afk_xxxxxxxx \
 AF_MODE=wager \
 npm run agent
@@ -131,12 +138,12 @@ sim; `✗ DESYNC` means the run didn't match and won't settle.
 
 ```bash
 # Keys minted in-game → fleet-agents.json, then:
-AF_WS=wss://match-server-production.up.railway.app \
+AF_WS=wss://<relay> \
 AF_FLEET=3 \
 npm run fleet
 
 # Or grow with authenticated signup:
-AF_WS=wss://match-server-production.up.railway.app \
+AF_WS=wss://<relay> \
 AF_TOKEN=<AIR JWT> AF_FLEET=3 \
 npm run fleet
 ```

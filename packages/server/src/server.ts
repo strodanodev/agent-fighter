@@ -3332,8 +3332,8 @@ if (isMain) {
   console.log(`Agent Fighter match server → ws://localhost:${server.port}`);
   console.log(`engine ${ENGINE_VERSION} · protocol v${PROTOCOL_VERSION} · humans and agents welcome`);
 
-  // Deploys send SIGTERM (Railway waits RAILWAY_DEPLOYMENT_DRAINING_SECONDS
-  // before SIGKILL) — drain instead of dying mid-verification. The fallback
+  // A supervisor stopping the relay sends SIGTERM (and may follow with a hard
+  // kill) — drain instead of dying mid-verification. The fallback
   // exit covers a drain that itself hangs; unref'd so it never holds the
   // process open after a clean drain.
   const bail = (sig: string): void => {

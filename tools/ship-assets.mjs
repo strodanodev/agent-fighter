@@ -6,8 +6,8 @@
  *
  * Both asset kinds are read off DISK by BOTH tiers, which is why they ship
  * together and always as a pair:
- *   · the Railway match server reads characters/ to re-simulate ledgers and
- *     pets/ to build its adoption catalog;
+ *   · the relay (the match server on the publisher's litnode node) reads
+ *     characters/ to re-simulate ledgers and pets/ to build its adoption catalog;
  *   · the Vercel client serves both directories as static art + manifests.
  * Updating one tier only means the server rolls a pet the client cannot draw,
  * or verifies a bundle the client does not have.
@@ -21,15 +21,17 @@
  *   2. BUNDLE-HASH PIN. Studio writes a canonical sim-only `versionHash`; if it
  *      ever drifts, online play breaks with "bundle hash mismatch". We assert
  *      `rehash --check` is clean before AND after building.
- *   3. PAIRED DEPLOY. The Railway match server reads every `character.json` off
- *      disk to verify matches, and the Vercel client serves the bundles + roster
- *      manifest. New characters must land on BOTH — always deploy the pair.
- *   4. WORKING-TREE UPLOAD. `railway up` / `vercel deploy` ship the WORKING TREE,
- *      not git HEAD. So an untracked, unfinished character (e.g. a Studio WIP)
- *      silently rides along to prod. This script blocks the deploy when an
- *      untracked/incomplete character would ship ENABLED, unless you pass
- *      --include-wip (finish it, mark it meta.disabled, or opt in explicitly).
- *   5. ENGINE SKEW. After deploy, the Railway `engine` must equal the client's
+ *   3. PAIRED DEPLOY. The relay reads every `character.json` off disk to verify
+ *      matches, and the Vercel client serves the bundles + roster manifest. New
+ *      characters must land on BOTH — always deploy the pair (tools/deploy.mjs:
+ *      push master for Vercel, then restart the `litnode-relay` task).
+ *   4. WORKING-TREE RELAY. The relay runs whatever is ON DISK in its AF_ROOT
+ *      checkout, not git HEAD — so an untracked, unfinished character (e.g. a
+ *      Studio WIP) silently rides along to prod on the next restart. This script
+ *      blocks the deploy when an untracked/incomplete character would ship
+ *      ENABLED, unless you pass --include-wip (finish it, mark it meta.disabled,
+ *      or opt in explicitly).
+ *   5. ENGINE SKEW. After deploy, the relay's `engine` must equal the client's
  *      ENGINE_VERSION; a mismatch hello-rejects every online match. We verify.
  *   6. REFERENCED-BUT-MISSING PET ART (2026-08-03, caught one commit before it
  *      shipped). `pet.json.sprites` is a CONTRACT: an unreferenced file that
@@ -43,7 +45,7 @@
  *      nothing about what prod is serving. Committing your assets and then
  *      running `ship` got you a refusal while prod stayed stale. So when the
  *      tree is clean we ask the live tiers instead: every character's pinned
- *      versionHash off Vercel, the character + pet ids off the Railway health
+ *      versionHash off Vercel, the character + pet ids off the relay's health
  *      endpoint. Drift ⇒ redeploy (no commit — there is nothing to commit).
  *      No drift ⇒ exit 0, because "prod is already correct" is success.
  *      Server unreachable ⇒ abort: drift is unknowable, so do not guess.
@@ -55,7 +57,8 @@
  * Flags:
  *   -m <msg>       Commit message. Default: auto-derived from the changed roster.
  *   --skip-verify  Skip `npm run verify` (typecheck + tests). NOT recommended.
- *   --no-deploy    Commit + push only; skip the Railway/Vercel deploy.
+ *   --no-deploy    Commit + push only; skip the relay restart. (A push to master IS
+ *                  Vercel's production deploy — the client ships either way.)
  *   --include-wip  Also commit untracked/incomplete characters (default: refuse).
  *   --all          Stage ALL modified tracked files, not just character/demo work.
  *   -y, --yes      Skip the confirmation prompt (for scripted/non-TTY runs).
@@ -75,7 +78,9 @@ const PETS = join(ROOT, 'pets');
 // NOTE: use the project ALIAS, never a deployment-specific *-<hash>.vercel.app
 // URL — those sit behind Vercel's deployment-protection wall and answer every
 // request with a 200 HTML login page, which reads as "asset missing".
-const HEALTH = process.env.AF_HEALTH_URL ?? 'https://match-server-production.up.railway.app/';
+// The relay runs on this machine (the publisher's litnode node, `litnode-relay` task); its public address is a
+// Cloudflare quick tunnel that changes on every node restart, so the drift check asks it locally.
+const HEALTH = process.env.AF_HEALTH_URL ?? `http://127.0.0.1:${process.env.AF_RELAY_PORT ?? 8477}/`;
 const VERCEL_ALIAS = process.env.AF_CLIENT_URL ?? 'https://agent-fighter.vercel.app';
 
 // ── tiny log helpers ────────────────────────────────────────────────────────
@@ -228,7 +233,7 @@ if (petProblems.length) {
 // The real question this tool exists to answer is "does prod match disk?", so
 // when the tree is clean we go and ASK prod. Both tiers, because either can lag:
 //   · Vercel serves each character.json → compare the pinned versionHash;
-//   · Railway lists its character + pet ids in /health → compare membership.
+//   · the relay lists its character + pet ids in /health → compare membership.
 // Drift ⇒ redeploy-only run (nothing to commit, so no commit/push).
 // No drift ⇒ genuinely nothing to do, and that is a SUCCESS, not a failure.
 const fetchJsonOr = async (url) => {
@@ -256,7 +261,7 @@ if (touchedChars.size === 0 && touchedPets.size === 0) {
     const theirs = await fetchJsonOr(`${VERCEL_ALIAS}/characters/${id}/character.json`);
     if (!theirs) { driftedChars.push(`${id} (missing on Vercel)`); continue; }
     if (mine && theirs.versionHash !== mine) driftedChars.push(`${id} (hash ${String(theirs.versionHash).slice(0, 8)} → ${String(mine).slice(0, 8)})`);
-    else if (!liveChars.has(id)) driftedChars.push(`${id} (missing on Railway)`);
+    else if (!liveChars.has(id)) driftedChars.push(`${id} (missing on the relay)`);
   }
   // pets: no hash to pin, so compare catalog membership + that the art resolves
   const livePets = new Set(Array.isArray(health.pets) ? health.pets : []);
@@ -339,7 +344,7 @@ if (!message && redeployOnly) {
   message = `feat(${scope}): ${parts.join('; ') || 'ship asset changes'}`;
 }
 log(`\n  ${c.b}commit:${c.x} ${redeployOnly ? `${message} ${c.dim}(only if the rebuild changes anything)${c.x}` : message}`);
-log(`  ${c.b}deploy:${c.x} ${flags.noDeploy ? 'NO (--no-deploy) — commit + push only' : 'Railway (server) + Vercel (client), paired'}`);
+log(`  ${c.b}deploy:${c.x} ${flags.noDeploy ? 'NO (--no-deploy) — commit + push only (the push still deploys the client)' : 'push master (Vercel client) + litnode-relay restart, paired'}`);
 log(`  ${c.b}verify:${c.x} ${flags.skipVerify ? 'SKIPPED (--skip-verify)' : 'npm run verify (typecheck + tests)'}`);
 
 if (flags.dryRun) { log(`\n${c.dim}dry run — nothing changed.${c.x}`); process.exit(0); }
@@ -363,8 +368,8 @@ step('Commit');
 exec('git add', 'git', ['add', 'characters/', 'pets/', 'packages/client/demo/']);
 // A redeploy-only run has nothing of its own to commit — but the rebuild above
 // can still churn the demo bundle, and `deploy.mjs` (correctly) refuses a dirty
-// tree because `railway up` uploads the WORKING TREE. So: commit if the rebuild
-// moved anything, skip the commit entirely if it did not.
+// tree because the relay runs the WORKING TREE. So: commit if the rebuild moved
+// anything, skip the commit entirely if it did not.
 if (redeployOnly) {
   if (flags.all || otherTracked.length) exec('git add (tracked)', 'git', ['add', '-u']);
   if (gitLines('diff --cached --name-only').length) {
@@ -423,11 +428,11 @@ if (!redeployOnly) {
   ok('pushed');
 }
 
-if (flags.noDeploy) { log(`\n${c.grn}${c.b}✓ committed + pushed. Deploy skipped (--no-deploy).${c.x}`); process.exit(0); }
+if (flags.noDeploy) { log(`\n${c.grn}${c.b}✓ committed + pushed (Vercel deploys the client from the push). Relay restart skipped (--no-deploy): run \`npm run deploy:relay\`.${c.x}`); process.exit(0); }
 
-// ── 8. paired deploy (reuses tools/deploy.mjs: clean-tree gate + Railway log tolerance) ──
-step('Deploy — Railway (server) + Vercel (client)');
-exec('deploy', 'node', ['tools/deploy.mjs', 'both'], { tolerate: /Build Logs:|Production:/ });
+// ── 8. paired deploy (tools/deploy.mjs: clean-tree gate, push → Vercel, relay restart) ──
+step('Deploy — push master (Vercel client) + restart the litnode-relay task');
+exec('deploy', 'node', ['tools/deploy.mjs', 'both']);
 
 // ── 9. post-deploy verification (engine skew + roster on both tiers) ─────────
 step('Verify prod (roster on both tiers + engine skew)');
@@ -438,7 +443,7 @@ const superset = (arr) => arr && want.size <= new Set(arr).size && [...want].eve
 
 const fetchJson = async (url) => { try { const r = await fetch(url, { cache: 'no-store' }); return await r.json(); } catch { return null; } };
 
-// Vercel alias updates fast; Railway builds async (~2–4 min). Poll both.
+// deploy.mjs already waited for both tiers; poll briefly in case an alias or a cache lags.
 // Pets must land on both tiers too: the client SERVES the art, the server
 // CATALOGS it. Checking one proves nothing about the other.
 const wantPets = new Set(petDirs.filter((id) => !petDef(id)?.disabled));
@@ -485,7 +490,7 @@ for (let i = 1; i <= 16 && !(serverOk && clientOk); i++) {
 log('');
 const petNote = verifyPets.size ? ` + ${verifyPets.size} pet(s) with their art` : '';
 if (clientOk) ok(`Vercel client: ${VERCEL_ALIAS} serves all ${want.size} characters${petNote}`); else warn(`Vercel client did not show everything yet — check ${VERCEL_ALIAS}/api/characters and /pets/<id>/pet.json`);
-if (serverOk) ok(`Railway server: full roster${verifyPets.size ? `, ${health.pets?.length ?? 0} pets in the catalog` : ''}, engine ${health.engine}`); else warn(`Railway server not updated yet (async build) — expected engine ${expectedEngine}; poll ${HEALTH}`);
+if (serverOk) ok(`relay: full roster${verifyPets.size ? `, ${health.pets?.length ?? 0} pets in the catalog` : ''}, engine ${health.engine}`); else warn(`relay not updated yet — expected engine ${expectedEngine}; check ${HEALTH} and the litnode-relay task`);
 if (verifyPets.size && health && !Array.isArray(health.pets)) {
   warn('this server build predates the pets health field — it cannot confirm its catalog. Redeploy the server, or check its logs for "[pets] N in the catalog".');
 }
@@ -494,6 +499,6 @@ if (health && expectedEngine && health.engine !== expectedEngine) warn(`ENGINE S
 if (serverOk && clientOk) {
   log(`\n${c.grn}${c.b}✓ shipped. New characters live at ${VERCEL_ALIAS}${c.x}`);
 } else {
-  log(`\n${c.ylw}${c.b}deploy uploaded; prod not fully confirmed yet. Railway builds async — re-poll ${HEALTH} in a couple minutes.${c.x}`);
+  log(`\n${c.ylw}${c.b}deployed; prod not fully confirmed yet — re-check ${HEALTH} and ${VERCEL_ALIAS} in a couple minutes.${c.x}`);
   process.exit(2);
 }

@@ -4,7 +4,7 @@
  * playing the ranked arcade around the clock, so the AGENTS leaderboard is
  * a live ecosystem instead of a ghost town.
  *
- *   AF_WS=wss://match-server-production.up.railway.app \
+ *   AF_WS=wss://<relay>   (the publisher relay: its node /health → wsAddr; docs/headless-agent.md) \
  *   AF_TOKEN=<AIR JWT>  AF_FLEET=3  npm run fleet -w @af/server
  *
  * Agents are operator-owned (AIR). Mint keys in-game (MY AGENT → CREATE

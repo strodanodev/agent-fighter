@@ -272,9 +272,12 @@ fallback.
    Chromium headless shell 1228 and WebKit 2311. Either install them
    (`npx playwright install chromium webkit`) and rerun, or let CI run it.
    Commits 2–5 follow it.
-2. **Push** agent-fighter `master`.
-3. **Deploy** the client (Vercel) and the relay (Railway) together. The engine
-   is now `af-core-9`, and the relay rejects other engines at `hello`.
+2. **Push** agent-fighter `master`. *(Done 23 Oct: `8aaa934`.)*
+3. **Deploy** the client and the relay together: the engine is now
+   `af-core-9`, and the relay rejects other engines at `hello`. The client
+   deploys from the push (Vercel's GitHub integration). The relay is the
+   `litnode-relay` scheduled task on the publisher's node, so restarting it is
+   the deploy (`npm run deploy`, docs/deploy.md). *(Done 23 Oct.)*
 4. **litnode, ruleset:** apply §3, `npm run bundle:af`, `npm run conformance`,
    then `npm run publish:title -- set-build rulesets/agent-fighter.v1.js`
    (TitleRegistry tx).
@@ -382,9 +385,16 @@ repo at `3d4d1d6` is buildHash `290200cf…7691` and passes conformance.
 
 ### User steps, in order
 
-1. Push agent-fighter `master`.
-2. Deploy the client (Vercel) and the relay (Railway) **together**: the engine
-   is `af-core-9`.
+1. Push agent-fighter `master`. *(Done 23 Oct: `0c49e9b..8aaa934`.)*
+2. Deploy the client and the relay **together**, because the engine is
+   `af-core-9`. *(Done 23 Oct.)*
+   - **Client:** Vercel deployed production from the push, and
+     www.agentfighter.wtf serves `af-core-9`.
+   - **Relay:** the desktop's `litnode-relay` task was restarted on `8aaa934`.
+   - **Still to do:** the m16 standby relay pulls `master` and restarts its
+     own task.
+   - There is no Railway any more. `npm run deploy` does both halves
+     (docs/deploy.md).
 3. litnode, with this repo at the deployed commit:
    1. `npm run bundle:af`
    2. `npm run sign:build -- rulesets/agent-fighter.v1.js` (release key)
