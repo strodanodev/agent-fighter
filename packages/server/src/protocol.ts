@@ -258,7 +258,12 @@ export interface CResume { t: 'resume'; matchId: string; token: string }
  * the result as 'players' provenance instead of 'relay'. Additive: a server
  * that does not know it ignores it, a client that never sends it loses nothing.
  */
-export interface CSign { t: 'sign'; sig: string }
+/**
+ * The player's litnode ledger signature (produced by the arcade shell). `matchId` / `buildHash` name what the
+ * arcade signed — the mesh match and build — so the relay can verify the signature and only then record the
+ * player's key as a participant (ADR 0014). A gauntlet needs neither: its seat ticket already proved the key.
+ */
+export interface CSign { t: 'sign'; sig: string; matchId?: string; buildHash?: string | null }
 export type ClientMsg = CHello | CQueue | CInput | CHash | COver | CResume | CPing | CPong | CSign;
 
 // ---- server → client

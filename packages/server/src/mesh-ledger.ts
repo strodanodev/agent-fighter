@@ -11,7 +11,7 @@
  * the same entries from the archived ledger (tools/lib/af-submission.mjs),
  * so a head computed here over `m.inputs` is the head the node verifies.
  */
-import { createHash } from 'node:crypto';
+import { createHash, createPublicKey, verify as edVerify } from 'node:crypto';
 
 const canonical = (value: unknown): string =>
   JSON.stringify(value, (_k, v: unknown) => {
@@ -35,4 +35,36 @@ export function meshLedger(inputs: [readonly number[], readonly number[]]): Mesh
   let head = 'genesis';
   for (let k = 0; k < n; k++) head = h('tick', head, { k, inputs: [inputs[0][k]! | 0, inputs[1][k]! | 0] });
   return { head, ticks: n };
+}
+
+/** litnode protocol/pairing.js roomCodeFor: the friendly-room code both placed players derive from the match id. */
+export const roomCodeFor = (matchId: string): string => `LIT-${matchId.slice(0, 32).toUpperCase()}`;
+
+/** What a player signs (litnode protocol/log.js ledgerBody). */
+export interface LedgerBody { matchId: string; ticks: number; head: string; buildHash: string | null }
+
+const HEX64 = /^[0-9a-f]{64}$/;
+const SIG_HEX = /^[0-9a-f]{128}$/;
+/** SPKI DER prefix for a raw 32-byte ed25519 public key (RFC 8410). */
+const ED25519_SPKI = Buffer.from('302a300506032b6570032100', 'hex');
+
+/**
+ * Did `playerKey` sign this ledger body? litnode protocol/keys.js signs the
+ * bytes `ledger NUL canonical(body)` with ed25519, keys and signatures as hex;
+ * this is the same check its verifyLedger runs, so a key the relay accepts
+ * here is a key the node would accept for the same body. Never throws.
+ *
+ * It is the relay's proof of possession: `hello.playerKey` is only a claim,
+ * and a relay ledger names a key as a participant only once that key signed
+ * the very log being archived (ADR 0014, identity).
+ */
+export function verifyLedgerSig(body: LedgerBody, sigHex: string, playerKey: string): boolean {
+  if (!HEX64.test(playerKey) || !SIG_HEX.test(sigHex) || !HEX64.test(body.matchId)) return false;
+  try {
+    const key = createPublicKey({ key: Buffer.concat([ED25519_SPKI, Buffer.from(playerKey, 'hex')]), format: 'der', type: 'spki' });
+    const bytes = Buffer.from(`ledger\0${canonical({ matchId: body.matchId, ticks: body.ticks, head: body.head, buildHash: body.buildHash })}`, 'utf8');
+    return edVerify(null, bytes, key, Buffer.from(sigHex, 'hex'));
+  } catch {
+    return false;
+  }
 }

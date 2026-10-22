@@ -36,7 +36,7 @@ import {
 } from './protocol.js';
 import type { ClientMsg, ItemPin, PetPin, SMatch, SResult, ServerMsg } from './protocol.js';
 import { verifyAirToken } from './airjwt.js';
-import { meshLedger } from './mesh-ledger.js';
+import { meshLedger, roomCodeFor, verifyLedgerSig } from './mesh-ledger.js';
 import { verifyTicket, type GauntletConfig, type GauntletOutcome } from './gauntlet.js';
 import type { AirIdentity } from './airjwt.js';
 import {
@@ -169,6 +169,8 @@ interface Client {
   playerKey: string;
   /** litnode ledger signature (CSign) for the match just finished, '' until it arrives. */
   ledgerSig: string;
+  /** What that signature says it covers: the mesh match id and build the arcade signed for (CSign). */
+  ledgerSigFor: { matchId: string; buildHash: string | null } | null;
   /** The friendly room this client parked in / paired through, '' otherwise.
    *  A `LIT-…` room is a mesh-placed match: its ledger is archived. */
   room: string;
@@ -1255,7 +1257,24 @@ export const createMatchServer = (opts: {
     // …plus friendlies placed by the LIT GAMES mesh (room `LIT-…`): those are
     // the matches a litnode witness replays, so their ledger IS the product.
     const meshPlaced = m.mode === 'friendly' && m.room.startsWith('LIT-');
+    /**
+     * Has side `i` PROVEN the player key it claimed (ADR 0014, identity)? In a gauntlet the seat ticket the node
+     * minted for that key proved it at the door. On the relay `hello.playerKey` is only a claim, so the key counts
+     * once it signed this very ledger: a valid ed25519 signature over { matchId, ticks, head, buildHash } for the
+     * mesh match whose room this is. An unproven side is archived with no key, which leaves the ledger to a
+     * casual, name-labelled path (`af:<name>` in litnode's af-watch) that never binds a profile or counts.
+     */
+    const provenKey = (i: 0 | 1): string => {
+      const key = m.playerKeys[i] ?? '';
+      if (gauntlet) return key;
+      const cl = m.clients[i];
+      const sf = cl?.ledgerSigFor;
+      if (!key || !cl || cl.playerKey !== key || !cl.ledgerSig || !sf || !result.ledger) return '';
+      if (roomCodeFor(sf.matchId) !== m.room) return '';
+      return verifyLedgerSig({ matchId: sf.matchId, ticks: result.ledger.ticks, head: result.ledger.head, buildHash: sf.buildHash }, cl.ledgerSig, key) ? key : '';
+    };
     const pinOf = () => {
+      const keys = [provenKey(0), provenKey(1)] as const;
       return {
           seed: m.seed,
           bounds: m.bounds ?? null,
@@ -1267,16 +1286,21 @@ export const createMatchServer = (opts: {
           charDigests: [charDigest(m.chars[0]), charDigest(m.chars[1])],
           names: m.names,
           // litnode: which mesh match this was (room) and who the mesh placed
-          // (player keys) — tools/af-watch.mjs settles under these.
+          // (player keys, PROVEN ones only: provenKey) — tools/af-watch.mjs
+          // settles under these.
           room: m.room || null,
           // ADR 0014: which intake produced this ledger. Only 'gauntlet' (a
           // node's per-match server, both players signing) may settle
           // ranked; a 'relay' ledger is casual, whatever room it was in.
           intake: gauntlet ? 'gauntlet' : 'relay',
-          playerKeys: m.playerKeys,
+          playerKeys: [keys[0], keys[1]],
+          // The mesh match id the players signed for (relay: from CSign; the
+          // gauntlet's own id), so a reader can re-check the signatures.
+          meshMatchId: gauntlet ? gauntlet.matchId : (m.clients.find((cl) => cl?.ledgerSigFor)?.ledgerSigFor?.matchId ?? null),
           // Their signatures over SResult.ledger (CSign), by player key —
-          // present for the sides that answered before archival.
-          signatures: Object.fromEntries(m.clients.flatMap((cl, i) => (cl?.playerKey && cl.ledgerSig && cl.playerKey === m.playerKeys[i] ? [[cl.playerKey, cl.ledgerSig]] : []))),
+          // present for the sides that answered before archival. Relay: only
+          // signatures the relay verified (the same check as provenKey).
+          signatures: Object.fromEntries(m.clients.flatMap((cl, i) => (cl?.playerKey && cl.ledgerSig && cl.playerKey === m.playerKeys[i] && (gauntlet || keys[i] === cl.playerKey) ? [[cl.playerKey, cl.ledgerSig]] : []))),
           agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
           delay: m.delay,
           items: m.items,
@@ -2284,7 +2308,15 @@ export const createMatchServer = (opts: {
         // named in `result` (produced by the cabinet shell). Kept on the client
         // record; the delayed archival copies it into the ledger pin.
         const sig = typeof (msg as { sig?: unknown }).sig === 'string' && /^[0-9a-f]{128}$/i.test((msg as { sig: string }).sig) ? (msg as { sig: string }).sig.toLowerCase() : '';
-        if (sig && c.playerKey) { c.ledgerSig = sig; if (c.match) console.log(`[match ${c.match.id}] ledger signature from side ${c.side}`); }
+        // The body the arcade signed names the MESH match id and build (the relay only knows the room code
+        // derived from it), so the client says which; the relay checks it before trusting the key (pinOf).
+        const sm = String((msg as { matchId?: unknown }).matchId ?? '').toLowerCase();
+        const sb = String((msg as { buildHash?: unknown }).buildHash ?? '').toLowerCase();
+        if (sig && c.playerKey) {
+          c.ledgerSig = sig;
+          c.ledgerSigFor = /^[0-9a-f]{64}$/.test(sm) ? { matchId: sm, buildHash: /^[0-9a-f]{64}$/.test(sb) ? sb : null } : null;
+          if (c.match) console.log(`[match ${c.match.id}] ledger signature from side ${c.side}`);
+        }
         return;
       }
       case 'over': {
@@ -3199,6 +3231,7 @@ export const createMatchServer = (opts: {
       email: '',
       playerKey: '',
       ledgerSig: '',
+      ledgerSigFor: null,
       room: '',
       seat: -1,
       rtt: -1,

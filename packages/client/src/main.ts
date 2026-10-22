@@ -36,7 +36,7 @@ import { audio, hitSfxFor, swingSfx } from './audio.js';
 import type { AudioChannel, SfxId } from './audio.js';
 import { auth, authLogin, authLogout, authName, authRehydrate, authToken, isFirstPartyArcade } from './auth.js';
 import { NetSession, SoloSession } from './net.js';
-import type { NetAccount, Session } from './net.js';
+import type { NetAccount, NetSetup, Session } from './net.js';
 import {
   auraGlow, drawFx, emitAura, emitBurst, emitRing, fxPulse, updateFx,
 } from './fx.js';
@@ -1554,7 +1554,9 @@ const applyBootDeepLink = (): void => {
     }
     if (d?.type === 'cabinet:seat-signed') { seatSigned?.(d as { sig?: string; error?: string }); return; }
     if (!d || d.type !== 'cabinet:signed' || !meshMatchId || d.matchId !== meshMatchId) return;
-    if (typeof d.sig === 'string' && net && 'signLedger' in net) (net as { signLedger: (s: string) => void }).signLedger(d.sig);
+    if (typeof d.sig === 'string' && net && 'signLedger' in net) {
+      (net as NetSession).signLedger(d.sig, { matchId: meshMatchId, buildHash: meshBuildHash || null });
+    }
   });
   if (meshRoom) void claimMeshSeat();
   if (meshPlayerKey) setInterval(() => { void fetchMeshProgress(); }, 60_000);
@@ -1716,6 +1718,20 @@ const startAgentDare = (code: string): void => {
 };
 
 /** Match setup arrived — install the pinned characters/stage and begin. */
+/**
+ * What a mesh-placed match counts for, in words (server ADR 0014). Only a gauntlet — a node's per-match server,
+ * the player's arcade key signing the result — can settle RANKED. A placed room the relay hosted is CASUAL, and
+ * so is anything the mesh would only know by a name (`af:<name>`): it never binds a profile or counts for rewards.
+ * [headline, detail]; null for a match the mesh did not place.
+ */
+const placedStakes = (p: NetSetup['placed']): [string, string] | null => {
+  if (!p) return null;
+  if (p.intake === 'relay') return ['CASUAL · RELAY-HOSTED      NOT RANKED ON THE MESH', 'NO GAUNTLET HOST TOOK THIS ROOM · ONLY A GAUNTLET SETTLES RANKED'];
+  return p.mode === 'ranked'
+    ? ['RANKED · PLACED BY THE MESH      NO FEE · YOUR ARCADE KEY SIGNS THE RESULT', 'INDEPENDENT NODES REPLAY IT · OFFICIAL ONCE THE WITNESSES AGREE']
+    : ['CASUAL · PLACED BY THE MESH      NO FEE · YOUR ARCADE KEY SIGNS THE RESULT', 'NODES REPLAY IT · NOT RANKED'];
+};
+
 const installOnlineMatch = (): void => {
   const s = net!.setup!;
   const r0 = allRosters.find((r) => r.id === s.chars[0].id);
@@ -1791,7 +1807,7 @@ const installOnlineMatch = (): void => {
         // Dare-vs-agent (ADR 0006): the pinned personality is the tell.
         s.solo?.personality ? 'VS A COACHED AGENT · RANKED · SERVER-VERIFIED' : 'RANKED · SERVER-VERIFIED']
       : s.mode === 'friendly'
-        ? ['FRIENDLY CHALLENGE      NO FEE · NO REWARDS · NO RECORDS', 'BRAGGING RIGHTS ONLY · SERVER-VERIFIED']
+        ? placedStakes(s.placed) ?? ['FRIENDLY CHALLENGE      NO FEE · NO REWARDS · NO RECORDS', 'BRAGGING RIGHTS ONLY · SERVER-VERIFIED']
         // TICKETS (ADR 0009): both entries burn — say so plainly. Nobody wins
         // the other player's credits; the prize is the ticket and the rating.
         : [`ENTRY −${s.fee ?? 10} CR      BOTH ENTRIES BURN      WINNER TAKES A 🎟 TICKET`,
@@ -3525,7 +3541,10 @@ const frame = (steps = 1): void => {
     ctx.fillText(arcadeQ
       ? 'RANKED GAUNTLET · 1 CREDIT PER RUN · EXTRACT THE BAG ALIVE'
       : friendlyQ
-        ? (meshRoom && friendlyRoom === meshRoom ? `RANKED · PLACED BY THE MESH · ROOM ${friendlyRoom}` : `FRIENDLY · FREE · UNRANKED · ROOM ${friendlyRoom}`)
+        ? (meshRoom && friendlyRoom === meshRoom
+          // ADR 0014: a seat on a gauntlet is the only way a placed match counts; the relay's copy is casual.
+          ? (meshSeated() ? `PLACED BY THE MESH · YOUR ARCADE KEY SIGNS · ROOM ${friendlyRoom}` : `CASUAL · RELAY-HOSTED · NOT RANKED · ROOM ${friendlyRoom}`)
+          : `FRIENDLY · FREE · UNRANKED · ROOM ${friendlyRoom}`)
         : solo
           ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
           : 'RANKED PVP · 10 CR ENTRY EACH · BOTH BURN · WINNER TAKES A 🎟 TICKET', VW / 2, VH / 2 - 4);
@@ -3980,6 +3999,13 @@ const frame = (steps = 1): void => {
           ok ? `✓ SERVER-VERIFIED RESULT · ${net.result.rounds[0]}-${net.result.rounds[1]}${entry}`
             : `RESULT: ${net.result.reason.toUpperCase()}`,
           VW / 2, VH - 44);
+        // A placed match: what it counts for on the mesh (ADR 0014) — ranked only from a gauntlet.
+        const placed = placedStakes(net.setup?.placed);
+        if (placed) {
+          ctx.font = 'bold 12px "Courier New", monospace';
+          ctx.fillStyle = net.setup?.placed?.mode === 'ranked' && net.setup.placed.intake === 'gauntlet' ? '#8fd0ff' : '#ffd166';
+          ctx.fillText(placed[0].replace(/\s{2,}/g, ' · '), VW / 2, VH - 62);
+        }
       } else if (net.status === 'error') {
         // The watchdog fired (server stranded the verification). Say so instead
         // of an eternal "VERIFYING…"; ESC/Enter below still leaves the screen.

@@ -71,6 +71,12 @@ export interface NetSetup {
    * sprite floats behind that fighter; `aura` is what the sim installs.
    */
   pets?: [NetPetPin | null, NetPetPin | null];
+  /**
+   * Mesh-placed (`LIT-…` room) matches: who serves it and at which level it can settle (server ADR 0014).
+   * `gauntlet` = a node's per-match server, the arcade key signs, `mode` is the placement's. `relay` = the
+   * always-on relay hosted the room: CASUAL, never ranked. Absent for everything else.
+   */
+  placed?: { intake: 'gauntlet' | 'relay'; mode: 'ranked' | 'casual' };
   /** This side's resume token — lets a dropped socket rejoin (ADR 0005). */
   resume?: string;
 }
@@ -326,9 +332,12 @@ export class NetSession {
     });
   }
 
-  /** litnode (protocol 3): forward the cabinet shell's ledger signature to the relay. */
-  signLedger(sig: string): void {
-    if (/^[0-9a-f]{128}$/i.test(sig)) this.send({ t: 'sign', sig: sig.toLowerCase() });
+  /**
+   * litnode (protocol 3): forward the cabinet shell's ledger signature to the relay, with the mesh match id and
+   * build it covers — the relay verifies it and only then records the arcade key as a participant (ADR 0014).
+   */
+  signLedger(sig: string, signedFor?: { matchId: string; buildHash: string | null }): void {
+    if (/^[0-9a-f]{128}$/i.test(sig)) this.send({ t: 'sign', sig: sig.toLowerCase(), ...(signedFor ?? {}) });
   }
 
   private send(msg: unknown): void {
