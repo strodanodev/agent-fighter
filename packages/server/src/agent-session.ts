@@ -107,6 +107,8 @@ export interface AgentResult {
   localTicks: number;
   /** Arcade battles: run position + the token that queues the NEXT battle. */
   arcade?: { token: string; node: number; fights: number; total: number };
+  /** Mesh-placed matches: the intake and level the server announced (SMatch.placed). */
+  placed?: SMatch['placed'];
 }
 
 /** Play exactly one online match. Resolves with the server-verified result. */
@@ -262,7 +264,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
               );
             } catch { /* debug only */ }
           }
-          const done = (entries?: AgentResult['entries']): void => { ws.close(); resolve({ result: msg, localHash, localTicks: simTick, arcade: setup?.arcade, entries }); };
+          const done = (entries?: AgentResult['entries']): void => { ws.close(); resolve({ result: msg, localHash, localTicks: simTick, arcade: setup?.arcade, placed: setup?.placed, entries }); };
           if (!msg.ledger) return done();
           const n = msg.ledger.ticks;
           const entries = Array.from({ length: n }, (_, k) => {

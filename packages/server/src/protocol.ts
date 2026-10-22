@@ -271,6 +271,14 @@ export interface SMatch {
   seed: number;
   stage: string;
   /**
+   * Mesh-placed (`LIT-…` room) matches only: who serves it and at which
+   * level it can settle, so the client labels it from fact (ADR 0014).
+   * `gauntlet` — a node's per-match server; players sign; `mode` is the
+   * placement's. `relay` — the always-on relay hosted the room: CASUAL,
+   * never ranked. Absent for everything else.
+   */
+  placed?: { intake: 'gauntlet' | 'relay'; mode: 'ranked' | 'casual' };
+  /**
    * The stage's playfield bounds in world px (the region camera + walls lock
    * to). Server-authoritative and part of the deterministic contract: BOTH
    * simulating ends must pass this to `createGameState(seed, bounds)` so the

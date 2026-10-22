@@ -22,3 +22,4 @@ the change.
 - [0011 — PETS: account-bound companions with rolled auras](0011-pets-and-auras.md)
 - [0012 — PETS: the warden's cache (deep-clear gacha) + the repeat-play ladder](0012-boss-pets-and-repeat-play.md) — **PROPOSED, not locked; renumbered from 0011 on merge**
 - [0013 — Mesh hosting: one match server per placed match, run by any litnode node](0013-mesh-hosting-gauntlet.md)
+- [0014 — One ranked intake: the gauntlet, with both players signing](0014-one-ranked-intake.md)

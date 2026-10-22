@@ -569,8 +569,10 @@ export const createMatchServer = (opts: {
   if (opts.noPaceCheck && persistence && !persistence.dev) {
     throw new Error('noPaceCheck is dev/test-only: refusing with a non-dev persistence');
   }
-  // AIR reputation write-back (ADR 0004) — on only when fully configured.
-  const airCfg = opts.airIssuer === undefined ? loadIssuerConfig(root) : null;
+  // AIR reputation write-back (ADR 0004) — on only when fully configured, and
+  // never in a gauntlet: the node passes its own environment on, and an
+  // operator's AIR_* must not turn a placed match into a credential issuer.
+  const airCfg = opts.airIssuer === undefined && !gauntlet ? loadIssuerConfig(root) : null;
   const airIssuer: AirIssuer | null = opts.airIssuer !== undefined
     ? opts.airIssuer
     : airCfg ? createAirIssuer(airCfg) : null;
@@ -956,6 +958,16 @@ export const createMatchServer = (opts: {
     const ticks = result.ledger?.ticks ?? Math.min(m.inputs[0].length, m.inputs[1].length);
     const entries = Array.from({ length: ticks }, (_, k) => ({ k, inputs: [m.inputs[0][k]! | 0, m.inputs[1][k]! | 0] }));
     const both = keys.every((k) => typeof pin.signatures[k] === 'string');
+    const sigs = Object.keys(pin.signatures).length;
+    // ADR 0014: the gauntlet with both players signing is the ONLY ranked intake. A ranked placement binds the
+    // mode, so an unsigned log cannot settle casual either (the node refuses a mode that differs from the
+    // descriptor); say so here instead of posting a submission the node can only refuse.
+    if (g.placedMode === 'ranked' && !both) {
+      const error = `ranked needs both players' ledger signatures (${sigs}/2 signed); not submitted`;
+      console.log(`[gauntlet ${g.matchId.slice(0, 12)}] ${error}`);
+      g.onDone?.({ posted: false, error, signatures: sigs });
+      return;
+    }
     const submission = {
       matchId: g.matchId, rulesetId: g.rulesetId, ...(g.buildHash ? { buildHash: g.buildHash } : {}), mode: g.placedMode,
       participants: keys, entries,
@@ -963,7 +975,6 @@ export const createMatchServer = (opts: {
       ...(both ? { signatures: Object.fromEntries(keys.map((k) => [k, pin.signatures[k]!])) } : {}),
       expected: { hash: result.hash, winner: result.winner, rounds: result.rounds, endTick: result.endTick, reason: result.reason },
     };
-    const sigs = Object.keys(pin.signatures).length;
     let outcome: GauntletOutcome;
     try {
       const res = await fetch(`${g.nodeUrl}/ledger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission), signal: AbortSignal.timeout(60_000) });
@@ -1258,6 +1269,10 @@ export const createMatchServer = (opts: {
           // litnode: which mesh match this was (room) and who the mesh placed
           // (player keys) — tools/af-watch.mjs settles under these.
           room: m.room || null,
+          // ADR 0014: which intake produced this ledger. Only 'gauntlet' (a
+          // node's per-match server, both players signing) may settle
+          // ranked; a 'relay' ledger is casual, whatever room it was in.
+          intake: gauntlet ? 'gauntlet' : 'relay',
           playerKeys: m.playerKeys,
           // Their signatures over SResult.ledger (CSign), by player key —
           // present for the sides that answered before archival.
@@ -1442,6 +1457,9 @@ export const createMatchServer = (opts: {
           : undefined,
         items: m.items[0].length > 0 || m.items[1].length > 0 ? m.items : undefined,
         pets: m.pets[0] || m.pets[1] ? m.pets : undefined,
+        placed: gauntlet
+          ? { intake: 'gauntlet', mode: gauntlet.placedMode }
+          : m.room.startsWith('LIT-') ? { intake: 'relay', mode: 'casual' } : undefined,
         resume: m.resumeTokens[c.side],
       };
       send(c, setup);

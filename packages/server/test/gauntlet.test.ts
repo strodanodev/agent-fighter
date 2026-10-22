@@ -100,6 +100,7 @@ describe('gauntlet mode: one placed match for a litnode node', () => {
       new Promise((r) => setTimeout(r, 300)).then(() => playOneMatch({ url: `ws://localhost:${server.port}`, name: 'A', character: 'analog', skill: 70, charactersDir, aiSeed: 1, paceMs: 1, mode: 'friendly', room, ticket: ticketFor(0), signLedger: signer })),
     ]);
     assert.equal(a.result.reason, 'verified'); assert.equal(b.result.reason, 'verified');
+    assert.deepEqual(a.placed, { intake: 'gauntlet', mode: 'ranked' }, 'the client is told who serves it, at which level');
     assert.equal(a.result.ledger?.ticks, a.result.endTick, 'the log ends at the final KO');
     assert.equal(heads.length, 2);
 
@@ -114,6 +115,7 @@ describe('gauntlet mode: one placed match for a litnode node', () => {
     assert.deepEqual(Object.keys(sub.signatures).sort(), [...keys].sort());
     assert.equal(sub.hydration.pin.seed, seedIntOf(seed), 'the placement\'s seed, not one the server rolled');
     assert.deepEqual(sub.hydration.pin.chars, ['analog', 'vector']);
+    assert.equal((sub.hydration.pin as { intake?: string }).intake, 'gauntlet');
     assert.ok(sub.hydration.bundles.analog && sub.hydration.bundles.vector, 'the character bundles travel with the pin');
   });
 
@@ -130,5 +132,42 @@ describe('gauntlet mode: one placed match for a litnode node', () => {
       setTimeout(() => { ws.close(); resolve(); }, 5000);
     });
     assert.match(answers.find((m) => m.t === 'error')?.msg ?? '', /has been played/);
+  });
+});
+
+describe('gauntlet mode: the only ranked intake (ADR 0014)', () => {
+  it('a ranked placement without both players\' signatures is reported, never posted', async () => {
+    const mid = hex(32);
+    const rm = `LIT-${mid.slice(0, 32).toUpperCase()}`;
+    const sec = hex(32);
+    const ks = [hex(32), hex(32)] as const;
+    const got: unknown[] = [];
+    const fake = createServer((req, res) => { req.resume(); req.on('end', () => { got.push(1); res.writeHead(200); res.end('{}'); }); });
+    await new Promise<void>((r) => fake.listen(0, '127.0.0.1', r));
+    let done: GauntletOutcome | null = null;
+    const g = gauntletFromEnv({
+      GAUNTLET_MATCH_ID: mid, GAUNTLET_ROOM: rm, GAUNTLET_SEED: hex(32), GAUNTLET_SECRET: sec,
+      GAUNTLET_SEATS: JSON.stringify([{ sub: ks[0], team: 0, slot: 0 }, { sub: ks[1], team: 1, slot: 0 }]),
+      GAUNTLET_NODE_URL: `http://127.0.0.1:${(fake.address() as { port: number }).port}`,
+      GAUNTLET_PLACED_MODE: 'ranked',
+    });
+    const srv = await createMatchServer({ port: 0, noPaceCheck: true, gauntlet: { ...g, signWaitMs: 300, onDone: (o) => { done = o; } } });
+    try {
+      const tk = (i: 0 | 1): string => mintTicket({ sub: ks[i], matchId: mid, team: i, slot: 0, mode: 'singles', exp: Date.now() + 60_000 }, sec);
+      // Only side 0 signs: one signature is not enough for ranked.
+      await Promise.all([
+        playOneMatch({ url: `ws://localhost:${srv.port}`, name: 'A', character: 'analog', skill: 70, charactersDir, aiSeed: 1, paceMs: 1, mode: 'friendly', room: rm, ticket: tk(0), signLedger: () => 'cd'.repeat(64) }),
+        playOneMatch({ url: `ws://localhost:${srv.port}`, name: 'B', character: 'vector', skill: 55, charactersDir, aiSeed: 2, paceMs: 1, mode: 'friendly', room: rm, ticket: tk(1) }),
+      ]);
+      for (let i = 0; i < 50 && !done; i++) await new Promise((r) => setTimeout(r, 100));
+      const o = done as GauntletOutcome | null;
+      assert.equal(o?.posted, false);
+      assert.equal(o?.signatures, 1);
+      assert.match(o?.error ?? '', /ranked needs both players' ledger signatures/);
+      assert.equal(got.length, 0, 'nothing was posted to the node');
+    } finally {
+      await srv.close();
+      fake.close();
+    }
   });
 });
