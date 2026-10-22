@@ -2,7 +2,9 @@
 
 Status: ACCEPTED — gauntlet mode IMPLEMENTED (2026-10-05, `gauntlet.ts`,
 `gauntlet-server.ts`); not yet deployed to any node. The always-on relay stays
-until it is retired (litnode Title Hosting Standard, P4).
+until it is retired (litnode Title Hosting Standard, P4). Since
+[0014](0014-one-ranked-intake.md) (2026-10-22) the gauntlet is the ONLY ranked
+intake; that ADR carries the relay's retirement plan.
 Date: 2026-10-05
 Relates to: [0003](0003-online-architecture-agents-first.md) (input authority,
 which this keeps), [0005](0005-disconnect-settlement.md) (the settlement ladder,
