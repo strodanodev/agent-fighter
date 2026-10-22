@@ -19,41 +19,86 @@
  * synchronous and used everywhere — can read it; refreshed in the background
  * at boot. `?ws=` still overrides everything.
  */
-const RPC = 'https://liteforge.rpc.caldera.xyz/http';
-// The contract set is READ, not baked: litnode publishes the current one as
-// contracts.json (https://arcade.litvm.games/contracts.json and /cabinet/contracts.json
-// on every node — generated from its contracts/deployed.testnet.json), and the
-// cabinet hands it to a launched title in cabinet:init.chain. Nodes announce
-// only on the CURRENT generation's directory: v1 (0xf63AA459…) and v2
-// (0x278e4550…) are retired, and a client that still read the baked v2 pair
-// resolved the desktop's relay hostname from 20 Sep — a quick tunnel dead for
-// two days — and showed SERVER OFFLINE on every launch the cabinet did not
-// hand a ?ws= to (22 Sep 2026). The pair below is the generation-3 set, the
-// LAST RESORT when neither source answers; tools/check-contracts.mjs (CI)
-// fails when it lags litnode's deployed set.
+// The contract set is READ, never baked: litnode publishes the current one as contracts.json
+// (https://arcade.litvm.games/contracts.json, and /cabinet/contracts.json on every node — generated from its
+// contracts/deployed.testnet.json on every deploy), and the cabinet hands it to a launched title in
+// cabinet:init.chain. There is no fallback pair. A hand-copied set is what took the client down: a baked
+// generation-2 pair resolved the desktop's dead quick-tunnel hostname and showed SERVER OFFLINE on every
+// launch the cabinet did not hand a ?ws= to (22 Sep 2026), and the CI check meant to catch a lagging copy was
+// never wired in. tools/check-contracts.mjs (part of `npm run verify`) now fails on ANY address literal in
+// source. With no set read yet, discovery has nothing to ask and says so; a launch the cabinet hands a ?ws=
+// to still plays.
 const CONTRACTS_URL = 'https://arcade.litvm.games/contracts.json';
 const CONTRACTS_KEY = 'af.mesh-contracts';
+/** A set read this recently is used as is; an older one is re-read, and kept only while the arcade cannot answer. */
 const CONTRACTS_MS = 10 * 60_000;
-const BAKED = { NODE_DIRECTORY: '0xac0C73008028E3eAA05Bc5C72f0C233F94b4E3df', NODE_STAKE: '0x3CFe2D006d946A1E0E5Cf6B3E0958aFc3fF73717', generation: 3 };
-type ContractSet = { NODE_DIRECTORY: string; NODE_STAKE: string; generation: number | null; at?: number };
-let contracts: ContractSet = BAKED;
+/** A set older than this is not trusted even as a stand-in: a generation may have moved since. */
+const CONTRACTS_MAX_MS = 7 * 24 * 3600_000;
+/** RPC to read the chain through when the set names none (contracts.json does: `rpc`). Not an address. */
+const DEFAULT_RPC = 'https://liteforge.rpc.caldera.xyz/http';
+export interface ContractSet {
+  NODE_DIRECTORY: string;
+  NODE_STAKE: string;
+  generation: number | null;
+  chainId: number | null;
+  rpc: string;
+  /** Every contract the set names, by its litnode name (MatchBook, EpochAnchor, TitleRegistry, …). */
+  addresses: Record<string, string>;
+  /** Block explorer base URL, when the set names one (for MatchBook / EpochAnchor links). */
+  explorer: string | null;
+  /** The arcade origin the set came from — its receipt pages (#/match/<id>) explain a result. */
+  arcade: string | null;
+  at: number;
+}
+let contracts: ContractSet | null = null;
 const isAddr = (v: unknown): v is string => typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v);
-/** litnode's contracts.json shape: { generation, chainId, rpc, contracts: { NodeDirectory: { address }, NodeStake: { address }, … } }. */
-function takeContractSet(doc: unknown, source: string): boolean {
-  const d = doc as { generation?: number; contracts?: Record<string, { address?: string }> } | null;
+const isHttps = (v: unknown): v is string => typeof v === 'string' && /^https:\/\/[^\s"'<>]+$/.test(v);
+/** litnode's contracts.json shape: { generation, chainId, rpc, explorer?, contracts: { NodeDirectory: { address }, … } }. */
+function takeContractSet(doc: unknown, source: string, arcade: string | null): boolean {
+  const d = doc as { generation?: unknown; chainId?: unknown; rpc?: unknown; explorer?: unknown; contracts?: Record<string, { address?: string }> } | null;
   const dir = d?.contracts?.NodeDirectory?.address, stake = d?.contracts?.NodeStake?.address;
-  if (!isAddr(dir) || !isAddr(stake)) return false;
-  contracts = { NODE_DIRECTORY: dir, NODE_STAKE: stake, generation: typeof d?.generation === 'number' ? d.generation : null, at: Date.now() };
+  if (!isAddr(dir) || !isAddr(stake)) { console.warn(`[mesh] ${source} is not a contract set (no NodeDirectory / NodeStake)`); return false; }
+  const addresses: Record<string, string> = {};
+  for (const [name, c] of Object.entries(d?.contracts ?? {})) if (isAddr(c?.address)) addresses[name] = c.address;
+  contracts = {
+    NODE_DIRECTORY: dir, NODE_STAKE: stake,
+    generation: typeof d?.generation === 'number' ? d.generation : null,
+    chainId: typeof d?.chainId === 'number' ? d.chainId : null,
+    rpc: isHttps(d?.rpc) ? d.rpc : DEFAULT_RPC,
+    addresses,
+    explorer: isHttps(d?.explorer) ? d.explorer.replace(/\/+$/, '') : null,
+    arcade, at: Date.now(),
+  };
   try { localStorage.setItem(CONTRACTS_KEY, JSON.stringify(contracts)); } catch { /* private mode */ }
-  if (contracts.generation != null && BAKED.generation != null && contracts.generation !== BAKED.generation) console.warn(`[mesh] contract set from ${source} is generation ${contracts.generation}; this build was cut for ${BAKED.generation} — update the baked pair`);
   return true;
 }
-/** The cabinet's cabinet:init.chain — the CURRENT set, straight from the node that launched us. */
-export function useCabinetContracts(chain: unknown): void { takeContractSet(chain, 'cabinet:init'); }
-/** contracts.json from the arcade (cached CONTRACTS_MS); the baked pair only when it cannot be read. */
-async function loadContracts(): Promise<void> {
-  try { const c = JSON.parse(localStorage.getItem(CONTRACTS_KEY) ?? 'null') as ContractSet | null; if (c && isAddr(c.NODE_DIRECTORY) && isAddr(c.NODE_STAKE) && typeof c.at === 'number' && Date.now() - c.at < CONTRACTS_MS) { contracts = c; return; } } catch { /* fall through */ }
-  try { const r = await fetch(CONTRACTS_URL, { signal: AbortSignal.timeout(6000), cache: 'no-store' }); if (r.ok) takeContractSet(await r.json(), CONTRACTS_URL); } catch { /* keep what we have */ }
+/** The cabinet's cabinet:init.chain — the CURRENT set, straight from the arcade that launched us (its origin). */
+export function useCabinetContracts(chain: unknown, arcadeOrigin: string): void { takeContractSet(chain, 'cabinet:init', arcadeOrigin); }
+/** The contract set last read from the arcade, or null when none could be read. Synchronous. */
+export const contractSet = (): ContractSet | null => contracts;
+const cachedSet = (): ContractSet | null => {
+  try {
+    const c = JSON.parse(localStorage.getItem(CONTRACTS_KEY) ?? 'null') as ContractSet | null;
+    return c && isAddr(c.NODE_DIRECTORY) && isAddr(c.NODE_STAKE) && typeof c.at === 'number' && c.addresses && typeof c.rpc === 'string' ? c : null;
+  } catch { return null; }
+};
+/** contracts.json from the arcade (cached CONTRACTS_MS). With no answer, a set read within CONTRACTS_MAX_MS
+ *  stands in; with none of those, there is no set and discovery fails closed. */
+async function loadContracts(): Promise<ContractSet> {
+  const cached = cachedSet();
+  if (contracts && Date.now() - contracts.at < CONTRACTS_MS) return contracts;
+  if (cached && Date.now() - cached.at < CONTRACTS_MS) return (contracts = cached);
+  try {
+    const r = await fetch(CONTRACTS_URL, { signal: AbortSignal.timeout(6000), cache: 'no-store' });
+    if (r.ok && takeContractSet(await r.json(), CONTRACTS_URL, new URL(CONTRACTS_URL).origin)) return contracts!;
+  } catch { /* the arcade did not answer */ }
+  const stale = contracts ?? cached;
+  if (stale && Date.now() - stale.at < CONTRACTS_MAX_MS) return (contracts = stale);
+  throw new Error("no litVM contract set: the arcade's contracts.json did not answer and none was read before");
+}
+/** Read the contract set if none is held (for proof links on a page that never ran relay discovery). Never throws. */
+export async function ensureContractSet(): Promise<ContractSet | null> {
+  try { return await loadContracts(); } catch { return null; }
 }
 const SEL = { keys: '0x307540f6', entryOf: '0x82fb8643', standingOf: '0x43aa9ad3' } as const;
 const CACHE_KEY = 'af.mesh-relay';
@@ -78,7 +123,7 @@ const HEALTH_MS = 6000;
 
 let id = 0;
 async function rpc(method: string, params: unknown[]): Promise<string> {
-  const r = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }), signal: AbortSignal.timeout(8000) });
+  const r = await fetch(contracts?.rpc ?? DEFAULT_RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }), signal: AbortSignal.timeout(8000) });
   const j = (await r.json()) as { result?: string; error?: { message: string } };
   if (j.error) throw new Error(j.error.message);
   return j.result ?? '0x';
@@ -146,8 +191,7 @@ async function probeRelay(wsAddr: string): Promise<'ok' | 'other' | 'down'> {
 
 /** Read NodeDirectory + NodeStake and cache the first live relay in PREFERRED_RELAYS order. */
 export async function discoverRelay(): Promise<string | null> {
-  await loadContracts();
-  const { NODE_DIRECTORY, NODE_STAKE } = contracts;
+  const { NODE_DIRECTORY, NODE_STAKE } = await loadContracts();
   const keys = decodeKeys(await call(NODE_DIRECTORY, SEL.keys));
   const nowS = Math.floor(Date.now() / 1000);
   const found: { nodeId: string; wsAddr: string; updatedAt: number }[] = [];

@@ -18,7 +18,9 @@ import {
 } from './progress.js';
 import type { Profile } from './progress.js';
 import { listCharacters, loadRoster, drawFighter, resetFighterTrails } from './atlas.js';
-import { cachedRelay, isPublisherRelay, publisherOnline, publisherUp, refreshRelay, relayFailed, relayReady, useCabinetContracts } from './mesh.js';
+import { cachedRelay, ensureContractSet, isPublisherRelay, publisherOnline, publisherUp, refreshRelay, relayFailed, relayReady, useCabinetContracts } from './mesh.js';
+import { fetchMatchProof, fetchMeshHistory, pendingProof, proofLabel, proofLink } from './proof.js';
+import type { MatchProof } from './proof.js';
 import { drawPet, loadMatchPets, loadPet } from './pets.js';
 import type { LoadedPet } from './pets.js';
 import type { Roster } from './atlas.js';
@@ -341,8 +343,20 @@ let meshSeat: { ticket: string; ws: string } | null = null;
 interface MeshProgress { level: number; xp: number; xpForNext: number | null; wins: number; losses: number; draws: number; streak: number; rating: number }
 let meshProgress: MeshProgress | null = null;
 let meshNodeUrl = '';
+/**
+ * This key's latest settled results on the mesh, each with its settlement proof level and a link to check it
+ * (proof.ts) — the in-game match history, shown under the fighter card on the select screen.
+ */
+let meshHistory: MatchProof[] = [];
+/** The settlement proof of the placed match just played, polled from the arcade's node after the result. */
+let meshResultProof: MatchProof | null = null;
+let meshProofPolling = false;
+/** The result screen's proof link has been on screen long enough to take a tap (zoneSettled). */
+let proofResultSettled = false;
 const fetchMeshProgress = async (): Promise<void> => {
   if (!meshNodeUrl || !meshPlayerKey) return;
+  void ensureContractSet(); // the links in the history and on the result screen come from it
+  void fetchMeshHistory(meshNodeUrl, meshPlayerKey).then((h) => { meshHistory = h; });
   try {
     const r = await fetch(`${meshNodeUrl.replace(/\/+$/, '')}/progress?ruleset=agent-fighter.v1&player=${meshPlayerKey}`, { signal: AbortSignal.timeout(8000), cache: 'no-store' });
     const j = (await r.json()) as Partial<MeshProgress> & { error?: string };
@@ -1317,6 +1331,66 @@ const storedArcadeRun = (): StoredArcadeRun | null => {
 let titleToast = '';
 let titleToastAge = -1;
 const showToast = (msg: string): void => { titleToast = msg; titleToastAge = 0; };
+/** Open where a settled result can be checked (proof.ts proofLink): the arcade receipt, MatchBook or EpochAnchor. */
+const openProof = (p: MatchProof): void => {
+  const link = proofLink(p);
+  if (link) window.open(link.url, '_blank', 'noopener');
+  else showToast('NO CONTRACT SET READ FROM THE ARCADE YET — NOTHING TO LINK TO');
+};
+/**
+ * A tap zone that has only just appeared must not take the press that made it appear: a click that changes the
+ * screen can arrive as two events (press, then click) on either side of the switch. A zone counts once it has
+ * been drawn in every frame for at least two frames and SETTLE_MS (frames, not a wall-clock gap, so a
+ * throttled background tab still settles). `key` names the zone; call every frame it is drawn.
+ */
+const SETTLE_MS = 400;
+let renderNo = 0;
+const zoneSeen = new Map<string, { since: number; sinceFrame: number; lastFrame: number }>();
+const zoneSettled = (key: string): boolean => {
+  const now = performance.now();
+  const z = zoneSeen.get(key);
+  if (!z || z.lastFrame < renderNo - 1) { zoneSeen.set(key, { since: now, sinceFrame: renderNo, lastFrame: renderNo }); return false; }
+  z.lastFrame = renderNo;
+  return renderNo - z.sinceFrame >= 2 && now - z.since >= SETTLE_MS;
+};
+/**
+ * The in-game match history for an arcade launch: this key's latest settled mesh results, each with the proof
+ * level the mesh committed and a tap-through to check it (settlement v4). Drawn over the PLAYER 2 card, which in
+ * an arcade launch only mirrors the P1 pick (the opponent is the placed key, not a local player).
+ */
+const drawMeshHistory = (): void => {
+  if (!meshPlayerKey || meshHistory.length === 0) return;
+  const settled = zoneSettled('mesh-history');
+  const rowH = 20, x = 512, w = 420, top = 334;
+  ctx.save();
+  ctx.fillStyle = '#0d0a1e';
+  ctx.fillRect(x - 10, top, w + 20, 172);
+  ctx.font = 'bold 12px "Courier New", monospace';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#8fd0ff';
+  ctx.fillText('YOUR MESH RESULTS', x, top + 20);
+  ctx.fillStyle = '#ffffff77';
+  ctx.textAlign = 'right';
+  ctx.fillText('PROOF · TAP A ROW TO CHECK IT', x + w, top + 20);
+  meshHistory.forEach((p, i) => {
+    const y = top + 46 + i * rowH;
+    const opp = p.participants.find((k) => k !== meshPlayerKey) ?? '';
+    const me = p.scores[meshPlayerKey] ?? 0, them = p.scores[opp] ?? 0;
+    const res = me > them ? 'WIN' : me < them ? 'LOSS' : 'DRAW';
+    const link = proofLink(p);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = res === 'WIN' ? '#7ee85a' : res === 'LOSS' ? '#ff6b6b' : '#ffd166';
+    ctx.fillText(`${res} ${me}-${them}`, x, y);
+    ctx.fillStyle = p.proof === 'verified' ? '#7ee85a' : '#ffd166';
+    ctx.fillText(`${proofLabel(p.proof)}${p.mode ? ` · ${p.mode.toUpperCase()}` : ''}${p.official ? ' · OFFICIAL' : ''}`, x + 84, y);
+    ctx.fillStyle = '#ffffffaa';
+    ctx.textAlign = 'right';
+    ctx.fillText(link ? (link.label.includes('MATCHBOOK') ? 'MATCHBOOK ›' : 'EPOCHANCHOR ›') : `vs ${opp.slice(0, 8)}`, x + w, y);
+    if (link) tapZone(x - 10, y - 14, w + 20, rowH, `proof:hist:${i}`);
+  });
+  ctx.restore();
+  if (settled) for (let i = 0; i < meshHistory.length; i++) if (taps.has(`proof:hist:${i}`)) openProof(meshHistory[i]!);
+};
 
 /**
  * Module-scope twin of the title branch's local enterSelect() — needed
@@ -1544,7 +1618,7 @@ const applyBootDeepLink = (): void => {
     // discovery reads it ahead of the arcade's copy and the baked pair (mesh.ts). Only from a first-party
     // arcade origin: a contract set picks the directory, and the directory picks the relay.
     if (d?.type === 'cabinet:init') {
-      if (d.chain && isFirstPartyArcade(e.origin)) useCabinetContracts(d.chain);
+      if (d.chain && isFirstPartyArcade(e.origin)) useCabinetContracts(d.chain, e.origin);
       // The node the arcade talks to, for this player's mesh progression (display only). A node-served arcade
       // IS its node, so its origin is the address.
       const node = (d as { node?: { url?: unknown } }).node?.url;
@@ -2814,6 +2888,7 @@ const frame = (steps = 1): void => {
   // (audit 2026-07-20), where a slow frame made the old loop re-render up to 12
   // times per rAF. At a steady 60fps steps===1, so normal play is unchanged.
   uiTick += steps;
+  renderNo++;
   for (let s = 0; s < steps; s++) updateFx(); // advance cosmetic particles/rings per tick (fight AND results)
   // Tap targets are rebuilt by this frame's draw calls. Clearing here (rather
   // than after) means a press landing between frames still hit-tests the
@@ -3489,6 +3564,7 @@ const frame = (steps = 1): void => {
           level: profile.level, xp: profile.xp, xpNeed: xpForNext(profile.level),
           wins: profile.wins, losses: profile.losses,
         });
+    drawMeshHistory();
     drawWalletStrip();
   } else if (screen === 'stageSelect') {
     tickStageSelect();
@@ -4006,6 +4082,15 @@ const frame = (steps = 1): void => {
           ctx.fillStyle = net.setup?.placed?.mode === 'ranked' && net.setup.placed.intake === 'gauntlet' ? '#8fd0ff' : '#ffd166';
           ctx.fillText(placed[0].replace(/\s{2,}/g, ' · '), VW / 2, VH - 62);
         }
+        // …and the settlement proof the mesh gave it, with the place to check it (settlement v4).
+        if (meshResultProof && net.setup?.placed?.intake === 'gauntlet') {
+          const link = proofLink(meshResultProof);
+          const line = `PROOF ${proofLabel(meshResultProof.proof)}${meshResultProof.mode ? ` · ${meshResultProof.mode.toUpperCase()}` : ''}${link ? `  ·  ${link.label} ›` : ''}`;
+          ctx.font = 'bold 12px "Courier New", monospace';
+          ctx.fillStyle = meshResultProof.proof === 'verified' ? '#7ee85a' : meshResultProof.proof ? '#ffd166' : '#ffffff99';
+          ctx.fillText(line, VW / 2, VH - 80);
+          if (link) { tapZone(VW / 2 - 260, VH - 93, 520, 18, 'proof:result'); proofResultSettled = zoneSettled('proof-result'); }
+        }
       } else if (net.status === 'error') {
         // The watchdog fired (server stranded the verification). Say so instead
         // of an eternal "VERIFYING…"; ESC/Enter below still leaves the screen.
@@ -4017,8 +4102,9 @@ const frame = (steps = 1): void => {
       }
     }
     drawWalletStrip();
+    if (taps.has('proof:result') && meshResultProof && proofResultSettled) openProof(meshResultProof);
     // 'back' overlaps the full-screen 'start' region, so check it first.
-    if (canDare && (pressedThisFrame.has('KeyD') || taps.has('dare'))) {
+    else if (canDare && (pressedThisFrame.has('KeyD') || taps.has('dare'))) {
       enterInvite('results'); // ESC on the invite screen returns here
     } else if (pressedThisFrame.has('Escape') || taps.has('back')) {
       if (arcade) {
@@ -4242,8 +4328,29 @@ const drawPerf = (): void => {
  *  to the relay as CSign. Checked every frame, whatever phase the local sim is
  *  in — the first version only asked on the "server settled under a live
  *  fight" path, so a match that ended normally was never signed. */
+/**
+ * After a placed GAUNTLET match (the only kind that can settle ranked, ADR 0014), follow its settlement on the
+ * arcade's node: the result screen shows the proof level the node derived and a link to check it. Every 5 s for
+ * up to 3 min, until the node holds the result. The arcade's node may not be the match's host; until it learns
+ * the result the line says SETTLING and the link opens the arcade's receipt page, which reads the chain itself.
+ */
+const watchMeshProof = (): void => {
+  if (meshProofPolling || !meshMatchId || !meshNodeUrl || !net?.result || net.setup?.placed?.intake !== 'gauntlet') return;
+  meshProofPolling = true;
+  meshResultProof = pendingProof(meshMatchId);
+  let tries = 0;
+  const poll = async (): Promise<void> => {
+    const p = await fetchMatchProof(meshNodeUrl, meshMatchId);
+    if (p) meshResultProof = p;
+    if (!p?.proof && ++tries < 36) setTimeout(() => { void poll(); }, 5000);
+    else void fetchMeshProgress(); // the new result joins the history
+  };
+  setTimeout(() => { void poll(); }, 3000);
+};
+
 const askMeshSign = (): void => {
   if (meshRoom && net?.result && queuedMode === 'friendly') meshPlayed = true;
+  watchMeshProof();
   if (meshSignAsked || !net?.result?.ledger || !meshMatchId || window.parent === window) return;
   meshSignAsked = true;
   // With our OWN record of the log the arcade computes the head itself and signs only that (litnode 0.11.19+);
