@@ -316,3 +316,84 @@ fallback.
    stat on L3?
 7. **af-watch:** confirm the §6 step-1 rule (unplaced casual under the relay
    id, no player signatures, skip gauntlet rows), or stop it now.
+
+---
+
+## After litnode 7b752dd (2026-10-23)
+
+litnode took the §3 patch as-is and answered §10 Q1–Q7. Its build from this
+repo at `3d4d1d6` is buildHash `290200cf…7691` and passes conformance.
+
+### What changed here (commit `d70eea5`)
+
+- **The ledger carries the placement descriptor** (litnode 0.11.31 binding).
+  - The client keeps `cabinet:init` `match.descriptor` and sends it back with
+    its ledger signature (`CSign.descriptor`).
+  - The gauntlet forwards the first envelope from a seated player that names
+    this match: id, ruleset, mode and the two seated keys.
+  - It must also carry its placer's `match` signature
+    (`mesh-ledger.ts descriptorProblem`, cross-checked against litnode's own
+    `seal` / `opened`).
+  - It goes into the submission as `descriptor`. A forged or mismatched one is
+    dropped and logged.
+  - The node still verifies the placer's bond and the beacon.
+- **Proof routes.**
+  - The result screen polls `GET /delta/<id>?chain=1`.
+  - The history asks `GET /deltas?ruleset=agent-fighter.v1&player=<key>`. The
+    client-side participant filter stays for nodes before 0.12.0.
+- **Links have one source per kind and no fallbacks.**
+  - A result on MatchBook opens the receipt page of the arcade the contract
+    set came from.
+  - A result off MatchBook opens EpochAnchor at the set's `explorer`. If no
+    explorer is named, there is no link.
+  - `check-contracts` stays green. With `--arcade`, it warns while the live
+    set names no explorer.
+- **Browser determinism, run locally.**
+  - Both engines reproduce all 6 af-core-9 goldens bit for bit: Chromium
+    6/6 and WebKit 6/6.
+  - This used the repo's harness with the installed Chromium headless shell
+    1248 and WebKit 2370 via `executablePath`. Playwright 1.61.1 pins 1228 and
+    2311, which aren't installed here.
+  - CI runs the pinned builds on push.
+- `npm run verify` is green: core 150/150, server 159/159, typecheck and
+  `check-contracts`.
+
+### The commit to bundle from
+
+**`d70eea5`**, or any later commit (the commit after it is docs only).
+
+- `packages/core` has not changed since `29ca1a2`, so `npm run bundle:af`
+  should reproduce **`290200cf…7691`**.
+- The gauntlet server did change (`server.ts`, `mesh-ledger.ts`,
+  `protocol.ts`, `agent-session.ts`), so **`101661fb…dd62` is stale**. Rebuild
+  the server bundle from `d70eea5`.
+
+### What litnode still needs
+
+1. **A new server bundle hash** from `d70eea5` (above).
+2. **The live arcade on 0.12.0.** `contracts.json` must carry `explorer`, and
+   the nodes the arcade points at must serve `?chain=1` and `?player=`.
+   - Until then EpochAnchor links stay off.
+   - An older node's `/delta` has no `chain`, so a final ranked match links
+     to EpochAnchor instead of its MatchBook receipt.
+3. **Optional:** pass the node's own envelope to the gauntlet (for example a
+   `GAUNTLET_DESCRIPTOR` env) as a second source when neither player sends
+   one. Today only the players' copies travel.
+
+### User steps, in order
+
+1. Push agent-fighter `master`.
+2. Deploy the client (Vercel) and the relay (Railway) **together**: the engine
+   is `af-core-9`.
+3. litnode, with this repo at the deployed commit:
+   1. `npm run bundle:af`
+   2. `npm run sign:build -- rulesets/agent-fighter.v1.js` (release key)
+   3. commit
+   4. `npm run publish:title -- set-build rulesets/agent-fighter.v1.js`
+4. litnode:
+   1. `npm run bundle:server -- gauntlets/agent-fighter.server.json`
+   2. `npm run publish:title -- set-build servers/agent-fighter.v1.server.json`
+   3. serve it with
+      `GAUNTLET_SERVERS=agent-fighter.v1=servers/agent-fighter.v1.server.tgz`
+5. Operators: `GAUNTLET_SERVERS=agent-fighter.v1` on two or more operators,
+   then the week-long relay retirement in ADR 0014.
