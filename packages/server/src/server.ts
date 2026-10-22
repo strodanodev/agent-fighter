@@ -20,13 +20,13 @@ import {
   ITEM_COST, ITEM_TIER_ODDS, Phase, REGION_NAME, REPLAY_CODEC_VERSION, aiPoll,
   canonicalJson, createAi, createGameState, encodeLedger, exitNodes,
   generateBoard, isFightNode,
-  isLegalMove, itemById, loadCharacter, minFights, nodeById, setCharacters,
-  setMatchItems, stateHash, step, successors, validateAllTemplates,
+  isLegalMove, itemById, loadCharacter, minFights, nodeById,
+  stateHash, step, successors, validateAllTemplates,
   AURA_LINES, AURA_LINES_BY_RARITY, AURA_MAX, AURA_MIN, PET_COST, PET_ROLL_TICKETS,
-  PET_RARITY_ODDS, auraIsEmpty, clampAura, setMatchPets,
+  PET_RARITY_ODDS, auraIsEmpty, clampAura,
 } from '@af/core';
 import type {
-  Board, BoardNode, CharacterBundle, GameState, ItemDef, ItemEffect,
+  Board, BoardNode, CharacterBundle, GameState, ItemDef, ItemEffect, MatchPins,
   PetAura, PetDef, PetRarity,
 } from '@af/core';
 import {
@@ -377,29 +377,22 @@ type MatchPets = [PetPin | null, PetPin | null];
 const NO_PETS: MatchPets = [null, null];
 
 /**
- * Install a match's pinned pet auras into the core module slot (the
- * setCharacters pattern). EVERY re-sim path must run this — including the
- * pet-less default, which CLEARS the slot so one verification can never leak
- * an aura into the next match.
+ * A match's pinned pet auras, as core match pins. Handed to createGameState
+ * per match (af-core-9), so one verification can never leak an aura into the
+ * next, however re-sims interleave.
  */
-const installPets = (pets: MatchPets): void => {
-  setMatchPets(pets[0]?.aura ?? null, pets[1]?.aura ?? null);
-};
+const petPins = (pets: MatchPets): NonNullable<MatchPins['pets']> =>
+  [pets[0]?.aura ?? null, pets[1]?.aura ?? null];
 
 /**
- * Install a match's pinned drink loadouts into the core module slot (the
- * setCharacters pattern). EVERY re-sim path must run this — including the
- * item-less default, which CLEARS the slot so one verification can never
- * leak drinks into the next.
+ * A match's pinned drink loadouts, as core match pins (per match, like
+ * petPins). The pin's effect shape is validated at queue time (it comes from
+ * the core ITEMS registry) and core re-clamps values — the cast is safe.
  */
-const installItems = (items: MatchItems): void => {
-  // The pin's effect shape is validated at queue time (it comes from the
-  // core ITEMS registry) and core re-clamps values — the cast is safe.
-  setMatchItems(
-    items[0].map((p) => p.effect as ItemEffect),
-    items[1].map((p) => p.effect as ItemEffect),
-  );
-};
+const itemPins = (items: MatchItems): NonNullable<MatchPins['items']> => [
+  items[0].map((p) => p.effect as ItemEffect),
+  items[1].map((p) => p.effect as ItemEffect),
+];
 
 /**
  * Which pinned slots the re-simmed GameState shows as DRUNK: a pinned slot
@@ -430,8 +423,9 @@ interface VerifyOutcome {
  * Re-simulate the ledger, derive the result, AND scan the client-reported
  * hashes for the deviator — in ONE forward pass (v1.02_scale).
  *
- * Synchronous on purpose: verification is the trust anchor and Node's single
- * thread makes the global character slots race-free without locks.
+ * The match's characters, drinks and auras are pinned on its own GameState
+ * (af-core-9 createGameState pins), so re-sims cannot cross-talk however they
+ * interleave; it stays synchronous because it is one CPU-bound pass.
  *
  * This used to be TWO full re-sims per settled match: `verifyLedger` (derive
  * the outcome) followed by `findDeviator` (walk the ledger again checking
@@ -458,10 +452,11 @@ const verifyAndScan = (
   matchId = '',
   pets: MatchPets = NO_PETS,
 ): { outcome: VerifyOutcome; deviator: 0 | 1 | undefined } => {
-  setCharacters(loadCharacter(bundles[0]), loadCharacter(bundles[1]));
-  installItems(items);
-  installPets(pets);
-  const g = createGameState(seed, bounds);
+  const g = createGameState(seed, bounds, {
+    chars: [loadCharacter(bundles[0]), loadCharacter(bundles[1])],
+    items: itemPins(items),
+    pets: petPins(pets),
+  });
   const ai = solo ? createAi(1, solo.skill, solo.aiSeed, solo.personality) : null;
   const n = solo ? inputs[0].length : Math.min(inputs[0].length, inputs[1].length);
 

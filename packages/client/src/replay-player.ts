@@ -22,8 +22,7 @@
  * detail nobody would think to check.
  */
 import {
-  Phase, STAGE, createGameState, decodeLedger, fpToPx, setCharacters,
-  setMatchItems, setMatchPets, stateHash, step,
+  Phase, STAGE, createGameState, decodeLedger, fpToPx, legacyStateHash, stateHash, step,
 } from '@af/core';
 import type { GameState, ItemEffect, PetAura } from '@af/core';
 import { drawFighter, loadRoster, resetFighterTrails } from './atlas.js';
@@ -120,26 +119,26 @@ export const mountReplay = async (opts: MountOptions): Promise<ReplayHandle> => 
     r0.bundle.maxHealth || 1, r1.bundle.maxHealth || 1,
   ];
 
-  let game: GameState = createGameState(pin.seed, pin.bounds ?? undefined);
-
   /**
-   * Install the pinned setup and re-step to `target`.
-   *
-   * Characters, items and pet auras are re-installed on EVERY rebuild, not
-   * once at mount.
-   * They live in module-level slots inside the core (the `setCharacters`
-   * pattern), so another replay — or the game itself — mounting in the same
-   * page would otherwise leave the wrong cast installed and silently produce a
-   * different match.
+   * The pinned setup as a fresh GameState. Characters, items and pet auras
+   * are per-match pins on the state itself (af-core-9), so another replay —
+   * or the game itself — running in the same page cannot swap the cast out
+   * from under this one.
    */
-  const rebuild = (target: number): void => {
-    setCharacters(r0.ch, r1.ch);
-    setMatchItems(
+  const fresh = (): GameState => createGameState(pin.seed, pin.bounds ?? undefined, {
+    chars: [r0.ch, r1.ch],
+    items: [
       (pin.items?.[0] ?? []).map((p) => p.effect),
       (pin.items?.[1] ?? []).map((p) => p.effect),
-    );
-    setMatchPets(pin.pets?.[0]?.aura ?? null, pin.pets?.[1]?.aura ?? null);
-    game = createGameState(pin.seed, pin.bounds ?? undefined);
+    ],
+    pets: [pin.pets?.[0]?.aura ?? null, pin.pets?.[1]?.aura ?? null],
+  });
+
+  let game: GameState = fresh();
+
+  /** Rebuild the pinned setup and re-step to `target`. */
+  const rebuild = (target: number): void => {
+    game = fresh();
     resetFighterTrails();
     let t = 0;
     while (t < target && t < state.total && game.phase !== Phase.MatchOver) {
@@ -189,7 +188,11 @@ export const mountReplay = async (opts: MountOptions): Promise<ReplayHandle> => 
    */
   const checkVerified = (): void => {
     if (state.verified !== null || !pin.result) return;
-    state.verified = stateHash(game) === pin.result.hash;
+    // A ledger archived before af-core-9 pinned an af-core-8 hash. The match
+    // stats af-core-9 added are pure observers, so legacyStateHash reproduces
+    // that hash exactly (stats.test.ts pins it) — the same replay, verified.
+    const h = pin.result.hash;
+    state.verified = stateHash(game) === h || legacyStateHash(game) === h;
   };
 
   // ---------------------------------------------------------------- render

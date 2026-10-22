@@ -15,7 +15,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, loadCharacter,
-  setCharacters, setMatchItems, setMatchPets, stateHash, step,
+  stateHash, step,
 } from '@af/core';
 import type { AiState, CharacterBundle, GameState, InputFrame, ItemEffect } from '@af/core';
 import { HASH_EVERY, PROTOCOL_VERSION } from './protocol.js';
@@ -123,27 +123,6 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
     let ai: AiState | null = null;
     let side: 0 | 1 = 0;
     let delay = 3;
-    // This match's loaded characters, re-pinned into the ENGINE-GLOBAL slots
-    // before every sim burst: concurrent in-process sessions (house bots,
-    // tests, the server's own verifier) share those globals, and two matches
-    // with different character pairs would silently corrupt each other's
-    // lockstep sims without this.
-    let myChars: [ReturnType<typeof loadCharacter>, ReturnType<typeof loadCharacter>] | null = null;
-    // Pinned drink loadouts (ADR 0007) are engine-global exactly like
-    // characters — re-pin both before every burst or concurrent sessions
-    // corrupt each other. undefined when the setup carried no items.
-    let myItems: SMatch['items'] = undefined;
-    /** Pinned pet auras (ADR 0011) — engine-global for the same reason. */
-    let myPets: SMatch['pets'] = undefined;
-    const pinChars = (): void => {
-      if (!myChars) return;
-      setCharacters(myChars[0], myChars[1]);
-      setMatchItems(
-        myItems?.[0]?.map((p) => p.effect as ItemEffect) ?? null,
-        myItems?.[1]?.map((p) => p.effect as ItemEffect) ?? null,
-      );
-      setMatchPets(myPets?.[0]?.aura ?? null, myPets?.[1]?.aura ?? null);
-    };
 
     const myInputs: number[] = [];
     const oppInputs: (number | undefined)[] = [];
@@ -207,14 +186,18 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
           setup = msg;
           side = msg.side;
           delay = msg.delay;
-          myChars = [
-            loadCharacter(bundleOf(msg.chars[0].id)),
-            loadCharacter(bundleOf(msg.chars[1].id)),
-          ];
-          myItems = msg.items;
-          myPets = msg.pets;
-          pinChars();
-          game = createGameState(msg.seed, msg.bounds);
+          // This match's characters, drinks (ADR 0007) and pet auras (ADR
+          // 0011) are pinned on its own GameState (af-core-9), so concurrent
+          // in-process sessions — house bots, tests, the server's verifier —
+          // cannot corrupt each other's lockstep sims.
+          game = createGameState(msg.seed, msg.bounds, {
+            chars: [loadCharacter(bundleOf(msg.chars[0].id)), loadCharacter(bundleOf(msg.chars[1].id))],
+            items: [
+              msg.items?.[0]?.map((p) => p.effect as ItemEffect) ?? null,
+              msg.items?.[1]?.map((p) => p.effect as ItemEffect) ?? null,
+            ],
+            pets: [msg.pets?.[0]?.aura ?? null, msg.pets?.[1]?.aura ?? null],
+          });
           ai = createAi(side, opts.skill, opts.aiSeed ?? msg.seed ^ (side + 1) * 0x9e37, opts.personality);
           const paceMs = opts.paceMs ?? 16;
           const burst = paceMs <= 2 ? 64 : 1;
@@ -229,7 +212,6 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
             const houseAi = createAi(1, msg.solo.skill, msg.solo.aiSeed, msg.solo.personality);
             pacer = setInterval(() => {
               if (!game || !ai) return;
-              pinChars();
               for (let b = 0; b < burst && game.phase !== Phase.MatchOver; b++) {
                 const mine = opts.policy ? opts.policy(game, ai) : aiPoll(ai, game);
                 myInputs[simTick] = mine;
@@ -260,7 +242,6 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
           // agent-vs-agent matches run as fast as round-trips allow — OS
           // timers are too coarse (Windows ~15ms) for a 1ms interval to help.
           pacer = setInterval(() => {
-            pinChars();
             for (let b = 0; b < burst && sendTick - simTick < delay + 8; b++) emitOne();
             advance();
           }, paceMs);
@@ -268,7 +249,6 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
         }
         case 'i': {
           oppInputs[msg.k] = msg.v;
-          pinChars();
           return advance();
         }
         case 'result': {

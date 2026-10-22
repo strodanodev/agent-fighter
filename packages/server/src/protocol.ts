@@ -324,8 +324,8 @@ export interface SMatch {
   /**
    * CONSUMABLES (ADR 0007 final shape): the pinned per-side drink LOADOUTS
    * (each side's EQUIPPED cans, slot order, ≤ 3). BOTH simulating ends
-   * (client + verifier + any rollback peer) must install this via core
-   * `setMatchItems` BEFORE createGameState — the pin is part of the
+   * (client + verifier + any rollback peer) must pass this to core
+   * createGameState as `pins.items` — the pin is part of the
    * deterministic contract exactly like characters and `solo.personality`.
    * Values are re-clamped in core. Absent = item-less match. The server
    * reads each profile's equipped loadout itself at queue time (the client
@@ -336,7 +336,7 @@ export interface SMatch {
   /**
    * PETS (ADR 0011): the pinned per-side companion, or null for a side with
    * none equipped. Same deterministic contract as `items` — BOTH simulating
-   * ends install it via core `setMatchPets` BEFORE createGameState, and core
+   * ends pass it to core createGameState as `pins.pets`, and core
    * re-clamps every line. Absent = pet-less match.
    *
    * The server reads each profile's equipped pet itself at queue time; the

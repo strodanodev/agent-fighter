@@ -1,5 +1,5 @@
 import {
-  ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, restore, setMatchItems, setMatchPets, snapshot, stateHash, step,
+  ENGINE_VERSION, Phase, aiPoll, createAi, createGameState, restore, snapshot, stateHash, step,
 } from '@af/core';
 import type { AiState, GameState, InputFrame, ItemEffect } from '@af/core';
 
@@ -60,7 +60,7 @@ export interface NetSetup {
    * CONSUMABLES (ADR 0007 Phase 2): the server-pinned per-side drinks. The
    * sim applies items ONLY from this echo — never from what we asked for —
    * so an old server (which ignores CQueue.item) simply means an item-less
-   * match, not a desync. Installed via installSetupItems() before EVERY
+   * match, not a desync. Pinned via setupGame() on EVERY
    * createGameState (begin + resume rebuild); absent clears the slot.
    */
   items?: [NetItemPin[], NetItemPin[]];
@@ -94,18 +94,20 @@ export interface NetPetPin {
 }
 
 /**
- * Install a setup's pinned drinks AND pet auras into core — part of match
- * construction, not a cosmetic step: skipping either would simulate a
+ * Build a setup's GameState with its pinned drinks AND pet auras — part of
+ * match construction, not a cosmetic step: skipping either would simulate a
  * different match than the server's verifier and convict this client as the
- * deviator for its own opponent's pet.
+ * deviator for its own opponent's pet. They go to createGameState as per-match
+ * pins (af-core-9); the characters are the ones main.ts installed for this
+ * setup (setCharacters), which createGameState pins onto the state.
  */
-const installSetupItems = (s: NetSetup): void => {
-  setMatchItems(
+const setupGame = (s: NetSetup): GameState => createGameState(s.seed, s.bounds, {
+  items: [
     s.items?.[0]?.map((p) => p.effect as ItemEffect) ?? null,
     s.items?.[1]?.map((p) => p.effect as ItemEffect) ?? null,
-  );
-  setMatchPets(s.pets?.[0]?.aura ?? null, s.pets?.[1]?.aura ?? null);
-};
+  ],
+  pets: [s.pets?.[0]?.aura ?? null, s.pets?.[1]?.aura ?? null],
+});
 
 export interface NetResult {
   winner: number;
@@ -430,8 +432,7 @@ export class NetSession {
   /** Call after installing characters for the pinned setup. */
   begin(): void {
     const s = this.setup!;
-    installSetupItems(s);
-    this.game = createGameState(s.seed, s.bounds);
+    this.game = setupGame(s);
     // First `delay` ticks are neutral by convention — symmetric with the peer.
     for (let k = 0; k < s.delay; k++) {
       this.myInputs[k] = 0;
@@ -459,8 +460,7 @@ export class NetSession {
     this.oppInputs = asSparse(s.side === 0 ? s.inputs[1] : s.inputs[0]);
     this.usedOpp = [];
     this.snaps = new Array(SNAP_RING).fill(null);
-    installSetupItems(s);
-    this.game = createGameState(s.seed, s.bounds);
+    this.game = setupGame(s);
     let t = 0;
     while (
       this.myInputs[t] !== undefined && this.oppInputs[t] !== undefined
@@ -750,8 +750,7 @@ export class SoloSession {
    */
   private rebuildFrom(s: NetSetup & { inputs: [(number | null)[], (number | null)[]] }): void {
     this.setup = s;
-    installSetupItems(s);
-    this.game = createGameState(s.seed, s.bounds);
+    this.game = setupGame(s);
     this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed, s.solo!.personality);
     const mine = s.inputs[0];
     let t = 0;
@@ -807,8 +806,7 @@ export class SoloSession {
   /** Call after installing characters for the pinned setup. */
   begin(): void {
     const s = this.setup!;
-    installSetupItems(s);
-    this.game = createGameState(s.seed, s.bounds);
+    this.game = setupGame(s);
     this.houseAi = createAi(1, s.solo!.skill, s.solo!.aiSeed, s.solo!.personality);
     // Same throttled-tab race as NetSession.begin(): a result that landed
     // before the first frame must keep its terminal status.

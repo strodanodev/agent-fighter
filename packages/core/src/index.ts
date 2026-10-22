@@ -16,10 +16,13 @@ export type {
 export { HIST_LEN, numpadDir, detectMotion, downTappedRecently } from './motion.js';
 export { ANALOG } from './characters/analog.js';
 export {
-  Action, Phase, PROJECTILE_SLOTS, characters, setCharacters,
+  Action, Phase, PROJECTILE_SLOTS, characters, setCharacters, charsOf,
   createGameState, resetRound, snapshot, restore, serialize, stateHash,
+  legacyStateHash, STAT_FIELDS,
 } from './state.js';
-export type { GameState, FighterState, ProjectileState, StageBounds } from './state.js';
+export type { GameState, FighterState, ProjectileState, StageBounds, MatchPins } from './state.js';
+export { STATS_SCHEMA, matchStats } from './stats.js';
+export type { StatLine, StatName, StatOp } from './stats.js';
 export { step, debugBoxes, debugInfo } from './sim.js';
 export type { DebugBox, DebugFighterInfo } from './sim.js';
 export { SYS, spriteForFighter } from './anim.js';

@@ -6,10 +6,10 @@ import { clamp, fp, fpToPx, nextRand } from './fp.js';
 import {
   PET_CRIT_BONUS, PET_CRIT_FLASH_TICKS, PET_REGEN_PERIOD_TICKS,
 } from './pets.js';
-import { BUTTON_BITS, BUTTON_PRIORITY, STAGE, TUNING } from './data.js';
+import { BUTTON_BITS, BUTTON_PRIORITY, ROUND_SECONDS, STAGE, TICKS_PER_SEC, TUNING } from './data.js';
 import type { HitboxDef, LoadedCharacter, MoveDef, Rect } from './data.js';
 import { detectMotion, downTappedRecently, numpadDir } from './motion.js';
-import { Action, PROJECTILE_SLOTS, Phase, characters, resetRound } from './state.js';
+import { Action, PROJECTILE_SLOTS, Phase, charsOf, resetRound } from './state.js';
 import type { FighterState, GameState, ProjectileState } from './state.js';
 
 const FLOOR = fp(STAGE.floorYPx);
@@ -705,7 +705,9 @@ const strike = (s: GameState, src: StrikeSource, vic: FighterState, hb: HitboxDe
 
   if (canBlock(vic, src.x, hb.guard)) {
     // Chip is never critical — a crit is a clean-hit reward, not a chip one.
+    const hpBefore = vic.health;
     vic.health = Math.max(0, vic.health - (hb.chip > 0 ? buffScaled(hb.chip, src, vic, 0) : 0));
+    tallyDamage(src.buff, vic, hpBefore);
     vic.blockstunLeft = hb.blockstun;
     vic.velX = dir * fp(hb.pushbackBlock);
     vic.pushblocked = 0;
@@ -734,7 +736,16 @@ const strike = (s: GameState, src: StrikeSource, vic: FighterState, hb: HitboxDe
   vic.comboScaling = Math.max(
     Math.trunc((vic.comboScaling * TUNING.scalingMult) / 1000), TUNING.scalingFloor);
   if (vicAir) vic.juggleBudget -= hb.juggleCost;
+  const hpBefore = vic.health;
   vic.health = Math.max(0, vic.health - dmg);
+  tallyDamage(src.buff, vic, hpBefore);
+  if (vic.comboHits > src.buff.stMaxCombo) src.buff.stMaxCombo = vic.comboHits;
+  // A super "lands" on its first clean contact. attackConnected still holds
+  // this move's earlier contacts here (step() writes this one after strike
+  // returns); a projectile hits once, so it needs no such check.
+  if (src.move.type === 'super' && (!src.attacker || src.attacker.attackConnected !== 1)) {
+    src.buff.stSupers++;
+  }
 
   const stun = Math.max(
     hb.hitstun - (vic.comboHits >> TUNING.hitstunDecayShift), TUNING.minHitstun);
@@ -775,6 +786,18 @@ const strike = (s: GameState, src: StrikeSource, vic: FighterState, hb: HitboxDe
   return 1;
 };
 
+/**
+ * MATCH STATS (settlement v4): credit the health a strike or throw actually
+ * removed (overkill past 0 is not damage dealt) and mark the victim touched
+ * this round. Writes stat fields only — nothing in the sim reads them back.
+ */
+const tallyDamage = (by: FighterState, vic: FighterState, hpBefore: number): void => {
+  const dealt = hpBefore - vic.health;
+  if (dealt <= 0) return;
+  by.stDamage += dealt;
+  vic.stTouched = 1;
+};
+
 /** Cornered victims transfer pushback to a grounded melee attacker. */
 const cornerTransfer = (vic: FighterState, src: StrikeSource, push: number, dir: number): void => {
   const atWall = (dir < 0 && vic.x <= WALL_L + CORNER) || (dir > 0 && vic.x >= WALL_R - CORNER);
@@ -794,7 +817,7 @@ const koFighter = (f: FighterState, dir: number): void => {
 // ---------------------------------------------------------------------------
 
 const spawnProjectile = (s: GameState, owner: number, f: FighterState, moveIdx: number): void => {
-  const move = characters[owner as 0 | 1].b.moves[moveIdx]!;
+  const move = charsOf(s)[owner as 0 | 1].b.moves[moveIdx]!;
   const pd = move.projectile!;
   // One live projectile per player (classic fireball rule).
   for (const p of s.projectiles) if (p.active && p.owner === owner) return;
@@ -813,8 +836,8 @@ const spawnProjectile = (s: GameState, owner: number, f: FighterState, moveIdx: 
   }
 };
 
-const projectileRect = (p: ProjectileState): WorldRect => {
-  const pd = characters[p.owner as 0 | 1].b.moves[p.moveIdx]!.projectile!;
+const projectileRect = (s: GameState, p: ProjectileState): WorldRect => {
+  const pd = charsOf(s)[p.owner as 0 | 1].b.moves[p.moveIdx]!.projectile!;
   const facing = p.velX >= 0 ? 1 : -1;
   return worldRect(p.x, p.y, facing, pd.rect);
 };
@@ -832,7 +855,7 @@ const updateProjectiles = (s: GameState): void => {
     for (let j = i + 1; j < PROJECTILE_SLOTS; j++) {
       const b = s.projectiles[j]!;
       if (!b.active || a.owner === b.owner) continue;
-      if (overlaps(projectileRect(a), projectileRect(b))) {
+      if (overlaps(projectileRect(s, a), projectileRect(s, b))) {
         a.active = 0;
         b.active = 0;
       }
@@ -876,10 +899,11 @@ const resolveGrabs = (s: GameState): void => {
     const att = s.fighters[i];
     if (att.action !== Action.Grab) continue;
     const vic = s.fighters[1 - i]!;
-    const ch = characters[i];
+    const ch = charsOf(s)[i];
     if (vic.techLeft === -1) {
       // Teched: break apart, no damage.
       vic.techLeft = 0;
+      vic.stTechs++;
       att.velX = -att.facing * fp(7);
       vic.velX = -vic.facing * fp(7);
       setAction(att, Action.Idle);
@@ -894,7 +918,10 @@ const resolveGrabs = (s: GameState): void => {
       vic.comboScaling = Math.max(
         Math.trunc((TUNING.scalingStart * TUNING.scalingMult) / 1000), TUNING.scalingFloor);
       vic.juggleBudget = TUNING.juggleBudget;
+      const hpBefore = vic.health;
       vic.health = Math.max(0, vic.health - ch.b.throwDamage);
+      tallyDamage(att, vic, hpBefore);
+      if (att.stMaxCombo < 1) att.stMaxCombo = 1;
       vic.velX = dir * fp(ch.b.throwTossVelX);
       vic.velY = fp(ch.b.throwTossVelY);
       vic.hitstunLeft = 60;
@@ -922,7 +949,7 @@ export const step = (s: GameState, inputs: [InputFrame, InputFrame]): void => {
   WALL_R = s.wallR;
   s.tick++;
   const [f0, f1] = s.fighters;
-  const [c0, c1] = characters;
+  const [c0, c1] = charsOf(s);
 
   // Inputs are gathered every tick — even frozen ones — so buffered motions
   // survive hitstop and super flash.
@@ -1041,10 +1068,10 @@ export const step = (s: GameState, inputs: [InputFrame, InputFrame]): void => {
   for (const p of s.projectiles) {
     if (!p.active || p.hasHit) continue;
     const vic = s.fighters[(1 - p.owner) as 0 | 1];
-    const vicCh = characters[(1 - p.owner) as 0 | 1];
-    const move = characters[p.owner as 0 | 1].b.moves[p.moveIdx]!;
+    const vicCh = p.owner === 0 ? c1 : c0;
+    const move = (p.owner === 0 ? c0 : c1).b.moves[p.moveIdx]!;
     const pd = move.projectile!;
-    const rectW = projectileRect(p);
+    const rectW = projectileRect(s, p);
     for (const vb of hurtboxesOf(vic, vicCh)) {
       if (overlaps(rectW, worldRect(vic.x, vic.y, vic.facing, vb))) {
         const owner = s.fighters[p.owner as 0 | 1];
@@ -1066,6 +1093,9 @@ export const step = (s: GameState, inputs: [InputFrame, InputFrame]): void => {
   const dead1 = f1.health <= 0;
   if (dead0 || dead1) {
     endRound(s, dead0 && dead1 ? 2 : dead0 ? 1 : 0);
+    const clock = ROUND_SECONDS * TICKS_PER_SEC - s.timerTicks;
+    if (dead1) tallyKo(f0, clock);
+    if (dead0) tallyKo(f1, clock);
   } else if (s.timerTicks <= 0) {
     endRound(s, f0.health === f1.health ? 2 : f0.health > f1.health ? 0 : 1);
   }
@@ -1132,8 +1162,18 @@ const endRound = (s: GameState, winner: number): void => {
   s.roundWinner = winner;
   if (winner === 0 || winner === 2) s.roundsWon0++;
   if (winner === 1 || winner === 2) s.roundsWon1++;
+  // A perfect is an outright round win (KO or time) without taking damage.
+  if ((winner === 0 || winner === 1) && s.fighters[winner].stTouched === 0) {
+    s.fighters[winner].stPerfects++;
+  }
   s.phase = Phase.RoundOver;
   s.phaseTimer = TUNING.roundOverTicks;
+};
+
+/** MATCH STATS: a KO landed `clock` round-clock ticks into the round. */
+const tallyKo = (f: FighterState, clock: number): void => {
+  f.stKos++;
+  if (f.stFastestKo === 0 || clock < f.stFastestKo) f.stFastestKo = clock;
 };
 
 // ---------------------------------------------------------------------------
@@ -1149,7 +1189,7 @@ export const debugBoxes = (s: GameState): {
     x: fpToPx(r.l), y: fpToPx(r.t), w: fpToPx(r.r - r.l), h: fpToPx(r.b - r.t),
   });
   return s.fighters.map((f, i) => {
-    const ch = characters[i as 0 | 1];
+    const ch = charsOf(s)[i as 0 | 1];
     const hurtboxes = hurtboxesOf(f, ch).map((r) => toPx(worldRect(f.x, f.y, f.facing, r)));
     const hitboxes: DebugBox[] = [];
     const move = currentMove(f, ch);
@@ -1178,7 +1218,7 @@ export interface DebugFighterInfo {
 
 export const debugInfo = (s: GameState): DebugFighterInfo[] =>
   s.fighters.map((f, i) => {
-    const ch = characters[i as 0 | 1];
+    const ch = charsOf(s)[i as 0 | 1];
     const move = currentMove(f, ch);
     const si = move ? stepIndexAt(move, f.actionFrame) : -1;
     return {

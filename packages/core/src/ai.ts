@@ -3,7 +3,7 @@ import type { InputFrame } from './input.js';
 import { fp, fpToPx, nextRand } from './fp.js';
 import { STAGE, TUNING } from './data.js';
 import type { GuardKind, LoadedCharacter, MoveDef } from './data.js';
-import { Action, Phase, characters } from './state.js';
+import { Action, Phase, charsOf } from './state.js';
 import type { FighterState, GameState } from './state.js';
 
 /**
@@ -205,13 +205,13 @@ const canSuper = (ai: AiState, ch: LoadedCharacter, me: FighterState): boolean =
  */
 const superOdds = (
   ai: AiState, me: FighterState, op: FighterState, dist: number, comboEnder: boolean,
+  oppMax: number,
 ): number => {
   const r = skillRamp(ai, SUPER_SKILL_FLOOR);
   if (r === 0) return 0; // a novice has no presence of mind for meter
   // Cashing a bar out of a confirmed chain is worth far more than a raw one.
   let odds = Math.trunc(((comboEnder ? 195 : 105) * r) / 100);
   // Close out the round: the opponent is one good hit from dead.
-  const oppMax = characters[ai.side === 0 ? 1 : 0]?.b.maxHealth ?? 10000;
   if (op.health <= Math.trunc(oppMax / 4)) odds += Math.trunc((115 * r) / 100);
   // Capped meter means every further gain is being thrown away — spend it.
   if (me.meter >= TUNING.meterMax) odds += Math.trunc((60 * r) / 100);
@@ -442,7 +442,9 @@ const drinkSlot = (
 export const aiPoll = (ai: AiState, g: GameState): InputFrame => {
   const me = g.fighters[ai.side];
   const op = g.fighters[1 - ai.side]!;
-  const ch = characters[ai.side];
+  const chars = charsOf(g);
+  const ch = chars[ai.side];
+  const oppMax = chars[ai.side === 0 ? 1 : 0]?.b.maxHealth ?? 10000;
 
   if (!ai.bookBuilt) buildBook(ai, ch);
   if (ai.lastHealth < 0) ai.lastHealth = me.health;
@@ -475,7 +477,7 @@ export const aiPoll = (ai: AiState, g: GameState): InputFrame => {
       // fallback for an untagged move). Feeds the Defend appetite below.
       // (Every overhead in this roster is a jump-in — already counted as
       // eatJump above, so there is no separate grounded-overhead counter.)
-      const opCh = characters[(1 - ai.side) as 0 | 1];
+      const opCh = chars[(1 - ai.side) as 0 | 1];
       const mv = op.moveIdx >= 0 ? opCh.b.moves[op.moveIdx] : null;
       if (moveHasGuard(mv, 'low') || mv?.stance === 'crouch') ai.eatLow = Math.min(9, ai.eatLow + 1);
     }
@@ -545,7 +547,7 @@ export const aiPoll = (ai: AiState, g: GameState): InputFrame => {
     case Action.Attack: {
       // Hit-confirm: continue the combo book. Blocked → usually stop (safe).
       if (me.attackConnected === 1) {
-        const next = comboNext(ai, ch, me, op, dist);
+        const next = comboNext(ai, ch, me, op, dist, oppMax);
         if (next) return emit(me, null, 0, false); // queued; emitted next tick
       } else if (me.attackConnected === 2 && chance(ai, lerp(ai, 90, 30))) {
         // Low skill mashes one more into block sometimes — very human.
@@ -616,7 +618,7 @@ export const aiPoll = (ai: AiState, g: GameState): InputFrame => {
     // A whiffed move is the cleanest super punish in the game — take it before
     // settling for a normal string.
     if (canSuper(ai, ch, me) && ai.queue.length === 0 && g.tick >= ai.nextSuperAt
-      && chance(ai, superOdds(ai, me, op, dist, true))) {
+      && chance(ai, superOdds(ai, me, op, dist, true, oppMax))) {
       qFireball(ai, Btn.LP | Btn.MP);
       ai.nextSuperAt = g.tick + 90;
       return emit(me, null, 0, false);
@@ -631,10 +633,9 @@ export const aiPoll = (ai: AiState, g: GameState): InputFrame => {
   // finishing the round, or meter that would otherwise overflow.
   if (canSuper(ai, ch, me) && ai.queue.length === 0 && g.tick >= ai.nextSuperAt
     && dist < 260 && aiGrounded(op)) {
-    const oppMax = characters[ai.side === 0 ? 1 : 0]?.b.maxHealth ?? 10000;
     const finisher = op.health <= Math.trunc(oppMax / 4);
     const overflowing = me.meter >= TUNING.meterMax;
-    if ((finisher || overflowing) && chance(ai, superOdds(ai, me, op, dist, false))) {
+    if ((finisher || overflowing) && chance(ai, superOdds(ai, me, op, dist, false, oppMax))) {
       qFireball(ai, Btn.LP | Btn.MP);
       ai.nextSuperAt = g.tick + 150;
       return emit(me, null, 0, false);
@@ -783,6 +784,7 @@ const openString = (ai: AiState, ch: LoadedCharacter, dist: number): void => {
  */
 const comboNext = (
   ai: AiState, ch: LoadedCharacter, me: FighterState, op: FighterState, dist: number,
+  oppMax: number,
 ): boolean => {
   // Flubbed link: hesitate — the buffer may still save it, sometimes not.
   const flub = !chance(ai, lerp(ai, 150, 246));
@@ -798,7 +800,7 @@ const comboNext = (
     // End of ground chain: super / launcher / special, by skill + situation.
     // Cashing a bar out of a confirmed chain is the single best thing the
     // agent can do with meter, so it gets first refusal.
-    if (canSuper(ai, ch, me) && chance(ai, superOdds(ai, me, op, dist, true))) {
+    if (canSuper(ai, ch, me) && chance(ai, superOdds(ai, me, op, dist, true, oppMax))) {
       qFireball(ai, Btn.LP | Btn.MP); // 236 + two punches = super
       return true;
     }

@@ -25,10 +25,10 @@ import { createHash } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  Phase, canonicalJson, createGameState, decodeLedger, loadCharacter,
-  setCharacters, setMatchItems, stateHash, step,
+  Phase, canonicalJson, createGameState, decodeLedger, legacyStateHash, loadCharacter,
+  stateHash, step,
 } from '@af/core';
-import type { CharacterBundle, ItemEffect } from '@af/core';
+import type { CharacterBundle, ItemEffect, PetAura } from '@af/core';
 import { loadDotEnv } from '../packages/server/src/persist.js';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -50,6 +50,7 @@ interface LedgerRow {
     chars: [string, string]; charDigests: [string, string];
     delay: number; names: [string, string];
     items?: [Array<{ effect: ItemEffect }>, Array<{ effect: ItemEffect }>];
+    pets?: [{ aura: PetAura } | null, { aura: PetAura } | null] | null;
     result: {
       hash: number; winner: number; rounds: [number, number];
       endTick: number; reason: string;
@@ -110,15 +111,18 @@ console.log(`  characters    ${mark(charsOk)}  ${charsOk ? 'bundles unchanged si
 
 // 3. replay, exactly as the server's verifier does
 const [t0, t1] = decodeLedger(row.ledger);
-setCharacters(
-  loadCharacter(JSON.parse(readFileSync(charFile(pin.chars[0]), 'utf8')) as CharacterBundle),
-  loadCharacter(JSON.parse(readFileSync(charFile(pin.chars[1]), 'utf8')) as CharacterBundle),
-);
-setMatchItems(
-  (pin.items?.[0] ?? []).map((p) => p.effect),
-  (pin.items?.[1] ?? []).map((p) => p.effect),
-);
-const g = createGameState(pin.seed, pin.bounds ?? undefined);
+const g = createGameState(pin.seed, pin.bounds ?? undefined, {
+  chars: [
+    loadCharacter(JSON.parse(readFileSync(charFile(pin.chars[0]), 'utf8')) as CharacterBundle),
+    loadCharacter(JSON.parse(readFileSync(charFile(pin.chars[1]), 'utf8')) as CharacterBundle),
+  ],
+  items: [
+    (pin.items?.[0] ?? []).map((p) => p.effect),
+    (pin.items?.[1] ?? []).map((p) => p.effect),
+  ],
+  // The pets were missing here, so a pet match never reproduced.
+  pets: [pin.pets?.[0]?.aura ?? null, pin.pets?.[1]?.aura ?? null],
+});
 const n = Math.min(t0.length, t1.length);
 let t = 0;
 while (g.phase !== Phase.MatchOver && t < n) {
@@ -131,7 +135,9 @@ const got = {
   winner: g.winner,
   rounds: `${g.roundsWon0}-${g.roundsWon1}`,
   endTick: t,
-  hash: stateHash(g),
+  // An af-core-8 ledger pinned the hash without the af-core-9 match stats;
+  // legacyStateHash reproduces exactly that layout.
+  hash: row.engine === 'af-core-8' ? legacyStateHash(g) : stateHash(g),
 };
 const wantRounds = `${want.rounds[0]}-${want.rounds[1]}`;
 

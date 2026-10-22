@@ -345,8 +345,17 @@ export const ROUND_SECONDS = 99;
  *            gated on a non-zero line, and `rngSeed` (live for the first time,
  *            as the crit roll) only advances when a fighter with a crit aura
  *            lands a clean hit. The 61 behavioural tests must not move.
+ * af-core-9: MATCH STATS (settlement v4). Eight FighterState counters
+ *            (stKos … stTouched) appended to the serialize layout so litnode
+ *            witnesses recompute per-match stats from the replay; goldens
+ *            re-blessed. Pure observers — the sim never reads them into an
+ *            outcome, so behaviour is unchanged and legacyStateHash() still
+ *            reproduces every af-core-8 hash exactly. The match pins
+ *            (characters, drinks, auras) also moved into createGameState's
+ *            `pins` / GameState.chars so one process can run many matches.
+ *            A consensus change for litnode: new bundle, new buildHash.
  */
-export const ENGINE_VERSION = 'af-core-8';
+export const ENGINE_VERSION = 'af-core-9';
 
 const TUNING_INIT = {
   roundsToWin: 2, // best of 3

@@ -115,6 +115,20 @@ export interface FighterState {
   /** Cosmetic: ticks left of the crit flash. State-driven so the renderer
    *  stays a pure function of GameState (and rollback un-flashes correctly). */
   critFlash: number;
+  // MATCH STATS (settlement v4) — the competitive counters litnode witnesses
+  // recompute by replaying the signed log (the adapter's stats() reads them
+  // off the final state). Pure OBSERVERS: the sim writes them and never reads
+  // them back into an outcome, so adding them moved the hash, not the game
+  // (stats.test.ts scrambles them every tick to prove it). Match-scoped —
+  // carried across round resets like meter — except stTouched.
+  stKos: number; // rounds won by KO (the opponent's health reached 0)
+  stPerfects: number; // rounds won outright without taking any damage
+  stDamage: number; // health actually removed from the opponent (hits, chip, throws)
+  stMaxCombo: number; // longest combo landed, in hits
+  stSupers: number; // supers that landed at least one clean hit
+  stTechs: number; // throws escaped with a tech
+  stFastestKo: number; // fewest round-clock ticks to a KO win; 0 = none yet
+  stTouched: number; // 0/1 — took damage THIS round (perfect check); per round
   dirHist: number[]; // ring buffer of numpad dirs, length HIST_LEN
 }
 
@@ -153,19 +167,36 @@ export interface GameState {
   wallR: number;
   fighters: [FighterState, FighterState];
   projectiles: ProjectileState[]; // fixed PROJECTILE_SLOTS length
+  /**
+   * The two loaded character bundles this match runs — the one field that is
+   * not a number. It is match CONFIGURATION, fixed by createGameState and
+   * never written by step(), so it is not serialized: two peers agree on it
+   * by hash-checking bundles at match setup (spec §3.1), exactly as they did
+   * when it was a process global. Holding it here is what lets one process
+   * simulate several matches at once. NON-ENUMERABLE, so JSON, canonical
+   * encoders and Object.keys still see a flat bag of numbers; snapshot()
+   * and restore() carry it explicitly.
+   */
+  readonly chars: readonly [LoadedCharacter, LoadedCharacter];
 }
 
-/** M1: both players run the Analog bundle. Later: per-match selection. */
+/**
+ * DEFAULT character pins: what createGameState uses when the caller passes
+ * no `pins.chars`. M1: both players run the Analog bundle. Kept for callers
+ * that still pin through setCharacters (Studio, feel-lab); the sim itself
+ * reads `GameState.chars`, never this.
+ */
 export const characters: [LoadedCharacter, LoadedCharacter] = [
   loadCharacter(ANALOG),
   loadCharacter(ANALOG),
 ];
 
 /**
- * Swap the active character bundles (Studio live preview; later, match
- * setup). Must be called between matches, never mid-sim — the loaded
- * character is part of the deterministic contract, so both netplay peers
- * must install identical bundles (hash-checked at match setup, spec §3.1).
+ * Swap the DEFAULT character bundles the next createGameState picks up when
+ * it is given no `pins.chars`. A match already created keeps its own
+ * (`GameState.chars`), so this can no longer re-pin a match in flight. The
+ * loaded character is part of the deterministic contract: every peer must
+ * install identical bundles (hash-checked at match setup, spec §3.1).
  */
 export const setCharacters = (c0: LoadedCharacter, c1: LoadedCharacter): void => {
   characters[0] = c0;
@@ -189,15 +220,16 @@ export const ITEM_SLOTS = 3;
 
 const matchItems: [ItemEffect[], ItemEffect[]] = [[], []];
 
+const clampLoadout = (side: ItemEffect[] | null): ItemEffect[] =>
+  (side ?? []).slice(0, ITEM_SLOTS).map((e) => ({
+    kind: e.kind,
+    amount: Math.max(0, Math.min(500, Math.trunc(e.amount))),
+    durationTicks: Math.max(0, Math.min(7200, Math.trunc(e.durationTicks))),
+  }));
+
 export const setMatchItems = (i0: ItemEffect[] | null, i1: ItemEffect[] | null): void => {
-  const clampSide = (side: ItemEffect[] | null): ItemEffect[] =>
-    (side ?? []).slice(0, ITEM_SLOTS).map((e) => ({
-      kind: e.kind,
-      amount: Math.max(0, Math.min(500, Math.trunc(e.amount))),
-      durationTicks: Math.max(0, Math.min(7200, Math.trunc(e.durationTicks))),
-    }));
-  matchItems[0] = clampSide(i0);
-  matchItems[1] = clampSide(i1);
+  matchItems[0] = clampLoadout(i0);
+  matchItems[1] = clampLoadout(i1);
 };
 
 /**
@@ -219,14 +251,30 @@ export const setMatchPets = (
   matchAuras[1] = clampAura(a1);
 };
 
+/**
+ * One match's setup, handed straight to createGameState — the per-match
+ * alternative to the setCharacters / setMatchItems / setMatchPets defaults.
+ * Anything omitted falls back to the matching default, so existing callers
+ * are unchanged. Characters stay on the state for the whole match
+ * (`GameState.chars`); drinks and auras are copied into each fighter's
+ * numeric fields at spawn, so after createGameState returns nothing about
+ * this match lives in a process global and matches can interleave freely.
+ * Items and auras are clamped exactly as the setters clamp them.
+ */
+export interface MatchPins {
+  chars?: readonly [LoadedCharacter, LoadedCharacter];
+  items?: readonly [ItemEffect[] | null, ItemEffect[] | null];
+  pets?: readonly [Partial<PetAura> | null, Partial<PetAura> | null];
+}
+
 /** Effect kind → the small integer stored in FighterState.itemKindN (serialized). */
 const ITEM_KIND_CODE: Record<ItemEffect['kind'], number> = {
   heal: 1, damageMult: 2, defenseMult: 3, meterGain: 4,
 };
 
-/** The carried trio for side `i`, slot `s` from the pinned loadout (0s = empty). */
-const carriedItem = (i: 0 | 1, s: number): { kind: number; amount: number; dur: number } => {
-  const e = matchItems[i][s];
+/** The carried trio for slot `s` of a loadout (0s = empty). */
+const carriedItem = (loadout: readonly ItemEffect[], s: number): { kind: number; amount: number; dur: number } => {
+  const e = loadout[s];
   return e
     ? { kind: ITEM_KIND_CODE[e.kind], amount: e.amount, dur: e.durationTicks }
     : { kind: 0, amount: 0, dur: 0 };
@@ -300,6 +348,15 @@ const spawnFighter = (
   auraHpAcc: 0,
   auraMeterAcc: 0,
   critFlash: 0,
+  // Match stats start at zero; resetRound carries the match-scoped ones.
+  stKos: 0,
+  stPerfects: 0,
+  stDamage: 0,
+  stMaxCombo: 0,
+  stSupers: 0,
+  stTechs: 0,
+  stFastestKo: 0,
+  stTouched: 0,
   dirHist: new Array(HIST_LEN).fill(5),
 });
 
@@ -329,15 +386,36 @@ const spawnOffsetFor = (wallL: number, wallR: number): number => {
   return Math.max(0, Math.min(SPAWN_OFFSET, halfGap - 20));
 };
 
+/** Attach the match's characters as the non-enumerable `chars` field. */
+const withChars = (s: Omit<GameState, 'chars'>, chars: GameState['chars']): GameState =>
+  Object.defineProperty(s, 'chars', {
+    value: chars, enumerable: false, writable: false, configurable: true,
+  }) as GameState;
+
+/**
+ * The characters a state runs: its own pins, or — for a state that lost its
+ * non-enumerable field on a JSON round-trip — the process defaults, which is
+ * what such a state ran on before the pins moved into GameState.
+ */
+export const charsOf = (s: GameState): GameState['chars'] => s.chars ?? characters;
+
 export const createGameState = (
   seed: number,
   bounds: StageBounds = DEFAULT_BOUNDS,
+  pins: MatchPins = {},
 ): GameState => {
   const wallL = wallLFp(bounds);
   const wallR = wallRFp(bounds);
   const cx = centerPx(wallL, wallR);
   const off = spawnOffsetFor(wallL, wallR);
-  return {
+  const chars: GameState['chars'] = pins.chars ?? [characters[0], characters[1]];
+  const items = pins.items
+    ? [clampLoadout(pins.items[0]), clampLoadout(pins.items[1])] as const
+    : matchItems;
+  const pets = pins.pets
+    ? [clampAura(pins.pets[0]), clampAura(pins.pets[1])] as const
+    : matchAuras;
+  return withChars({
     tick: 0,
     rngSeed: seed | 0,
     phase: Phase.PreRound,
@@ -353,33 +431,35 @@ export const createGameState = (
     wallL,
     wallR,
     fighters: [
-      spawnItemFighter(0, cx, off),
-      spawnItemFighter(1, cx, off),
+      spawnItemFighter(0, cx, off, chars[0], items[0], pets[0]),
+      spawnItemFighter(1, cx, off, chars[1], items[1], pets[1]),
     ],
     projectiles: Array.from({ length: PROJECTILE_SLOTS }, emptyProjectile),
-  };
+  }, chars);
 };
 
-/** Spawn side `i` at match start, loading its carried drinks from the pin. */
-const spawnItemFighter = (i: 0 | 1, cx: number, off: number): FighterState => {
+/** Spawn side `i` at match start, loading its carried drinks and aura from the pins. */
+const spawnItemFighter = (
+  i: 0 | 1, cx: number, off: number,
+  ch: LoadedCharacter, loadout: readonly ItemEffect[], aura: PetAura,
+): FighterState => {
   const f = spawnFighter(
     cx + (i === 0 ? -off : off),
     i === 0 ? 1 : -1,
-    characters[i],
+    ch,
     i,
   );
-  loadCarriedSlots(f, i);
-  installAura(f, i);
+  loadCarriedSlots(f, loadout);
+  installAura(f, aura);
   return f;
 };
 
 /**
- * Apply side `i`'s pinned pet aura (ADR 0011). Called at match start AND at
+ * Apply a side's pinned pet aura (ADR 0011). Called at match start AND at
  * every round reset: an aura is a property of the equipped pet, not a
  * consumable, so it is on for every round of the match.
  */
-const installAura = (f: FighterState, i: 0 | 1): void => {
-  const a = matchAuras[i];
+const installAura = (f: FighterState, a: PetAura): void => {
   f.auraAtk = a.atk;
   f.auraDef = a.def;
   f.auraCrit = a.crit;
@@ -391,10 +471,10 @@ const installAura = (f: FighterState, i: 0 | 1): void => {
 };
 
 /** Fill a fresh fighter's carried slots from the pinned loadout. */
-const loadCarriedSlots = (f: FighterState, i: 0 | 1): void => {
-  const s0 = carriedItem(i, 0);
-  const s1 = carriedItem(i, 1);
-  const s2 = carriedItem(i, 2);
+const loadCarriedSlots = (f: FighterState, loadout: readonly ItemEffect[]): void => {
+  const s0 = carriedItem(loadout, 0);
+  const s1 = carriedItem(loadout, 1);
+  const s2 = carriedItem(loadout, 2);
   f.itemKind0 = s0.kind; f.itemAmount0 = s0.amount; f.itemDur0 = s0.dur;
   f.itemKind1 = s1.kind; f.itemAmount1 = s1.amount; f.itemDur1 = s1.dur;
   f.itemKind2 = s2.kind; f.itemAmount2 = s2.amount; f.itemDur2 = s2.dur;
@@ -404,12 +484,13 @@ const loadCarriedSlots = (f: FighterState, i: 0 | 1): void => {
 export const resetRound = (s: GameState): void => {
   const cx = centerPx(s.wallL, s.wallR);
   const off = spawnOffsetFor(s.wallL, s.wallR);
+  const chars = charsOf(s);
   for (const i of [0, 1] as const) {
     const prev = s.fighters[i];
     const fresh = spawnFighter(
       cx + (i === 0 ? -off : off),
       i === 0 ? 1 : -1,
-      characters[i],
+      chars[i],
       i,
     );
     fresh.meter = prev.meter; // meter persists across rounds
@@ -428,6 +509,14 @@ export const resetRound = (s: GameState): void => {
     fresh.auraHpRegen = prev.auraHpRegen;
     fresh.auraEnergyRegen = prev.auraEnergyRegen;
     // Accumulators and the crit flash do NOT carry — fresh round, fresh bar.
+    // Match stats carry; stTouched does not (it is about THIS round).
+    fresh.stKos = prev.stKos;
+    fresh.stPerfects = prev.stPerfects;
+    fresh.stDamage = prev.stDamage;
+    fresh.stMaxCombo = prev.stMaxCombo;
+    fresh.stSupers = prev.stSupers;
+    fresh.stTechs = prev.stTechs;
+    fresh.stFastestKo = prev.stFastestKo;
     s.fighters[i] = fresh as GameState['fighters'][0];
   }
   for (let i = 0; i < PROJECTILE_SLOTS; i++) s.projectiles[i] = emptyProjectile();
@@ -439,18 +528,22 @@ export const resetRound = (s: GameState): void => {
   s.roundNum++;
 };
 
-/** Cheap deep copy — the whole state is flat numbers. Required for rollback. */
-export const snapshot = (s: GameState): GameState => ({
+/**
+ * Cheap deep copy — the whole state is flat numbers. Required for rollback.
+ * The characters are immutable configuration, so the copy shares them.
+ */
+export const snapshot = (s: GameState): GameState => withChars({
   ...s,
   fighters: [
     { ...s.fighters[0], dirHist: s.fighters[0].dirHist.slice() },
     { ...s.fighters[1], dirHist: s.fighters[1].dirHist.slice() },
   ],
   projectiles: s.projectiles.map((p) => ({ ...p })),
-});
+}, charsOf(s));
 
 export const restore = (dst: GameState, snap: GameState): void => {
   Object.assign(dst, snap, { fighters: dst.fighters, projectiles: dst.projectiles });
+  if (snap.chars && snap.chars !== dst.chars) withChars(dst, snap.chars);
   for (const i of [0, 1] as const) {
     const keepHist = dst.fighters[i].dirHist;
     Object.assign(dst.fighters[i], snap.fighters[i], { dirHist: keepHist });
@@ -460,6 +553,12 @@ export const restore = (dst: GameState, snap: GameState): void => {
     Object.assign(dst.projectiles[i]!, snap.projectiles[i]!);
   }
 };
+
+/** The per-fighter match-stat fields, in serialize order (af-core-9). */
+export const STAT_FIELDS = [
+  'stKos', 'stPerfects', 'stDamage', 'stMaxCombo', 'stSupers', 'stTechs',
+  'stFastestKo', 'stTouched',
+] as const;
 
 const FIGHTER_FIELDS = [
   'x', 'y', 'velX', 'velY', 'facing', 'health', 'meter',
@@ -477,6 +576,9 @@ const FIGHTER_FIELDS = [
   'itemDmg', 'itemDmgLeft', 'itemDef', 'itemDefLeft',
   'auraAtk', 'auraDef', 'auraCrit', 'auraHpRegen', 'auraEnergyRegen',
   'auraHpAcc', 'auraMeterAcc', 'critFlash',
+  // Appended in af-core-9 (settlement v4): the match stats. Everything above
+  // is the af-core-8 layout, unchanged — legacyStateHash() relies on that.
+  ...STAT_FIELDS,
 ] as const;
 
 const PROJECTILE_FIELDS = [
@@ -511,8 +613,32 @@ export const serialize = (s: GameState): Int32Array => {
 };
 
 /** FNV-1a over the serialized state. Used for desync detection + CI replay tests. */
-export const stateHash = (s: GameState): number => {
-  const data = serialize(s);
+export const stateHash = (s: GameState): number => fnv(serialize(s));
+
+/**
+ * The hash this state would have had on af-core-8, the last engine before the
+ * match stats: serialize() minus STAT_FIELDS. Exact, not approximate — the
+ * stats are pure observers appended after every older field, so dropping them
+ * leaves the af-core-8 bytes. For checking ledgers and replays recorded
+ * before the bump (their pinned result hash is an af-core-8 hash).
+ */
+export const legacyStateHash = (s: GameState): number => {
+  const full = serialize(s);
+  const fighterLen = FIGHTER_FIELDS.length + HIST_LEN;
+  const statStart = FIGHTER_FIELDS.length - STAT_FIELDS.length;
+  const out: number[] = [];
+  let i = 0;
+  for (; i < GLOBAL_FIELDS.length; i++) out.push(full[i]!);
+  for (let f = 0; f < 2; f++, i += fighterLen) {
+    for (let k = 0; k < fighterLen; k++) {
+      if (k < statStart || k >= FIGHTER_FIELDS.length) out.push(full[i + k]!);
+    }
+  }
+  for (; i < full.length; i++) out.push(full[i]!);
+  return fnv(Int32Array.from(out));
+};
+
+const fnv = (data: Int32Array): number => {
   let h = 0x811c9dc5;
   for (let i = 0; i < data.length; i++) {
     const v = data[i]!;
