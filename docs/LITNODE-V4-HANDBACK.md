@@ -414,14 +414,29 @@ Status as of 23 Oct, after `b7d0923`.
      The desktop still serves the af-core-8 server `00f7319c…`, which turns
      away af-core-9 players. Then restart the node.
 5. **litnode 0.12.0**, in one window (litnode CHANGELOG, "Upgrading"):
-   1. `npm run release`, signed with the release key. This publishes to
-      GitHub Releases and nodes update from it.
-   2. Steps 3 and 4 run in the same window, along with Pickle Brawl's and
-      FLOOD CONTROL's builds.
-   3. **Protocol 4:** protocol-3 and protocol-4 nodes exclude each other.
+   1. *(Done 22 Oct 20:24 UTC: `v0.12.0` is on GitHub Releases, and its
+      `release.json` is signed with the release key `4d8759b0…`.)* **Do not
+      run `npm run release` again.** It re-uploads the zips over the
+      published ones.
+   2. **Left:** `npm run release:registry -- register dist/release.json`. Nodes
+      with a ReleaseRegistry hold the update until its four zips are
+      registered. None are registered yet, which is why the desktop is still
+      on 0.11.29.
+   3. Steps 3 and 4 run in the same window, along with Pickle Brawl's build
+      (`98d23e4e…`). FLOOD CONTROL is not on TitleRegistry at all, so
+      registering it picks its owner wallet.
+   4. **Wallet for all of these:** `0x04bE2b954346324Ee54c4B4c0189DF5bb577a378`.
+      It is the testnet deployer, the ReleaseRegistry admin, and the title
+      holder of `agent-fighter.v1` and `pickle-brawl.v1`.
+      - Both tools accept its key as `DEPLOYER_KEY`, so set that once in the
+        terminal session.
+      - Gas is 10 gwei, and the wallet holds about 0.0023, which is enough
+        for every step.
+      - Both registries activate 60 s after the transaction is mined.
+   5. **Protocol 4:** protocol-3 and protocol-4 nodes exclude each other.
       Every operator updates within the hour, and
       `npm run host -- doctor` shows `settlement` true.
-   4. Then redeploy the arcade from litnode `cabinet/` (its own Vercel
+   6. Then redeploy the arcade from litnode `cabinet/` (its own Vercel
       project). The arcade's `contracts.json` then carries `explorer`, and
       EpochAnchor links turn on. It still has no `rpcFallback`. The client
       carries its own fallback list, so that field is optional.
