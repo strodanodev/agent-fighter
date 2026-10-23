@@ -12,7 +12,7 @@
   "scripts": {
     "test": "npm run test -w @af/core",
     "typecheck": "npm run typecheck -w @af/core && npm run typecheck -w @af/client && npm run typecheck -w @af/studio && npm run typecheck -w @af/server",
-    "verify": "npm run typecheck && npm run test && npm run test -w @af/server && node tools/check-contracts.mjs",
+    "verify": "npm run typecheck && npm run test && npm run test -w @af/server && npm run test -w @af/client && node tools/check-contracts.mjs",
     "golden:bless": "npm run golden:bless -w @af/core",
     "determinism:browser": "node tools/determinism-browser.mjs",
     "build": "npm run build -w @af/core && npm run build -w @af/client",

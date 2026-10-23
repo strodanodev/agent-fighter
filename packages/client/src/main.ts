@@ -450,7 +450,8 @@ const drawWalletStrip = (): void => {
 /**
  * Match-server endpoints. `?ws=` overrides everything (the LIT GAMES
  * cabinet passes the drawn host's relay this way); an https page uses the
- * relay the mesh announced (cached by mesh.ts, refreshed at boot); anything
+ * relay the mesh announced (cached by mesh.ts: read at boot, re-read in the
+ * background once two minutes old); anything
  * else is a local dev box running the server beside the page (`npm run play`).
  * With no relay known yet the address is one that never resolves (`.invalid`,
  * RFC 2606): the connection fails at once and the retry below re-reads the

@@ -15,9 +15,9 @@
  * decoding are inlined below (the selectors are keccak-derived in litnode's
  * protocol/keccak.js; hard-coded here so the game bundle stays dependency-free).
  *
- * Cached in localStorage for CACHE_MS so `matchWsUrl()` — which is
- * synchronous and used everywhere — can read it; refreshed in the background
- * at boot. `?ws=` still overrides everything.
+ * Cached in localStorage so `matchWsUrl()` — which is synchronous and used
+ * everywhere — can read it: read at boot, and re-read in the background once
+ * the read is CACHE_MS old. `?ws=` still overrides everything.
  */
 // The contract set is READ, never baked: litnode publishes the current one as contracts.json
 // (https://arcade.litvm.games/contracts.json, and /cabinet/contracts.json on every node — generated from its
@@ -113,9 +113,12 @@ export async function ensureContractSet(): Promise<ContractSet | null> {
 }
 const SEL = { entryOf: '0x82fb8643', standingOf: '0x43aa9ad3' } as const;
 const CACHE_KEY = 'af.mesh-relay';
-// Short: a node behind a quick tunnel gets a new hostname on every restart,
-// and a client holding the old one for ten minutes saw 'server offline'.
+// A read this old is re-read. Short: a node behind a quick tunnel gets a new
+// hostname on every restart, and a client holding the old one for ten minutes
+// saw 'server offline'.
 const CACHE_MS = 2 * 60_000;
+/** A read that found no relay (chain unreachable, none announced) is not repeated sooner: cachedRelay() runs every frame on some screens. */
+const RETRY_MS = 30_000;
 /** An entry older than this is a node that stopped announcing (litnode FRESH_S). */
 const FRESH_S = 7 * 24 * 3600;
 /**
@@ -181,10 +184,16 @@ function readCache(): Cached | null {
   try { const c = JSON.parse(localStorage.getItem(CACHE_KEY) ?? 'null') as Cached | null; return c && typeof c.wsAddr === 'string' ? c : null; } catch { return null; }
 }
 
-/** The relay the mesh announced, if we have read it recently. Synchronous. */
+/**
+ * The relay the mesh announced at the last read, however old; null before any read. Synchronous. A read CACHE_MS
+ * old is re-read in the background, and the last address stands in meanwhile: a node that moved costs that one
+ * connection (the lobby re-reads on a refusal). Answering null instead sent every call made two minutes after
+ * load to no relay at all, the account fetch among them, and the game showed SERVER OFFLINE (23 Oct 2026).
+ */
 export function cachedRelay(): string | null {
   const c = readCache();
-  return c && Date.now() - c.at < CACHE_MS ? c.wsAddr : null;
+  if (c && Date.now() - c.at >= CACHE_MS) refreshRelay();
+  return c?.wsAddr ?? null;
 }
 
 /**
@@ -259,20 +268,31 @@ let publisherCheck: { at: number; up: boolean } | null = null;
 export async function publisherOnline(force = false): Promise<boolean> {
   if (!force && publisherCheck && Date.now() - publisherCheck.at < PUBLISHER_MS) return publisherCheck.up;
   await relayReady();
-  if (!publisherRelays().length) { try { await discoverRelay(); } catch { /* chain unreachable */ } }
-  const probes = await Promise.all(publisherRelays().map(probeRelay));
-  publisherCheck = { at: Date.now(), up: probes.includes('ok') };
-  return publisherCheck.up;
+  const anyUp = async (): Promise<boolean> => (await Promise.all(publisherRelays().map(probeRelay))).includes('ok');
+  let up = publisherRelays().length > 0 && await anyUp();
+  // None answered: the node may have restarted onto a new tunnel hostname. Read the directory now and probe what
+  // it names, rather than probing the dead address every minute (23 Oct 2026: wagers paused until a reload).
+  if (!up) {
+    try { await discoverRelay(); } catch { /* chain unreachable */ }
+    up = await anyUp();
+  }
+  publisherCheck = { at: Date.now(), up };
+  return up;
 }
 /** The last answer of publisherOnline(): true/false, or null before the first probe. Synchronous. */
 export const publisherUp = (): boolean | null => publisherCheck?.up ?? null;
 
 let inflight: Promise<unknown> | null = null;
-/** Refresh in the background; returns immediately. Call once at boot. */
+let readAgainAt = 0;
+/** Re-read the directory in the background when no read is current (none yet, or CACHE_MS old); returns immediately. */
 export function refreshRelay(): void {
+  if (inflight || Date.now() < readAgainAt) return;
   const c = readCache();
   if (c && Date.now() - c.at < CACHE_MS && publisherRelays().length) return;
-  inflight = discoverRelay().catch(() => { /* chain unreachable: keep whatever we had */ }).finally(() => { inflight = null; });
+  inflight = discoverRelay()
+    .then((addr) => { if (!addr) readAgainAt = Date.now() + RETRY_MS; })
+    .catch(() => { readAgainAt = Date.now() + RETRY_MS; /* chain unreachable: keep whatever we had */ })
+    .finally(() => { inflight = null; });
 }
-/** Resolves once the boot discovery (if any) is done, so a caller deciding where a token may go reads its answer. */
-export const relayReady = (): Promise<unknown> => inflight ?? Promise.resolve();
+/** Resolves once the relay read is current (a stale one is re-read first), so a caller deciding where a token may go reads a current answer. */
+export const relayReady = (): Promise<unknown> => { refreshRelay(); return inflight ?? Promise.resolve(); };
