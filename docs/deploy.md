@@ -63,14 +63,23 @@ relay's secrets to keep in sync.
 
 ## Relay env
 
-`run-af-relay.cmd` loads `AF_ROOT\.env` into the relay's environment, and
-`PORT` comes from the node's `RELAY_PORT` (default 8477).
+`run-af-relay.cmd` loads the node's `node.env` and then `AF_ROOT\.env` into
+the relay's environment. `.env` wins, so it is where the relay's own values
+go. `PORT` comes from the node's `RELAY_PORT` (default 8477).
+
+**Every `node.env` variable reaches the relay too.** On 23 Oct 2026 the node's
+`AIR_PARTNER_ID` (the arcade's AIR partner, for the node's own login) pinned
+the relay to that partner. Every agentfighter.wtf sign-in got a 401 on `/me`,
+and the game showed SERVER OFFLINE while the relay was up. The relay log said
+`[auth] token rejected: partnerId …`. Check that log before chasing tunnels.
 
 | Var | Required | Notes |
 |---|---|---|
 | `SUPABASE_URL` | **yes** | Project URL |
 | `SUPABASE_SERVICE_KEY` | **yes** | Service role. Bypasses RLS — relay only, NEVER in the client bundle |
 | `PORT` | no | Set from `RELAY_PORT`; falls back to 8477 |
+| `AIR_PARTNER_IDS` | no | Comma-separated AIR partners whose tokens the relay accepts: agentfighter.wtf's `cdbfc9c4-62db-4947-b0de-c28932887132` and the arcade's `62e01755-138f-4e58-9cdc-fab71e037afd`. Unset, a lone `AIR_PARTNER_ID` is enforced; neither, any partner's token is accepted |
+| `AIR_PARTNER_ID` | no | The partner the relay issues credentials as (default: the site's). Set it blank in `.env` so the node's arcade value is not inherited |
 | `AIR_ISSUER_DID` | no | Reputation write-back (ADR 0004); off unless fully configured |
 | `AIR_CREDENTIAL_ID` | no | Issuance-program id |
 | `AIR_PARTNER_KEY_FILE` | no | Private PEM, default `air/partner_rs256.pem` |

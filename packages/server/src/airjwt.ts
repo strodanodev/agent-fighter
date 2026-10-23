@@ -96,6 +96,25 @@ export const verifyJwtWithKeys = (
   return payload;
 };
 
+/**
+ * The AIR partner apps whose tokens this relay accepts. Two are legitimate:
+ * agentfighter.wtf's own (packages/client/src/auth.ts) and, framed by the
+ * litVM arcade, the arcade's (universal login lends the arcade's session).
+ * AIR_PARTNER_IDS (comma-separated) is the allowlist; with it unset, a single
+ * AIR_PARTNER_ID is honoured as before. Neither set → [] → any partner.
+ *
+ * AIR_PARTNER_IDS wins because the desktop relay inherits the litnode node's
+ * node.env (run-af-relay.cmd), whose AIR_PARTNER_ID is the ARCADE's partner
+ * for the node's own login: inherited alone, it 401'd every agentfighter.wtf
+ * sign-in and the game showed SERVER OFFLINE (23 Oct 2026).
+ */
+export const acceptedPartners = (env: NodeJS.ProcessEnv = process.env): string[] =>
+  (env.AIR_PARTNER_IDS ?? env.AIR_PARTNER_ID ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+
+/** Is a token minted for `partnerId` acceptable? An empty allowlist accepts any. */
+export const partnerAccepted = (partnerId: string | undefined, accepted: string[]): boolean =>
+  accepted.length === 0 || (partnerId !== undefined && accepted.includes(partnerId));
+
 // JWKS cache: refetched at most every 10 min, and once eagerly when a token
 // arrives with an unknown kid (key rotation without a restart).
 const JWKS_TTL_MS = 10 * 60 * 1000;
@@ -149,12 +168,12 @@ export const verifyAirToken = async (
     const partnerId = typeof payload.partnerId === 'string' ? payload.partnerId : undefined;
     // Cross-app token replay guard (audit 2026-07-18 H4): any token AIR's JWKS
     // signed — including one minted for a DIFFERENT partner app — verifies here.
-    // Enforce our own partnerId when it is configured. Env-gated so it stays a
-    // no-op until AIR_PARTNER_ID is set to the correct value (never lock out
-    // real tokens by guessing it).
-    const required = process.env.AIR_PARTNER_ID;
-    if (required && partnerId !== required) {
-      console.log(`[auth] token rejected: partnerId "${partnerId ?? ''}" != "${required}"`);
+    // Enforce our partner allowlist when it is configured. Env-gated so it stays
+    // a no-op until it is set to the correct values (never lock out real tokens
+    // by guessing them).
+    const accepted = acceptedPartners();
+    if (!partnerAccepted(partnerId, accepted)) {
+      console.log(`[auth] token rejected: partnerId "${partnerId ?? ''}" not in [${accepted.join(', ')}]`);
       return null;
     }
     return {
