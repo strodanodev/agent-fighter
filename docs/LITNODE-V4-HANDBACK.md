@@ -400,46 +400,61 @@ Status as of 23 Oct, after `b7d0923`.
    - **m16 standby:** it runs no relay, so there is nothing to pull.
    - There is no Railway any more. `npm run deploy` does both halves
      (docs/deploy.md).
-3. **Ruleset.** *(Built and release-signed in litnode `bea6429` / `0e9e948`
-   from `29d4400`: `7414ddf3…4423`. `packages/core` has not changed since.)*
-   - **Left, publisher wallet:** `npm run publish:title -- set-build
-     rulesets/agent-fighter.v1.js`. TitleRegistry holds only `859e7215…`
-     (af-core-8) and `00f7319c…` (the af-core-8 server) today.
-4. **Gauntlet server bundle.** *(Built and signed in litnode from `29d4400`:
-   `e8d8f22b…02fd`. Rebuilt here from `b7d0923`, it is byte-identical.)*
-   - **Left, publisher wallet:** `npm run publish:title -- set-build
-     servers/agent-fighter.v1.server.json`.
-   - **Left, once the desktop runs 0.12.0:** copy
-     `servers/agent-fighter.v1.server.{tgz,json}` over `C:\litvm\servers\`.
-     The desktop still serves the af-core-8 server `00f7319c…`, which turns
-     away af-core-9 players. Then restart the node.
-5. **litnode 0.12.0**, in one window (litnode CHANGELOG, "Upgrading"):
-   1. *(Done 22 Oct 20:24 UTC: `v0.12.0` is on GitHub Releases, and its
-      `release.json` is signed with the release key `4d8759b0…`.)* **Do not
-      run `npm run release` again.** It re-uploads the zips over the
-      published ones.
-   2. **Left:** `npm run release:registry -- register dist/release.json`. Nodes
-      with a ReleaseRegistry hold the update until its four zips are
-      registered. None are registered yet, which is why the desktop is still
-      on 0.11.29.
-   3. Steps 3 and 4 run in the same window, along with Pickle Brawl's build
-      (`98d23e4e…`). FLOOD CONTROL is not on TitleRegistry at all, so
-      registering it picks its owner wallet.
-   4. **Wallet for all of these:** `0x04bE2b954346324Ee54c4B4c0189DF5bb577a378`.
-      It is the testnet deployer, the ReleaseRegistry admin, and the title
-      holder of `agent-fighter.v1` and `pickle-brawl.v1`.
-      - Both tools accept its key as `DEPLOYER_KEY`, so set that once in the
-        terminal session.
-      - Gas is 10 gwei, and the wallet holds about 0.0023, which is enough
-        for every step.
-      - Both registries activate 60 s after the transaction is mined.
-   5. **Protocol 4:** protocol-3 and protocol-4 nodes exclude each other.
-      Every operator updates within the hour, and
-      `npm run host -- doctor` shows `settlement` true.
-   6. Then redeploy the arcade from litnode `cabinet/` (its own Vercel
-      project). The arcade's `contracts.json` then carries `explorer`, and
-      EpochAnchor links turn on. It still has no `rpcFallback`. The client
-      carries its own fallback list, so that field is optional.
+3. **Ruleset.** *(Done 23 Oct.)* `7414ddf3…4423` was built and
+   release-signed in litnode `bea6429` / `0e9e948` from `29d4400`, and
+   `packages/core` has not changed since.
+   - Registered on TitleRegistry: tx `0xaec4d385…`, active since 10:30:11 UTC.
+4. **Gauntlet server bundle.** *(Done 23 Oct.)* `e8d8f22b…02fd` was built in
+   litnode from `29d4400`. Rebuilt here from `b7d0923`, it is byte-identical.
+   - Registered on TitleRegistry: tx `0x60c38999…`, active since 10:30:27 UTC.
+   - The desktop serves it from `C:\litvm\servers\`. The af-core-8 server
+     `00f7319c…` is kept in `C:\litvm\servers\af-core-8-00f7319c\`.
+   - litnode's `demo/server-bundle.test.mjs` "real server" case passes on
+     0.12.0. A second node fetches the bundle by hash, places a ranked match
+     and plays it with bots, and the result settles with both players'
+     signatures.
+5. **litnode 0.12.0.** *(Done 23 Oct.)*
+   1. The release has been on GitHub Releases since 22 Oct 20:24 UTC, signed
+      with the release key `4d8759b0…`. **Do not run `npm run release`
+      again.** It re-uploads the zips over the published ones.
+   2. Its four zips are registered on ReleaseRegistry (tx `0x4fae4a8a…` and
+      three more), active since 10:31:09 UTC.
+   3. Pickle Brawl `98d23e4e…` is registered too (tx `0x47c49afa…`).
+      FLOOD CONTROL is not on TitleRegistry at all, and registering it picks
+      its owner wallet.
+   4. **The wallet for all of these** is
+      `0x04bE2b954346324Ee54c4B4c0189DF5bb577a378`. It is the testnet
+      deployer, the ReleaseRegistry admin, and the holder of the
+      `agent-fighter.v1` and `pickle-brawl.v1` titles. Both tools take its
+      key as `DEPLOYER_KEY`.
+   5. **The desktop node** (`5b703f12…`) runs 0.12.0 on protocol 4.
+      - It is bonded, holds `7414ddf3…`, and the gauntlet serves
+        `e8d8f22b…`.
+      - Doctor reports `settlement` protocol 4.
+      - It announced its new tunnel on NodeDirectory (tx `0x682bc990…`).
+      - The 0.11.29 rollback copy is kept at
+        `E:\NPC\litnode-desktop-rollback-0.11.29`.
+   6. **The arcade** was redeployed from litnode `cabinet/`.
+      - The Vercel team is `NPC`, project `cabinet`, deployment
+        `cabinet-aktx449hb`. The previous one, `cabinet-o9nnsjp9u`, is the
+        rollback.
+      - `contracts.json` carries `explorer`, and the client's EpochAnchor
+        links are on.
+      - It still has no `rpcFallback`. The client carries its own fallback
+        list, so that field is optional.
+   7. **Gotcha: the LITNODE Control Plane app.** Opening it starts its own
+      bundled 0.11.29 node as `desktop-test`, unbonded, on port 7801. That
+      blocks the `litnode` task's node.
+      - Quitting the app leaves that node and its `cloudflared` running.
+      - Don't open it on the publisher's desktop until the app ships 0.12.0
+        and drives the task node instead.
+   8. **Restarting the node task.** `schtasks /End` ends only the task's
+      wrapper. The elevated node survives and keeps the port.
+      - When an update is pending, a loopback `POST /update` applies it and
+        the node exits on its own.
+      - Otherwise run `restart-node.cmd` from an admin prompt.
+      - If the wrapper is gone, follow either with
+        `schtasks /Run /TN litnode`.
 6. **Dedicated relay checkout.** *(Prepared: `E:\NPC\AGENT FIGHTER\agent-fighter-relay`,
    a clone of `b7d0923` that tracks GitHub `master`, with `npm ci` done.
    Without `.env` it refuses to start, as designed.)*
