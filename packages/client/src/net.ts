@@ -72,11 +72,10 @@ export interface NetSetup {
    */
   pets?: [NetPetPin | null, NetPetPin | null];
   /**
-   * Mesh-placed (`LIT-…` room) matches: who serves it and at which level it can settle (server ADR 0014).
-   * `gauntlet` = a node's per-match server, the arcade key signs, `mode` is the placement's. `relay` = the
-   * always-on relay hosted the room: CASUAL, never ranked. Absent for everything else.
+   * Arcade-placed matches, which always run on a node's per-match gauntlet (server ADR 0014): the arcade key
+   * signs, `mode` is the placement's. Absent for everything the relay hosts.
    */
-  placed?: { intake: 'gauntlet' | 'relay'; mode: 'ranked' | 'casual' };
+  placed?: { intake: 'gauntlet'; mode: 'ranked' | 'casual' };
   /** This side's resume token — lets a dropped socket rejoin (ADR 0005). */
   resume?: string;
 }
@@ -122,7 +121,7 @@ export interface NetResult {
   endTick: number;
   hash: number;
   deviator?: 0 | 1;
-  /** Mesh-placed matches: the litnode ledger commitment to sign (SResult.ledger). */
+  /** Placed matches (gauntlet): the litnode ledger commitment to sign (SResult.ledger). */
   ledger?: { head: string; ticks: number };
 }
 
@@ -333,13 +332,11 @@ export class NetSession {
   }
 
   /**
-   * litnode (protocol 3): forward the cabinet shell's ledger signature to the relay, with the mesh match id and
-   * build it covers — the relay verifies it and only then records the arcade key as a participant (ADR 0014) —
-   * and the placement envelope the arcade was served, which a gauntlet passes on as the submission's
-   * `descriptor` (litnode 0.11.31 binding).
+   * A placed match: forward the cabinet shell's ledger signature to the gauntlet, with the placement envelope the
+   * arcade was served, which the gauntlet passes on as the submission's `descriptor` (litnode 0.11.31 binding).
    */
-  signLedger(sig: string, signedFor?: { matchId: string; buildHash: string | null; descriptor?: unknown }): void {
-    if (/^[0-9a-f]{128}$/i.test(sig)) this.send({ t: 'sign', sig: sig.toLowerCase(), ...(signedFor ?? {}) });
+  signLedger(sig: string, descriptor?: unknown): void {
+    if (/^[0-9a-f]{128}$/i.test(sig)) this.send({ t: 'sign', sig: sig.toLowerCase(), ...(descriptor ? { descriptor } : {}) });
   }
 
   private send(msg: unknown): void {

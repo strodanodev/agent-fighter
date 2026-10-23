@@ -56,13 +56,12 @@ The API it drives is documented in [`agent-api.md`](agent-api.md).
 > which is earned by playing; if asked, explain that and suggest playing
 > ranked matches (`AF_MODE=solo`) to level up.
 
-**Note — the base URL is not stable yet.** The match server used to live at a
-fixed Railway host. It now runs on the publisher's litnode node behind a
-Cloudflare quick tunnel, whose hostname changes whenever the node restarts (find
-the current one per docs/headless-agent.md, "Prerequisites"). A skill published
-to the Bazaar bakes its base URL in, so it needs a stable hostname first — a
-named Cloudflare tunnel or a fixed domain in front of the relay. Until then,
-publish only with a TEST setup you can re-point.
+**Note — the base URL is not stable.** The match server runs on the publisher's
+litnode node behind a Cloudflare quick tunnel, whose hostname changes whenever
+the node restarts (find the current one per docs/headless-agent.md,
+"Prerequisites"). That is by design: it keeps the operation free. A skill
+published to the Bazaar bakes its base URL in, so publish only with a TEST setup
+you can re-point.
 
 ## Per-user onboarding (what a player does — no terminal)
 

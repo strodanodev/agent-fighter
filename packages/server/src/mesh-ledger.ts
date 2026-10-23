@@ -1,15 +1,15 @@
 /**
- * The litnode ledger commitment, ported so the relay can tell both players
- * what to sign at match end (protocol 3, github.com/strodanodev/litnode
- * protocol/log.js). Kept dependency-free and byte-for-byte compatible:
+ * The litnode ledger commitment, ported so a gauntlet can tell both players
+ * what to sign at match end (github.com/strodanodev/litnode protocol/log.js).
+ * Kept dependency-free and byte-for-byte compatible:
  *
  *   entries  = [{k, inputs:[side0[k]|0, side1[k]|0]} for k < min(len0, len1)]
  *   head     = fold over entries of sha256(`tick` NUL prev NUL canonical(entry))
  *   body     = { matchId, ticks, head, buildHash }   (what the player signs)
  *
  * canonical() is JSON with recursively sorted object keys. The node rebuilds
- * the same entries from the archived ledger (tools/lib/af-submission.mjs),
- * so a head computed here over `m.inputs` is the head the node verifies.
+ * the same entries from the submission's `entries`, so a head computed here
+ * over `m.inputs` is the head the node verifies.
  */
 import { createHash, createPublicKey, verify as edVerify } from 'node:crypto';
 
@@ -37,31 +37,10 @@ export function meshLedger(inputs: [readonly number[], readonly number[]]): Mesh
   return { head, ticks: n };
 }
 
-/** litnode protocol/pairing.js roomCodeFor: the friendly-room code both placed players derive from the match id. */
-export const roomCodeFor = (matchId: string): string => `LIT-${matchId.slice(0, 32).toUpperCase()}`;
-
-/** What a player signs (litnode protocol/log.js ledgerBody). */
-export interface LedgerBody { matchId: string; ticks: number; head: string; buildHash: string | null }
-
 const HEX64 = /^[0-9a-f]{64}$/;
 const SIG_HEX = /^[0-9a-f]{128}$/;
 /** SPKI DER prefix for a raw 32-byte ed25519 public key (RFC 8410). */
 const ED25519_SPKI = Buffer.from('302a300506032b6570032100', 'hex');
-
-/**
- * Did `playerKey` sign this ledger body? litnode protocol/keys.js signs the
- * bytes `ledger NUL canonical(body)` with ed25519, keys and signatures as hex;
- * this is the same check its verifyLedger runs, so a key the relay accepts
- * here is a key the node would accept for the same body. Never throws.
- *
- * It is the relay's proof of possession: `hello.playerKey` is only a claim,
- * and a relay ledger names a key as a participant only once that key signed
- * the very log being archived (ADR 0014, identity).
- */
-export function verifyLedgerSig(body: LedgerBody, sigHex: string, playerKey: string): boolean {
-  if (!HEX64.test(body.matchId)) return false;
-  return verifyTagged('ledger', { matchId: body.matchId, ticks: body.ticks, head: body.head, buildHash: body.buildHash }, sigHex, playerKey);
-}
 
 /** litnode protocol/keys.js verify(): ed25519 over `tag NUL canonical(body)`, key and signature as hex. Never throws. */
 function verifyTagged(tag: string, body: unknown, sigHex: string, keyHex: string): boolean {

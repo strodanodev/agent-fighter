@@ -36,7 +36,7 @@ import {
 } from './protocol.js';
 import type { ClientMsg, ItemPin, PetPin, SMatch, SResult, ServerMsg } from './protocol.js';
 import { verifyAirToken } from './airjwt.js';
-import { descriptorProblem, meshLedger, roomCodeFor, verifyLedgerSig } from './mesh-ledger.js';
+import { descriptorProblem, meshLedger } from './mesh-ledger.js';
 import { verifyTicket, type GauntletConfig, type GauntletOutcome } from './gauntlet.js';
 import type { AirIdentity } from './airjwt.js';
 import {
@@ -167,15 +167,12 @@ interface Client {
   email: string;
   /** litnode player key from hello (64 hex) or '' — see CHello.playerKey. */
   playerKey: string;
-  /** litnode ledger signature (CSign) for the match just finished, '' until it arrives. */
+  /** litnode ledger signature (CSign) for the match just finished, '' until it arrives. Gauntlet mode only. */
   ledgerSig: string;
-  /** What that signature says it covers: the mesh match id and build the arcade signed for (CSign). */
-  ledgerSigFor: { matchId: string; buildHash: string | null } | null;
   /** The placement envelope the arcade served this player (CSign.descriptor), handed on to the node unverified
    *  here except for descriptorProblem(); null when the client sent none. */
   descriptor: unknown;
-  /** The friendly room this client parked in / paired through, '' otherwise.
-   *  A `LIT-…` room is a mesh-placed match: its ledger is archived. */
+  /** The friendly room this client parked in / paired through, '' otherwise (gauntlet: the placed match's room). */
   room: string;
   /** Gauntlet mode: the team this socket's seat ticket names (side 0 or 1); -1 = not seated. */
   seat: -1 | 0 | 1;
@@ -210,10 +207,10 @@ interface Match {
   bounds?: { left: number; right: number };
   chars: [string, string];
   names: [string, string];
-  /** litnode player keys per side ('' when the client sent none). Pinned into
-   *  the archived ledger so the mesh settles under the keys it placed. */
+  /** litnode player keys per side ('' when the client sent none). Gauntlet mode: the keys the node's seat
+   *  tickets named, pinned into the submission so the mesh settles under the keys it placed. */
   playerKeys: [string, string];
-  /** Friendly room code, '' otherwise. `LIT-<32 hex>` = a mesh-placed match. */
+  /** Friendly room code, '' otherwise (gauntlet: the placed match's `LIT-<32 hex>` room). */
   room: string;
   /** Local-sim solo: the deterministic house AI the client must simulate.
    *  `personality` present = a TRAINED agent opponent (dare-vs-agent /
@@ -1045,10 +1042,10 @@ export const createMatchServer = (opts: {
         rounds: v.rounds, endTick: v.endTick, hash: v.hash, deviator,
       };
     }
-    // litnode (protocol 3): a mesh-placed match tells both players what to
-    // sign — the ledger head exactly as a mesh node rebuilds it. Their
-    // signatures come back as CSign and are archived with the ledger below.
-    if (m.mode === 'friendly' && m.room.startsWith('LIT-')) {
+    // Gauntlet: the placed match tells both players what to sign — the ledger
+    // head exactly as a mesh node rebuilds it. Their signatures come back as
+    // CSign and travel to the node with the log (handOff).
+    if (gauntlet) {
       // A gauntlet's log is the match: exactly the ticks up to the final KO when it reached one, so the
       // head both players sign and the node replays covers what was fought and nothing after it.
       const end = gauntlet && v.reachedEnd ? v.endTick : Math.min(m.inputs[0].length, m.inputs[1].length);
@@ -1269,27 +1266,12 @@ export const createMatchServer = (opts: {
     //
     // Wrapped in its OWN try/catch and fire-and-forget: an archival failure
     // must never touch a settled result. Settlement is money; replays are not.
-    // …plus friendlies placed by the LIT GAMES mesh (room `LIT-…`): those are
-    // the matches a litnode witness replays, so their ledger IS the product.
-    const meshPlaced = m.mode === 'friendly' && m.room.startsWith('LIT-');
-    /**
-     * Has side `i` PROVEN the player key it claimed (ADR 0014, identity)? In a gauntlet the seat ticket the node
-     * minted for that key proved it at the door. On the relay `hello.playerKey` is only a claim, so the key counts
-     * once it signed this very ledger: a valid ed25519 signature over { matchId, ticks, head, buildHash } for the
-     * mesh match whose room this is. An unproven side is archived with no key, which leaves the ledger to a
-     * casual, name-labelled path (`af:<name>` in litnode's af-watch) that never binds a profile or counts.
-     */
-    const provenKey = (i: 0 | 1): string => {
-      const key = m.playerKeys[i] ?? '';
-      if (gauntlet) return key;
-      const cl = m.clients[i];
-      const sf = cl?.ledgerSigFor;
-      if (!key || !cl || cl.playerKey !== key || !cl.ledgerSig || !sf || !result.ledger) return '';
-      if (roomCodeFor(sf.matchId) !== m.room) return '';
-      return verifyLedgerSig({ matchId: sf.matchId, ticks: result.ledger.ticks, head: result.ledger.head, buildHash: sf.buildHash }, cl.ledgerSig, key) ? key : '';
-    };
+    //
+    // Nothing archived here goes to the litnode mesh: relay matches stay in
+    // this database. Only a gauntlet (one placed match, run by a node) hands
+    // its log to the mesh, and its seat tickets proved the keys at the door.
     const pinOf = () => {
-      const keys = [provenKey(0), provenKey(1)] as const;
+      const keys = gauntlet ? [m.playerKeys[0], m.playerKeys[1]] as const : ['', ''] as const;
       return {
           seed: m.seed,
           bounds: m.bounds ?? null,
@@ -1300,22 +1282,17 @@ export const createMatchServer = (opts: {
           // a retuned bundle stops reproducing exactly like a bumped engine.
           charDigests: [charDigest(m.chars[0]), charDigest(m.chars[1])],
           names: m.names,
-          // litnode: which mesh match this was (room) and who the mesh placed
-          // (player keys, PROVEN ones only: provenKey) — tools/af-watch.mjs
-          // settles under these.
+          // litnode (gauntlet only): which mesh match this was (room, id) and
+          // the keys the node placed; '' / null on the relay.
           room: m.room || null,
           // ADR 0014: which intake produced this ledger. Only 'gauntlet' (a
-          // node's per-match server, both players signing) may settle
-          // ranked; a 'relay' ledger is casual, whatever room it was in.
+          // node's per-match server, both players signing) reaches the mesh.
           intake: gauntlet ? 'gauntlet' : 'relay',
           playerKeys: [keys[0], keys[1]],
-          // The mesh match id the players signed for (relay: from CSign; the
-          // gauntlet's own id), so a reader can re-check the signatures.
-          meshMatchId: gauntlet ? gauntlet.matchId : (m.clients.find((cl) => cl?.ledgerSigFor)?.ledgerSigFor?.matchId ?? null),
-          // Their signatures over SResult.ledger (CSign), by player key —
-          // present for the sides that answered before archival. Relay: only
-          // signatures the relay verified (the same check as provenKey).
-          signatures: Object.fromEntries(m.clients.flatMap((cl, i) => (cl?.playerKey && cl.ledgerSig && cl.playerKey === m.playerKeys[i] && (gauntlet || keys[i] === cl.playerKey) ? [[cl.playerKey, cl.ledgerSig]] : []))),
+          meshMatchId: gauntlet ? gauntlet.matchId : null,
+          // Gauntlet: the players' signatures over SResult.ledger (CSign), by
+          // player key, for the sides that answered.
+          signatures: gauntlet ? Object.fromEntries(m.clients.flatMap((cl, i) => (cl?.playerKey && cl.ledgerSig && cl.playerKey === m.playerKeys[i] ? [[cl.playerKey, cl.ledgerSig]] : []))) : {},
           agents: [m.clients[0].agent, m.clients[1]?.agent ?? true],
           delay: m.delay,
           items: m.items,
@@ -1333,7 +1310,6 @@ export const createMatchServer = (opts: {
     const archive = (): void => {
       try {
         const pin = pinOf();
-        if (meshPlaced) console.log(`[match ${m.id}] archiving mesh ledger with ${Object.keys(pin.signatures).length}/2 player signatures`);
         const ledger = encodeLedger([m.inputs[0], m.inputs[1]]);
         // Canonical digest — hashed over CANONICAL json (sorted keys), not
         // JSON.stringify. The pin is stored as Postgres jsonb, which does not
@@ -1364,10 +1340,7 @@ export const createMatchServer = (opts: {
         console.log(`[match ${m.id}] ledger encode failed: ${String(e)}`);
       }
     };
-    // Mesh-placed: give both players a moment to answer `result` with their
-    // ledger signatures so the pin archives them. Nothing waits on this — a
-    // signature that never comes archives the ledger as relay-attested.
-    if (persistence?.saveLedger && (m.mode === 'wager' || meshPlaced)) setTimeout(archive, meshPlaced ? 3000 : 0);
+    if (persistence?.saveLedger && m.mode === 'wager') setTimeout(archive, 0);
     if (gauntlet && m.id === gauntlet.matchId) void handOff(m, result, pinOf);
 
     if (process.env.AF_DEBUG_LEDGER) {
@@ -1496,9 +1469,7 @@ export const createMatchServer = (opts: {
           : undefined,
         items: m.items[0].length > 0 || m.items[1].length > 0 ? m.items : undefined,
         pets: m.pets[0] || m.pets[1] ? m.pets : undefined,
-        placed: gauntlet
-          ? { intake: 'gauntlet', mode: gauntlet.placedMode }
-          : m.room.startsWith('LIT-') ? { intake: 'relay', mode: 'casual' } : undefined,
+        placed: gauntlet ? { intake: 'gauntlet', mode: gauntlet.placedMode } : undefined,
         resume: m.resumeTokens[c.side],
       };
       send(c, setup);
@@ -2073,6 +2044,10 @@ export const createMatchServer = (opts: {
             if (!/^[A-Z0-9-]{3,40}$/.test(room)) {
               return send(c, { t: 'error', msg: 'friendly challenge needs a room code' });
             }
+            // An arcade-placed match (`LIT-…`) runs on the gauntlet of the host the mesh placed it on, never here.
+            if (room.startsWith('LIT-')) {
+              return send(c, { t: 'error', msg: 'arcade matches are played on the host that placed them: launch it again from the arcade' });
+            }
             const waiter = rooms.get(room);
             c.room = room;
             if (waiter && waiter !== c && waiter.ws.readyState === WebSocket.OPEN && waiter.state === 'queued') {
@@ -2319,17 +2294,13 @@ export const createMatchServer = (opts: {
         return;
       }
       case 'sign': {
-        // litnode: the player's signature over the mesh ledger body the server
+        // Gauntlet: the player's signature over the mesh ledger body the server
         // named in `result` (produced by the cabinet shell). Kept on the client
-        // record; the delayed archival copies it into the ledger pin.
+        // record; handOff sends it to the node with the log.
+        if (!gauntlet) return;
         const sig = typeof (msg as { sig?: unknown }).sig === 'string' && /^[0-9a-f]{128}$/i.test((msg as { sig: string }).sig) ? (msg as { sig: string }).sig.toLowerCase() : '';
-        // The body the arcade signed names the MESH match id and build (the relay only knows the room code
-        // derived from it), so the client says which; the relay checks it before trusting the key (pinOf).
-        const sm = String((msg as { matchId?: unknown }).matchId ?? '').toLowerCase();
-        const sb = String((msg as { buildHash?: unknown }).buildHash ?? '').toLowerCase();
         if (sig && c.playerKey) {
           c.ledgerSig = sig;
-          c.ledgerSigFor = /^[0-9a-f]{64}$/.test(sm) ? { matchId: sm, buildHash: /^[0-9a-f]{64}$/.test(sb) ? sb : null } : null;
           // litnode 0.11.31: the placement envelope the arcade served (cabinet:init match.descriptor), sent back
           // with the ledger so a ranked match binds to it even after the host's book let it go. Bounded; it is
           // checked against the match in handOff and verified by the node.
@@ -3251,7 +3222,6 @@ export const createMatchServer = (opts: {
       email: '',
       playerKey: '',
       ledgerSig: '',
-      ledgerSigFor: null,
       descriptor: null,
       room: '',
       seat: -1,

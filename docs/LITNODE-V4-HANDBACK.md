@@ -455,25 +455,44 @@ Status as of 23 Oct, after `b7d0923`.
       - Otherwise run `restart-node.cmd` from an admin prompt.
       - If the wrapper is gone, follow either with
         `schtasks /Run /TN litnode`.
-6. **Dedicated relay checkout.** *(Prepared: `E:\NPC\AGENT FIGHTER\agent-fighter-relay`,
-   a clone of `b7d0923` that tracks GitHub `master`, with `npm ci` done.
-   Without `.env` it refuses to start, as designed.)*
-   - **Left:**
-     1. Copy `.env` into it, and `air/partner_rs256.pem` too if AIR
-        write-back is on.
-     2. Set `AF_ROOT` in `E:\NPC\LITNODE-DESKTOP\node.env` to the new
-        checkout.
-     3. Run `LITNODE_DIR=E:\NPC\LITNODE-DESKTOP npm run deploy:relay`.
-   - Do the copy **before** the `AF_ROOT` change. A relay without `.env`
-     does not come back up.
-7. **Stable relay hostname.** A named tunnel needs a hostname in a Cloudflare
-   zone. `agentfighter.wtf` and `litvm.games` are both on Vercel DNS, so this
-   needs a domain (or a subdomain's zone) moved to Cloudflare first. Then:
-   1. `cloudflared tunnel login`
-   2. `create`
-   3. `route dns`
-   4. Set `RELAY_TUNNEL_NAME` / `RELAY_TUNNEL_HOST` in `node.env`.
+6. **Withdrawn: a dedicated relay checkout.** It would have meant a second
+   copy of the relay's secrets. The relay keeps running from this checkout;
+   keep it clean (docs/deploy.md).
+7. **Withdrawn: a stable relay hostname.** Litnode stays on free quick
+   tunnels. The game finds the relay on chain, and the arcade passes the
+   placed host.
+8. Operators: `GAUNTLET_SERVERS=agent-fighter.v1` on more operators, when they
+   want to host placed matches. The relay retirement in ADR 0014 is already
+   done (below).
 
-   `cloudflared` 2025.7.0 is installed on the desktop.
-8. Operators: `GAUNTLET_SERVERS=agent-fighter.v1` on two or more operators,
-   then the week-long relay retirement in ADR 0014.
+## Simplification (2026-10-23)
+
+Reviewed for overlap, and removed:
+
+- **Relay results no longer go to the mesh.**
+  - litnode's `af-watch`, `af-import-ledger`, `af-submission` and the
+    bridge's Agent Fighter adapter are gone, and so is the `litnode-watch`
+    task.
+  - Wagers stay in Supabase.
+  - The gauntlet, in bundle mode, is Agent Fighter's only intake.
+- **No relay fallback for arcade matches.**
+  - The relay turns away `LIT-` rooms. A failed seat claim tells the player
+    to launch again from the arcade.
+  - The relay and the only gauntlet host share one machine and one tunnel,
+    so the fallback added no uptime.
+- **Bundle-only gauntlet.** litnode's checkout-mode
+  `gauntlets/agent-fighter.json` is gone. Operators opt in with
+  `GAUNTLET_SERVERS` and need no clone.
+- **Publisher-only discovery.**
+  - The client reads only `PREFERRED_RELAYS` entries: 4 chain calls instead
+    of 2 per announced node.
+  - The separate publisher-relay list is folded into the relay cache.
+  - The dead Railway constant is gone.
+- **CSign** no longer carries `matchId` / `buildHash`, which only the relay's
+  key check used.
+
+**Note for the next gauntlet bundle.** `server.ts`, `protocol.ts` and
+`mesh-ledger.ts` changed, so `npm run bundle:server` from master no longer
+reproduces the registered `e8d8f22b…02fd`. Gauntlet behavior is unchanged, so
+the registered bundle stays correct. The next rebuild needs a new
+`publish:title set-build`.

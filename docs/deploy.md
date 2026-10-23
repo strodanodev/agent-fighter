@@ -42,9 +42,6 @@ be stopped from an ordinary shell. `schtasks` can stop it, and the task's loop
 Always use the paired `npm run deploy` when `ENGINE_VERSION` changes. A client
 and relay on different engines reject every player at `hello`.
 
-Other relay operators (the m16 standby) pull `master` and restart their own
-`litnode-relay` task.
-
 **Never `vercel deploy` from this repo.** Its `.vercel` link points at a
 different, empty project, and the CLI login on the publisher's desktop cannot
 see the production project. A redeploy without a new commit is done from the
@@ -53,21 +50,16 @@ Vercel dashboard ("Redeploy").
 ## The relay runs what is on disk
 
 `run-af-relay.cmd` restarts the relay whenever it exits, from whatever is in
-`AF_ROOT` at that moment, not from git `HEAD`. If `AF_ROOT` is the checkout you
-develop in, a crash puts your uncommitted edits in front of players.
+`AF_ROOT` (this checkout) at that moment, not from git `HEAD`. A crash puts
+uncommitted edits in front of players.
 
 That happened on 22 Oct 2026. A half-finished engine bump went live on the
 relay while the client was still on the old engine.
 
-So:
-
-- **Recommended:** point `AF_ROOT` (in the node's `node.env`) at a dedicated
-  checkout or worktree that only moves on deploy. Then set `LITNODE_DIR` to the
-  node folder when you deploy. `deploy.mjs` reads `AF_ROOT` from `node.env` and
-  fast-forwards that checkout to `origin/master` before the restart. If
-  `package-lock.json` changed, it tells you to run `npm ci` there.
-- **Until then:** keep the development checkout clean whenever you are not
-  deploying, and treat any edit in it as live.
+So keep the checkout clean whenever you are not deploying, and treat any edit
+in it as live. `deploy.mjs` refuses to deploy from a dirty tree. There is
+deliberately no second relay checkout: it would mean a second copy of the
+relay's secrets to keep in sync.
 
 ## Relay env
 
@@ -113,14 +105,18 @@ hostname changes every time the node restarts. The node announces the current
 `matchWsUrl()` in `packages/client/src/main.ts` resolves in this order:
 
 1. The `?ws=` query parameter overrides everything. The LIT GAMES arcade
-   passes the placed host's relay this way; it is also how you test.
-2. An https page uses the relay the mesh announced. `mesh.ts` reads
-   NodeDirectory and NodeStake with addresses from the arcade's
-   `contracts.json`, prefers the publisher's relays, and caches the result.
-3. Otherwise, the `PROD_MATCH_WS` constant. It is a dead Railway address kept
-   only as a last resort, so with no chain and no cache the game honestly
-   shows offline.
-4. On http (local `npm run play`), `ws://<hostname>:8477`.
+   passes the placed host this way; it is also how you test. The player's AIR
+   token never goes to a `?ws=` host unless it is one of the publisher's
+   relays.
+2. An https page uses the relay the publisher's nodes announced. `mesh.ts`
+   reads only those nodes' NodeDirectory entries and NodeStake standing
+   (`PREFERRED_RELAYS`), with addresses from the arcade's `contracts.json`,
+   and caches the result. No relay known yet means an address that never
+   resolves, so the game retries discovery and then honestly shows offline.
+3. On http (local `npm run play`), `ws://<hostname>:8477`.
+
+An arcade-placed match never uses this: it plays on the placed host's gauntlet
+with a seat ticket, or not at all (ADR 0014).
 
 **To find the relay by hand** (for headless agents, see
 [headless-agent.md](headless-agent.md)), use either:

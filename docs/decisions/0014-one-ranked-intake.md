@@ -1,7 +1,8 @@
 # 0014 — One ranked intake: the gauntlet, with both players signing
 
 Status: ACCEPTED. The Agent Fighter side is implemented (2026-10-22). The
-relay intake is retired in steps; see "Retirement plan".
+relay intake was retired outright on 2026-10-23; see "Update: the relay intake
+is gone".
 Date: 2026-10-22
 Relates to: [0013](0013-mesh-hosting-gauntlet.md) (gauntlet mode, which this
 makes the only ranked path), [0010](0010-esports-api-and-replays.md) (the
@@ -86,6 +87,24 @@ gauntlet has neither weakness.
 
 Wager matches keep archiving to `match_ledgers` for replays (ADR 0010). They
 are the publisher's off-chain economy and never go to the mesh as ranked.
+
+## Update: the relay intake is gone (2026-10-23)
+
+Step 5 ran early, and step 6 was dropped. The precondition (two or more
+gauntlet operators) protected availability, but the relay and the only
+gauntlet host are the same desktop behind the same tunnel. When one is down,
+so is the other. The fallback added no uptime; it only turned failed ranked
+matches into silent casual ones.
+
+- **Relay:** it turns away `LIT-` rooms ("launch it again from the arcade") and
+  archives only wagers, with no mesh keys or signatures in the pin. Test:
+  `identity.test.ts`.
+- **Client:** a failed seat claim says "no seat on the host, launch the match
+  again from the arcade". It never falls back to the relay.
+- **litnode:** `af-watch`, `af-import-ledger`, `af-submission` and the bridge's
+  Agent Fighter adapter are removed, and so is the `litnode-watch` task.
+  Relay matches stay in Agent Fighter's own database. The gauntlet, in bundle
+  mode, is the only way an Agent Fighter match reaches the mesh.
 
 ## Do not re-litigate
 

@@ -315,9 +315,9 @@ let pendingRoom = ''; // ?room= from a challenge link, waiting on sign-in
 /** ?player= from the LIT GAMES cabinet: the litnode key this match was placed
  *  under. Sent in hello, pinned into the ledger by the server. In-memory only. */
 let meshPlayerKey = '';
-// litnode (protocol 3): the mesh match and build this client was launched for
-// (?match= ?build= from the cabinet). At `result` the client asks the cabinet
-// shell to sign the ledger body and forwards the signature to the relay.
+// litnode: the mesh match and build this client was launched for (?match=
+// ?build= from the cabinet). At `result` the client asks the cabinet shell to
+// sign the ledger body and forwards the signature to the gauntlet.
 let meshMatchId = '';
 let meshBuildHash = '';
 /**
@@ -337,11 +337,12 @@ let meshSignAsked = false;
 let meshRoom = '';
 let meshPlayed = false;
 /**
- * A cabinet launch onto a host that runs Agent Fighter as a GAUNTLET (one server per placed match, litnode
- * node/gauntlet.js): the seat ticket and the match's own room URL, once claimed. 'none' = this host has no
- * seat to claim (it fronts the relay), so the placed room plays on the relay as before.
+ * A cabinet launch: the placed match runs on the host's GAUNTLET (one server per placed match, litnode
+ * node/gauntlet.js), admitted by a seat ticket. The seat ticket and the match's own room URL, once claimed.
+ * Without a seat the placed match cannot be played here: the relay never hosts it (server ADR 0014).
  */
 let meshSeat: { ticket: string; ws: string } | null = null;
+const SEAT_NEEDED = 'NO SEAT ON THE HOST — LAUNCH THE MATCH AGAIN FROM THE ARCADE';
 /**
  * Progression on the mesh for the key the arcade launched us with: XP, level and record folded by the node
  * from ranked results final on chain (litnode /progress, protocol/progression.js). Publisher-independent:
@@ -370,7 +371,7 @@ const fetchMeshProgress = async (): Promise<void> => {
     if (r.ok && typeof j.level === 'number') meshProgress = { level: j.level, xp: j.xp ?? 0, xpForNext: j.xpForNext ?? null, wins: j.wins ?? 0, losses: j.losses ?? 0, draws: j.draws ?? 0, streak: j.streak ?? 0, rating: j.rating ?? 1200 };
   } catch { /* a node older than 0.11.21, or unreachable: keep what we had */ }
 };
-let meshSeatState: 'idle' | 'claiming' | 'seated' | 'none' | 'failed' = 'idle';
+let meshSeatState: 'idle' | 'claiming' | 'seated' | 'failed' = 'idle';
 let seatSigned: ((m: { sig?: string; error?: string }) => void) | null = null;
 // The select screen is shared by wager and friendly (both PvP, one fighter to
 // pick). This flag tells its lock handler which to queue — set true only for
@@ -447,26 +448,19 @@ const drawWalletStrip = (): void => {
 };
 
 /**
- * Last-resort match server address. The real one is DISCOVERED: the relay
- * runs on an operator's machine behind a tunnel whose hostname changes, and
- * the operator's litnode publishes the current wss:// on litVM (mesh.ts).
- * This constant only answers when the chain cannot be read and nothing is
- * cached; Railway is gone, so that is "offline", honestly. MUST be wss://
- * — the game is served over https and browsers block ws:// from it.
- */
-const PROD_MATCH_WS = 'wss://match-server-production.up.railway.app';
-
-/**
  * Match-server endpoints. `?ws=` overrides everything (the LIT GAMES
  * cabinet passes the drawn host's relay this way); an https page uses the
- * relay the mesh announced (cached by mesh.ts, refreshed at boot), then the
- * constant; anything else is a local dev box running the server beside the
- * page (`npm run play`).
+ * relay the mesh announced (cached by mesh.ts, refreshed at boot); anything
+ * else is a local dev box running the server beside the page (`npm run play`).
+ * With no relay known yet the address is one that never resolves (`.invalid`,
+ * RFC 2606): the connection fails at once and the retry below re-reads the
+ * directory, so the player sees CONNECTING or an honest OFFLINE.
  */
+const NO_RELAY = 'wss://no-relay.invalid';
 const matchWsUrl = (): string => {
   const override = new URLSearchParams(location.search).get('ws');
   if (override) return override;
-  if (location.protocol === 'https:') return cachedRelay() ?? PROD_MATCH_WS;
+  if (location.protocol === 'https:') return cachedRelay() ?? NO_RELAY;
   return `ws://${location.hostname}:8477`;
 };
 if (location.protocol === 'https:') refreshRelay();
@@ -510,13 +504,18 @@ const askSeatSignature = (challenge: SeatChallenge): Promise<string> => new Prom
 });
 /**
  * Claim this player's seat on the placed host's gateway. The gateway answers with a one-time challenge,
- * the arcade signs it, and the signed ask returns the seat ticket and the match's room URL. A host with no
- * gauntlet for this room (it fronts the relay) answers 404, or the relay's own /health: no seat, the relay
- * plays the placed room as before.
+ * the arcade signs it, and the signed ask returns the seat ticket and the match's room URL. Anything else
+ * (no gauntlet for this room: 404; no host or key in the launch; an error) leaves the placed match
+ * unplayable here, and the player is told to launch it again from the arcade.
  */
 const claimMeshSeat = async (): Promise<void> => {
   const ws = new URLSearchParams(location.search).get('ws');
-  if (!ws || !meshRoom || !meshPlayerKey || window.parent === window) { meshSeatState = 'none'; return; }
+  const fail = (why: unknown): void => {
+    meshSeatState = 'failed';
+    console.warn('[mesh] seat claim failed:', why);
+    showToast(SEAT_NEEDED);
+  };
+  if (!ws || !meshPlayerKey || window.parent === window) return fail('the launch named no host or player key');
   meshSeatState = 'claiming';
   const base = `${ws.replace(/^ws/, 'http').replace(/\/+$/, '')}/${meshRoom}/ticket?player=${meshPlayerKey}`;
   try {
@@ -527,21 +526,16 @@ const claimMeshSeat = async (): Promise<void> => {
       const sig = await askSeatSignature(challenge);
       r = await fetch(`${base}&nonce=${challenge.nonce}&sig=${sig}`, { signal: AbortSignal.timeout(10_000), cache: 'no-store' });
     }
-    if (r.status === 404) { meshSeatState = 'none'; return; }
+    if (r.status === 404) return fail('the host runs no gauntlet for this room');
     const j = (await r.json().catch(() => ({}))) as { ticket?: string; ws?: string; error?: string };
     if (r.ok && j.ticket && j.ws) { meshSeat = { ticket: j.ticket, ws: j.ws }; meshSeatState = 'seated'; return; }
-    if (r.ok) { meshSeatState = 'none'; return; }
-    throw new Error(j.error ?? `the host answered ${r.status}`);
+    fail(j.error ?? `the host answered ${r.status} without a seat`);
   } catch (e) {
-    meshSeatState = 'failed';
-    console.warn('[mesh] seat claim failed; trying the relay:', e);
-    showToast('COULD NOT CLAIM THE SEAT ON THE HOST — TRYING THE RELAY');
+    fail(e);
   }
 };
 /** The placed match runs on a gauntlet and this player holds its seat: no sign-in, no account, no token. */
 const meshSeated = (): boolean => !!meshRoom && meshSeatState === 'seated' && !!meshSeat;
-/** A placed launch waits for its seat claim before falling back to the relay. */
-const meshSeatPending = (): boolean => !!meshRoom && (meshSeatState === 'idle' || meshSeatState === 'claiming');
 const relayAuthToken = async (): Promise<string | undefined> => {
   await relayReady();
   if (!isPublisherRelay(matchWsUrl())) return undefined;
@@ -1639,7 +1633,7 @@ const applyBootDeepLink = (): void => {
     if (d?.type === 'cabinet:seat-signed') { seatSigned?.(d as { sig?: string; error?: string }); return; }
     if (!d || d.type !== 'cabinet:signed' || !meshMatchId || d.matchId !== meshMatchId) return;
     if (typeof d.sig === 'string' && net && 'signLedger' in net) {
-      (net as NetSession).signLedger(d.sig, { matchId: meshMatchId, buildHash: meshBuildHash || null, ...(meshDescriptor ? { descriptor: meshDescriptor } : {}) });
+      (net as NetSession).signLedger(d.sig, meshDescriptor ?? undefined);
     }
   });
   if (meshRoom) void claimMeshSeat();
@@ -1731,6 +1725,10 @@ const startOnline = (
   /** ARCADE v2: the board node being moved to — the move IS the queue. */
   arcadeNode?: number,
 ): void => {
+  // A seated placed match plays on the host's gauntlet: its own room URL, the seat ticket, no AIR token.
+  // Without the seat it is not played at all; the relay never hosts it (server ADR 0014).
+  const seat = m === 'friendly' && friendlyRoom === meshRoom && meshSeated() ? meshSeat : null;
+  if (m === 'friendly' && meshRoom && friendlyRoom === meshRoom && !seat) { screen = 'title'; showToast(SEAT_NEEDED); return; }
   lastOnlineArgs = [m, runToken, agentOf, arcadeNode];
   const roster = allRosters[picks[0]]!;
   lastFighter = roster.id;
@@ -1745,8 +1743,6 @@ const startOnline = (
   // Play under the AIR identity (fresh token; the server verifies it against
   // the JWKS and settles credits/XP). ?dev=NAME plays a dev-economy account.
   const name = authName() ?? DEV_GUEST ?? `PLAYER-${(profile.wins + profile.losses) % 1000}`;
-  // A seated placed match plays on the host's gauntlet: its own room URL, the seat ticket, no AIR token.
-  const seat = m === 'friendly' && friendlyRoom === meshRoom && meshSeated() ? meshSeat : null;
   void (seat ? Promise.resolve(undefined) : relayAuthToken()).then((token) => {
     if (screen !== 'online' || net) return; // player backed out while fetching
     const email = auth.email || undefined; // AIR write-back target (ADR 0004)
@@ -1803,14 +1799,12 @@ const startAgentDare = (code: string): void => {
 
 /** Match setup arrived — install the pinned characters/stage and begin. */
 /**
- * What a mesh-placed match counts for, in words (server ADR 0014). Only a gauntlet — a node's per-match server,
- * the player's arcade key signing the result — can settle RANKED. A placed room the relay hosted is CASUAL, and
- * so is anything the mesh would only know by a name (`af:<name>`): it never binds a profile or counts for rewards.
+ * What a mesh-placed match counts for, in words (server ADR 0014). It always runs on a gauntlet — a node's
+ * per-match server, the player's arcade key signing the result — and counts as its placement's mode.
  * [headline, detail]; null for a match the mesh did not place.
  */
 const placedStakes = (p: NetSetup['placed']): [string, string] | null => {
   if (!p) return null;
-  if (p.intake === 'relay') return ['CASUAL · RELAY-HOSTED      NOT RANKED ON THE MESH', 'NO GAUNTLET HOST TOOK THIS ROOM · ONLY A GAUNTLET SETTLES RANKED'];
   return p.mode === 'ranked'
     ? ['RANKED · PLACED BY THE MESH      NO FEE · YOUR ARCADE KEY SIGNS THE RESULT', 'INDEPENDENT NODES REPLAY IT · OFFICIAL ONCE THE WITNESSES AGREE']
     : ['CASUAL · PLACED BY THE MESH      NO FEE · YOUR ARCADE KEY SIGNS THE RESULT', 'NODES REPLAY IT · NOT RANKED'];
@@ -2825,8 +2819,9 @@ const tickSelect = (): void => {
         pendingArcadeToken = '';
         if (!token) { screen = 'title'; showToast('ENTER AGENT ARCADE FROM THE TITLE'); return; }
         startArcadeRanked(token);
-      } else if (meshSeated()) {
-        // A placed match on a gauntlet: the seat ticket is the admission — no account, nothing escrowed.
+      } else if (meshRoom) {
+        // A cabinet launch: the placed match on the host's gauntlet, admitted by the seat ticket — no account,
+        // nothing escrowed ("change fighter" lands here too). startOnline refuses it without a seat.
         if (meshPlayed) { locked = [false, false]; screen = 'title'; showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE'); return; }
         friendlyRoom = meshRoom;
         startOnline('friendly');
@@ -2835,11 +2830,6 @@ const tickSelect = (): void => {
         // "change fighter" is bounced to sign-in rather than queued unpaid.
         locked = [false, false];
         void authLogin();
-      } else if (meshRoom) {
-        // "change fighter" inside a cabinet launch: still the placed room
-        if (meshPlayed) { locked = [false, false]; screen = 'title'; showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE'); return; }
-        friendlyRoom = meshRoom;
-        startOnline('friendly');
       } else if (publisherPaused()) {
         // The publisher went offline while this player was picking: nothing is escrowed yet.
         locked = [false, false];
@@ -2935,7 +2925,8 @@ const frame = (steps = 1): void => {
     // A challenge link (?room=) auto-joins the friend's room the moment the
     // sign-in gate clears — clicking the link WAS the consent. One last
     // title frame draws beneath; the lobby takes over next frame.
-    if (pendingRoom && (meshSeated() || (signedIn && accountFetch === 'done' && !meshSeatPending()))) {
+    // A cabinet launch's room waits for its seat on the host instead (and is never joined without one).
+    if (pendingRoom && (meshRoom ? meshSeated() : signedIn && accountFetch === 'done')) {
       const room = pendingRoom;
       pendingRoom = '';
       startFriendly(room);
@@ -3003,9 +2994,13 @@ const frame = (steps = 1): void => {
       // A guest here opens sign-in instead of queuing. (On touch the dialog is
       // fired in-gesture from the pointerdown handler; this covers desktop
       // Enter and any keyboard fall-through — authLogin() no-ops if already busy.)
-      if (mode === 'online' && !isSignedIn() && !meshSeated()) { void authLogin(); return; }
-      // A cabinet launch: RANKED is the placed room, never the wager queue.
-      if (mode === 'online' && meshRoom) { if (meshPlayed) { showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE'); return; } startFriendly(meshRoom); return; }
+      // A cabinet launch: RANKED is the placed match on the host's gauntlet, never the wager queue.
+      if (mode === 'online' && meshRoom) {
+        if (meshPlayed) { showToast('MATCH PLAYED — THE NEXT RANKED MATCH IS PLACED IN THE ARCADE'); return; }
+        if (!meshSeated()) { showToast(SEAT_NEEDED); return; }
+        startFriendly(meshRoom); return;
+      }
+      if (mode === 'online' && !isSignedIn()) { void authLogin(); return; }
       // The wager queue needs the publisher's escrow: paused while no publisher relay answers (re-probed on press).
       if (mode === 'online' && publisherPaused()) { showToast(WAGERS_PAUSED); void publisherOnline(true).catch(() => {}); return; }
       // AGENT ARCADE (ADR 0007 credits rework): a SIGNED-IN player pays the
@@ -3628,8 +3623,7 @@ const frame = (steps = 1): void => {
       ? 'RANKED GAUNTLET · 1 CREDIT PER RUN · EXTRACT THE BAG ALIVE'
       : friendlyQ
         ? (meshRoom && friendlyRoom === meshRoom
-          // ADR 0014: a seat on a gauntlet is the only way a placed match counts; the relay's copy is casual.
-          ? (meshSeated() ? `PLACED BY THE MESH · YOUR ARCADE KEY SIGNS · ROOM ${friendlyRoom}` : `CASUAL · RELAY-HOSTED · NOT RANKED · ROOM ${friendlyRoom}`)
+          ? `PLACED BY THE MESH · YOUR ARCADE KEY SIGNS · ROOM ${friendlyRoom}`
           : `FRIENDLY · FREE · UNRANKED · ROOM ${friendlyRoom}`)
         : solo
           ? 'RANKED VS AGENT · 1 CREDIT · WIN +1 · LOSE −15 XP'
@@ -4089,11 +4083,11 @@ const frame = (steps = 1): void => {
         const placed = placedStakes(net.setup?.placed);
         if (placed) {
           ctx.font = 'bold 12px "Courier New", monospace';
-          ctx.fillStyle = net.setup?.placed?.mode === 'ranked' && net.setup.placed.intake === 'gauntlet' ? '#8fd0ff' : '#ffd166';
+          ctx.fillStyle = net.setup?.placed?.mode === 'ranked' ? '#8fd0ff' : '#ffd166';
           ctx.fillText(placed[0].replace(/\s{2,}/g, ' · '), VW / 2, VH - 62);
         }
         // …and the settlement proof the mesh gave it, with the place to check it (settlement v4).
-        if (meshResultProof && net.setup?.placed?.intake === 'gauntlet') {
+        if (meshResultProof && net.setup?.placed) {
           const link = proofLink(meshResultProof);
           const line = `PROOF ${proofLabel(meshResultProof.proof)}${meshResultProof.mode ? ` · ${meshResultProof.mode.toUpperCase()}` : ''}${link ? `  ·  ${link.label} ›` : ''}`;
           ctx.font = 'bold 12px "Courier New", monospace';
@@ -4345,7 +4339,7 @@ const drawPerf = (): void => {
  * the result the line says SETTLING and the link opens the arcade's receipt page, which reads the chain itself.
  */
 const watchMeshProof = (): void => {
-  if (meshProofPolling || !meshMatchId || !meshNodeUrl || !net?.result || net.setup?.placed?.intake !== 'gauntlet') return;
+  if (meshProofPolling || !meshMatchId || !meshNodeUrl || !net?.result || !net.setup?.placed) return;
   meshProofPolling = true;
   meshResultProof = pendingProof(meshMatchId);
   let tries = 0;

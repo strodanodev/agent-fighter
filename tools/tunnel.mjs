@@ -1,19 +1,17 @@
 /**
- * Zero-cost match server: run it on this machine and expose it through a
- * Cloudflare Tunnel instead of Railway.
+ * A throwaway public match server for testing from a laptop: run it on this
+ * machine behind a Cloudflare quick tunnel. (The real relay runs on the
+ * publisher's litnode node, whose own tunnel and directory entry make it
+ * discoverable; this script is not part of that.)
  *
  *   npm run tunnel                       # quick tunnel: random *.trycloudflare.com, no account
- *   AF_TUNNEL_NAME=af-match npm run tunnel   # named tunnel: stable hostname (needs `cloudflared tunnel login` once)
  *
  * What it does: loads .env, starts `npm run server` on PORT (8477), waits for
  * GET / to answer, then starts cloudflared pointed at it and prints the
- * wss:// origin. Cloudflare terminates TLS, so the server stays plain ws —
- * exactly the Railway arrangement, minus the bill.
+ * wss:// origin. Cloudflare terminates TLS, so the server stays plain ws.
  *
  * Play against it from ANY deployed client with the `?ws=` override:
  *   https://<your-client>/?ws=wss://<printed host>
- * For a named tunnel, put the stable host into PROD_MATCH_WS
- * (packages/client/src/main.ts) once and redeploy the client.
  *
  * Nothing here relaxes the server's own guards: without SUPABASE_URL and
  * SUPABASE_SERVICE_KEY it refuses to start unless AF_ALLOW_DEV_ECONOMY=1,
@@ -35,7 +33,6 @@ if (existsSync(envFile)) {
 }
 const port = Number(env.PORT || 8477);
 const origin = `http://127.0.0.1:${port}`;
-const tunnelName = env.AF_TUNNEL_NAME;
 
 if (!env.SUPABASE_URL && env.AF_ALLOW_DEV_ECONOMY !== '1') {
   console.error('tunnel: SUPABASE_URL / SUPABASE_SERVICE_KEY missing in .env (or set AF_ALLOW_DEV_ECONOMY=1 for a throwaway laptop economy).');
@@ -74,11 +71,8 @@ start('npm', ['run', 'server'], 'server');
 const health = await waitForServer();
 console.log(`\n[tunnel] match server up on ${origin} · engine ${health.engine ?? '?'} · persistence ${health.persistence ?? health.db ?? '?'}`);
 
-const args = tunnelName
-  ? ['tunnel', 'run', '--url', origin, tunnelName]
-  : ['tunnel', '--url', origin];
 let announced = false;
-start('cloudflared', args, 'cloudflared', {
+start('cloudflared', ['tunnel', '--url', origin], 'cloudflared', {
   onStderr(text) {
     const m = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/.exec(text);
     if (m && !announced) {
@@ -86,8 +80,7 @@ start('cloudflared', args, 'cloudflared', {
       const wss = m[0].replace(/^https/, 'wss');
       console.log(`\n[tunnel] PUBLIC MATCH SERVER  ${wss}`);
       console.log(`[tunnel] play: <your client origin>/?ws=${wss}`);
-      console.log(`[tunnel] quick tunnels change hostname every run; set AF_TUNNEL_NAME for a stable one.\n`);
+      console.log(`[tunnel] quick tunnels change hostname every run.\n`);
     }
   },
 });
-if (tunnelName) console.log(`[tunnel] named tunnel "${tunnelName}" — its hostname is whatever you routed with \`cloudflared tunnel route dns ${tunnelName} <host>\`; use wss://<host>.`);

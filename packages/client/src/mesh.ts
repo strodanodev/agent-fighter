@@ -5,13 +5,13 @@
  * machine behind an outbound tunnel whose hostname can change, and the
  * operator's node publishes the current one on litVM (NodeDirectory —
  * github.com/strodanodev/litnode, docs/WALLET-IDENTITY.md and the
- * "decentralized bootstrap" notes). This module reads that list straight
- * from the chain: every announced node key, its entry (url, wsAddr,
- * updatedAt), and whether NodeStake still shows it bonded. Of the bonded
- * seeds that advertise a relay, the first in PREFERRED_RELAYS order whose
- * /health answers `game: agent-fighter` is the match server.
+ * "decentralized bootstrap" notes). This module reads it straight from the
+ * chain for the publisher's own nodes only (PREFERRED_RELAYS): each one's
+ * entry (url, wsAddr, updatedAt) and whether NodeStake still shows it bonded.
+ * Of those that advertise a relay, the first whose /health answers
+ * `game: agent-fighter` is the match server.
  *
- * Read-only, no wallet, no library: three eth_call shapes and their ABI
+ * Read-only, no wallet, no library: two eth_call shapes and their ABI
  * decoding are inlined below (the selectors are keccak-derived in litnode's
  * protocol/keccak.js; hard-coded here so the game bundle stays dependency-free).
  *
@@ -111,7 +111,7 @@ async function loadContracts(): Promise<ContractSet> {
 export async function ensureContractSet(): Promise<ContractSet | null> {
   try { return await loadContracts(); } catch { return null; }
 }
-const SEL = { keys: '0x307540f6', entryOf: '0x82fb8643', standingOf: '0x43aa9ad3' } as const;
+const SEL = { entryOf: '0x82fb8643', standingOf: '0x43aa9ad3' } as const;
 const CACHE_KEY = 'af.mesh-relay';
 // Short: a node behind a quick tunnel gets a new hostname on every restart,
 // and a client holding the old one for ten minutes saw 'server offline'.
@@ -119,12 +119,11 @@ const CACHE_MS = 2 * 60_000;
 /** An entry older than this is a node that stopped announcing (litnode FRESH_S). */
 const FRESH_S = 7 * 24 * 3600;
 /**
- * The order every client tries relays in. The relay is the matchmaker, so two
- * players only meet when they pick the SAME one. "Newest announcement wins"
- * followed whichever node last rotated its quick tunnel, and kept naming a
- * machine that died without withdrawing its entry (the desktop, 27 Sep 2026).
- * So: the desktop, then the m16 standby, then any other bonded relay (newest
- * first) — and a relay counts only while its /health says agent-fighter.
+ * The publisher's nodes, in the order every client tries them. Only these are asked: the relay is also the
+ * account API and the economy, so a relay the publisher does not run is never used. The relay is the
+ * matchmaker, so two players only meet when they pick the SAME one; a fixed order (not "newest announcement
+ * wins", which kept naming a machine that died without withdrawing its entry, 27 Sep 2026) makes them agree,
+ * and a relay counts only while its /health says agent-fighter.
  */
 const PREFERRED_RELAYS = [
   '5b703f1288765c0ca3734ab0625df161121ef45a9eabafaaae539be1add95151', // desktop
@@ -169,13 +168,6 @@ const call = (to: string, data: string): Promise<string> => rpc('eth_call', [{ t
 const word = (d: string, i: number): string => d.slice(i * 64, i * 64 + 64);
 const utf8 = (hex: string): string => new TextDecoder().decode(Uint8Array.from(hex.match(/../g) ?? [], (h) => parseInt(h, 16)));
 
-function decodeKeys(ret: string): string[] {
-  const d = ret.replace(/^0x/, '');
-  if (d.length < 128) return [];
-  const off = Number(BigInt('0x' + word(d, 0))) * 2;
-  const n = Number(BigInt('0x' + d.slice(off, off + 64)));
-  return Array.from({ length: n }, (_, i) => d.slice(off + 64 + i * 64, off + 128 + i * 64));
-}
 function decodeEntry(ret: string): { url: string; wsAddr: string; updatedAt: number } {
   const d = ret.replace(/^0x/, '');
   const str = (offWord: string): string => { const o = Number(BigInt('0x' + offWord)) * 2; const l = Number(BigInt('0x' + d.slice(o, o + 64))); return utf8(d.slice(o + 64, o + 64 + l * 2)); };
@@ -183,7 +175,8 @@ function decodeEntry(ret: string): { url: string; wsAddr: string; updatedAt: num
 }
 const decodeActive = (ret: string): boolean => BigInt('0x' + word(ret.replace(/^0x/, ''), 2)) === 1n;
 
-type Cached = { wsAddr: string; at: number };
+/** The chosen relay, and every relay the publisher's nodes announced at that read (for isPublisherRelay). */
+type Cached = { wsAddr: string; relays?: string[]; at: number };
 function readCache(): Cached | null {
   try { const c = JSON.parse(localStorage.getItem(CACHE_KEY) ?? 'null') as Cached | null; return c && typeof c.wsAddr === 'string' ? c : null; } catch { return null; }
 }
@@ -196,15 +189,13 @@ export function cachedRelay(): string | null {
 
 /**
  * The relays the PUBLISHER runs: the wsAddr each PREFERRED_RELAYS node announced at the last directory read.
- * A NodeDirectory entry is written by that node's own announcer, so the address is the node's. Agent Fighter's
- * account API is the relay itself and any bonded node may run one, so only these may receive the player's AIR
- * token (a bearer credential for the whole API: /me, /items/buy, /agent/key). Anything else is played without it.
+ * A NodeDirectory entry is written by that node's own announcer, so the address is the node's. Only these may
+ * receive the player's AIR token (a bearer credential for the whole account API: /me, /items/buy, /agent/key):
+ * a `?ws=` override names some other host, and is played without it.
  */
-const PUBLISHER_KEY = 'af.mesh-publisher-relays';
 let publisherList: string[] = [];
 function publisherRelays(): string[] {
-  if (publisherList.length) return publisherList;
-  try { const c = JSON.parse(localStorage.getItem(PUBLISHER_KEY) ?? 'null') as { relays?: unknown } | null; if (Array.isArray(c?.relays)) publisherList = c.relays.filter((r): r is string => typeof r === 'string'); } catch { /* private mode */ }
+  if (!publisherList.length) publisherList = (readCache()?.relays ?? []).filter((r): r is string => typeof r === 'string');
   return publisherList;
 }
 const originOf = (u: string): string | null => { try { const x = new URL(u); return `${x.protocol}//${x.host}`; } catch { return null; } };
@@ -226,28 +217,26 @@ async function probeRelay(wsAddr: string): Promise<'ok' | 'other' | 'down'> {
   } catch { return 'down'; }
 }
 
-/** Read NodeDirectory + NodeStake and cache the first live relay in PREFERRED_RELAYS order. */
+/** Read the publisher's NodeDirectory entries + NodeStake standing and cache the first live relay, in PREFERRED_RELAYS order. */
 export async function discoverRelay(): Promise<string | null> {
   const { NODE_DIRECTORY, NODE_STAKE } = await loadContracts();
-  const keys = decodeKeys(await call(NODE_DIRECTORY, SEL.keys));
   const nowS = Math.floor(Date.now() / 1000);
-  const found: { nodeId: string; wsAddr: string; updatedAt: number }[] = [];
-  await Promise.all(keys.map(async (k) => {
-    const [entry, standing] = await Promise.all([call(NODE_DIRECTORY, SEL.entryOf + k), call(NODE_STAKE, SEL.standingOf + k)]);
-    const e = decodeEntry(entry);
-    if (e.wsAddr && /^wss:\/\//.test(e.wsAddr) && nowS - e.updatedAt <= FRESH_S && decodeActive(standing)) found.push({ nodeId: k.toLowerCase(), wsAddr: e.wsAddr, updatedAt: e.updatedAt });
+  // One node that left the directory (its entry reverts or decodes empty) is skipped, not fatal.
+  const entries = await Promise.all(PREFERRED_RELAYS.map(async (k) => {
+    try {
+      const [entry, standing] = await Promise.all([call(NODE_DIRECTORY, SEL.entryOf + k), call(NODE_STAKE, SEL.standingOf + k)]);
+      const e = decodeEntry(entry);
+      return e.wsAddr && /^wss:\/\//.test(e.wsAddr) && nowS - e.updatedAt <= FRESH_S && decodeActive(standing) ? e.wsAddr : null;
+    } catch { return null; }
   }));
-  const rank = (nodeId: string): number => { const i = PREFERRED_RELAYS.indexOf(nodeId); return i < 0 ? PREFERRED_RELAYS.length : i; };
-  found.sort((a, b) => rank(a.nodeId) - rank(b.nodeId) || b.updatedAt - a.updatedAt);
+  const found = entries.filter((w): w is string => !!w);
   // Probe them all at once, then take the first that answers in that order. When none answers
   // (every relay down, or this network blocks the probe) fall back to the first that is not
-  // another title's, as before — the lobby's connect-failure path re-reads from here.
-  const probes = await Promise.all(found.map((f) => probeRelay(f.wsAddr)));
-  const pick = found[probes.indexOf('ok')] ?? found[probes.indexOf('down')];
-  const wsAddr = pick?.wsAddr ?? null;
-  publisherList = found.filter((f) => PREFERRED_RELAYS.includes(f.nodeId)).map((f) => f.wsAddr);
-  try { localStorage.setItem(PUBLISHER_KEY, JSON.stringify({ relays: publisherList, at: Date.now() })); } catch { /* private mode */ }
-  try { if (wsAddr) localStorage.setItem(CACHE_KEY, JSON.stringify({ wsAddr, at: Date.now() } satisfies Cached)); } catch { /* private mode */ }
+  // another title's — the lobby's connect-failure path re-reads from here.
+  const probes = await Promise.all(found.map(probeRelay));
+  const wsAddr = found[probes.indexOf('ok')] ?? found[probes.indexOf('down')] ?? null;
+  publisherList = found;
+  try { if (wsAddr) localStorage.setItem(CACHE_KEY, JSON.stringify({ wsAddr, relays: found, at: Date.now() } satisfies Cached)); } catch { /* private mode */ }
   return wsAddr;
 }
 

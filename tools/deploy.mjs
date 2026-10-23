@@ -9,18 +9,18 @@
  *     client IS pushing master; this waits for Vercel's GitHub deployment of HEAD and reads the live bundle's
  *     ENGINE_VERSION back. Never `vercel deploy` from here: this repo's `.vercel` link points at a different,
  *     empty project, and the CLI login on the publisher's desktop cannot see the real one.
- *   · RELAY. The match server runs on the publisher's litnode node, from that node's AF_ROOT checkout, as the
- *     Windows scheduled task `litnode-relay` (LITNODE-DESKTOP/run-af-relay.cmd: a loop that frees the port and
- *     runs `npm run server`). Deploying it is restarting that task. The task runs elevated, so its process
+ *   · RELAY. The match server runs on the publisher's litnode node, from this checkout (node.env AF_ROOT), as
+ *     the Windows scheduled task `litnode-relay` (LITNODE-DESKTOP/run-af-relay.cmd: a loop that frees the port
+ *     and runs `npm run server`). Deploying it is restarting that task. The task runs elevated, so its process
  *     cannot be stopped from an ordinary shell — `schtasks /End` + `/Run` can, and the loop clears any orphan on
- *     the port when it starts. Other operators' relays (the m16 standby) restart on their own machines.
+ *     the port when it starts.
  *   · PLACED MATCHES run on gauntlet servers the nodes spawn per match (ADR 0013/0014) from litnode's server
  *     bundle — a litnode release step, not this script.
  *
  * Rules enforced:
- *   1. Clean tree (untracked files are fine). The relay runs whatever is ON DISK in AF_ROOT, and its restart
- *      loop reloads it on any crash: uncommitted edits in that checkout reach players without ever reaching git
- *      or Vercel. (On 22 Oct 2026 it picked up a session's half-finished engine bump that way.)
+ *   1. Clean tree (untracked files are fine). The relay runs whatever is ON DISK in this checkout, and its
+ *      restart loop reloads it on any crash: uncommitted edits reach players without ever reaching git or
+ *      Vercel. (On 22 Oct 2026 it picked up a session's half-finished engine bump that way.)
  *   2. On master and not behind origin/master: the push must fast-forward what is live.
  *   3. `deploy` (no target) is the PAIRED deploy: push → Vercel production of HEAD → relay restart → skew check.
  *      Required whenever ENGINE_VERSION bumps — a skewed pair hello-rejects every player.
@@ -28,14 +28,11 @@
  * Environment:
  *   AF_CLIENT_URL   live client to read the engine from (default https://www.agentfighter.wtf/)
  *   AF_RELAY_TASK   scheduled task name (default litnode-relay)
- *   AF_RELAY_PORT   relay port on this machine (default 8477, or RELAY_PORT from node.env)
- *   LITNODE_DIR     the litnode node folder (holds node.env). When its AF_ROOT is ANOTHER checkout — the
- *                   recommended setup, so dev edits never reach the relay — that checkout is fast-forwarded to
- *                   origin/master before the restart. Unset: the relay is assumed to run this checkout.
+ *   AF_RELAY_PORT   relay port on this machine (default 8477)
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -136,20 +133,7 @@ const deployClient = async () => {
 };
 
 // ── relay: restart the litnode-relay scheduled task ───────────────────────────
-const nodeEnv = (() => {
-  const dir = process.env.LITNODE_DIR;
-  if (!dir) return {};
-  const f = join(dir, 'node.env');
-  if (!existsSync(f)) fail(`LITNODE_DIR=${dir} has no node.env`);
-  const out = {};
-  // Only the two settings this script needs; node.env also holds keys, which are never read here.
-  for (const line of readFileSync(f, 'utf8').split(/\r?\n/)) {
-    const m = line.match(/^(AF_ROOT|RELAY_PORT)=(.*)$/);
-    if (m) out[m[1]] = m[2].trim();
-  }
-  return out;
-})();
-const RELAY_PORT = Number(process.env.AF_RELAY_PORT ?? nodeEnv.RELAY_PORT ?? 8477);
+const RELAY_PORT = Number(process.env.AF_RELAY_PORT ?? 8477);
 const listenerPid = () => {
   const r = run('powershell', ['-NoProfile', '-Command',
     `(Get-NetTCPConnection -LocalPort ${RELAY_PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess`]);
@@ -164,31 +148,12 @@ const relayHealth = async () => {
 
 const deployRelay = async () => {
   if (process.platform !== 'win32') fail(`the relay is the Windows scheduled task "${TASK}" on the publisher's litnode node; run this there`);
-  // A dedicated relay checkout moves only here: fast-forward it to what was just pushed.
-  const afRoot = nodeEnv.AF_ROOT ? resolve(nodeEnv.AF_ROOT) : null;
-  const separate = !!afRoot && afRoot.toLowerCase() !== resolve(root).toLowerCase();
   const q = run('schtasks', ['/Query', '/TN', TASK]);
   if (!q.ok) fail(`no scheduled task "${TASK}" on this machine — install it with the litnode node's install-task.cmd`);
   if (DRY) {
     const h = await relayHealth();
-    const where = separate ? `${afRoot} (would fast-forward ${git(['rev-parse', '--short', 'HEAD'], afRoot).out} → origin/master)` : afRoot ? 'this checkout (node.env AF_ROOT)' : 'this checkout (assumed; set LITNODE_DIR to check)';
-    console.log(`→ relay: would restart "${TASK}" (${/Running/.test(q.out) ? 'running' : 'not running'}) from ${where}; port ${RELAY_PORT} pid ${listenerPid() ?? 'none'}; engine ${h?.engine ?? '?'}, ${h?.online ?? '?'} online, ${h?.queued ?? '?'} queued`);
+    console.log(`→ relay: would restart "${TASK}" (${/Running/.test(q.out) ? 'running' : 'not running'}); port ${RELAY_PORT} pid ${listenerPid() ?? 'none'}; engine ${h?.engine ?? '?'}, ${h?.online ?? '?'} online, ${h?.queued ?? '?'} queued`);
     return null;
-  }
-  if (separate) {
-    console.log(`→ relay checkout ${afRoot}: fast-forward to origin/master`);
-    const d = git(['status', '--porcelain'], afRoot).out.split('\n').filter((l) => l.trim() && !l.startsWith('??'));
-    if (d.length) fail(`${afRoot} has uncommitted changes — the relay would run them; clean it first`);
-    const before = git(['rev-parse', 'HEAD'], afRoot).out;
-    if (!git(['fetch', '--quiet', 'origin', 'master'], afRoot).ok) fail(`git fetch failed in ${afRoot}`);
-    const ff = git(['merge', '--ff-only', 'origin/master'], afRoot);
-    if (!ff.ok) fail(`${afRoot} cannot fast-forward to origin/master:\n${ff.out}`);
-    if (git(['diff', '--quiet', before, 'HEAD', '--', 'package-lock.json'], afRoot).ok === false) {
-      console.log(`  ! package-lock.json changed: run \`npm ci\` in ${afRoot} before players arrive`);
-    }
-    console.log(`  ✓ ${afRoot} at ${git(['log', '-1', '--format=%h %s'], afRoot).out}`);
-  } else if (!afRoot) {
-    console.log(`→ relay: assuming the "${TASK}" task runs this checkout (set LITNODE_DIR to check node.env's AF_ROOT)`);
   }
   const before = listenerPid();
   const h0 = await relayHealth();
@@ -204,7 +169,7 @@ const deployRelay = async () => {
     if (pid && pid !== before) { health = await relayHealth(); if (health) break; }
   }
   if (!health) fail(`the relay did not come back on :${RELAY_PORT} within 2 min — check the task and litnode-relay.log`);
-  if (health.engine !== ENGINE) fail(`the relay came back on engine ${health.engine}, expected ${ENGINE} — is AF_ROOT this checkout?`);
+  if (health.engine !== ENGINE) fail(`the relay came back on engine ${health.engine}, expected ${ENGINE} — is node.env's AF_ROOT this checkout?`);
   console.log(`  ✓ relay pid ${pid}: engine ${health.engine}, protocol ${health.protocol}, persistence ${health.persistence ? 'on' : 'OFF'}`);
   return health.engine;
 };
@@ -221,4 +186,4 @@ if (target === 'relay') {
   const live = await liveEngine();
   if (live && live !== relay) console.log(`! ENGINE SKEW: relay ${relay}, live client ${live} — run \`npm run deploy:client\` now`);
 }
-console.log(`✓ deployed ${target}. Other relay operators (the m16 standby) pull master and restart their own "${TASK}" task.`);
+console.log(`✓ deployed ${target}.`);

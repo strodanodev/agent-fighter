@@ -117,11 +117,9 @@ export interface CHello {
   engine: string; // ENGINE_VERSION — pinned
   /**
    * litnode player key (optional): the 64-hex ed25519 public key the LIT GAMES
-   * cabinet queued with. Carried into the match ledger's pin so the mesh
-   * settles the result under the key that was placed, not a display name.
-   * NOT verified here — the server cannot check an ed25519 signature cheaply
-   * and does not need to: the mesh's own attestation covers it. Never an
-   * identity for progression; that stays on the verified AIR `sub`.
+   * cabinet queued with. A gauntlet-mode server takes the key its seat ticket
+   * names instead; the relay records it nowhere. Never an identity for
+   * progression; that stays on the verified AIR `sub`.
    */
   playerKey?: string;
   /**
@@ -251,21 +249,14 @@ export interface CPong { t: 'pong'; ts: number }
  */
 export interface CResume { t: 'resume'; matchId: string; token: string }
 /**
- * litnode (protocol 3): the player's Ed25519 signature over the mesh ledger
- * body `{matchId, ticks, head, buildHash}` that SResult.ledger named,
- * produced by the LIT GAMES cabinet shell (the key never enters this client).
- * Archived into the ledger pin; a mesh node holding both signatures settles
- * the result as 'players' provenance instead of 'relay'. Additive: a server
- * that does not know it ignores it, a client that never sends it loses nothing.
- */
-/**
- * The player's litnode ledger signature (produced by the arcade shell). `matchId` / `buildHash` name what the
- * arcade signed — the mesh match and build — so the relay can verify the signature and only then record the
- * player's key as a participant (ADR 0014). A gauntlet needs neither: its seat ticket already proved the key.
+ * Gauntlet only: the player's Ed25519 signature over the mesh ledger body
+ * `{matchId, ticks, head, buildHash}` that SResult.ledger named, produced by
+ * the LIT GAMES cabinet shell (the key never enters this client). The gauntlet
+ * hands both signatures to the node with the log; the relay ignores it.
  * `descriptor` is the placement envelope the arcade served (cabinet:init match.descriptor, litnode GET /match
  * `envelope`): a gauntlet passes it on as the submission's `descriptor` (litnode 0.11.31 binding).
  */
-export interface CSign { t: 'sign'; sig: string; matchId?: string; buildHash?: string | null; descriptor?: unknown }
+export interface CSign { t: 'sign'; sig: string; descriptor?: unknown }
 export type ClientMsg = CHello | CQueue | CInput | CHash | COver | CResume | CPing | CPong | CSign;
 
 // ---- server → client
@@ -278,13 +269,11 @@ export interface SMatch {
   seed: number;
   stage: string;
   /**
-   * Mesh-placed (`LIT-…` room) matches only: who serves it and at which
-   * level it can settle, so the client labels it from fact (ADR 0014).
-   * `gauntlet` — a node's per-match server; players sign; `mode` is the
-   * placement's. `relay` — the always-on relay hosted the room: CASUAL,
-   * never ranked. Absent for everything else.
+   * Arcade-placed matches only, which always run on a node's per-match
+   * gauntlet (ADR 0014): players sign; `mode` is the placement's, so the
+   * client labels it from fact. Absent for everything the relay hosts.
    */
-  placed?: { intake: 'gauntlet' | 'relay'; mode: 'ranked' | 'casual' };
+  placed?: { intake: 'gauntlet'; mode: 'ranked' | 'casual' };
   /**
    * The stage's playfield bounds in world px (the region camera + walls lock
    * to). Server-authoritative and part of the deterministic contract: BOTH
@@ -405,10 +394,10 @@ export interface SResult {
   hash: number; // server re-sim final stateHash (0 for forfeit)
   deviator?: 0 | 1; // side whose reported hashes diverged from the re-sim
   /**
-   * Mesh-placed matches (a `LIT-` room) only: the litnode ledger commitment
-   * over the archived input tracks — the head a mesh node rebuilds and the
-   * tick count it covers. What each player signs (CSign) together with the
-   * mesh match id and build the cabinet launched them with.
+   * Gauntlet only: the litnode ledger commitment over the input tracks — the
+   * head a mesh node rebuilds and the tick count it covers. What each player
+   * signs (CSign) together with the mesh match id and build the cabinet
+   * launched them with.
    */
   ledger?: { head: string; ticks: number };
 }

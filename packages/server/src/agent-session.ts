@@ -67,21 +67,18 @@ export interface AgentOptions {
    * either way, so the loot they walk past is nobody's money.
    */
   mode?: 'wager' | 'solo' | 'arcade' | 'friendly';
-  /** Friendly only: the rendezvous room (a mesh-placed match: its `LIT-…` code). */
+  /** Friendly only: the rendezvous room (a gauntlet seats by ticket and ignores it). */
   room?: string;
-  /** litnode player key carried in hello (a mesh-placed match). */
+  /** litnode player key carried in hello (a placed match). */
   playerKey?: string;
   /** litnode gauntlet seat ticket (gauntlet.ts): required by a gauntlet-mode server. */
   ticket?: string;
   /**
-   * Mesh-placed matches: sign the ledger the result names. Called with the server's ledger and THIS
+   * Placed matches (gauntlet): sign the ledger the result names. Called with the server's ledger and THIS
    * agent's own record of the log (its inputs and the opponent's, side order) up to the same tick, so the
    * signer can check the head itself before signing. Return the signature (128 hex), or null to refuse.
    */
   signLedger?: (ledger: { head: string; ticks: number }, entries: { k: number; inputs: [number, number] }[]) => Promise<string | null> | string | null;
-  /** The mesh match id (and build) the signature covers, sent with it so a relay can verify it (CSign). */
-  meshMatchId?: string;
-  meshBuildHash?: string | null;
   /** The placement envelope to send back with the signature (cabinet:init match.descriptor; CSign.descriptor). */
   descriptor?: unknown;
   /**
@@ -112,7 +109,7 @@ export interface AgentResult {
   localTicks: number;
   /** Arcade battles: run position + the token that queues the NEXT battle. */
   arcade?: { token: string; node: number; fights: number; total: number };
-  /** Mesh-placed matches: the intake and level the server announced (SMatch.placed). */
+  /** Placed matches: the intake and level the gauntlet announced (SMatch.placed). */
   placed?: SMatch['placed'];
 }
 
@@ -278,7 +275,7 @@ export const playOneMatch = (opts: AgentOptions): Promise<AgentResult> =>
           });
           if (!opts.signLedger) return done(entries);
           void Promise.resolve(opts.signLedger(msg.ledger, entries)).then((sig) => {
-            if (sig) sendMsg({ t: 'sign', sig, ...(opts.meshMatchId ? { matchId: opts.meshMatchId, buildHash: opts.meshBuildHash ?? null } : {}), ...(opts.descriptor ? { descriptor: opts.descriptor } : {}) } as ClientMsg);
+            if (sig) sendMsg({ t: 'sign', sig, ...(opts.descriptor ? { descriptor: opts.descriptor } : {}) } as ClientMsg);
             setTimeout(() => done(entries), 200); // let the signature leave before the socket closes
           }, () => done(entries));
           return;
