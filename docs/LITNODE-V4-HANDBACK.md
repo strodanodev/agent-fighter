@@ -385,25 +385,65 @@ repo at `3d4d1d6` is buildHash `290200cf…7691` and passes conformance.
 
 ### User steps, in order
 
-1. Push agent-fighter `master`. *(Done 23 Oct: `0c49e9b..8aaa934`.)*
+Status as of 23 Oct, after `b7d0923`.
+
+1. Push agent-fighter `master`. *(Done: `0c49e9b..8aaa934`, then `29d4400`
+   and `b7d0923`.)*
 2. Deploy the client and the relay **together**, because the engine is
-   `af-core-9`. *(Done 23 Oct.)*
-   - **Client:** Vercel deployed production from the push, and
-     www.agentfighter.wtf serves `af-core-9`.
+   `af-core-9`. *(Done.)*
+   - **Client:** www.agentfighter.wtf serves `af-core-9` from `b7d0923`.
+     That commit adds the RPC fallback: Caldera's public `/http` ran out of
+     bandwidth on 23 Oct, and discovery now falls through to
+     `/infra-partner-http`.
    - **Relay:** the desktop's `litnode-relay` task was restarted on `8aaa934`.
-   - **Still to do:** the m16 standby relay pulls `master` and restarts its
-     own task.
+     The server has not changed since.
+   - **m16 standby:** it runs no relay, so there is nothing to pull.
    - There is no Railway any more. `npm run deploy` does both halves
      (docs/deploy.md).
-3. litnode, with this repo at the deployed commit:
-   1. `npm run bundle:af`
-   2. `npm run sign:build -- rulesets/agent-fighter.v1.js` (release key)
-   3. commit
-   4. `npm run publish:title -- set-build rulesets/agent-fighter.v1.js`
-4. litnode:
-   1. `npm run bundle:server -- gauntlets/agent-fighter.server.json`
-   2. `npm run publish:title -- set-build servers/agent-fighter.v1.server.json`
-   3. serve it with
-      `GAUNTLET_SERVERS=agent-fighter.v1=servers/agent-fighter.v1.server.tgz`
-5. Operators: `GAUNTLET_SERVERS=agent-fighter.v1` on two or more operators,
+3. **Ruleset.** *(Built and release-signed in litnode `bea6429` / `0e9e948`
+   from `29d4400`: `7414ddf3…4423`. `packages/core` has not changed since.)*
+   - **Left, publisher wallet:** `npm run publish:title -- set-build
+     rulesets/agent-fighter.v1.js`. TitleRegistry holds only `859e7215…`
+     (af-core-8) and `00f7319c…` (the af-core-8 server) today.
+4. **Gauntlet server bundle.** *(Built and signed in litnode from `29d4400`:
+   `e8d8f22b…02fd`. Rebuilt here from `b7d0923`, it is byte-identical.)*
+   - **Left, publisher wallet:** `npm run publish:title -- set-build
+     servers/agent-fighter.v1.server.json`.
+   - **Left, once the desktop runs 0.12.0:** copy
+     `servers/agent-fighter.v1.server.{tgz,json}` over `C:\litvm\servers\`.
+     The desktop still serves the af-core-8 server `00f7319c…`, which turns
+     away af-core-9 players. Then restart the node.
+5. **litnode 0.12.0**, in one window (litnode CHANGELOG, "Upgrading"):
+   1. `npm run release`, signed with the release key. This publishes to
+      GitHub Releases and nodes update from it.
+   2. Steps 3 and 4 run in the same window, along with Pickle Brawl's and
+      FLOOD CONTROL's builds.
+   3. **Protocol 4:** protocol-3 and protocol-4 nodes exclude each other.
+      Every operator updates within the hour, and
+      `npm run host -- doctor` shows `settlement` true.
+   4. Then redeploy the arcade from litnode `cabinet/` (its own Vercel
+      project). The arcade's `contracts.json` then carries `explorer`, and
+      EpochAnchor links turn on. It still has no `rpcFallback`. The client
+      carries its own fallback list, so that field is optional.
+6. **Dedicated relay checkout.** *(Prepared: `E:\NPC\AGENT FIGHTER\agent-fighter-relay`,
+   a clone of `b7d0923` that tracks GitHub `master`, with `npm ci` done.
+   Without `.env` it refuses to start, as designed.)*
+   - **Left:**
+     1. Copy `.env` into it, and `air/partner_rs256.pem` too if AIR
+        write-back is on.
+     2. Set `AF_ROOT` in `E:\NPC\LITNODE-DESKTOP\node.env` to the new
+        checkout.
+     3. Run `LITNODE_DIR=E:\NPC\LITNODE-DESKTOP npm run deploy:relay`.
+   - Do the copy **before** the `AF_ROOT` change. A relay without `.env`
+     does not come back up.
+7. **Stable relay hostname.** A named tunnel needs a hostname in a Cloudflare
+   zone. `agentfighter.wtf` and `litvm.games` are both on Vercel DNS, so this
+   needs a domain (or a subdomain's zone) moved to Cloudflare first. Then:
+   1. `cloudflared tunnel login`
+   2. `create`
+   3. `route dns`
+   4. Set `RELAY_TUNNEL_NAME` / `RELAY_TUNNEL_HOST` in `node.env`.
+
+   `cloudflared` 2025.7.0 is installed on the desktop.
+8. Operators: `GAUNTLET_SERVERS=agent-fighter.v1` on two or more operators,
    then the week-long relay retirement in ADR 0014.
